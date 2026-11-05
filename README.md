@@ -317,17 +317,12 @@ the main workspace — see [DEV.md](DEV.md) for build steps.
   closed with `unsupported_capability`; it never edits the file underneath a
   live editor that cannot perform the native flip.
 
-## License: free for the little guys
+## License
 
-Konnect is licensed under the **[GNU AGPL-3.0](LICENSE)**.
-
-If you're a hobbyist, student, freelancer, or open-source project: **use it freely,
-no strings attached.** Design boards, ship them, sell them.
-
-If you're a business: the AGPL requires that anything you build on or around Konnect —
-including software provided over a network — be open-sourced under the same license.
-If that doesn't work for you, **commercial licenses are available**: see
-[COMMERCIAL.md](COMMERCIAL.md).
+This fork is licensed under the **[GNU AGPL-3.0-only](LICENSE)**. Anything you build on
+or around it, including software provided over a network, must be released under the
+same license. There is no CLA and no commercial license for this fork. The upstream
+project's commercial terms ([COMMERCIAL.md](COMMERCIAL.md)) do not apply here.
 
 ## Relationship to KiCAD-MCP-Server
 
