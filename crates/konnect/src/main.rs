@@ -6,12 +6,13 @@ mod transaction_cli;
 mod transport;
 
 use anyhow::Result;
-use config::{Config, TransportMode};
+use config::Config;
 use konnect_core::config_resolution::ConfigSource;
 use konnect_core::mcp::handler::McpHandler;
 use std::io::IsTerminal;
 use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter};
+use transport::TransportPlan;
 
 /// What an invocation means, decided from the arguments alone.
 ///
@@ -136,6 +137,9 @@ async fn main() -> Result<()> {
     info!("Konnect v{} starting", env!("CARGO_PKG_VERSION"));
     ipc_source.log(&config.ipc_address);
 
+    // Before anything is registered or bound: a refused HTTP bind exits here.
+    let transports = TransportPlan::from_config(&config)?;
+
     // Name the configuration that actually started this process. A user whose
     // settings appear to be ignored otherwise has nothing to go on before the
     // first tool call, and `get_installation_info` may not be reachable at all
@@ -187,8 +191,8 @@ async fn main() -> Result<()> {
         Err(error) => tracing::warn!("guidance drift detection unavailable: {error:#}"),
     }
 
-    match config.transport {
-        TransportMode::Stdio => {
+    match transports {
+        TransportPlan::Stdio => {
             handler.enable_stdio_reload();
             match transport::stdio::run_stdio(handler).await? {
                 transport::stdio::StdioExit::Eof => {}
@@ -202,14 +206,13 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        TransportMode::Http => {
-            transport::http::run_http(handler, &config.http_address).await?;
+        TransportPlan::Http(policy) => {
+            transport::http::run_http(handler, policy).await?;
         }
-        TransportMode::Both => {
+        TransportPlan::Both(policy) => {
             let handler_http = handler.clone();
-            let http_addr = config.http_address.clone();
             let http_task = tokio::spawn(async move {
-                transport::http::run_http(handler_http, &http_addr)
+                transport::http::run_http(handler_http, policy)
                     .await
                     .expect("HTTP transport failed");
             });

@@ -19,15 +19,52 @@ struct HttpServer {
     _config: tempfile::NamedTempFile,
 }
 
+/// Spawn the binary against a temp JSON config, with `KONNECT_HTTP_TOKEN`
+/// set to `env_token` or removed.
+fn spawn_konnect(
+    config_json: &str,
+    env_token: Option<&str>,
+    stderr: Stdio,
+) -> (Child, tempfile::NamedTempFile) {
+    let mut config = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+    config.write_all(config_json.as_bytes()).unwrap();
+    config.flush().unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+    command
+        .arg("--config")
+        .arg(config.path())
+        .stdin(Stdio::piped()) // piped stdin so it doesn't detect a TTY
+        .stdout(Stdio::null())
+        .stderr(stderr);
+    match env_token {
+        Some(token) => command.env("KONNECT_HTTP_TOKEN", token),
+        None => command.env_remove("KONNECT_HTTP_TOKEN"),
+    };
+    let child = command.spawn().expect("failed to spawn konnect binary");
+    (child, config)
+}
+
+fn free_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
+}
+
 impl HttpServer {
     fn spawn() -> Self {
+        Self::spawn_bound("127.0.0.1", "", None)
+    }
+
+    /// `extra_config` is spliced into the JSON config object after the
+    /// transport and address, e.g. `,"http_token":"t"`.
+    fn spawn_bound(bind_ip: &str, extra_config: &str, env_token: Option<&str>) -> Self {
         // The probed port can be taken between the probe and the child's own
         // bind (TOCTOU) — same race that made the konnect-ipc mocks flaky on
         // CI. The child needs a real TCP port (separate process, no inproc
         // option), so handle the race by retrying on a fresh port instead.
         let mut last_err = String::new();
         for _ in 0..5 {
-            match Self::try_spawn() {
+            match Self::try_spawn(bind_ip, extra_config, env_token) {
                 Ok(server) => return server,
                 Err(e) => last_err = e,
             }
@@ -35,26 +72,16 @@ impl HttpServer {
         panic!("server never became ready: {last_err}");
     }
 
-    fn try_spawn() -> Result<Self, String> {
-        // Pick a free port by binding then dropping a listener.
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
+    fn try_spawn(
+        bind_ip: &str,
+        extra_config: &str,
+        env_token: Option<&str>,
+    ) -> Result<Self, String> {
+        let port = free_port();
+        let config_json =
+            format!(r#"{{"transport":"http","http_address":"{bind_ip}:{port}"{extra_config}}}"#);
+        let (child, config) = spawn_konnect(&config_json, env_token, Stdio::null());
         let addr = format!("127.0.0.1:{port}");
-
-        let mut config = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
-        write!(config, r#"{{"transport":"http","http_address":"{addr}"}}"#).unwrap();
-        config.flush().unwrap();
-
-        let child = Command::new(env!("CARGO_BIN_EXE_konnect"))
-            .arg("--config")
-            .arg(config.path())
-            .stdin(Stdio::piped()) // piped stdin so it doesn't detect a TTY
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to spawn konnect binary");
 
         let mut server = HttpServer {
             child,
@@ -92,10 +119,15 @@ impl HttpServer {
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         let body = body.unwrap_or("");
         let mut req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n",
-            self.addr,
+            "{method} {path} HTTP/1.1\r\nConnection: close\r\nContent-Length: {}\r\n",
             body.len()
         );
+        if !extra_headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("host"))
+        {
+            req.push_str(&format!("Host: {}\r\n", self.addr));
+        }
         if body.starts_with('{') {
             req.push_str("Content-Type: application/json\r\n");
         }
@@ -263,5 +295,167 @@ fn sse_stream_delivers_tools_list_changed() {
     assert!(
         saw_notification,
         "tools/list_changed never arrived on the SSE stream"
+    );
+}
+
+fn ping(id: u32) -> String {
+    format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#)
+}
+
+#[test]
+fn origin_is_judged_by_its_parsed_host() {
+    let server = HttpServer::spawn();
+    for (origin, expected) in [
+        ("http://[::1]:3000", 200),
+        ("http://127.0.0.1", 200),
+        ("http://localhost:3000", 200),
+        ("http://localhost.evil.com", 403),
+        ("http://127.0.0.1.evil.com", 403),
+        ("null", 403),
+        ("file://localhost", 403),
+    ] {
+        let (status, _, _) = server
+            .raw_request("POST", "/mcp", &[("Origin", origin)], Some(&ping(11)))
+            .unwrap();
+        assert_eq!(status, expected, "Origin: {origin}");
+    }
+}
+
+#[test]
+fn a_foreign_host_header_is_forbidden() {
+    let server = HttpServer::spawn();
+    let port = server.addr.rsplit(':').next().unwrap().to_string();
+    for (host, expected) in [
+        (format!("evil.example.com:{port}"), 403),
+        (format!("localhost.evil.com:{port}"), 403),
+        (format!("localhost:{port}"), 200),
+        (format!("[::1]:{port}"), 200),
+    ] {
+        let (status, _, _) = server
+            .raw_request("POST", "/mcp", &[("Host", &host)], Some(&ping(12)))
+            .unwrap();
+        assert_eq!(status, expected, "Host: {host}");
+    }
+}
+
+fn request_with_token(
+    server: &HttpServer,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+) -> (u16, String) {
+    let header = token.map(|t| format!("Bearer {t}"));
+    let headers: Vec<(&str, &str)> = header
+        .as_deref()
+        .map(|h| vec![("Authorization", h)])
+        .unwrap_or_default();
+    let body = (method == "POST").then(|| ping(13));
+    let (status, head, _) = server
+        .raw_request(method, path, &headers, body.as_deref())
+        .unwrap();
+    (status, head)
+}
+
+#[test]
+fn a_configured_token_is_required_on_every_mcp_route() {
+    let server = HttpServer::spawn_bound("127.0.0.1", r#","http_token":"s3cret""#, None);
+
+    let (status, head) = request_with_token(&server, "POST", "/mcp", None);
+    assert_eq!(status, 401);
+    assert!(
+        head.to_lowercase().contains("www-authenticate: bearer"),
+        "401 must name the scheme:\n{head}"
+    );
+    assert_eq!(
+        request_with_token(&server, "POST", "/mcp", Some("wrong")).0,
+        401
+    );
+    assert_eq!(
+        request_with_token(&server, "POST", "/mcp", Some("s3cret")).0,
+        200
+    );
+    assert_eq!(
+        request_with_token(&server, "GET", "/mcp/sse", None).0,
+        401,
+        "the SSE alias is guarded too"
+    );
+
+    // Probes stay open; the body carries no tool data.
+    let (status, _, body) = server.raw_request("GET", "/health", &[], None).unwrap();
+    assert_eq!((status, body.as_str()), (200, "ok"));
+}
+
+#[test]
+fn the_environment_token_replaces_the_file_token() {
+    let server = HttpServer::spawn_bound(
+        "127.0.0.1",
+        r#","http_token":"from-file""#,
+        Some("from-env"),
+    );
+    assert_eq!(
+        request_with_token(&server, "POST", "/mcp", Some("from-file")).0,
+        401
+    );
+    assert_eq!(
+        request_with_token(&server, "POST", "/mcp", Some("from-env")).0,
+        200
+    );
+}
+
+/// Run the binary with a config that must be refused, and return its exit
+/// status and stderr.
+fn refused_startup(extra_config: &str) -> (std::process::ExitStatus, String) {
+    let config_json = format!(
+        r#"{{"transport":"http","http_address":"0.0.0.0:{}"{extra_config}}}"#,
+        free_port()
+    );
+    let (mut child, _config) = spawn_konnect(&config_json, None, Stdio::piped());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("konnect kept running with a refused config: {config_json}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    (status, stderr)
+}
+
+#[test]
+fn a_non_loopback_bind_without_opt_in_refuses_to_start() {
+    let (status, stderr) = refused_startup(r#","http_token":"t""#);
+    assert!(!status.success(), "{status}");
+    assert!(stderr.contains("http_allow_remote"), "{stderr}");
+}
+
+#[test]
+fn a_non_loopback_bind_without_a_token_refuses_to_start() {
+    let (status, stderr) = refused_startup(r#","http_allow_remote":true"#);
+    assert!(!status.success(), "{status}");
+    assert!(stderr.contains("http_token"), "{stderr}");
+}
+
+#[test]
+fn an_opted_in_remote_bind_serves_with_the_token() {
+    let server = HttpServer::spawn_bound(
+        "0.0.0.0",
+        r#","http_allow_remote":true,"http_token":"s3cret""#,
+        None,
+    );
+    assert_eq!(request_with_token(&server, "POST", "/mcp", None).0, 401);
+    assert_eq!(
+        request_with_token(&server, "POST", "/mcp", Some("s3cret")).0,
+        200
     );
 }

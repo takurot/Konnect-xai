@@ -1,3 +1,4 @@
+use crate::transport::http_policy::BearerToken;
 use anyhow::Result;
 use konnect_core::config_resolution::ConfigResolution;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,16 @@ pub struct Config {
     /// HTTP server bind address (used when transport includes HTTP)
     #[serde(default = "default_http_address")]
     pub http_address: String,
+
+    /// Permit a non-loopback `http_address`. Startup still fails unless a
+    /// token is also configured.
+    #[serde(default)]
+    pub http_allow_remote: bool,
+
+    /// Bearer token the HTTP transport requires on `/mcp`. The
+    /// `KONNECT_HTTP_TOKEN` environment variable overrides it.
+    #[serde(default, skip_serializing)]
+    pub http_token: Option<BearerToken>,
 
     /// JLCPCB database cache path
     #[serde(default)]
@@ -253,6 +264,8 @@ impl Default for Config {
             ipc_address: String::new(),
             transport: TransportMode::default(),
             http_address: default_http_address(),
+            http_allow_remote: false,
+            http_token: None,
             jlcpcb_db_path: None,
             log_level: default_log_level(),
             auto_load_toolsets: false,
@@ -426,6 +439,35 @@ mod tests {
         assert!(matches!(c.transport, TransportMode::Http));
         assert_eq!(c.http_address, "127.0.0.1:9999");
         assert_eq!(c.log_level, "info"); // untouched default
+    }
+
+    #[test]
+    fn http_security_settings_default_to_loopback_without_a_token() {
+        let f = write_temp("json", "{}");
+        let c = Config::load_from(f.path()).unwrap();
+        assert_eq!(c.http_address, "127.0.0.1:3000");
+        assert!(!c.http_allow_remote);
+        assert!(c.http_token.is_none());
+    }
+
+    #[test]
+    fn the_http_token_is_read_but_never_shown() {
+        let f = write_temp(
+            "toml",
+            "http_allow_remote = true\nhttp_token = \"s3cret\"\n",
+        );
+        let c = Config::load_from(f.path()).unwrap();
+        assert!(c.http_allow_remote);
+        assert!(c.http_token.is_some());
+        let shown = format!("{c:?} {}", serde_json::to_string(&c).unwrap());
+        assert!(!shown.contains("s3cret"), "{shown}");
+    }
+
+    #[test]
+    fn a_blank_http_token_in_a_file_is_an_error() {
+        let f = write_temp("json", r#"{"http_token": "  "}"#);
+        let err = Config::load_from(f.path()).unwrap_err();
+        assert!(err.to_string().contains("http_token"), "{err}");
     }
 
     // Mutates the process-wide env var, so these two run serially.
