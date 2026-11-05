@@ -5,10 +5,15 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Weekly, so an advisory published against an unchanged Cargo.lock still
+  # fails the `advisories` job instead of waiting for the next dependency PR.
+  schedule:
+    - cron: "17 6 * * 1"
 
-# A new push to the same branch/PR supersedes the previous run.
+# A new push to the same branch/PR supersedes the previous run. The event is
+# in the key so the weekly run on main never cancels a push run on main.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -133,6 +138,18 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses
+
+  # RUSTSEC advisory gate (deny.toml [advisories]). Accepted advisories live
+  # in its ignore list, each with a reason.
+  advisories:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
 
   fmt:
     name: Format
