@@ -1,4 +1,4 @@
-# cargo-deny configuration — dependency license gate.
+# cargo-deny configuration: dependency license and advisory gates.
 #
 # Konnect is AGPL-3.0 with a commercial dual license (COMMERCIAL.md), so every
 # dependency's license matters twice: it must be AGPL-compatible AND
@@ -37,11 +37,16 @@ confidence-threshold = 0.8
 ignore = true
 
 [advisories]
-# Advisory auditing is a separate concern from license gating; keep the gate
-# focused so a new RUSTSEC entry cannot block an unrelated license check.
-# Dependabot covers version currency.
+# Gated by the CI `advisories` job, separate from `licenses` so a new RUSTSEC
+# entry cannot block an unrelated license check. Its weekly schedule catches
+# advisories published against an unchanged Cargo.lock.
+# Run locally: cargo deny check advisories
 version = 2
 yanked = "warn"
+ignore = [
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils (unmaintained, no vulnerability): hyper still depends on it and no replacement release exists" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml (unmaintained): only via konnect's serde_yaml_ng dev-dependency, which parses repository-owned workflow YAML in tests" },
+]
 
 [bans]
 multiple-versions = "allow"
