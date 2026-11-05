@@ -11,15 +11,16 @@
 //! `GET /mcp/sse` is kept as an alias for older configs. `GET /health`
 //! returns "ok" for probes.
 //!
-//! Security (per the MCP spec's Streamable HTTP requirements): the server
-//! binds to 127.0.0.1 by default, and every request's `Origin` header — when
-//! present — must be a localhost origin, otherwise 403. This prevents DNS
-//! rebinding attacks from remote websites against the local server.
+//! Security: the bind is validated by [`HttpPolicy`] before this runs. Every
+//! request's `Host` and `Origin` (when present) must name loopback, or 403,
+//! which defeats DNS rebinding. With a token configured, every route but
+//! `/health` also needs `Authorization: Bearer <token>`, or 401.
 
+use super::http_policy::{origin_allowed, HttpPolicy};
 use anyhow::Result;
 use axum::{
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    extract::{Request, State},
+    http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event, Sse},
@@ -33,7 +34,7 @@ use serde_json::Value;
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Clone)]
 struct AppState {
@@ -41,7 +42,18 @@ struct AppState {
 }
 
 /// Run the MCP server over Streamable HTTP.
-pub async fn run_http(handler: McpHandler, addr: &str) -> Result<()> {
+pub async fn run_http(handler: McpHandler, policy: HttpPolicy) -> Result<()> {
+    let addr = policy.addr();
+    if policy.is_remote() {
+        warn!(
+            "HTTP transport is bound to non-loopback address {addr} (http_allow_remote): \
+             every tool, including ones that write files, is reachable from the network, \
+             guarded only by the bearer token. Use TLS or a trusted network."
+        );
+    } else if !policy.has_token() {
+        info!("HTTP transport has no http_token: any local process can call its tools");
+    }
+
     let state = AppState {
         handler: Arc::new(handler),
     };
@@ -55,38 +67,46 @@ pub async fn run_http(handler: McpHandler, addr: &str) -> Result<()> {
         )
         .route("/mcp/sse", get(handle_sse)) // legacy alias
         .route("/health", get(handle_health))
-        .layer(middleware::from_fn(validate_origin))
+        .layer(middleware::from_fn_with_state(Arc::new(policy), guard))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!("Streamable HTTP transport listening on http://{}/mcp", addr);
+    info!("Streamable HTTP transport listening on http://{addr}/mcp");
 
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-/// Reject any request whose `Origin` header is present and not a localhost
-/// origin (MCP spec: servers MUST validate Origin to prevent DNS rebinding).
-/// Requests without an Origin header (curl, native MCP clients) pass through.
-async fn validate_origin(
-    headers: HeaderMap,
-    request: axum::extract::Request,
-    next: Next,
-) -> Response {
-    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
-        let allowed = origin
-            .strip_prefix("http://")
-            .or_else(|| origin.strip_prefix("https://"))
-            .map(|rest| {
-                let host = rest.split(':').next().unwrap_or("");
-                host == "localhost" || host == "127.0.0.1" || host == "[::1]"
-            })
-            .unwrap_or(false);
-        if !allowed {
-            return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
-        }
+async fn guard(State(policy): State<Arc<HttpPolicy>>, request: Request, next: Next) -> Response {
+    match refusal(&policy, request.uri().path(), request.headers()) {
+        Some(response) => response,
+        None => next.run(request).await,
     }
-    next.run(request).await
+}
+
+/// Absent `Host` and `Origin` pass: native MCP clients and curl may omit
+/// them, and a browser always sends both. A header that is present but not
+/// valid UTF-8 is refused.
+fn refusal(policy: &HttpPolicy, path: &str, headers: &HeaderMap) -> Option<Response> {
+    let value = |name| headers.get(name).map(|v| v.to_str().unwrap_or(""));
+
+    if value(header::HOST).is_some_and(|host| !policy.host_allowed(host)) {
+        return Some((StatusCode::FORBIDDEN, "Host not allowed").into_response());
+    }
+    if value(header::ORIGIN).is_some_and(|origin| !origin_allowed(origin)) {
+        return Some((StatusCode::FORBIDDEN, "Origin not allowed").into_response());
+    }
+    if path != "/health" && !policy.authorized(value(header::AUTHORIZATION)) {
+        return Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                "Missing or invalid bearer token",
+            )
+                .into_response(),
+        );
+    }
+    None
 }
 
 async fn handle_post(State(state): State<AppState>, Json(body): Json<Value>) -> Response {

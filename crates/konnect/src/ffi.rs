@@ -35,7 +35,8 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
     };
 
     rt.spawn(async move {
-        use crate::config::{Config, TransportMode};
+        use crate::config::Config;
+        use crate::transport::TransportPlan;
         use konnect_core::config_resolution::ConfigResolution;
         use konnect_core::mcp::handler::McpHandler;
 
@@ -63,6 +64,13 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
             .with_env_filter(filter)
             .try_init();
         ipc_source.log(&config.ipc_address);
+        let transports = match TransportPlan::from_config(&config) {
+            Ok(transports) => transports,
+            Err(error) => {
+                eprintln!("kicad_plugin_init: {error}");
+                return;
+            }
+        };
         let server_config = konnect_core::tools::ServerConfig {
             kicad_cli: config.kicad_cli.clone(),
             kicad_binary: config.kicad_binary.clone(),
@@ -73,22 +81,21 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
             eager_toolsets: config.eager_toolsets,
         };
         match McpHandler::new_with_config_resolution(server_config, config_resolution).await {
-            Ok(handler) => match config.transport {
-                TransportMode::Stdio => {
+            Ok(handler) => match transports {
+                TransportPlan::Stdio => {
                     // This server is embedded in the host process. Even on
                     // Unix stdio, current_exe() names that host (for example
                     // KiCad), not the Konnect cdylib, so in-place reload is a
                     // standalone-binary capability and is not enabled here.
                     run_embedded_stdio(handler).await;
                 }
-                TransportMode::Http => {
-                    let _ = crate::transport::http::run_http(handler, &config.http_address).await;
+                TransportPlan::Http(policy) => {
+                    let _ = crate::transport::http::run_http(handler, policy).await;
                 }
-                TransportMode::Both => {
+                TransportPlan::Both(policy) => {
                     let handler_http = handler.clone();
-                    let http_addr = config.http_address.clone();
                     tokio::select! {
-                        _ = crate::transport::http::run_http(handler_http, &http_addr) => {},
+                        _ = crate::transport::http::run_http(handler_http, policy) => {},
                         _ = run_embedded_stdio(handler) => {},
                     }
                 }

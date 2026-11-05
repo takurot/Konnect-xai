@@ -226,8 +226,51 @@ ipc_address = "ipc://C:/Users/<you>/AppData/Local/Temp/kicad/api.sock"
 
 Start `konnect` from a normal terminal and point the client at
 `http://127.0.0.1:3000/mcp`; `http://127.0.0.1:3000/health` answers `ok` while
-the server is up. Keep the address on `127.0.0.1`: the HTTP transport has no
-authentication. KiCad needs no change.
+the server is up. Keep the address on `127.0.0.1`, as
+[HTTP transport security](#http-transport-security) explains. KiCad needs no
+change.
+
+## HTTP transport security
+
+The HTTP transport (`transport = "http"` or `"both"`) exposes every tool,
+including ones that overwrite schematics and boards, delete files and launch
+`kicad-cli`. These settings decide who can reach it.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `http_address` | `127.0.0.1:3000` | The bind address. Loopback (`127.0.0.0/8`, `::1`, `localhost`) needs nothing else. |
+| `http_allow_remote` | `false` | Must be `true` for any other address. |
+| `http_token` | unset | A bearer token. Required when `http_allow_remote` is on, optional on loopback. |
+| `KONNECT_HTTP_TOKEN` | unset | Environment variable. Overrides `http_token` when non-blank. |
+
+Konnect refuses to start, and exits non-zero before binding, when the address
+is not loopback and `http_allow_remote` is not `true`. It also refuses when
+`http_allow_remote` is `true` and no token is set: a network bind without
+authentication is never allowed. An allowed network bind logs a warning at
+startup. The token travels in plain text, so use it only on a trusted network
+or behind a TLS proxy.
+
+With a token set, every request except `GET /health` needs
+`Authorization: Bearer <token>`, or it gets `401` with
+`WWW-Authenticate: Bearer`. `/health` stays open for probes and returns only
+`ok`. The token never appears in logs.
+
+Every request is also checked for DNS rebinding. A `Host` header must name a
+loopback address or `localhost`; on a network bind it may also name the bind
+address, and a wildcard bind (`0.0.0.0`, `::`) accepts any host because the
+token is required there. An `Origin` header must be `http` or `https` on a
+loopback host, so `http://[::1]:3000` passes and `http://localhost.evil.com`
+and `null` do not. A failed check gets `403`. Requests without these headers,
+such as those from native MCP clients and curl, are not refused for that.
+
+```toml
+# Reachable from the LAN, authenticated
+transport = "http"
+http_address = "0.0.0.0:3000"
+http_allow_remote = true
+# or set KONNECT_HTTP_TOKEN instead of writing the token here
+http_token = "<a long random string>"
+```
 
 ## Tools answer from the file while KiCad is open
 
