@@ -1,5 +1,11 @@
 # Contributing to Konnect
 
+> **Fork notice.** This file describes the governance and licensing of the upstream
+> project, [mixelpixx/Konnect](https://github.com/mixelpixx/Konnect), and does not
+> apply to this fork. [takurot/Konnect-xai](https://github.com/takurot/Konnect-xai)
+> is licensed AGPL-3.0-only, has no contributor license agreement, and offers no
+> commercial license. It is kept unchanged below for reference.
+
 Thanks for your interest! Bug reports, feature requests, and pull requests are welcome.
 
 ## Before you start
