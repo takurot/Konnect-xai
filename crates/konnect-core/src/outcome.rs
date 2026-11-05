@@ -146,6 +146,35 @@ mod tests {
         removal_criteria: String,
     }
 
+    fn is_tracking_issue_url(issue: &str) -> bool {
+        use konnect_ipc::project_links::{REPO_URL, UPSTREAM_REPO_URL};
+        [UPSTREAM_REPO_URL, REPO_URL].iter().any(|repo| {
+            issue
+                .strip_prefix(repo)
+                .and_then(|rest| rest.strip_prefix("/issues/"))
+                .is_some_and(|number| number.parse::<u64>().is_ok())
+        })
+    }
+
+    #[test]
+    fn tracking_issues_may_live_upstream_or_in_this_fork() {
+        assert!(is_tracking_issue_url(
+            "https://github.com/mixelpixx/Konnect/issues/119"
+        ));
+        assert!(is_tracking_issue_url(
+            "https://github.com/takurot/Konnect-xai/issues/10"
+        ));
+        for invalid in [
+            "https://github.com/takurot/Konnect-xai/issues/",
+            "https://github.com/takurot/Konnect-xai/issues/ten",
+            "https://github.com/takurot/Konnect-xai/pull/10",
+            "https://github.com/someone/else/issues/10",
+            "https://github.com/takurot/Konnect-xai/issues/x/10",
+        ] {
+            assert!(!is_tracking_issue_url(invalid), "{invalid}");
+        }
+    }
+
     #[test]
     fn reliability_contract_inventory_is_reviewed_and_bounded() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -217,11 +246,7 @@ mod tests {
             );
             for issue in entry.tracking_issues {
                 assert!(
-                    issue.starts_with("https://github.com/mixelpixx/Konnect/issues/")
-                        && issue
-                            .rsplit('/')
-                            .next()
-                            .is_some_and(|number| number.parse::<u64>().is_ok()),
+                    is_tracking_issue_url(&issue),
                     "{} has an invalid issue URL: {issue}",
                     entry.id
                 );

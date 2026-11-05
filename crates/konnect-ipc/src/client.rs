@@ -1076,15 +1076,18 @@ impl KiCadIpcClient {
         if self.socket_path.is_empty() {
             return Err(unreachable_error(
                 UnreachableReason::NotConfigured,
-                "KiCAD IPC socket path not configured. To fix: \
-                 (1) in KiCAD, enable Edit > Preferences > Plugins > 'Enable KiCad API' \
-                 and copy the listed ipc:// address; \
-                 (2) paste it into the 'IPC Socket' field of the Konnect settings dialog \
-                 (Tools > External Plugins > Konnect) and save; \
-                 (3) restart the AI client so the server rereads settings. \
-                 Alternatively set ipc_socket_path in konnect-settings.json or launch \
-                 via KiCAD (which sets KICAD_API_SOCKET). \
-                 Full guide: https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md",
+                format!(
+                    "KiCAD IPC socket path not configured. To fix: \
+                     (1) in KiCAD, enable Edit > Preferences > Plugins > 'Enable KiCad API' \
+                     and copy the listed ipc:// address; \
+                     (2) paste it into the 'IPC Socket' field of the Konnect settings dialog \
+                     (Tools > External Plugins > Konnect) and save; \
+                     (3) restart the AI client so the server rereads settings. \
+                     Alternatively set ipc_socket_path in konnect-settings.json or launch \
+                     via KiCAD (which sets KICAD_API_SOCKET). \
+                     Full guide: {}",
+                    crate::project_links::docs_url("TROUBLESHOOTING.md")
+                ),
             ));
         }
 
@@ -1164,9 +1167,9 @@ impl KiCadIpcClient {
             unreachable_error(
                 reason,
                 format!(
-                    "Cannot connect to KiCad IPC at {diagnostic_dial_url}: {error}. {} Guide: \
-                     https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md",
-                    reason.explanation()
+                    "Cannot connect to KiCad IPC at {diagnostic_dial_url}: {error}. {} Guide: {}",
+                    reason.explanation(),
+                    crate::project_links::docs_url("TROUBLESHOOTING.md")
                 ),
             )
         })?;
@@ -5884,6 +5887,23 @@ mod diagnostic_tests {
             "{outcome:?}"
         );
         assert!(!client.ping().unwrap());
+    }
+
+    #[test]
+    fn the_not_configured_error_links_to_this_repositorys_troubleshooting_guide() {
+        let mut client = KiCadIpcClient::new("");
+        client.socket_path.clear();
+        let error = client
+            .send_command(
+                &kiapi::common::commands::Ping {},
+                "kiapi.common.commands.Ping",
+            )
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.contains(&crate::project_links::docs_url("TROUBLESHOOTING.md")),
+            "{text}"
+        );
     }
 
     #[test]

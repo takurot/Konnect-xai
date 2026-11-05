@@ -5,44 +5,21 @@
 <img src="resources/images/KiCAD-MCP-Server-rust.svg" alt="KiCAD-MCP-Server Logo" height="240" />
 
 
-# Konnect has moved to Konnect-EDA
-
-## [Go to Konnect-EDA →](https://github.com/Orchis-ai-LLC/Konnect-EDA)
+# Konnect
 
 </div>
 
-This repository is being archived, which makes it read-only. Development continues
-at Konnect-EDA, from Orchis.ai LLC.
+This is [takurot/Konnect-xai](https://github.com/takurot/Konnect-xai), a maintained
+fork of [mixelpixx/Konnect](https://github.com/mixelpixx/Konnect). The upstream
+repository is archived. This fork was last synced with upstream at commit `676efce`.
 
-## It stays free, unless you're a business
-
-Konnect-EDA is now commercial and closed source. Here's what that means for you:
-
-- **Everyone, businesses included:** free until version 1.0.
-- **Personal, hobby, student and open-hardware work:** still free after 1.0. You'll
-  need a license key, and that key is free too.
-- **Businesses:** a paid license from 1.0.
-
-Business licenses pay for the work, and that's what lets us keep it free for
-everyone else.
-
-**Nothing here is being taken away.** The code and releases in this repository stay
-available under the AGPL-3.0. The original
-[KiCAD MCP Server](https://github.com/mixelpixx/KiCAD-MCP-Server) stays open source
-under the MIT license and is still maintained. The boards you design are always yours.
-
-## Where to go now
-
-- **Downloads:** the [Konnect-EDA releases page](https://github.com/Orchis-ai-LLC/Konnect-EDA/releases).
-  The first release is coming soon.
-- **Bugs and feature requests:** the
-  [Konnect-EDA issue tracker](https://github.com/Orchis-ai-LLC/Konnect-EDA/issues).
-- **Want to help build it?** [Sign up to contribute](https://orchis.ai/konnect/join).
-- **Contributed to Konnect?** Please [complete your sign-off](https://orchis.ai/konnect/sign-off)
-  by November 20.
-- **Using it at a company?** See [licensing](https://konnect-eda.orchis.ai/licensing/).
-
-Thank you to everyone who built Konnect with us.
+- **License:** AGPL-3.0-only, the same as upstream. The upstream contributor agreement and
+  commercial licensing do not apply to this fork.
+- **Bugs and feature requests:** [this repository's issues](https://github.com/takurot/Konnect-xai/issues).
+  Please do not file reports for this fork upstream.
+- **Upstream's successor:** development of the original project continues as
+  [Konnect-EDA](https://github.com/Orchis-ai-LLC/Konnect-EDA), a commercial product
+  from Orchis.ai LLC that is separate from this fork.
 
 ---
 
@@ -340,17 +317,12 @@ the main workspace — see [DEV.md](DEV.md) for build steps.
   closed with `unsupported_capability`; it never edits the file underneath a
   live editor that cannot perform the native flip.
 
-## License: free for the little guys
+## License
 
-Konnect is licensed under the **[GNU AGPL-3.0](LICENSE)**.
-
-If you're a hobbyist, student, freelancer, or open-source project: **use it freely,
-no strings attached.** Design boards, ship them, sell them.
-
-If you're a business: the AGPL requires that anything you build on or around Konnect —
-including software provided over a network — be open-sourced under the same license.
-If that doesn't work for you, **commercial licenses are available**: see
-[COMMERCIAL.md](COMMERCIAL.md).
+This fork is licensed under the **[GNU AGPL-3.0-only](LICENSE)**. Anything you build on
+or around it, including software provided over a network, must be released under the
+same license. There is no CLA and no commercial license for this fork. The upstream
+project's commercial terms ([COMMERCIAL.md](COMMERCIAL.md)) do not apply here.
 
 ## Relationship to KiCAD-MCP-Server
 

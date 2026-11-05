@@ -60,3 +60,37 @@ decision and its safety gates are described in
    paths and the gates between them.
 5. [Testing and release](TESTING_AND_RELEASE.md) maps changes to tests, CI, live
    KiCad validation, documentation, and packaging.
+
+## Fork identity
+
+This repository is `takurot/Konnect-xai`, a fork of the archived
+`mixelpixx/Konnect`. Repository links in code come from one place,
+`konnect_ipc::project_links`. `REPO_URL` is this fork and `UPSTREAM_REPO_URL`
+is upstream. Runtime error text builds doc links with `docs_url`, and a test in
+that module fails if any Rust source links to upstream docs again. Reliability
+tracking issues may cite either repository.
+
+**Decision: keep the PCM identifier `com.github.mixelpixx.konnect`.** The fork
+is a drop-in replacement for upstream. KiCad's Plugin and Content Manager keys
+a package by its identifier, and the identifier also sets the install directory
+`com_github_mixelpixx_konnect`. The client configs that `konnect init` already
+wrote record the binary's path inside that directory, as do the
+`examples/*.json` configs and the README install paths. `runtime_info.rs`
+matches the identifier to recognize a PCM install. Keeping it means a user can
+replace an upstream install with this fork's package, and their AI client
+configuration keeps working.
+
+**Alternative not taken: rename the identifier**, for example to
+`com.github.takurot.konnect-xai`. The fork would then be a separate PCM package
+that can be installed beside upstream. The rename has to be applied together in
+`packaging/metadata.json`, `plugin/plugin.json`,
+`crates/konnect-core/src/runtime_info.rs`,
+`crates/schematic-viewer/tauri.conf.json`, `examples/*.json`, `README.md`, and
+`DEV.md`. Existing users would have to reinstall and edit their client configs.
+Revisit this only if the two packages need to coexist.
+
+The PCM metadata points `resources.homepage` and `author.contact.web` at this
+fork. These are display links in the PCM schema and are independent of the
+identifier. `author.name` stays `mixelpixx`, who wrote the plugin. The
+`download_url` printed by `packaging/build-pcm.sh` and `build-pcm.ps1` points at
+this fork's releases.
