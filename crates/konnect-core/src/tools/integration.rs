@@ -410,7 +410,11 @@ async fn download_jlcpcb_archive(
     Ok((chunk_count, downloaded_bytes))
 }
 
-fn extract_jlcpcb_database(archive_path: &Path, output_path: &Path) -> anyhow::Result<()> {
+fn extract_jlcpcb_database(
+    archive_path: &Path,
+    output_path: &Path,
+    max_database_bytes: u64,
+) -> anyhow::Result<()> {
     let archive_file = std::fs::File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(archive_file)?;
     if archive.len() != 1 {
@@ -424,10 +428,10 @@ fn extract_jlcpcb_database(archive_path: &Path, output_path: &Path) -> anyhow::R
     if database.is_dir() || database.enclosed_name().is_none() {
         anyhow::bail!("JLCPCB archive does not contain a safe database file");
     }
-    if database.size() > JLCPCB_MAX_DATABASE_BYTES {
+    if database.size() > max_database_bytes {
         anyhow::bail!(
             "JLCPCB database exceeds the {} byte safety limit",
-            JLCPCB_MAX_DATABASE_BYTES
+            max_database_bytes
         );
     }
 
@@ -618,7 +622,7 @@ async fn handle_download_jlcpcb(
     let (part_count, size_bytes) = tokio::task::spawn_blocking({
         let db_path = db_path.clone();
         move || -> anyhow::Result<(u64, u64)> {
-            extract_jlcpcb_database(&archive_path, &upstream_path)?;
+            extract_jlcpcb_database(&archive_path, &upstream_path, JLCPCB_MAX_DATABASE_BYTES)?;
             let part_count = build_konnect_jlcpcb_database(&upstream_path, &staged_path)?;
             let size_bytes = std::fs::metadata(&staged_path)?.len();
             replace_jlcpcb_database(&staged_path, &db_path, &backup_path)?;
@@ -2954,29 +2958,101 @@ mod jlcpcb_database_tests {
         assert!(parse_jlcpcb_chunk_count("not-a-number").is_err());
     }
 
+    enum Entry<'a> {
+        File(&'a str, &'a [u8]),
+        Dir(&'a str),
+    }
+
+    fn write_feed_archive(path: &Path, entries: &[Entry]) {
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for entry in entries {
+            match entry {
+                Entry::File(name, bytes) => {
+                    archive.start_file(*name, options).unwrap();
+                    archive.write_all(bytes).unwrap();
+                }
+                Entry::Dir(name) => archive.add_directory(*name, options).unwrap(),
+            }
+        }
+        archive.finish().unwrap();
+    }
+
+    fn extract_error(entries: &[Entry], max_database_bytes: u64) -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive_path = dir.path().join("parts.db.zip");
+        let output_path = dir.path().join("upstream.db");
+        write_feed_archive(&archive_path, entries);
+
+        let error = extract_jlcpcb_database(&archive_path, &output_path, max_database_bytes)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !output_path.exists(),
+            "a rejected archive must not leave an output file"
+        );
+        error
+    }
+
     #[test]
     fn extracts_single_database_from_feed_archive() {
         let dir = tempfile::tempdir().expect("tempdir");
         let archive_path = dir.path().join("parts.db.zip");
         let output_path = dir.path().join("upstream.db");
-        let archive_file = std::fs::File::create(&archive_path).unwrap();
-        let mut archive = zip::ZipWriter::new(archive_file);
-        archive
-            .start_file(
+        write_feed_archive(
+            &archive_path,
+            &[Entry::File(
                 "current-parts-fts5.db",
-                zip::write::SimpleFileOptions::default()
-                    .compression_method(zip::CompressionMethod::Deflated),
-            )
-            .unwrap();
-        archive.write_all(b"SQLite database bytes").unwrap();
-        archive.finish().unwrap();
+                b"SQLite database bytes",
+            )],
+        );
 
-        extract_jlcpcb_database(&archive_path, &output_path).unwrap();
+        extract_jlcpcb_database(&archive_path, &output_path, JLCPCB_MAX_DATABASE_BYTES).unwrap();
 
         assert_eq!(
             std::fs::read(output_path).unwrap(),
             b"SQLite database bytes"
         );
+    }
+
+    #[test]
+    fn rejects_feed_archive_without_entries() {
+        let error = extract_error(&[], JLCPCB_MAX_DATABASE_BYTES);
+        assert!(error.contains("found 0 entries"), "{error}");
+    }
+
+    #[test]
+    fn rejects_feed_archive_with_two_entries() {
+        let error = extract_error(
+            &[Entry::File("a.db", b"one"), Entry::File("b.db", b"two")],
+            JLCPCB_MAX_DATABASE_BYTES,
+        );
+        assert!(error.contains("found 2 entries"), "{error}");
+    }
+
+    #[test]
+    fn rejects_feed_archive_whose_only_entry_is_a_directory() {
+        let error = extract_error(
+            &[Entry::Dir("current-parts-fts5.db/")],
+            JLCPCB_MAX_DATABASE_BYTES,
+        );
+        assert!(error.contains("safe database file"), "{error}");
+    }
+
+    #[test]
+    fn rejects_feed_archive_entry_that_escapes_the_extraction_root() {
+        let error = extract_error(
+            &[Entry::File("../escaped.db", b"SQLite database bytes")],
+            JLCPCB_MAX_DATABASE_BYTES,
+        );
+        assert!(error.contains("safe database file"), "{error}");
+    }
+
+    #[test]
+    fn rejects_feed_archive_entry_larger_than_the_limit() {
+        let error = extract_error(&[Entry::File("current-parts-fts5.db", b"12345")], 4);
+        assert!(error.contains("4 byte safety limit"), "{error}");
     }
 
     #[test]
