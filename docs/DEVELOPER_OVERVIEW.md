@@ -94,3 +94,20 @@ fork. These are display links in the PCM schema and are independent of the
 identifier. `author.name` stays `mixelpixx`, who wrote the plugin. The
 `download_url` printed by `packaging/build-pcm.sh` and `build-pcm.ps1` points at
 this fork's releases.
+
+## npm distribution
+
+`npm/` holds the launcher package `@konnect-xai/konnect` and one package per platform
+(`konnect-linux-x64`, `-linux-arm64`, `-darwin-x64`, `-darwin-arm64`, `-win32-x64`). The
+launcher resolves the installed platform package and runs its binary with inherited stdio.
+Version and binaries are not committed: `.github/workflows/release.yml` (`publish-npm`) runs
+`npm/scripts/version.js` (the tag must equal the Cargo workspace version), `stage.js` (puts
+the release binaries into the platform packages and pins `optionalDependencies`), `smoke.js`
+(pack, install, `--version`, MCP `initialize`), then `npm publish --provenance`.
+
+Publishing uses npm Trusted Publishing, so no npm token is stored. Each of the six packages is
+registered for the repository and workflow file with
+`npm trust github <package> --repo takurot/Konnect-xai --file release.yml --allow-publish`.
+Renaming `release.yml` breaks publishing until the registration is redone. A manual dispatch of
+the workflow runs everything except the real publish (`--dry-run`). Test locally with
+`node --test npm/test`.

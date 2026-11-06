@@ -115,6 +115,26 @@ Konnect.
 
 ## Installation
 
+### Run with npx (no install, no local path)
+
+Requires Node.js 18 or newer. The package installs the server binary for your
+platform (Linux x64/arm64, macOS Intel/Apple Silicon, Windows x64) as an optional
+dependency, so the MCP client config needs no path:
+
+```json
+{
+  "mcpServers": {
+    "konnect": { "command": "npx", "args": ["-y", "@konnect-xai/konnect"] }
+  }
+}
+```
+
+For Claude Code: `claude mcp add konnect -- npx -y @konnect-xai/konnect`.
+Pin a version with `@konnect-xai/konnect@<version>`. Pass options after the
+package name, for example `"args": ["-y", "@konnect-xai/konnect", "--config", "/path/to/settings.json"]`.
+Do not install with `--omit=optional` or `--no-optional`: the binary lives in
+the optional platform package. KiCad itself is still installed separately.
+
 ### From the KiCAD Plugin Manager (recommended)
 
 1. Download the package for your OS from [Releases](https://github.com/mixelpixx/Konnect/releases):
