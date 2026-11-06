@@ -276,7 +276,7 @@ jobs:
           node-version: 24
 
       - name: Launcher and staging tests
-        run: node --test npm/test
+        run: node --test "npm/test/*.test.js"
 
       - name: Resolve the package version
         id: version

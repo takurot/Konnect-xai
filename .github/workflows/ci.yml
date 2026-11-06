@@ -66,7 +66,7 @@ jobs:
         with:
           node-version: 24
       - name: Test
-        run: node --test npm/test
+        run: node --test "npm/test/*.test.js"
 
   # The KiCAD action plugin is Python, so cargo never sees it. Its only real
   # logic is the server-PID bookkeeping (#103), where an unconditional

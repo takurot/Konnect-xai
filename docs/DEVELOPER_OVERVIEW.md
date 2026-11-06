@@ -110,4 +110,4 @@ registered for the repository and workflow file with
 `npm trust github <package> --repo takurot/Konnect-xai --file release.yml --allow-publish`.
 Renaming `release.yml` breaks publishing until the registration is redone. A manual dispatch of
 the workflow runs everything except the real publish (`--dry-run`). Test locally with
-`node --test npm/test`.
+`node --test "npm/test/*.test.js"`.
