@@ -46,6 +46,9 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
@@ -252,6 +255,67 @@ jobs:
         with:
           name: konnect-pcm-${{ matrix.platform }}
           path: dist/konnect-pcm-*.zip
+
+  # Publishes @konnect-xai/konnect and its five platform packages. Auth is npm
+  # Trusted Publishing (OIDC, registered per package for this workflow file), so
+  # no npm token exists anywhere. A manual dispatch stages and smoke-tests the
+  # packages and runs `npm publish --dry-run`.
+  publish-npm:
+    name: Publish to npm
+    needs: [real-kicad-acceptance, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Launcher and staging tests
+        run: node --test "npm/test/*.test.js"
+
+      - name: Resolve the package version
+        id: version
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            # The dry run reports the real binary's version, not the synthetic input.
+            version="$(node npm/scripts/version.js)"
+          else
+            version="$(node npm/scripts/version.js "${RELEASE_VERSION#v}")"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Stage platform binaries
+        run: node npm/scripts/stage.js "${{ steps.version.outputs.version }}" artifacts
+
+      - name: Smoke test the installed package
+        run: node npm/scripts/smoke.js "${{ steps.version.outputs.version }}" npm
+
+      - name: Publish
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && '--dry-run' || '' }}
+        run: |
+          tag=latest
+          case "$VERSION" in *-*) tag=next ;; esac
+          # Platform packages first so the launcher never points at a missing one.
+          for dir in konnect-linux-x64 konnect-linux-arm64 konnect-darwin-x64 konnect-darwin-arm64 konnect-win32-x64 konnect; do
+            name="$(node -p "require('./npm/${dir}/package.json').name")"
+            if npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
+              echo "${name}@${VERSION} is already published, skipping"
+              continue
+            fi
+            npm publish "./npm/${dir}" --access public --provenance --tag "$tag" $DRY_RUN
+          done
 
   release:
     name: Create Release

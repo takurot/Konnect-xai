@@ -1,0 +1,23 @@
+{
+  "name": "@konnect-xai/konnect-linux-arm64",
+  "description": "Prebuilt Konnect server binary for linux-arm64. Installed automatically by @konnect-xai/konnect.",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "version": "0.0.0-development",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/takurot/Konnect-xai.git"
+  },
+  "homepage": "https://github.com/takurot/Konnect-xai",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "bin"
+  ]
+}

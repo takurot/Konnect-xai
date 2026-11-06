@@ -1,0 +1,12 @@
+{
+  "_comment_1": "Save as `.mcp.json` in the root of your Claude Code project, or merge into claude_desktop_config.json.",
+  "_comment_2": "No local path needed: npx fetches @konnect-xai/konnect and the binary for your OS and CPU.",
+  "_comment_3": "Pin a release with \"@konnect-xai/konnect@<version>\" for a reproducible team setup. The --config args are optional.",
+
+  "mcpServers": {
+    "konnect": {
+      "command": "npx",
+      "args": ["-y", "@konnect-xai/konnect"]
+    }
+  }
+}

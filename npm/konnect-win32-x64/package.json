@@ -1,0 +1,23 @@
+{
+  "name": "@konnect-xai/konnect-win32-x64",
+  "description": "Prebuilt Konnect server binary for win32-x64. Installed automatically by @konnect-xai/konnect.",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "version": "0.0.0-development",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/takurot/Konnect-xai.git"
+  },
+  "homepage": "https://github.com/takurot/Konnect-xai",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "bin"
+  ]
+}
