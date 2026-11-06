@@ -1,0 +1,37 @@
+{
+  "name": "@konnect-xai/konnect",
+  "description": "Konnect: a KiCad MCP server. Run it with npx; the platform binary is installed automatically.",
+  "version": "0.0.0-development",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/takurot/Konnect-xai.git"
+  },
+  "homepage": "https://github.com/takurot/Konnect-xai",
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "konnect": "bin/konnect.js"
+  },
+  "files": [
+    "bin",
+    "lib"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "kicad",
+    "eda",
+    "model-context-protocol"
+  ],
+  "optionalDependencies": {
+    "@konnect-xai/konnect-linux-x64": "0.0.0-development",
+    "@konnect-xai/konnect-linux-arm64": "0.0.0-development",
+    "@konnect-xai/konnect-darwin-arm64": "0.0.0-development",
+    "@konnect-xai/konnect-darwin-x64": "0.0.0-development",
+    "@konnect-xai/konnect-win32-x64": "0.0.0-development"
+  }
+}
