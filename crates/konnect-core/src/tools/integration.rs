@@ -2924,6 +2924,18 @@ mod jlcpcb_database_tests {
     use super::*;
     use std::io::Write;
 
+    #[test]
+    fn linked_sqlite_includes_the_wal_page_size_security_fix() {
+        // RUSTSEC-2026-0459: SQLite before 3.54.0 can expose page-cache
+        // memory when an existing catalog has a mismatched sibling WAL.
+        // Check the engine actually linked into Konnect, not just Cargo.lock.
+        assert!(
+            rusqlite::version_number() >= 3_054_000,
+            "RUSTSEC-2026-0459 requires SQLite >= 3.54.0; linked {}",
+            rusqlite::version()
+        );
+    }
+
     fn seed_upstream_database(path: &Path) {
         let conn = rusqlite::Connection::open(path).expect("open upstream database");
         conn.execute_batch(
