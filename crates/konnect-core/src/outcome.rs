@@ -284,3 +284,51 @@ mod tests {
         assert_eq!(status(&result), Some(OutcomeStatus::Partial));
     }
 }
+
+#[cfg(test)]
+mod writer_ratchet_tests {
+    #[test]
+    fn reliability_contract_unchecked_writer_inventory() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let baseline: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("docs/reliability-legacy-inventory.json")).unwrap(),
+        )
+        .unwrap();
+        let allowed = baseline["unchecked_write_atomic"]
+            .as_array()
+            .expect("reviewed unchecked writer inventory");
+        fn visit(path: &std::path::Path, root: &std::path::Path, found: &mut Vec<String>) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, root, found);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    let count = text.matches("write_atomic(").count();
+                    if count > 0 {
+                        found.push(format!(
+                            "{}:{count}",
+                            path.strip_prefix(root)
+                                .unwrap()
+                                .to_string_lossy()
+                                .replace('\\', "/")
+                        ));
+                    }
+                }
+            }
+        }
+        let mut actual = Vec::new();
+        visit(
+            &root.join("crates/konnect-core/src/tools"),
+            &root,
+            &mut actual,
+        );
+        actual.sort();
+        let mut expected = allowed
+            .iter()
+            .map(|x| x["site"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+}

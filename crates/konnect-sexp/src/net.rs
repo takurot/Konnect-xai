@@ -173,8 +173,8 @@ impl NetRef {
     /// companion — exactly as a zone should embed them.
     pub fn zone_net_nodes(&self) -> String {
         match self {
-            NetRef::ByName(name) => format!("(net \"{name}\")"),
-            NetRef::ById { id, name } => format!("(net {id}) (net_name \"{name}\")"),
+            NetRef::ByName(name) => format!("(net {})", crate::quoted(name)),
+            NetRef::ById { id, name } => format!("(net {id}) (net_name {})", crate::quoted(name)),
         }
     }
 
@@ -183,8 +183,8 @@ impl NetRef {
     /// zones use `(layer …)`.
     pub fn zone_layer_node(&self, layer: &str) -> String {
         match self {
-            NetRef::ByName(_) => format!("(layers \"{layer}\")"),
-            NetRef::ById { .. } => format!("(layer \"{layer}\")"),
+            NetRef::ByName(_) => format!("(layers {})", crate::quoted(layer)),
+            NetRef::ById { .. } => format!("(layer {})", crate::quoted(layer)),
         }
     }
 }
@@ -346,5 +346,42 @@ mod tests {
     fn nets_are_found_at_any_depth() {
         let t = node("(kicad_pcb (group (footprint (pad (net \"DEEP\")))))");
         assert_eq!(collect_net_keys(&t), HashSet::from(["DEEP".to_string()]));
+    }
+}
+
+#[cfg(test)]
+mod zone_string_safety_tests {
+    use super::*;
+    #[test]
+    fn zone_net_and_layer_strings_roundtrip() {
+        let value = "a\"b\\c";
+        for net in [
+            NetRef::ByName(value.to_owned()),
+            NetRef::ById {
+                id: "3".to_owned(),
+                name: value.to_owned(),
+            },
+        ] {
+            let block = format!(
+                "(zone {} {})",
+                net.zone_net_nodes(),
+                net.zone_layer_node(value)
+            );
+            let tree = crate::parse_sexp(&block).unwrap();
+            assert_eq!(
+                tree.find("layers")
+                    .or_else(|| tree.find("layer"))
+                    .unwrap()
+                    .get(1)
+                    .and_then(crate::SexpNode::as_str),
+                Some(value)
+            );
+            let name_node = if matches!(net, NetRef::ByName(_)) {
+                "net"
+            } else {
+                "net_name"
+            };
+            assert_eq!(tree.find_str(name_node), Some(value));
+        }
     }
 }

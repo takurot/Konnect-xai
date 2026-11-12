@@ -410,10 +410,35 @@ impl McpHandler {
                         Some("invalid_argument".to_string()),
                     )
                 }
+                Err(e) if mutation_uncertain_result(&e, name).is_some() => (
+                    mutation_uncertain_result(&e, name).expect("guard matched"),
+                    CallStatus::Uncertain,
+                    Some("mutation_outcome_uncertain".to_string()),
+                ),
+                Err(e) if revision_conflict_result(&e).is_some() => (
+                    revision_conflict_result(&e).expect("guard matched"),
+                    CallStatus::Error,
+                    Some("conflict".to_string()),
+                ),
                 Err(e) if kicad_editor_locked_path(&e).is_some() => {
                     let locked = kicad_editor_locked_path(&e).expect("guard matched");
                     let path = locked.display().to_string();
                     if locked
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pro"))
+                    {
+                        let lock_path = kicad_editor_lock_file(&e)
+                            .expect("lock error carries the lock path")
+                            .display();
+                        (
+                            CallToolResult::error_kind(
+                                ToolErrorKind::Conflict { paths: vec![path.clone()] },
+                                format!("Project '{path}' has a KiCad project lock at '{lock_path}'. Close Eeschema and Pcbnew sessions using this project before retrying; either editor may overwrite project settings from its in-memory copy. Resolve a presumed stale lock only after confirming that no editor owns the project."),
+                            ),
+                            CallStatus::Error,
+                            Some("conflict".to_string()),
+                        )
+                    } else if locked
                         .extension()
                         .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pcb"))
                     {
@@ -517,6 +542,71 @@ impl McpHandler {
             sinks.retain(|tx| tx.try_send(json.clone()).is_ok());
         }
     }
+}
+
+fn mutation_uncertain_result(error: &anyhow::Error, operation: &str) -> Option<CallToolResult> {
+    let (path, reason) = error.chain().find_map(|cause| {
+        if let Some(konnect_sexp::SexpError::MutationOutcomeUncertain { path, reason }) =
+            cause.downcast_ref::<konnect_sexp::SexpError>()
+        {
+            return Some((path, reason));
+        }
+        if let Some(konnect_schematic_editor::Error::MutationOutcomeUncertain { path, reason }) =
+            cause.downcast_ref::<konnect_schematic_editor::Error>()
+        {
+            return Some((path, reason));
+        }
+        None
+    })?;
+    let path = path.display().to_string();
+    let result = CallToolResult::error_kind(
+        ToolErrorKind::MutationOutcomeUncertain { operation: operation.into(), path: path.clone(), reason: reason.clone() },
+        format!("Saved-file mutation outcome is uncertain for '{path}': {reason}. Reload and inspect the document before retrying; do not repeat the mutation blindly."),
+    );
+    Some(crate::outcome::attach(
+        result,
+        json!({
+            "status":"uncertain", "target":path, "source":"saved_file_readback",
+            "retry":crate::outcome::inspect_before_retry()
+        }),
+    ))
+}
+
+fn revision_conflict_result(error: &anyhow::Error) -> Option<CallToolResult> {
+    let path = error.chain().find_map(|cause| {
+        if let Some(konnect_sexp::SexpError::Conflict { path }) =
+            cause.downcast_ref::<konnect_sexp::SexpError>()
+        {
+            return Some(path);
+        }
+        if let Some(konnect_schematic_editor::Error::Conflict(path)) =
+            cause.downcast_ref::<konnect_schematic_editor::Error>()
+        {
+            return Some(path);
+        }
+        None
+    })?;
+    let path = path.display().to_string();
+    Some(CallToolResult::error_kind(
+        ToolErrorKind::Conflict { paths: vec![path.clone()] },
+        format!("Revision conflict for '{path}'. Reload and inspect the current document state before retrying; the requested result was not verified."),
+    ))
+}
+
+fn kicad_editor_lock_file(error: &anyhow::Error) -> Option<&std::path::Path> {
+    error.chain().find_map(|cause| {
+        if let Some(konnect_sexp::SexpError::KiCadEditorLocked { lock_path, .. }) =
+            cause.downcast_ref::<konnect_sexp::SexpError>()
+        {
+            return Some(lock_path.as_path());
+        }
+        if let Some(konnect_schematic_editor::Error::KiCadEditorLocked { lock_path, .. }) =
+            cause.downcast_ref::<konnect_schematic_editor::Error>()
+        {
+            return Some(lock_path.as_path());
+        }
+        None
+    })
 }
 
 fn kicad_editor_locked_path(error: &anyhow::Error) -> Option<&std::path::Path> {
@@ -3069,5 +3159,73 @@ mod label_children_dispatch_tests {
         assert!(!written.contains("fields_autoplaced yes"), "{written}");
         assert!(after(&written, "(at 187.96 275.59 0)").starts_with("(fields_autoplaced)"));
         assert!(after(&written, "(at 394.97 69.85 0)").starts_with("(fields_autoplaced)"));
+    }
+}
+
+#[cfg(test)]
+mod revision_error_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn typed_revision_conflicts_preserve_kind_and_document_path_through_context() {
+        let path = std::path::PathBuf::from("design.kicad_sch");
+        let errors = [
+            anyhow::Error::new(konnect_sexp::SexpError::Conflict { path: path.clone() })
+                .context("write failed"),
+            anyhow::Error::new(konnect_schematic_editor::Error::Conflict(path.clone()))
+                .context("overwrite failed"),
+        ];
+        for error in errors {
+            let result =
+                revision_conflict_result(&error).expect("typed revision errors must be classified");
+            assert!(result.is_error);
+            let ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text")
+            };
+            let body: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["error"]["kind"], "conflict");
+            assert_eq!(body["error"]["paths"], json!(["design.kicad_sch"]));
+            assert!(body["message"].as_str().unwrap_or(text).contains("inspect"));
+            assert!(
+                !text.contains("did not modify"),
+                "post-write readback conflicts must not promise no write"
+            );
+        }
+        assert!(revision_conflict_result(&anyhow::anyhow!("untyped failure")).is_none());
+    }
+}
+
+#[cfg(test)]
+mod uncertain_revision_boundary_tests {
+    use super::*;
+    #[test]
+    fn postcommit_readback_failure_is_uncertain_and_never_mechanically_retryable() {
+        let path = std::path::PathBuf::from("design.kicad_sch");
+        let errors = [
+            anyhow::Error::new(konnect_sexp::SexpError::MutationOutcomeUncertain {
+                path: path.clone(),
+                reason: "readback differed".into(),
+            })
+            .context("save"),
+            anyhow::Error::new(konnect_schematic_editor::Error::MutationOutcomeUncertain {
+                path,
+                reason: "readback failed".into(),
+            })
+            .context("overwrite"),
+        ];
+        for error in errors {
+            assert!(revision_conflict_result(&error).is_none());
+            let result = mutation_uncertain_result(&error, "save_fixture")
+                .expect("uncertainty must remain typed");
+            assert!(result.is_error);
+            let ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text")
+            };
+            let body: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["error"]["kind"], "mutation_outcome_uncertain");
+            assert_eq!(body["outcome"]["status"], "uncertain");
+            assert_eq!(body["outcome"]["retry"]["safe"], false);
+            assert_eq!(call_status(&result), CallStatus::Uncertain);
+        }
     }
 }

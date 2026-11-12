@@ -8,7 +8,7 @@ use crate::tool;
 use crate::tools::{
     get_path, opt_str, require_f64, require_str, with_board_ipc_classified, ToolContext, ToolDef,
 };
-use konnect_sexp::writer::write_atomic;
+use konnect_sexp::writer::{write_atomic_if_unchanged, write_new_atomic};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::task;
@@ -437,7 +437,8 @@ async fn handle_set_design_rules(
         return Ok(refusal);
     }
     let project_path = sibling_project_path(&board);
-    let project_content = tokio::fs::read_to_string(&project_path).await?;
+    konnect_sexp::writer::ensure_kicad_design_document_is_closed(&project_path)?;
+    let project_content = konnect_sexp::writer::read_consistent(&project_path)?;
     let mut project: serde_json::Value = serde_json::from_str(&project_content)?;
 
     let mut changed = Vec::new();
@@ -466,7 +467,7 @@ async fn handle_set_design_rules(
     if !changed.is_empty() {
         let mut content = serde_json::to_string_pretty(&project)?;
         content.push('\n');
-        write_atomic(&project_path, &content)?;
+        write_atomic_if_unchanged(&project_path, &project_content, &content)?;
     }
 
     Ok(CallToolResult::text(
@@ -531,7 +532,9 @@ fn project_design_settings_mut(
         })
 }
 
-fn load_sibling_project(board: &Path) -> anyhow::Result<Result<(PathBuf, Value), CallToolResult>> {
+fn load_sibling_project(
+    board: &Path,
+) -> anyhow::Result<Result<(PathBuf, Value, String), CallToolResult>> {
     let project_path = sibling_project_path(board);
     if !project_path.exists() {
         return Ok(Err(CallToolResult::error(format!(
@@ -541,9 +544,10 @@ fn load_sibling_project(board: &Path) -> anyhow::Result<Result<(PathBuf, Value),
             project_path.display()
         ))));
     }
-    let settings: Value = serde_json::from_str(&std::fs::read_to_string(&project_path)?)
+    let source = konnect_sexp::writer::read_consistent(&project_path)?;
+    let settings: Value = serde_json::from_str(&source)
         .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", project_path.display()))?;
-    Ok(Ok((project_path, settings)))
+    Ok(Ok((project_path, settings, source)))
 }
 
 fn finite_positive(value: f64, field: &str) -> Result<f64, CallToolResult> {
@@ -680,7 +684,8 @@ async fn handle_set_predefined_sizes(
         return Ok(refusal);
     }
 
-    let (project_path, mut project) = match load_sibling_project(&board)? {
+    konnect_sexp::writer::ensure_kicad_design_document_is_closed(&sibling_project_path(&board))?;
+    let (project_path, mut project, project_content) = match load_sibling_project(&board)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -708,7 +713,7 @@ async fn handle_set_predefined_sizes(
         settings.insert("via_dimensions".into(), via_dimensions.clone());
         let mut content = serde_json::to_string_pretty(&project)?;
         content.push('\n');
-        write_atomic(&project_path, &content)?;
+        write_atomic_if_unchanged(&project_path, &project_content, &content)?;
     }
 
     Ok(CallToolResult::json(&json!({
@@ -727,7 +732,7 @@ async fn handle_get_predefined_sizes(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let (project_path, project) = match load_sibling_project(&board)? {
+    let (project_path, project, _source) = match load_sibling_project(&board)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -987,17 +992,21 @@ async fn handle_copy_routing_pattern(
         };
 
     let content = tokio::fs::read_to_string(&board).await?;
+    let tree = konnect_sexp::parse_sexp(&content)?;
+    anyhow::ensure!(tree.head() == Some("kicad_pcb"), "Expected a KiCad board");
     let mut new_tracks = Vec::new();
 
     // Find all (segment ...) and (via ...) blocks within the bounding box
     // and collect translated copies.
     for (block_start, block_end, _block_type) in find_routing_blocks(&content) {
         let block = &content[block_start..block_end];
-        if let Some((bx, by)) = extract_start_xy(block) {
-            if bx >= src_x1 && bx <= src_x2 && by >= src_y1 && by <= src_y2 {
-                let translated = translate_block(block, dx, dy, &net_map);
-                new_tracks.push(translated);
-            }
+        let points = routing_points(block);
+        if !points.is_empty()
+            && points
+                .iter()
+                .all(|&(x, y)| x >= src_x1 && x <= src_x2 && y >= src_y1 && y <= src_y2)
+        {
+            new_tracks.push(translate_block(block, dx, dy, &net_map));
         }
     }
 
@@ -1022,9 +1031,8 @@ async fn handle_copy_routing_pattern(
     );
 
     // Assign new UUIDs to inserted blocks (replace uuid "ORIGINAL" with new ones)
-    let new_content = reassign_uuids(&new_content, insert_pos);
 
-    write_atomic(&board, &new_content)?;
+    write_atomic_if_unchanged(&board, &content, &new_content)?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
@@ -1039,123 +1047,124 @@ async fn handle_copy_routing_pattern(
 /// Find all `(segment ...)` and `(via ...)` blocks in the PCB content.
 /// Returns (start, end, type) tuples.
 fn find_routing_blocks(content: &str) -> Vec<(usize, usize, &'static str)> {
-    let mut results = Vec::new();
-    for (prefix, kind) in &[("\n  (segment ", "segment"), ("\n  (via ", "via")] {
-        let mut pos = 0;
-        while let Some(found) = content[pos..].find(prefix) {
-            let start = pos + found + 3; // skip \n
-            let mut depth = 0i32;
-            let mut end = start;
-            for (i, ch) in content[start..].char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = start + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            results.push((start, end, *kind));
-            pos = start + 1;
-        }
-    }
-    results
+    konnect_sexp::writer::find_direct_child_blocks(content, "kicad_pcb")
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let node = konnect_sexp::parse_sexp(&content[start..end]).ok()?;
+            let kind = match node.head()? {
+                "segment" => "segment",
+                "via" => "via",
+                "arc" => "arc",
+                _ => return None,
+            };
+            Some((start, end, kind))
+        })
+        .collect()
 }
 
-/// Extract the `(start X Y)` coordinates from a routing block.
-fn extract_start_xy(block: &str) -> Option<(f64, f64)> {
-    let pat = "(start ";
-    let pos = block.find(pat)?;
-    let after = &block[pos + pat.len()..];
-    let end = after.find(')')?;
-    let parts: Vec<&str> = after[..end].split_whitespace().collect();
-    let x = parts.first()?.parse::<f64>().ok()?;
-    let y = parts.get(1)?.parse::<f64>().ok()?;
-    Some((x, y))
+fn routing_points(block: &str) -> Vec<(f64, f64)> {
+    let Ok(root) = konnect_sexp::parse_sexp(block) else {
+        return Vec::new();
+    };
+    root.children()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|node| matches!(node.head(), Some("start" | "mid" | "end" | "at")))
+        .filter_map(|node| {
+            Some((
+                node.get(1)?.as_str()?.parse::<f64>().ok()?,
+                node.get(2)?.as_str()?.parse::<f64>().ok()?,
+            ))
+        })
+        .collect()
 }
 
-/// Translate all coordinate pairs in a routing block by (dx, dy).
 fn translate_block(
     block: &str,
     dx: f64,
     dy: f64,
     net_map: &std::collections::HashMap<String, String>,
 ) -> String {
-    let mut result = block.to_string();
-
-    // Translate (start X Y), (end X Y), (at X Y) coordinate pairs
-    for coord_key in &["start", "end", "at"] {
-        let pat = format!("({} ", coord_key);
-        let mut new_result = String::new();
-        let mut remaining = result.as_str();
-        while let Some(pos) = remaining.find(&pat) {
-            new_result.push_str(&remaining[..pos]);
-            new_result.push_str(&pat);
-            let after = &remaining[pos + pat.len()..];
-            if let Some(close) = after.find(')') {
-                let coords_str = &after[..close];
-                let parts: Vec<&str> = coords_str.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let (Ok(x), Ok(y)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-                        new_result.push_str(&format!("{} {}", x + dx, y + dy));
-                        if parts.len() > 2 {
-                            new_result.push(' ');
-                            new_result.push_str(&parts[2..].join(" "));
-                        }
-                        new_result.push(')');
-                        remaining = &remaining[pos + pat.len() + close + 1..];
-                        continue;
-                    }
+    let root = konnect_sexp::parse_sexp(block).expect("validated routing block");
+    let mut edits = Vec::new();
+    let mut has_uuid = false;
+    for (start, end) in konnect_sexp::writer::find_direct_child_blocks(block, root.head().unwrap())
+    {
+        let node = konnect_sexp::parse_sexp(&block[start..end]).expect("validated routing child");
+        match node.head() {
+            Some(key @ ("start" | "mid" | "end" | "at")) => {
+                if let (Some(x), Some(y)) = (
+                    node.get(1)
+                        .and_then(|n| n.as_str().and_then(|value| value.parse::<f64>().ok())),
+                    node.get(2)
+                        .and_then(|n| n.as_str().and_then(|value| value.parse::<f64>().ok())),
+                ) {
+                    let suffix = node
+                        .children()
+                        .unwrap()
+                        .iter()
+                        .skip(3)
+                        .map(|node| {
+                            node.as_str()
+                                .and_then(|value| value.parse::<f64>().ok())
+                                .map(|n| n.to_string())
+                                .unwrap_or_default()
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    edits.push(konnect_sexp::writer::SexpEdit::replace(
+                        start,
+                        end,
+                        format!(
+                            "({key} {} {}{})",
+                            konnect_sexp::geometry::round6(x + dx),
+                            konnect_sexp::geometry::round6(y + dy),
+                            if suffix.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" {suffix}")
+                            }
+                        ),
+                    ));
                 }
-                // Fall through if parsing failed
-                new_result.push_str(coords_str);
-                new_result.push(')');
-                remaining = &remaining[pos + pat.len() + close + 1..];
-            } else {
-                break;
             }
-        }
-        new_result.push_str(remaining);
-        result = new_result;
-    }
-
-    // Remap net names
-    for (old_net, new_net) in net_map {
-        let old_pat = format!("(net \"{}\")", old_net);
-        let new_pat = format!("(net \"{}\")", new_net);
-        result = result.replace(&old_pat, &new_pat);
-        // Also handle numeric net references if needed (not replaced here)
-    }
-
-    result
-}
-
-/// Reassign UUIDs in all newly inserted blocks (those after `insert_boundary`).
-fn reassign_uuids(content: &str, insert_boundary: usize) -> String {
-    let mut result = String::with_capacity(content.len() + 64);
-    result.push_str(&content[..insert_boundary]);
-    let tail = &content[insert_boundary..];
-    let mut remaining = tail;
-    while let Some(pos) = remaining.find("(uuid \"") {
-        result.push_str(&remaining[..pos]);
-        result.push_str("(uuid \"");
-        // Find end of UUID string
-        let after = &remaining[pos + 7..];
-        if let Some(end) = after.find('"') {
-            let new_uuid = uuid::Uuid::new_v4().to_string();
-            result.push_str(&new_uuid);
-            result.push('"');
-            remaining = &remaining[pos + 7 + end + 1..];
-        } else {
-            break;
+            Some("uuid") => {
+                has_uuid = true;
+                edits.push(konnect_sexp::writer::SexpEdit::replace(
+                    start,
+                    end,
+                    format!(
+                        "(uuid {})",
+                        konnect_sexp::quoted(&uuid::Uuid::new_v4().to_string())
+                    ),
+                ));
+            }
+            Some("net") => {
+                if let Some(net) = node
+                    .get(1)
+                    .and_then(|n| n.as_str())
+                    .and_then(|name| net_map.get(name))
+                {
+                    edits.push(konnect_sexp::writer::SexpEdit::replace(
+                        start,
+                        end,
+                        format!("(net {})", konnect_sexp::quoted(net)),
+                    ));
+                }
+            }
+            _ => {}
         }
     }
-    result.push_str(remaining);
-    result
+    if !has_uuid {
+        edits.push(konnect_sexp::writer::SexpEdit::insert(
+            block.rfind(')').unwrap(),
+            format!(
+                " (uuid {})",
+                konnect_sexp::quoted(&uuid::Uuid::new_v4().to_string())
+            ),
+        ));
+    }
+    konnect_sexp::writer::apply_edits(block.to_string(), edits)
 }
 
 // ─── Symbol info ──────────────────────────────────────────────────────────────
@@ -1181,11 +1190,14 @@ async fn handle_set_layer_constraints(
         "Layer name contains unsupported characters"
     );
     let rules_path = sibling_custom_rules_path(&board);
-    let mut content = match tokio::fs::read_to_string(&rules_path).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "(version 1)\n".to_string(),
+    let source = match tokio::fs::read_to_string(&rules_path).await {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
+    let mut content = source
+        .clone()
+        .unwrap_or_else(|| "(version 1)\n".to_string());
     let mut changed = Vec::new();
 
     if let Some(clearance) = args["min_clearance"].as_f64() {
@@ -1209,7 +1221,11 @@ async fn handle_set_layer_constraints(
     }
 
     if !changed.is_empty() {
-        write_atomic(&rules_path, &content)?;
+        if let Some(source) = &source {
+            write_atomic_if_unchanged(&rules_path, source, &content)?;
+        } else {
+            write_new_atomic(&rules_path, &content)?;
+        }
     }
 
     Ok(CallToolResult::text(
@@ -2143,5 +2159,63 @@ mod required_coordinate_tests {
                 "a refused copy must not touch the board"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod routing_file_safety_tests {
+    use super::*;
+    #[test]
+    fn routing_blocks_find_tabs_vias_and_arcs() {
+        let text="(kicad_pcb\n\t(segment\n\t\t(start 1 2) (end 3 4))\n\t(via (at 2 3))\n\t(arc (start 1 1) (mid 2 2) (end 3 1)))";
+        let blocks = find_routing_blocks(text);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(
+            blocks.iter().map(|b| b.2).collect::<Vec<_>>(),
+            vec!["segment", "via", "arc"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod routing_copy_readback_tests {
+    use super::*;
+    #[tokio::test]
+    async fn copies_kicad_segments_vias_and_arcs_with_new_uuids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("demo.kicad_pcb");
+        let source="(kicad_pcb\n\t(segment\n\t\t(start 1 1) (end 3 1) (uuid 11111111-1111-4111-8111-111111111111))\n\t(via (at 2 2) (uuid \"22222222-2222-4222-8222-222222222222\"))\n\t(arc (start 1 2) (mid 2 3) (end 3 2) (uuid \"33333333-3333-4333-8333-333333333333\")))";
+        std::fs::write(&path, source).unwrap();
+        let ctx = ToolContext::new(
+            Default::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result=handle_copy_routing_pattern(&json!({"board":path,"src_x1":0,"src_y1":0,"src_x2":5,"src_y2":5,"dest_x":10,"dest_y":20}),&ctx).await.unwrap();
+        assert!(!result.is_error);
+        let text = std::fs::read_to_string(path).unwrap();
+        let root = konnect_sexp::parse_sexp(&text).unwrap();
+        let mut uuids = std::collections::HashSet::new();
+        for tag in ["segment", "via", "arc"] {
+            let nodes = root.find_all(tag);
+            assert_eq!(nodes.len(), 2);
+            let a = nodes[0]
+                .find("uuid")
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .as_str()
+                .unwrap();
+            let b = nodes[1]
+                .find("uuid")
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .as_str()
+                .unwrap();
+            assert_ne!(a, b);
+            assert!(uuids.insert(b.to_string()));
+        }
+        assert!(text.contains("(mid 12 23)"));
+        assert!(text.contains("(at 12 22)"));
     }
 }

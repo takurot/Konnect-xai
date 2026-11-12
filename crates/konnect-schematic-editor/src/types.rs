@@ -71,6 +71,7 @@ impl At {
 
 #[derive(Debug, Clone)]
 pub struct Property {
+    pub private: bool,
     pub name: String,
     pub value: String,
     /// Trailing sub-nodes after name+value (at, effects, show_pin_number, …).
@@ -80,6 +81,7 @@ pub struct Property {
 impl Property {
     pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
         Property {
+            private: false,
             name: name.into(),
             value: value.into(),
             sub_nodes: vec![],
@@ -88,6 +90,8 @@ impl Property {
 
     pub fn from_sexp(node: &SexpNode) -> Option<Self> {
         let args = node.args();
+        let private = matches!(args.first(), Some(SexpNode::Atom(flag)) if flag == "private");
+        let args = &args[usize::from(private)..];
         let name = args.first()?.text()?.to_owned();
         let value = args.get(1)?.text()?.to_owned();
         let sub_nodes = args
@@ -97,6 +101,7 @@ impl Property {
             .cloned()
             .collect();
         Some(Property {
+            private,
             name,
             value,
             sub_nodes,
@@ -109,6 +114,9 @@ impl Property {
             qstr(self.name.clone()),
             qstr(self.value.clone()),
         ];
+        if self.private {
+            children.insert(1, atom("private"));
+        }
         children.extend(self.sub_nodes.iter().cloned());
         SexpNode::List(children)
     }

@@ -54,6 +54,14 @@ pub enum ToolErrorKind {
     Conflict { paths: Vec<String> },
     /// More than one observed object identifies a requested target. Clients
     /// must choose from the returned stable candidates rather than guessing.
+    WouldJoinNets {
+        nets: Vec<String>,
+        at: Vec<[f64; 2]>,
+    },
+    AmbiguousReference {
+        reference: String,
+        uuids: Vec<String>,
+    },
     AmbiguousTarget {
         target: String,
         candidates: Vec<String>,
@@ -158,6 +166,8 @@ impl ToolErrorKind {
             Self::InvalidArgument { .. } => "invalid_argument",
             Self::FileNotFound { .. } => "file_not_found",
             Self::Conflict { .. } => "conflict",
+            Self::WouldJoinNets { .. } => "would_join_nets",
+            Self::AmbiguousReference { .. } => "ambiguous_reference",
             Self::AmbiguousTarget { .. } => "ambiguous_target",
             Self::WrongDocument { .. } => "wrong_document",
             Self::WrongProject { .. } => "wrong_project",
@@ -296,6 +306,14 @@ mod tests {
             ToolErrorKind::FileNotFound { path: "p".into() },
             ToolErrorKind::Conflict {
                 paths: vec!["p".into()],
+            },
+            ToolErrorKind::WouldJoinNets {
+                nets: vec!["GND".into()],
+                at: vec![[0.0, 0.0]],
+            },
+            ToolErrorKind::AmbiguousReference {
+                reference: "R1".into(),
+                uuids: vec!["one".into(), "two".into()],
             },
             ToolErrorKind::AmbiguousTarget {
                 target: "t".into(),

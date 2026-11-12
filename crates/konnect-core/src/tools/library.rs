@@ -11,7 +11,7 @@ use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::parser::{parse_sexp, SexpNode};
 use konnect_sexp::writer::{
     apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks, read_consistent,
-    write_atomic, write_atomic_if_unchanged, write_new_atomic, SexpEdit,
+    write_atomic_if_unchanged, write_new_atomic, SexpEdit,
 };
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -93,6 +93,7 @@ pub fn tools() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
+                    "overwrite": {"type":"boolean","default":false,"description":"Explicitly replace an existing footprint; refuses a concurrent change."},
                     "output": { "type": "string", "description": "Output .kicad_mod file path" },
                     "name": { "type": "string", "description": "Footprint name" },
                     "description": { "type": "string", "description": "Footprint description (optional)" },
@@ -599,7 +600,7 @@ fn build_model_sexp(args: &serde_json::Value) -> String {
     let (rx, ry, rz) = xyz("rotate", 0.0);
     format!(
         "\n  (model \"{}\"\n    (offset (xyz {} {} {}))\n    (scale (xyz {} {} {}))\n    (rotate (xyz {} {} {}))\n  )",
-        path, ox, oy, oz, sx, sy, sz, rx, ry, rz
+        konnect_sexp::escaped_string(path), ox, oy, oz, sx, sy, sz, rx, ry, rz
     )
 }
 
@@ -713,7 +714,7 @@ fn build_footprint_graphics(args: &serde_json::Value, name: &str, pads: &[PadGeo
     ));
     s.push_str(&format!(
         "\n  (fp_text value \"{}\" (at {:.4} {:.4} 0) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))",
-        name, cx, cmax_y + 1.0
+        konnect_sexp::escaped_string(name), cx, cmax_y + 1.0
     ));
 
     s
@@ -742,6 +743,13 @@ async fn handle_create_footprint(
     if let Err(error) = validate_footprint_pad_items(&pads_val) {
         return Ok(error);
     }
+    let overwrite = match args.get("overwrite") {
+        None => false,
+        Some(value) => match value.as_bool() {
+            Some(overwrite) => overwrite,
+            None => return Ok(crate::tools::invalid_arg("overwrite", "must be a boolean")),
+        },
+    };
     let mut pad_geoms: Vec<PadGeom> = Vec::new();
     let mut pad_sexp = String::new();
     for pad in &pads_val {
@@ -818,7 +826,15 @@ async fn handle_create_footprint(
 
         pad_sexp.push_str(&format!(
             "\n  (pad \"{}\" {} {} {} (size {} {}) {} {} {})",
-            number, pad_type, shape, at, w, h, layers, drill_sexp, roundrect_ratio
+            konnect_sexp::escaped_string(&number),
+            pad_type,
+            shape,
+            at,
+            w,
+            h,
+            layers,
+            drill_sexp,
+            roundrect_ratio
         ));
         pad_geoms.push(PadGeom {
             number,
@@ -846,14 +862,29 @@ async fn handle_create_footprint(
 
     let content = format!(
         "(footprint \"{}\"\n  (version 20240108)\n  (generator \"konnect\")\n  (layer \"F.Cu\")\n  (descr \"{}\")\n  (attr {}){}{}{}\n)",
-        name, description, attr, pad_sexp, graphics, model_sexp
+        konnect_sexp::escaped_string(name), konnect_sexp::escaped_string(description), attr, pad_sexp, graphics, model_sexp
     );
 
-    // Ensure parent directory exists
+    parse_sexp(&content)?;
+    let expected = match std::fs::read_to_string(&output) {
+        Ok(content) if overwrite => Some(content),
+        Ok(_) => {
+            return Ok(CallToolResult::error(
+                "Footprint already exists; pass overwrite: true to replace it",
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    // Creating a directory is deferred until the input and overwrite policy pass.
     if let Some(parent) = output.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    write_atomic(&output, &content)?;
+    if let Some(expected) = expected {
+        write_atomic_if_unchanged(&output, &expected, &content)?;
+    } else {
+        write_new_atomic(&output, &content)?;
+    }
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
@@ -1397,7 +1428,7 @@ fn edit_footprint_pad_block(
 }
 
 fn escape_library_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    konnect_sexp::escaped_string(value)
 }
 
 // ─── Library table helpers ────────────────────────────────────────────────────
@@ -2529,7 +2560,7 @@ fn prepare_lib_table_registration(
 }
 
 pub(crate) fn quote_lib_table_string(value: &str) -> String {
-    format!("\"{}\"", escape_library_string(value))
+    konnect_sexp::quoted(value)
 }
 
 fn persist_lib_table_registration(
@@ -3084,10 +3115,10 @@ fn emit_pin(
         fmt_f64(y),
         fmt_f64(angle),
         fmt_f64(length),
-        name,
+        konnect_sexp::escaped_string(name),
         name_font,
         name_font,
-        number,
+        konnect_sexp::escaped_string(number),
         PIN_TEXT,
         PIN_TEXT
     )
@@ -4307,7 +4338,11 @@ async fn handle_create_symbol(
             warnings.extend(unit1.displacement_warning("unit 1"));
             units_report.push(unit1.to_json(1));
             let (inner1, body1) = (unit1.sexp, unit1.rect);
-            units_sexp.push_str(&format!("\n    (symbol \"{}_1_1\"{}\n    )", name, inner1));
+            units_sexp.push_str(&format!(
+                "\n    (symbol \"{}_1_1\"{}\n    )",
+                konnect_sexp::escaped_string(name),
+                inner1
+            ));
             // Unit 2: a rectangular power unit.
             let power_laid = layout_power_unit(&power);
             let unit2 = match build_symbol_unit(&power_laid, None, show_names, None) {
@@ -4318,7 +4353,11 @@ async fn handle_create_symbol(
             warnings.extend(unit2.displacement_warning("unit 2"));
             units_report.push(unit2.to_json(2));
             let inner2 = unit2.sexp;
-            units_sexp.push_str(&format!("\n    (symbol \"{}_2_1\"{}\n    )", name, inner2));
+            units_sexp.push_str(&format!(
+                "\n    (symbol \"{}_2_1\"{}\n    )",
+                konnect_sexp::escaped_string(name),
+                inner2
+            ));
             unit_count = 2;
             power_pin_count = power_laid.len();
             ref_body = body1;
@@ -4337,7 +4376,11 @@ async fn handle_create_symbol(
             warnings.extend(unit.displacement_warning("unit 1"));
             units_report.push(unit.to_json(1));
             let (inner, body) = (unit.sexp, unit.rect);
-            units_sexp.push_str(&format!("\n    (symbol \"{}_0_1\"{}\n    )", name, inner));
+            units_sexp.push_str(&format!(
+                "\n    (symbol \"{}_0_1\"{}\n    )",
+                konnect_sexp::escaped_string(name),
+                inner
+            ));
             unit_count = 1;
             power_pin_count = pins_val.iter().filter(|pin| is_power_pin(pin)).count();
             ref_body = body;
@@ -4398,7 +4441,7 @@ async fn handle_create_symbol(
             }
             units_sexp.push_str(&format!(
                 "\n    (symbol \"{}_{}_1\"{}\n    )",
-                name,
+                konnect_sexp::escaped_string(name),
                 i + 1,
                 inner
             ));
@@ -4439,7 +4482,9 @@ async fn handle_create_symbol(
             let inner = unit.sexp;
             units_sexp.push_str(&format!(
                 "\n    (symbol \"{}_{}_1\"{}\n    )",
-                name, total, inner
+                konnect_sexp::escaped_string(name),
+                total,
+                inner
             ));
         }
         unit_count = total;
@@ -4470,6 +4515,8 @@ async fn handle_create_symbol(
         )
     };
     let visible_property = |name: &str, value: &str, y: f64| {
+        let name = konnect_sexp::escaped_string(name);
+        let value = konnect_sexp::escaped_string(value);
         format!(
             "\n    (property \"{name}\" \"{value}\" (at 0 {y:.4} 0) \
              (show_name no) (do_not_autoplace no) \
@@ -4477,6 +4524,8 @@ async fn handle_create_symbol(
         )
     };
     let hidden_property = |name: &str, value: &str| {
+        let name = konnect_sexp::escaped_string(name);
+        let value = konnect_sexp::escaped_string(value);
         format!(
             "\n    (property \"{name}\" \"{value}\" (at 0 0 0) \
              (show_name no) (do_not_autoplace no) (hide yes) \
@@ -4486,7 +4535,7 @@ async fn handle_create_symbol(
 
     let symbol_sexp = format!(
         "\n  (symbol \"{}\"{}{}\n    (exclude_from_sim no)\n    (in_bom yes)\n    (on_board yes)\n    (in_pos_files yes)\n    (duplicate_pin_numbers_are_jumpers no){}{}{}{}{}{}\n    (embedded_fonts no)\n  )",
-        name,
+        konnect_sexp::escaped_string(name),
         numbers,
         names,
         visible_property("Reference", ref_prefix, ref_y),
@@ -4497,9 +4546,22 @@ async fn handle_create_symbol(
         units_sexp
     );
 
+    let expected = match tokio::fs::read_to_string(&lib_path).await {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(source) = &expected {
+        anyhow::ensure!(
+            !top_level_symbol_names(source)?
+                .iter()
+                .any(|existing| existing == name),
+            "Symbol '{name}' already exists in library"
+        );
+    }
     // If file doesn't exist, create scaffold
-    let content = if lib_path.exists() {
-        let mut content = tokio::fs::read_to_string(&lib_path).await?;
+    let content = if let Some(source) = &expected {
+        let mut content = source.clone();
         content = content.replace("(version 20240108)", "(version 20251024)");
         if !content.contains("(generator_version ") {
             if let Some(position) = content.find("(generator \"") {
@@ -4523,7 +4585,12 @@ async fn handle_create_symbol(
     if let Some(parent) = lib_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    write_atomic(&lib_path, &new_content)?;
+    parse_sexp(&new_content)?;
+    if let Some(expected) = expected {
+        write_atomic_if_unchanged(&lib_path, &expected, &new_content)?;
+    } else {
+        write_new_atomic(&lib_path, &new_content)?;
+    }
 
     let mut result = json!({
         "success": true,
@@ -4554,40 +4621,27 @@ async fn handle_delete_symbol(
 
     let content = tokio::fs::read_to_string(&lib_path).await?;
 
-    // Find `  (symbol "NAME"` block
-    let pat = format!(r#"  (symbol "{}""#, symbol_name);
-    let start = content
-        .find(&pat)
-        .ok_or_else(|| anyhow::anyhow!("Symbol '{}' not found in library", symbol_name))?;
-
-    // Walk back to find preceding newline
-    let block_start = content[..start].rfind('\n').map(|i| i + 1).unwrap_or(start);
-
-    // Walk forward to find end of block (depth count)
-    let mut depth = 0i32;
-    let mut end = start;
-    for (i, ch) in content[start..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = start + i + 1;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    // Skip trailing newline
-    let end = if content[end..].starts_with('\n') {
-        end + 1
-    } else {
-        end
-    };
-
-    let new_content = format!("{}{}", &content[..block_start], &content[end..]);
-    write_atomic(&lib_path, &new_content)?;
+    let root = parse_sexp(&content)?;
+    anyhow::ensure!(
+        root.head() == Some("kicad_symbol_lib"),
+        "Expected a KiCad symbol library"
+    );
+    let matches = find_direct_child_blocks(&content, "kicad_symbol_lib")
+        .into_iter()
+        .filter(|&(start, end)| {
+            parse_sexp(&content[start..end]).ok().is_some_and(|node| {
+                node.head() == Some("symbol")
+                    && node.get(1).and_then(|n| n.as_str()) == Some(symbol_name)
+            })
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        matches.len() == 1,
+        "Symbol '{symbol_name}' not found or ambiguous in library"
+    );
+    let (start, end) = matches[0];
+    let new_content = apply_edits(content.clone(), vec![SexpEdit::delete(start, end)]);
+    write_atomic_if_unchanged(&lib_path, &content, &new_content)?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
@@ -10196,5 +10250,142 @@ mod required_argument_tests {
         assert!(result.is_error);
         assert_eq!(error_field(&result), "units[0].pins[1].name");
         assert!(!path.exists(), "no library may be created on rejection");
+    }
+}
+
+#[cfg(test)]
+mod file_safety_tests {
+    use super::*;
+    fn ctx() -> ToolContext {
+        ToolContext::new(
+            Default::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+    #[tokio::test]
+    async fn delete_symbol_understands_tabs_and_quoted_parentheses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stock.kicad_sym");
+        std::fs::write(&path,"(kicad_symbol_lib\n\t(symbol \"R\" (property \"Value\" \"keep ) ( parentheses\"))\n\t(symbol \"C\"))").unwrap();
+        let result = handle_delete_symbol(&json!({"library_path":path,"symbol_name":"R"}), &ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(
+            top_level_symbol_names(&std::fs::read_to_string(path).unwrap()).unwrap(),
+            vec!["C"]
+        );
+    }
+    #[tokio::test]
+    async fn footprint_creation_requires_explicit_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.kicad_mod");
+        std::fs::write(&path, "external footprint").unwrap();
+        let result =
+            handle_create_footprint(&json!({"output":path,"name":"X","pads":[]}), &ctx()).await;
+        assert!(result.is_err() || result.unwrap().is_error);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "external footprint");
+    }
+    #[tokio::test]
+    async fn symbol_creation_refuses_duplicate_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.kicad_sym");
+        let before = "(kicad_symbol_lib\n\t(symbol \"X\"))";
+        std::fs::write(&path, before).unwrap();
+        let result = handle_create_symbol(
+            &json!({"library_path":path,"name":"X","reference_prefix":"U","pins":[]}),
+            &ctx(),
+        )
+        .await;
+        assert!(result.is_err() || result.unwrap().is_error);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+    }
+    #[tokio::test]
+    async fn footprint_description_roundtrips_quotes_and_backslashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quoted.kicad_mod");
+        let description = "0.1\" pitch \\ path";
+        let result = handle_create_footprint(
+            &json!({"output":path,"name":"X","description":description,"pads":[]}),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            parse_sexp(&text)
+                .unwrap()
+                .find("descr")
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .as_str(),
+            Some(description)
+        );
+    }
+}
+
+#[cfg(test)]
+mod quoted_symbol_readback_tests {
+    use super::*;
+    #[tokio::test]
+    async fn symbol_names_properties_and_pin_text_roundtrip_escaping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quoted.kicad_sym");
+        let value = "a\"b\\c";
+        let ctx = ToolContext::new(
+            Default::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result=handle_create_symbol(&json!({"library_path":path,"name":value,"value":value,"datasheet":value,"reference_prefix":"U","pins":[{"number":"1","name":value,"type":"input","x":-5.08,"y":0,"angle":0,"length":2.54}]}),&ctx).await.unwrap();
+        assert!(!result.is_error);
+        let text = std::fs::read_to_string(path).unwrap();
+        let root = parse_sexp(&text).unwrap();
+        let sym = root.find("symbol").unwrap();
+        assert_eq!(sym.get(1).unwrap().as_str(), Some(value));
+        for name in ["Value", "Datasheet"] {
+            let prop = sym
+                .find_all("property")
+                .into_iter()
+                .find(|p| p.get(1).unwrap().as_str() == Some(name))
+                .unwrap();
+            assert_eq!(prop.get(2).unwrap().as_str(), Some(value));
+        }
+        let pin = descendants_with_head(sym, "pin")[0];
+        assert_eq!(
+            pin.find("name").unwrap().get(1).unwrap().as_str(),
+            Some(value)
+        );
+    }
+}
+
+#[cfg(test)]
+mod overwrite_argument_tests {
+    use super::*;
+    #[tokio::test]
+    async fn malformed_overwrite_is_refused_without_creating_a_footprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.kicad_mod");
+        let ctx = ToolContext::new(
+            Default::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        for overwrite in [json!("yes"), json!(1), json!(null), json!([])] {
+            let result = handle_create_footprint(
+                &json!({"output":path,"name":"X","pads":[],"overwrite":overwrite}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error);
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text")
+            };
+            let body: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["error"]["kind"], "invalid_argument");
+            assert_eq!(body["error"]["field"], "overwrite");
+            assert!(!path.exists());
+        }
     }
 }

@@ -149,3 +149,28 @@ The canonical source is `docs/RELIABILITY_CONTRACT.md`. The installer embeds the
 same bytes as the konnect skill's `references/reliability-contract.md`, so
 installed guidance can read it offline. Repository links above refer to current
 maintainer policy, which may be newer than an installed release.
+
+## File mutation guard (v0.14)
+
+Design edits compare the exact bytes read with the current file before atomic
+replacement and verify the persisted bytes afterward. A conflict requires a fresh
+read and re-planning; never retry the same prepared edit blindly. New library
+files use no-clobber creation. `create_footprint` requires `overwrite: true` to
+replace an existing footprint, and `create_symbol` refuses duplicate names.
+
+All shared design writers refuse a sibling KiCad lock, including
+`~<project>.kicad_pro.lck`. This covers Eeschema as well as PCB Editor: both may
+rewrite project settings from memory. KiCad 10's lock identifies username and
+hostname, not a process identity that can prove staleness. As explicitly selected
+for issue #27, a remaining lock always blocks writes. Close the editors; verify
+that no editor still owns the project before manually removing a stale lock.
+Konnect never removes or guesses the age of these locks.
+
+`set_footprint_metadata.attributes` adds flags while preserving existing ones,
+including `allow_soldermask_bridges` and unrecognized future flags. Explicit
+`replace: true` permits replacing the full list (`attributes: []` clears it).
+Responses report `attributes.before` and `attributes.after` so removals are visible.
+
+The reliability CI ratchet inventories unchecked `write_atomic` production calls
+under `tools/`. Its sole exemption is DRC report publication, an output artifact;
+all read/modify/write design paths require revision checks.

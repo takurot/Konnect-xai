@@ -15,6 +15,9 @@ pub enum Error {
     #[error("write conflict: '{0}' changed since it was loaded")]
     Conflict(PathBuf),
 
+    #[error("mutation outcome uncertain for {path}: {reason}")]
+    MutationOutcomeUncertain { path: PathBuf, reason: String },
+
     #[error("KiCad editor lock blocks write to '{path}': {lock_path}")]
     KiCadEditorLocked { path: PathBuf, lock_path: PathBuf },
 }

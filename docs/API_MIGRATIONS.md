@@ -3,6 +3,37 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## v0.14.0: conditional-write failures distinguish committed uncertainty
+
+A stale source revision returns `conflict`. If the replacement has committed
+but its immediate readback differs or cannot be read, the shared conditional
+writer instead returns `mutation_outcome_uncertain`. This distinction survives
+the schematic-editor and MCP boundaries, with an `uncertain` outcome and
+`retry.safe: false`. Reload and inspect the target before deciding whether to
+retry; an absent success response never proves that no mutation occurred.
+
+## v0.14.0: schematic routes require explicit net-join intent
+
+`connect_pins`, `batch_connect_pins`, `connect_to_net`, `batch_connect_to_net`,
+`add_wire`, `batch_add_wire`, `connect_pins_to_bus`, `connect_passthrough`, and
+`add_schematic_connection` preflight their
+proposed geometry before committing. Touching a pin, label, sheet pin or wire
+outside the selected endpoint nets returns `would_join_nets` with `nets` and
+`at` coordinates. Wire crossings are conservatively refused as well. Inspect
+and change the route, or explicitly pass `allow_join: true` to authorize the
+additional connections. A refused batch leaves the entire file unchanged.
+
+A coordinate-selected endpoint may intentionally land on an existing wire;
+a pin lying midspan on an undotted foreign wire does not already belong to
+that wire's net and cannot authorize joining it. Only junctions introduced
+by the new wire are inserted; unrelated undotted tees remain untouched.
+
+Duplicate references return `ambiguous_reference` with candidate `uuids`.
+Legitimate multi-unit instances remain supported. Reference selectors also
+accept an instance UUID; `connect_pins` additionally accepts `uuid1`/`uuid2`
+instead of `ref1`/`ref2`, and `connect_to_net` accepts `uuid` instead of
+`reference`. Parse failures refuse instead of bypassing junction analysis.
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
@@ -746,9 +777,11 @@ keep every other key, persist with an atomic conditional write against the
 text that was read (an atomic no-clobber create when there was no file), and
 answer from the file as read back. They add `path` and `created`. A
 persistence error, including the conditional writer's `conflict`, is
-`mutation_outcome_uncertain`: that writer reports a conflict both before a
-replacement and after one whose readback differs, so the response does not
-claim nothing was written — read the file before retrying. The one no-write
+`mutation_outcome_uncertain` under this configuration tool's conservative
+recovery contract, so read the file before retrying. The shared writer now
+distinguishes a pre-commit `conflict` from post-commit
+`mutation_outcome_uncertain`; configuration tools still require inspection
+before retrying persistence failures. The one no-write
 statement is a file that appears while Konnect is creating one, which is a
 `conflict`. `get_effective_config` and `list_design_rules` add `sources:
 {user, project}` (`"file"`, `"defaults"`, or `"not_configured"` when there is
@@ -2182,3 +2215,22 @@ open, falling back to the saved file otherwise. Scoring policy and every existin
 field are unchanged; the response adds `source`, either `"ipc"` or `"saved_file"`
 (matching `run_drc`'s own source-disclosure convention), so a caller can tell
 which board state was judged.
+
+## v0.14: file writes and footprint attributes require explicit destructive intent
+
+`create_footprint` refuses an existing output by default. Pass `overwrite: true`
+only after inspecting it; replacement still refuses if that inspected revision
+changes while the tool prepares the new footprint. `create_symbol` refuses a
+name already present in the library. Design mutations now report a write conflict
+when their source changed instead of silently overwriting the newer revision.
+Reload the document and re-plan before retrying.
+
+`set_footprint_metadata.attributes` now merges flags with the existing list.
+It preserves solder-mask bridge permission and future KiCad flags. To replace or
+clear the complete list, explicitly pass `replace: true`. Its response adds
+`attributes: {before: [...], after: [...]}`.
+
+Project-settings tools also refuse `~<project>.kicad_pro.lck`, including a lock
+left by Eeschema with no PCB Editor open. A lock cannot safely be assumed stale
+from KiCad 10's username/hostname metadata. Close editors and verify ownership
+before manually removing a leftover lock.

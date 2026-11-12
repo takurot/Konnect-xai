@@ -397,7 +397,10 @@ async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Re
 
     let exe = resolve_cli_executable(cli);
     let mut cmd = Command::new(&exe);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
     #[cfg(test)]
     let child = test_support::spawn_cli(&mut cmd)
@@ -3806,5 +3809,98 @@ mod cli_discovery_tests {
             "resolved path is not a file: {}",
             resolved.display()
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod cancellation_tests {
+    use super::*;
+
+    async fn wait_for_pid(path: &Path) -> String {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(path) {
+                    if !pid.is_empty() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fake CLI must start")
+    }
+
+    fn is_running(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    async fn assert_terminated(pid: &str) {
+        let terminated = timeout(Duration::from_secs(3), async {
+            while is_running(pid) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !terminated {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", pid])
+                .status();
+        }
+        assert!(terminated, "cancelled/timed-out CLI {pid} was left running");
+    }
+
+    async fn start_cli(
+        timeout_dur: Duration,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        tokio::task::JoinHandle<Result<CliOutput>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_support::write_script(
+            dir.path(),
+            "slow-cli",
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$1\"\nexec sleep 60\n",
+            "",
+        );
+        let pid_path = dir.path().join("pid");
+        let pid_arg = pid_path.clone();
+        let task = tokio::spawn(async move {
+            run_cli_captured(
+                cli.to_str().unwrap(),
+                &[pid_arg.to_str().unwrap()],
+                timeout_dur,
+            )
+            .await
+        });
+        (dir, pid_path, task)
+    }
+
+    #[tokio::test]
+    async fn dropping_cli_future_terminates_child() {
+        let (_dir, pid_path, task) = start_cli(Duration::from_secs(60)).await;
+        let pid = wait_for_pid(&pid_path).await;
+        assert!(is_running(&pid));
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert_terminated(&pid).await;
+    }
+
+    #[tokio::test]
+    async fn cli_timeout_terminates_child() {
+        let (_dir, pid_path, task) = start_cli(Duration::from_millis(500)).await;
+        let pid = wait_for_pid(&pid_path).await;
+        assert!(
+            matches!(task.await.unwrap(), Err(error) if error.to_string().contains("timed out"))
+        );
+        assert_terminated(&pid).await;
     }
 }

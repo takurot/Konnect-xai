@@ -698,8 +698,18 @@ pub fn extract_symbol_instances(tree: &SexpNode) -> Vec<SymbolInstance> {
             let prop = |name: &str| -> String {
                 node.find_all("property")
                     .iter()
-                    .find(|p| p.get(1).and_then(|n| n.as_str()) == Some(name))
-                    .and_then(|p| p.get(2))
+                    .find(|p| {
+                        let offset = usize::from(
+                            matches!(p.get(1), Some(SexpNode::Atom(flag)) if flag == "private"),
+                        );
+                        p.get(1 + offset).and_then(|n| n.as_str()) == Some(name)
+                    })
+                    .and_then(|p| {
+                        let offset = usize::from(
+                            matches!(p.get(1), Some(SexpNode::Atom(flag)) if flag == "private"),
+                        );
+                        p.get(2 + offset)
+                    })
                     .and_then(|n| n.as_str())
                     .unwrap_or("")
                     .to_string()
@@ -1089,11 +1099,11 @@ pub struct HierarchicalSheetSpec<'a> {
 
 pub fn format_hierarchical_sheet(spec: HierarchicalSheetSpec<'_>) -> String {
     let uuid = crate::writer::new_uuid();
-    let name = escape_quoted_text(spec.name);
-    let file = escape_quoted_text(spec.file);
-    let project_name = escape_quoted_text(spec.project_name);
-    let parent_instance_path = escape_quoted_text(spec.parent_instance_path);
-    let page = escape_quoted_text(spec.page);
+    let name = crate::escaped_string(spec.name);
+    let file = crate::escaped_string(spec.file);
+    let project_name = crate::escaped_string(spec.project_name);
+    let parent_instance_path = crate::escaped_string(spec.parent_instance_path);
+    let page = crate::escaped_string(spec.page);
     let name_y = spec.y - 0.635;
     let file_y = spec.y + spec.height + 0.635;
     format!(
@@ -1175,7 +1185,7 @@ pub fn format_sheet_pin(
     y: f64,
     rotation: f64,
 ) -> String {
-    let name = escape_quoted_text(name);
+    let name = crate::escaped_string(name);
     let uuid = crate::writer::new_uuid();
     format!(
         "(pin \"{name}\" {}\n\t(at {x} {y} {rotation})\n\t(uuid \"{uuid}\")\n)",
@@ -1183,13 +1193,9 @@ pub fn format_sheet_pin(
     )
 }
 
-fn escape_quoted_text(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 pub fn format_net_label(net: &str, x: f64, y: f64, rotation: f64) -> String {
     let uuid = crate::writer::new_uuid();
-    let net = escape_quoted_text(net);
+    let net = crate::escaped_string(net);
     // The tag must be `label`: KiCAD has no `net_label` in its schematic
     // format and refuses to load a file containing one ("Failed to load
     // schematic"), so emitting that made the whole schematic unopenable.

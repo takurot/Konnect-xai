@@ -22,6 +22,11 @@ pub enum SexpError {
     #[error("write conflict: {path} changed since it was read")]
     Conflict { path: PathBuf },
 
+    /// Atomic replacement committed, but the immediate readback did not
+    /// establish the requested state. Retrying may duplicate completed work.
+    #[error("mutation outcome uncertain for {path}: {reason}")]
+    MutationOutcomeUncertain { path: PathBuf, reason: String },
+
     /// KiCad owns, or may still own, the design document through its sibling
     /// lock.
     ///

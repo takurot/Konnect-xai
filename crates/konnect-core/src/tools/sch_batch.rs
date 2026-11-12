@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
+use super::sch_route_safety::{allow_join, check_route, route_segments};
 // Re-use the single-item component placer and pin-to-pin router.
 use super::sch_annotate::opt_string;
 use super::sch_components::{
@@ -32,7 +33,8 @@ use super::sch_components::{
     plan_component_and_item_deletions, set_property_value, ComponentDeleteTargetError,
 };
 use super::sch_wiring::{
-    add_stub_label, add_stub_wire, resolve_pin_endpoint, resolve_placed_pin, route_between,
+    add_stub_label, add_stub_wire, ambiguous_reference_result, resolve_pin_endpoint,
+    resolve_placed_pin, route_between,
 };
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -44,7 +46,8 @@ pub fn tools() -> Vec<ToolDef> {
             "Connect multiple component pins to a named net. By default it adds a net label \
              at each pin endpoint with no wire. Pass stub_length, direction and label_type \
              for connect_to_net's placement, applied to every pin in the call. \
-             Single file read → all edits → single file write. \
+             Single file read → all edits → single file write. Refuses the complete batch if a route \
+             touches an unselected net unless allow_join is explicitly true. \
              Labels are sheet-local: a sheet instanced N times gets N independent nets. \
              Use add_power_symbol or a global_label for a rail shared by every instance, and \
              only a local label for one that must stay per-instance — power symbols and \
@@ -52,6 +55,7 @@ pub fn tools() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
+                    "allow_join": {"type":"boolean","default":false,"description":"Explicitly permit joining nets touched by the planned routes; otherwise the complete batch is refused."},
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "net_name": { "type": "string", "description": "Name of the net to connect pins to" },
                     "net": { "type": "string",
@@ -128,10 +132,12 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_connect_pins",
             "Connect multiple component pin pairs by reference and pin number, in a single \
-             file read/write cycle.",
+             file read/write cycle. Refuses the complete batch if a route touches an unselected \
+             net unless allow_join is explicitly true.",
             json!({
                 "type": "object",
                 "properties": {
+                    "allow_join": {"type":"boolean","default":false,"description":"Explicitly permit joining nets touched by the planned routes; otherwise the complete batch is refused."},
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "connections": {
                         "type": "array",
@@ -258,6 +264,7 @@ pub fn tools() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
+                    "allow_join": {"type":"boolean","default":false,"description":"Explicitly permit the stub to touch additional nets"},
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "net_name": { "type": "string", "description": "Net name for the passthrough label" },
                     "x": { "type": "number", "description": "X position of the stub root in mm" },
@@ -430,6 +437,10 @@ async fn handle_batch_connect_to_net(
     _ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    let allow = match allow_join(args) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
     let net_name = match batch_net_name(args) {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -497,6 +508,9 @@ async fn handle_batch_connect_to_net(
         let (pin, t) = match resolve_placed_pin(&instances, &lib_syms, reference, pin_number) {
             Ok(p) => p,
             Err(e) => {
+                if let Some(refusal) = ambiguous_reference_result(&e) {
+                    return Ok(refusal);
+                }
                 errors.push(e.to_string());
                 continue;
             }
@@ -507,6 +521,20 @@ async fn handle_batch_connect_to_net(
         let dir = crate::tools::stub_direction(direction, Some(pin_outward_direction(&pin, t)));
         let (lx, ly) = dir.end((px, py), stub_length);
         let rotation = dir.label_rotation;
+        let staged_source = match &sch {
+            Some(schematic) => schematic.to_source(),
+            None => crate::tools::sch_wiring::insert_before_close(&content, &inserts),
+        };
+        let staged_tree = konnect_sexp::parse_sexp(&staged_source)?;
+        if let Err(refusal) = check_route(
+            &staged_tree,
+            &[((px, py), (lx, ly))],
+            &[(px, py)],
+            Some(&net_name),
+            allow,
+        ) {
+            return Ok(refusal);
+        }
 
         // Symbols stack several pins on one endpoint; a label each renders as
         // a smear. They stay connected by that endpoint. Two stubs can also
@@ -839,6 +867,10 @@ async fn handle_batch_connect_pins(
     _ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    let allow = match allow_join(args) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
     let connections = match args["connections"].as_array() {
         Some(a) => a.clone(),
         None => return Ok(CallToolResult::error("Missing 'connections' array")),
@@ -872,14 +904,29 @@ async fn handle_batch_connect_pins(
             resolve_pin_endpoint(&instances, &lib_syms, ref2, pin2),
         ) {
             (Ok((x1, y1)), Ok((x2, y2))) => resolved.push((x1, y1, x2, y2)),
-            (Err(e), _) | (_, Err(e)) => errors.push(e.to_string()),
+            (Err(e), _) | (_, Err(e)) => {
+                if let Some(refusal) = ambiguous_reference_result(&e) {
+                    return Ok(refusal);
+                }
+                errors.push(e.to_string());
+            }
         }
     }
 
     // ponytail: re-parses content per wire; incremental tree edits if batches get huge.
     let mut new_content = content;
     for (x1, y1, x2, y2) in &resolved {
-        new_content = route_between(new_content, *x1, *y1, *x2, *y2);
+        let staged_tree = konnect_sexp::parse_sexp(&new_content)?;
+        if let Err(refusal) = check_route(
+            &staged_tree,
+            &route_segments((*x1, *y1), (*x2, *y2)),
+            &[(*x1, *y1), (*x2, *y2)],
+            None,
+            allow,
+        ) {
+            return Ok(refusal);
+        }
+        new_content = route_between(new_content, *x1, *y1, *x2, *y2)?;
     }
 
     if !resolved.is_empty() {
@@ -947,7 +994,14 @@ fn property_translation_edits(
         };
         let prop = &content[prop_start..prop_end];
         // The property's own (at …), not one nested deeper in (effects …).
-        let Some(at_rel) = prop.find("(at ") else {
+        let Some((at_rel, _)) = konnect_sexp::writer::find_direct_child_blocks(prop, "property")
+            .into_iter()
+            .find(|&(a, b)| {
+                konnect_sexp::parser::parse_sexp(&prop[a..b])
+                    .ok()
+                    .is_some_and(|n| n.head() == Some("at"))
+            })
+        else {
             continue;
         };
         let at_abs = prop_start + at_rel + "(at ".len();
@@ -1475,6 +1529,10 @@ async fn handle_connect_passthrough(
     _ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    let allow = match allow_join(args) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
     let net_name = match require_str(args, "net_name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -1496,6 +1554,15 @@ async fn handle_connect_passthrough(
     let stub = 2.54_f64;
     let (wire_end_x, wire_end_y) = (x + dir.dx * stub, y + dir.dy * stub);
 
+    if let Err(refusal) = check_route(
+        &tree,
+        &[((x, y), (wire_end_x, wire_end_y))],
+        &[(x, y)],
+        Some(&net_name),
+        allow,
+    ) {
+        return Ok(refusal);
+    }
     let wire_sexp = format_wire(x, y, wire_end_x, wire_end_y);
     let label_sexp = format_net_label(&net_name, wire_end_x, wire_end_y, dir.label_rotation);
 
@@ -2506,6 +2573,7 @@ mod batch_place_and_connect_tests {
         let result = handle_batch_connect_pins(
             &json!({
                 "schematic": path.display().to_string(),
+                "allow_join":true,
                 "connections": [
                     { "ref1": "R1", "pin1": "1", "ref2": "R2", "pin2": "1" },
                     { "ref1": "R3", "pin1": "1", "ref2": "R4", "pin2": "1" },
@@ -4549,6 +4617,8 @@ mod batch_connect_options_tests {
             let (_d, batch_path) = fixture();
             let mut args = options.clone();
             args["net"] = json!("N");
+            // This fixture intentionally joins an existing wire at the stub end.
+            args["allow_join"] = json!(true);
             let result = batch(&batch_path, args.clone()).await;
             assert!(!result.is_error, "{result:?}");
             let body = body(&result);
@@ -4601,7 +4671,7 @@ mod batch_connect_options_tests {
     #[tokio::test]
     async fn rerunning_a_stubbed_batch_adds_nothing() {
         let (_d, path) = fixture();
-        let options = json!({ "net_name": "N", "stub_length": 2.54 });
+        let options = json!({ "net_name": "N", "stub_length": 2.54, "allow_join": true });
         assert!(!batch(&path, options.clone()).await.is_error);
         let before = std::fs::read_to_string(&path).unwrap();
         let result = batch(&path, options).await;
@@ -4705,3 +4775,20 @@ mod batch_connect_options_tests {
         assert!(!def.input_validator.is_valid(&args(-1.0)));
     }
 }
+
+#[cfg(test)]
+mod private_anchor_regression {
+    use super::*;
+    #[test]
+    fn translation_preserves_property_text_with_at() {
+        let source = r#"(symbol (property "Description" "see (at 5 5) note" (at 10 20 0)))"#;
+        let edits = property_translation_edits(source, 0, source.len(), 1.0, 2.0);
+        let after = apply_edits(source.to_owned(), edits);
+        assert!(after.contains("see (at 5 5) note"));
+        assert!(after.contains("(at 11 22 0)"));
+    }
+}
+
+#[cfg(test)]
+#[path = "sch_batch_route_safety_tests.rs"]
+mod route_safety_tests;

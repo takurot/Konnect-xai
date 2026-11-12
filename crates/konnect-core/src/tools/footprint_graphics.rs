@@ -728,6 +728,7 @@ fn stroke_clause(width_mm: f64) -> String {
 
 fn serialize_graphics(layer: &str, graphics: &[FootprintGraphic], indent: &str) -> String {
     let mut output = String::new();
+    let layer = konnect_sexp::quoted(layer);
     for graphic in graphics {
         output.push('\n');
         output.push_str(indent);
@@ -737,7 +738,7 @@ fn serialize_graphics(layer: &str, graphics: &[FootprintGraphic], indent: &str) 
                 end,
                 stroke_width_mm,
             } => output.push_str(&format!(
-                "(fp_line {} {} {} (layer \"{}\"))",
+                "(fp_line {} {} {} (layer {}))",
                 point_clause("start", *start),
                 point_clause("end", *end),
                 stroke_clause(*stroke_width_mm),
@@ -749,7 +750,7 @@ fn serialize_graphics(layer: &str, graphics: &[FootprintGraphic], indent: &str) 
                 end,
                 stroke_width_mm,
             } => output.push_str(&format!(
-                "(fp_arc {} {} {} {} (layer \"{}\"))",
+                "(fp_arc {} {} {} {} (layer {}))",
                 point_clause("start", *start),
                 point_clause("mid", *mid),
                 point_clause("end", *end),
@@ -762,7 +763,7 @@ fn serialize_graphics(layer: &str, graphics: &[FootprintGraphic], indent: &str) 
                 stroke_width_mm,
                 fill,
             } => output.push_str(&format!(
-                "(fp_rect {} {} {} (fill {}) (layer \"{}\"))",
+                "(fp_rect {} {} {} (fill {}) (layer {}))",
                 point_clause("start", *start),
                 point_clause("end", *end),
                 stroke_clause(*stroke_width_mm),
@@ -780,7 +781,7 @@ fn serialize_graphics(layer: &str, graphics: &[FootprintGraphic], indent: &str) 
                     y: center.y,
                 };
                 output.push_str(&format!(
-                    "(fp_circle {} {} {} (fill {}) (layer \"{}\"))",
+                    "(fp_circle {} {} {} (fill {}) (layer {}))",
                     point_clause("center", *center),
                     point_clause("end", end),
                     stroke_clause(*stroke_width_mm),
@@ -799,7 +800,7 @@ fn serialize_graphics(layer: &str, graphics: &[FootprintGraphic], indent: &str) 
                     .collect::<Vec<_>>()
                     .join(" ");
                 output.push_str(&format!(
-                    "(fp_poly (pts {points}) {} (fill {}) (layer \"{}\"))",
+                    "(fp_poly (pts {points}) {} (fill {}) (layer {}))",
                     stroke_clause(*stroke_width_mm),
                     fill.as_kicad(),
                     layer
@@ -999,6 +1000,64 @@ mod tests {
     use crate::tools::ServerConfig;
     use serde_json::json;
     use std::sync::Arc;
+
+    #[test]
+    fn graphic_serializers_escape_layer_strings() {
+        let start = Point { x: 0., y: 0. };
+        let end = Point { x: 1., y: 1. };
+        let graphics = vec![
+            FootprintGraphic::Line {
+                start,
+                end,
+                stroke_width_mm: 0.1,
+            },
+            FootprintGraphic::Arc {
+                start,
+                mid: Point { x: 1., y: 0. },
+                end,
+                stroke_width_mm: 0.1,
+            },
+            FootprintGraphic::Rect {
+                start,
+                end,
+                stroke_width_mm: 0.1,
+                fill: Fill::None,
+            },
+            FootprintGraphic::Circle {
+                center: start,
+                radius_mm: 1.,
+                stroke_width_mm: 0.1,
+                fill: Fill::Solid,
+            },
+            FootprintGraphic::Poly {
+                points: vec![start, end, Point { x: 0., y: 1. }],
+                stroke_width_mm: 0.1,
+                fill: Fill::None,
+            },
+        ];
+        let layer = "a\"b\\c";
+        let content = format!(
+            "(footprint \"test\" {})",
+            serialize_graphics(layer, &graphics, "  ")
+        );
+        let tree = konnect_sexp::parse_sexp(&content).unwrap();
+        assert_eq!(
+            tree.children()
+                .unwrap()
+                .iter()
+                .filter(|node| node.head().is_some_and(|head| head.starts_with("fp_")))
+                .count(),
+            graphics.len()
+        );
+        for item in tree
+            .children()
+            .unwrap()
+            .iter()
+            .filter(|node| node.head().is_some_and(|head| head.starts_with("fp_")))
+        {
+            assert_eq!(item.find_str("layer"), Some(layer));
+        }
+    }
 
     const OLD_FOOTPRINT: &str = r#"(footprint "Fixture" (version 20221018) (generator pcbnew)
   (layer "F.Cu")

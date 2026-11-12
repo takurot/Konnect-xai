@@ -591,3 +591,19 @@ remove the surrounding `(setup ...)` block. Konnect versions containing the
 fix for #610 refuse `set_active_layer` with `unsupported_capability` and leave
 the file byte-identical until stable KiCad IPC exposes a native operation with
 readback.
+
+## A stdio tool call is slow or was cancelled
+
+`ping` remains responsive while a stdio tool call is running. Tool calls,
+including cheap reads, run in arrival order with at most 128 additional calls
+queued. The transport rejects excess queued requests instead of growing an
+unbounded work queue.
+
+A client can cancel an active or queued request using
+`notifications/cancelled` with its exact `requestId` (numeric and string IDs
+are distinct). Konnect suppresses the cancelled response, drops the running
+future, and terminates an owned `kicad-cli` or Freerouting Java child. Cancellation
+does not undo changes already made to a file or live document: inspect the
+document before retrying a mutation. A tool panic returns a JSON-RPC internal
+error and leaves the stdio session available for the next request; the same
+readback rule applies before retrying it.

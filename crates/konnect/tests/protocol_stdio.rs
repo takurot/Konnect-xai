@@ -124,33 +124,23 @@ impl McpProcess {
         resp["result"].clone()
     }
 
-    /// Send a `tools/call`, then a fencing `ping`, and return every line the
-    /// server emits up to and including the ping response. The fence
-    /// guarantees the read loop terminates even when the tool call emits no
-    /// notification (as in bug #19), so a test can assert on side-effect
-    /// notifications without risking a hang.
+    /// Await the tool response before issuing a ping to fence its queued
+    /// notifications. Ping may overtake an in-flight tool call (#3).
     fn call_tool_then_fence(&mut self, name: &str, args: Value) -> Vec<Value> {
-        let call_id = self.next_id;
-        self.next_id += 1;
-        let call = json!({
-            "jsonrpc": "2.0", "id": call_id, "method": "tools/call",
-            "params": {"name": name, "arguments": args}
-        });
-        writeln!(self.stdin, "{}", call).unwrap();
+        let response = self.request("tools/call", json!({"name": name, "arguments": args}));
         let fence_id = self.next_id;
         self.next_id += 1;
         let fence = json!({"jsonrpc": "2.0", "id": fence_id, "method": "ping", "params": {}});
         writeln!(self.stdin, "{}", fence).unwrap();
         self.stdin.flush().unwrap();
-
-        let mut lines = Vec::new();
+        let mut lines = vec![response];
         loop {
             let mut line = String::new();
             let n = self.reader.read_line(&mut line).unwrap();
             assert!(n > 0, "server closed stdout before fence response");
-            let v: Value = serde_json::from_str(line.trim()).unwrap();
-            let is_fence = v.get("id").and_then(Value::as_i64) == Some(fence_id);
-            lines.push(v);
+            let value: Value = serde_json::from_str(line.trim()).unwrap();
+            let is_fence = value.get("id").and_then(Value::as_i64) == Some(fence_id);
+            lines.push(value);
             if is_fence {
                 break;
             }

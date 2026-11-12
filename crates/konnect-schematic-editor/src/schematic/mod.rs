@@ -161,6 +161,17 @@ impl Schematic {
                     "schematic revision state is unavailable after a panic",
                 ))
             })?;
+            // No model change must preserve the original formatting and unknown data.
+            let original_model = Self::from_sexp(
+                parser::parse(&original_source)?,
+                self.filepath.clone(),
+                original_source.clone(),
+            )?;
+            let text = if original_model.to_sexp() == self.to_sexp() {
+                original_source.clone()
+            } else {
+                text
+            };
             atomic_write_revision(path, &original_source, &text)?;
             *original_source = text;
             Ok(())
@@ -637,9 +648,28 @@ fn map_sexp_error(error: konnect_sexp::SexpError) -> crate::error::Error {
     match error {
         konnect_sexp::SexpError::Io(error) => crate::error::Error::Io(error),
         konnect_sexp::SexpError::Conflict { path } => crate::error::Error::Conflict(path),
+        konnect_sexp::SexpError::MutationOutcomeUncertain { path, reason } => {
+            crate::error::Error::MutationOutcomeUncertain { path, reason }
+        }
         konnect_sexp::SexpError::KiCadEditorLocked {
             path, lock_path, ..
         } => crate::error::Error::KiCadEditorLocked { path, lock_path },
         error => crate::error::Error::Io(std::io::Error::other(error)),
+    }
+}
+
+#[cfg(test)]
+mod uncertain_error_mapping_tests {
+    use super::*;
+    #[test]
+    fn postcommit_uncertainty_survives_editor_error_conversion() {
+        let path = std::path::PathBuf::from("design.kicad_sch");
+        let mapped = map_sexp_error(konnect_sexp::SexpError::MutationOutcomeUncertain {
+            path: path.clone(),
+            reason: "readback unavailable".into(),
+        });
+        assert!(
+            matches!(mapped, crate::error::Error::MutationOutcomeUncertain { path: observed, reason } if observed == path && reason == "readback unavailable")
+        );
     }
 }

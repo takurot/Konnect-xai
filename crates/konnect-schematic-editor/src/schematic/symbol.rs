@@ -36,6 +36,8 @@ pub struct Symbol {
     pub at: At,
     pub mirror: Option<String>,
     pub unit: u32,
+    pub body_style: Option<SexpNode>,
+    pub in_pos_files: Option<SexpNode>,
     /// `(exclude_from_sim …)`, present in KiCAD 8+ files. `None` for older
     /// files that omit it, so a round-trip doesn't invent the token.
     pub exclude_from_sim: Option<bool>,
@@ -60,6 +62,8 @@ impl Symbol {
             at: At::new(x, y),
             mirror: None,
             unit: 1,
+            body_style: None,
+            in_pos_files: None,
             exclude_from_sim: None,
             in_bom: true,
             on_board: true,
@@ -95,7 +99,9 @@ impl Symbol {
         let in_bom = node.get_bool("in_bom").unwrap_or(true);
         let on_board = node.get_bool("on_board").unwrap_or(true);
         let dnp = node.get_bool("dnp").unwrap_or(false);
-        let fields_autoplaced = node.find("fields_autoplaced").is_some();
+        let fields_autoplaced = node
+            .find("fields_autoplaced")
+            .is_some_and(|n| n.value() != Some("no"));
         let uuid = node.get_value("uuid").unwrap_or("").to_owned();
 
         let properties = node
@@ -114,6 +120,8 @@ impl Symbol {
             "at",
             "mirror",
             "unit",
+            "body_style",
+            "in_pos_files",
             "exclude_from_sim",
             "in_bom",
             "on_board",
@@ -130,6 +138,8 @@ impl Symbol {
             at,
             mirror,
             unit,
+            body_style: node.find("body_style").cloned(),
+            in_pos_files: node.find("in_pos_files").cloned(),
             exclude_from_sim,
             in_bom,
             on_board,
@@ -161,14 +171,20 @@ impl Symbol {
             c.push(tagged("mirror", vec![atom(m.clone())]));
         }
         c.push(tagged("unit", vec![atom(self.unit.to_string())]));
+        if let Some(value) = &self.body_style {
+            c.push(value.clone());
+        }
         if let Some(x) = self.exclude_from_sim {
             c.push(tagged("exclude_from_sim", vec![atom(bool_kw(x))]));
         }
         c.push(tagged("in_bom", vec![atom(bool_kw(self.in_bom))]));
         c.push(tagged("on_board", vec![atom(bool_kw(self.on_board))]));
+        if let Some(value) = &self.in_pos_files {
+            c.push(value.clone());
+        }
         c.push(tagged("dnp", vec![atom(bool_kw(self.dnp))]));
         if self.fields_autoplaced {
-            c.push(SexpNode::List(vec![atom("fields_autoplaced")]));
+            c.push(tagged("fields_autoplaced", vec![atom("yes")]));
         }
         c.push(tagged("uuid", vec![qstr(self.uuid.clone())]));
         for p in &self.properties {

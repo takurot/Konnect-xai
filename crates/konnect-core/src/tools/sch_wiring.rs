@@ -3,6 +3,9 @@
 //! Key rule: Every wire add operation must auto-detect T-junctions and insert
 //! junction dots. This uses `konnect_sexp::schematic::find_t_junctions`.
 
+use super::sch_route_safety::{
+    allow_join, check_coordinate_route, check_route, local_junctions, route_segments,
+};
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
@@ -14,9 +17,8 @@ use konnect_sexp::{
     geometry::{round6, snap_point},
     parser::parse_sexp,
     schematic::{
-        extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
-        format_junction, format_wire, parse_at, pin_endpoint, pin_outward_direction,
-        read_schematic, Wire,
+        extract_symbol_instances, extract_wires, find_lib_symbol, format_junction, format_wire,
+        parse_at, pin_endpoint, pin_outward_direction, read_schematic, Wire,
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
@@ -25,6 +27,10 @@ use konnect_sexp::{
     },
 };
 use serde_json::json;
+
+#[cfg(test)]
+#[path = "sch_wire_safety_tests.rs"]
+mod wire_safety_tests;
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
@@ -36,6 +42,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
+                    "allow_join": { "type": "boolean", "default": false, "description": "Explicitly permit the route to touch additional nets" },
                     "x1": { "type": "number" }, "y1": { "type": "number" },
                     "x2": { "type": "number" }, "y2": { "type": "number" }
                 },
@@ -50,6 +57,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
+                    "allow_join": { "type": "boolean", "default": false, "description": "Explicitly permit the route to touch additional nets" },
                     "wires": {
                         "type": "array",
                         "items": {
@@ -339,6 +347,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
+                    "allow_join": { "type": "boolean", "default": false, "description": "Explicitly permit the route to touch additional nets" },
+                    "uuid": {"type":"string", "description":"Instance UUID alternative to reference; use with pin_number"},
                     "reference": { "type": "string",
                         "description": "Component reference, e.g. 'U1'. Use with pin_number instead of pin_x/pin_y." },
                     "pin_number": { "type": "string", "description": "Pin number, e.g. '3'" },
@@ -373,12 +383,16 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
+                    "allow_join": { "type": "boolean", "default": false, "description": "Explicitly permit the route to touch additional nets" },
+                    "uuid1": { "type": "string", "description": "Instance UUID alternative to ref1" },
+                    "uuid2": { "type": "string", "description": "Instance UUID alternative to ref2" },
                     "ref1": { "type": "string", "description": "First component reference (e.g. 'R1')" },
                     "pin1": { "type": "string", "description": "First pin number (e.g. '1')" },
                     "ref2": { "type": "string", "description": "Second component reference (e.g. 'U1')" },
                     "pin2": { "type": "string", "description": "Second pin number (e.g. '3')" }
                 },
-                "required": ["schematic", "ref1", "pin1", "ref2", "pin2"]
+                "required": ["schematic", "pin1", "pin2"],
+                "allOf": [{"anyOf":[{"required":["ref1"]},{"required":["uuid1"]}]},{"anyOf":[{"required":["ref2"]},{"required":["uuid2"]}]}]
             }),
             |args, ctx| async move { handle_connect_pins(args, ctx).await }
         ),
@@ -390,6 +404,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
+                    "allow_join": { "type": "boolean", "default": false, "description": "Explicitly permit the route to touch additional nets" },
                     "x1": { "type": "number" }, "y1": { "type": "number" },
                     "x2": { "type": "number" }, "y2": { "type": "number" }
                 },
@@ -497,68 +512,49 @@ pub(crate) fn insert_wire_with_junctions(
     y1: f64,
     x2: f64,
     y2: f64,
-) -> String {
-    // Parse existing wires to detect new T-junctions
-    let tree = konnect_sexp::parse_sexp(&content).ok();
-    let mut existing_wires = tree.as_ref().map(extract_wires).unwrap_or_default();
-
-    // Existing junction positions, so a hit already marked isn't re-inserted
-    // (L-bends, and any loop calling this repeatedly, would otherwise double it).
-    let existing_junctions = tree
-        .as_ref()
-        .map(konnect_sexp::schematic::extract_junctions)
-        .unwrap_or_default();
-
-    // Add the new wire to the set before checking junctions (it may form T's too)
-    let new_wire = konnect_sexp::schematic::Wire {
+) -> anyhow::Result<String> {
+    let tree = parse_sexp(&content)?;
+    let existing_wires = extract_wires(&tree);
+    let existing_junctions = konnect_sexp::schematic::extract_junctions(&tree);
+    let new_wire = Wire {
         x1,
         y1,
         x2,
         y2,
         uuid: None,
     };
-    existing_wires.push(new_wire);
-
-    let mut junctions = find_t_junctions(&existing_wires, 0.01);
-    // Existing pins the new wire passes over also need junction dots.
-    let pins = tree
-        .as_ref()
-        .map(crate::tools::all_pin_endpoints)
-        .unwrap_or_default();
-    for (px, py) in pins_mid_segment(&pins, x1, y1, x2, y2) {
-        if !junctions
-            .iter()
-            .any(|&(jx, jy)| konnect_sexp::geometry::points_coincident(px, py, jx, jy, 0.01))
-        {
-            junctions.push((px, py));
-        }
-    }
-
-    let mut c = content;
-    c = insert_before_close(&c, &format_wire(x1, y1, x2, y2));
+    let mut junctions = local_junctions(&existing_wires, &new_wire);
+    let pins = crate::tools::all_pin_endpoints(&tree);
+    junctions.extend(pins_mid_segment(&pins, x1, y1, x2, y2));
+    let mut c = insert_before_close(&content, &format_wire(x1, y1, x2, y2));
+    let mut emitted = existing_junctions;
     for (jx, jy) in junctions {
-        if existing_junctions
+        if emitted
             .iter()
             .any(|(ex, ey)| konnect_sexp::geometry::points_coincident(jx, jy, *ex, *ey, 0.01))
         {
             continue;
         }
         c = insert_before_close(&c, &format_junction(jx, jy));
+        emitted.push((jx, jy));
     }
-    c
+    Ok(c)
 }
 
 /// Route a wire between two points: a single straight wire when axis-aligned,
 /// otherwise an H-then-V L-bend, each leg going through T-junction detection.
-pub(crate) fn route_between(content: String, x1: f64, y1: f64, x2: f64, y2: f64) -> String {
-    if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
-        insert_wire_with_junctions(content, x1, y1, x2, y2)
-    } else {
-        let mid_x = x2;
-        let mid_y = y1;
-        let content = insert_wire_with_junctions(content, x1, y1, mid_x, mid_y);
-        insert_wire_with_junctions(content, mid_x, mid_y, x2, y2)
+pub(crate) fn route_between(
+    content: String,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+) -> anyhow::Result<String> {
+    let mut content = content;
+    for (a, b) in route_segments((x1, y1), (x2, y2)) {
+        content = insert_wire_with_junctions(content, a.0, a.1, b.0, b.1)?;
     }
+    Ok(content)
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -568,47 +564,27 @@ async fn handle_add_wire(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let x1 = match require_f64(args, "x1") {
+    let mut points = Vec::new();
+    for key in ["x1", "y1", "x2", "y2"] {
+        match require_f64(args, key) {
+            Ok(v) => points.push(v),
+            Err(e) => return Ok(e),
+        }
+    }
+    let (x1, y1) = snap_point(points[0], points[1], 1.27);
+    let (x2, y2) = snap_point(points[2], points[3], 1.27);
+    let allow = match allow_join(args) {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y1 = match require_f64(args, "y1") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let x2 = match require_f64(args, "x2") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let y2 = match require_f64(args, "y2") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-
-    let (x1, y1) = snap_point(x1, y1, 1.27);
-    let (x2, y2) = snap_point(x2, y2, 1.27);
-
-    let mut sch = cse::Schematic::load(&sch_path)?;
-
-    // T-junction detection: bridge cse wires to konnect_sexp wires
-    let mut existing_wires = cse_wires_to_sexp(&sch);
-    existing_wires.push(konnect_sexp::schematic::Wire {
-        x1,
-        y1,
-        x2,
-        y2,
-        uuid: None,
-    });
-    let junctions = find_t_junctions(&existing_wires, 0.01);
-
-    sch.add_wire(x1, y1, x2, y2);
-    add_missing_junctions(&mut sch, &junctions);
-    // Pins the new wire passes over mid-segment also need junction dots.
-    let (_, tree) = read_schematic(&sch_path)?;
-    let pins = crate::tools::all_pin_endpoints(&tree);
-    add_missing_junctions(&mut sch, &pins_mid_segment(&pins, x1, y1, x2, y2));
-    sch.overwrite()?;
-
+    let (content, tree) = read_schematic(&sch_path)?;
+    if let Err(e) =
+        check_coordinate_route(&tree, &[((x1, y1), (x2, y2))], &[(x1, y1), (x2, y2)], allow)
+    {
+        return Ok(e);
+    }
+    let new_content = insert_wire_with_junctions(content.clone(), x1, y1, x2, y2)?;
+    write_atomic_if_unchanged(&sch_path, &content, &new_content)?;
     Ok(CallToolResult::json(
         &json!({ "added_wire": { "x1": x1, "y1": y1, "x2": x2, "y2": y2 } }),
     ))
@@ -620,62 +596,38 @@ async fn handle_batch_add_wire(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let wires = match require_array(args, "wires") {
-        Ok(a) => a.clone(),
+        Ok(v) => v,
         Err(e) => return Ok(e),
     };
-
-    // v0.6.0 made top-level required arguments refuse instead of defaulting,
-    // but array items took the same silent path one level down (#234): an
-    // element missing `x2` became a real wire to x=0 across the sheet,
-    // reported as success. Validate every element before touching anything,
-    // so a malformed batch changes nothing.
+    let allow = match allow_join(args) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let content = read_consistent(&sch_path)?;
+    let mut new_content = content.clone();
     for (i, w) in wires.iter().enumerate() {
+        let mut points = Vec::new();
         for key in ["x1", "y1", "x2", "y2"] {
-            if w[key].as_f64().is_none() {
-                return Ok(crate::tools::invalid_arg(
+            let Some(v) = w[key].as_f64().filter(|v| v.is_finite()) else {
+                return Ok(super::invalid_arg(
                     &format!("wires[{i}].{key}"),
-                    "missing or not a number",
+                    "missing or not a finite number",
                 ));
-            }
+            };
+            points.push(v);
         }
+        let (x1, y1) = snap_point(points[0], points[1], 1.27);
+        let (x2, y2) = snap_point(points[2], points[3], 1.27);
+        let tree = parse_sexp(&new_content)?;
+        if let Err(e) =
+            check_coordinate_route(&tree, &[((x1, y1), (x2, y2))], &[(x1, y1), (x2, y2)], allow)
+        {
+            return Ok(e);
+        }
+        new_content = insert_wire_with_junctions(new_content, x1, y1, x2, y2)?;
     }
-
-    let mut sch = cse::Schematic::load(&sch_path)?;
-    let mut added = 0usize;
-
-    // Pin endpoints are fixed for the whole batch (only wires change below).
-    let pins = read_schematic(&sch_path)
-        .map(|(_, tree)| crate::tools::all_pin_endpoints(&tree))
-        .unwrap_or_default();
-
-    for w in &wires {
-        let x1 = w["x1"].as_f64().unwrap_or(0.0);
-        let y1 = w["y1"].as_f64().unwrap_or(0.0);
-        let x2 = w["x2"].as_f64().unwrap_or(0.0);
-        let y2 = w["y2"].as_f64().unwrap_or(0.0);
-        let (x1, y1) = snap_point(x1, y1, 1.27);
-        let (x2, y2) = snap_point(x2, y2, 1.27);
-
-        // T-junction detection for each wire added incrementally.
-        let mut existing_wires = cse_wires_to_sexp(&sch);
-        existing_wires.push(konnect_sexp::schematic::Wire {
-            x1,
-            y1,
-            x2,
-            y2,
-            uuid: None,
-        });
-        let junctions = find_t_junctions(&existing_wires, 0.01);
-
-        sch.add_wire(x1, y1, x2, y2);
-        add_missing_junctions(&mut sch, &junctions);
-        // Pins this wire passes over mid-segment also need junction dots.
-        add_missing_junctions(&mut sch, &pins_mid_segment(&pins, x1, y1, x2, y2));
-        added += 1;
-    }
-
-    sch.overwrite()?;
-    Ok(CallToolResult::json(&json!({ "added_wires": added })))
+    write_atomic_if_unchanged(&sch_path, &content, &new_content)?;
+    Ok(CallToolResult::json(&json!({ "added_wires": wires.len() })))
 }
 
 async fn handle_delete_wire(
@@ -1880,6 +1832,17 @@ fn same_point(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-6
 }
 
+fn direct_label_child(block: &str, tag: &str) -> Option<(usize, usize)> {
+    let root = parse_sexp(block).ok()?;
+    konnect_sexp::writer::find_direct_child_blocks(block, root.head()?)
+        .into_iter()
+        .find(|&(start, end)| {
+            parse_sexp(&block[start..end])
+                .ok()
+                .is_some_and(|n| n.head() == Some(tag))
+        })
+}
+
 async fn handle_rotate_label(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -1935,8 +1898,8 @@ async fn handle_rotate_label(
     let mut edits = Vec::new();
 
     // 1. The (at X Y ROT) anchor.
-    let at_rel = block
-        .find("(at ")
+    let at_rel = direct_label_child(block, "at")
+        .map(|(start, _)| start)
         .ok_or_else(|| anyhow::anyhow!("No (at) in label block"))?;
     let at_val = block_start + at_rel + "(at ".len();
     let at_close = content[at_val..]
@@ -1960,14 +1923,18 @@ async fn handle_rotate_label(
         format!("(justify {justify})")
     };
 
-    if let Some(j_rel) = block.find("(justify ") {
+    let effects = direct_label_child(block, "effects");
+    let justify_child = effects.and_then(|(start, end)| {
+        direct_label_child(&block[start..end], "justify").map(|(a, _)| start + a)
+    });
+    if let Some(j_rel) = justify_child {
         // Replace the existing justify in place.
         let j_start = block_start + j_rel;
         let j_end = find_balanced_block(&content, j_start)
             .map(|(_, e)| e)
             .ok_or_else(|| anyhow::anyhow!("Malformed (justify)"))?;
         edits.push(SexpEdit::replace(j_start, j_end, justify_sexp));
-    } else if let Some(e_rel) = block.find("(effects") {
+    } else if let Some((e_rel, _)) = effects {
         // An effects block with no justify — add one just inside it.
         let e_start = block_start + e_rel;
         let (_, e_end) = find_balanced_block(&content, e_start)
@@ -1977,9 +1944,8 @@ async fn handle_rotate_label(
         // No effects at all — the shape add_schematic_net_label used to write.
         // Insert a complete block where eeschema puts it: before the uuid,
         // matching that line's indentation.
-        let insert_at = block
-            .find("(uuid")
-            .map(|r| block_start + r)
+        let insert_at = direct_label_child(block, "uuid")
+            .map(|(r, _)| block_start + r)
             .unwrap_or(block_end - 1);
         let line_start = content[..insert_at]
             .rfind('\n')
@@ -1997,6 +1963,10 @@ async fn handle_rotate_label(
 
     let new_content = apply_edits(content, edits);
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    anyhow::ensure!(
+        read_consistent(&sch_path)? == new_content,
+        "stale_target: label readback differs from committed content"
+    );
     Ok(CallToolResult::json(&json!({
         "rotated_label": net,
         "type": label.kind,
@@ -2040,8 +2010,8 @@ async fn handle_move_labels_by_offset(
         let (block_start, block_end) = find_balanced_block(&content, label.start)
             .ok_or_else(|| anyhow::anyhow!("Cannot parse label block"))?;
         let block = &content[block_start..block_end];
-        let at_rel = block
-            .find("(at ")
+        let at_rel = direct_label_child(block, "at")
+            .map(|(start, _)| start)
             .ok_or_else(|| anyhow::anyhow!("No (at) in label block"))?;
         let at_val = block_start + at_rel + "(at ".len();
         let at_close = content[at_val..]
@@ -2058,11 +2028,39 @@ async fn handle_move_labels_by_offset(
             at_close,
             format!("{} {} {}", label.x + dx, label.y + dy, rotation),
         ));
+        for (start, end) in konnect_sexp::writer::find_direct_child_blocks(block, label.kind) {
+            let property = &block[start..end];
+            if parse_sexp(property)
+                .ok()
+                .is_none_or(|n| n.head() != Some("property"))
+            {
+                continue;
+            }
+            let Some((a, b)) = direct_label_child(property, "at") else {
+                continue;
+            };
+            let (px, py, rot) = parse_at(&parse_sexp(&format!("(property {})", &property[a..b]))?)
+                .ok_or_else(|| anyhow::anyhow!("Malformed property anchor"))?;
+            edits.push(SexpEdit::replace(
+                block_start + start + a,
+                block_start + start + b,
+                format!(
+                    "(at {} {} {})",
+                    cse::types::fmt_f64(px + dx),
+                    cse::types::fmt_f64(py + dy),
+                    rot
+                ),
+            ));
+        }
     }
 
-    let moved = edits.len();
+    let moved = matching.len();
     let new_content = apply_edits(content, edits);
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    anyhow::ensure!(
+        read_consistent(&sch_path)? == new_content,
+        "stale_target: label readback differs from committed content"
+    );
 
     Ok(CallToolResult::json(
         &json!({ "moved_labels": moved, "net": net }),
@@ -2498,11 +2496,18 @@ async fn handle_connect_to_net(
     let stub_length = opt_f64(args, "stub_length").unwrap_or(2.54);
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
 
-    let (_, tree) = read_schematic(&sch_path)?;
+    let (content, tree) = read_schematic(&sch_path)?;
+    let allow = match allow_join(args) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
 
     // Name the pin, or give its coordinates. Naming it cannot miss the
     // endpoint, and the error says which pin was wrong.
-    let (pin_x, pin_y, outward) = match (opt_str(args, "reference"), opt_str(args, "pin_number")) {
+    let (pin_x, pin_y, outward) = match (
+        opt_str(args, "uuid").or_else(|| opt_str(args, "reference")),
+        opt_str(args, "pin_number"),
+    ) {
         (Some(reference), Some(pin_number)) => {
             let instances = extract_symbol_instances(&tree);
             let lib_syms = tree
@@ -2514,7 +2519,10 @@ async fn handle_connect_to_net(
                     let (x, y) = pin_endpoint(&pin, t);
                     (x, y, Some(pin_outward_direction(&pin, t)))
                 }
-                Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                Err(e) => {
+                    return Ok(ambiguous_reference_result(&e)
+                        .unwrap_or_else(|| CallToolResult::error(e.to_string())))
+                }
             }
         }
         (Some(_), None) | (None, Some(_)) => {
@@ -2550,7 +2558,17 @@ async fn handle_connect_to_net(
         Some(d) => crate::tools::stub_direction(direction, Some(d)),
         None => crate::tools::resolve_stub_direction(direction, (pin_x, pin_y), &tree),
     };
-    let mut sch = cse::Schematic::load(&sch_path)?;
+    let end = dir.end((pin_x, pin_y), stub_length);
+    if let Err(e) = check_route(
+        &tree,
+        &[((pin_x, pin_y), end)],
+        &[(pin_x, pin_y)],
+        Some(&net),
+        allow,
+    ) {
+        return Ok(e);
+    }
+    let mut sch = cse::Schematic::from_source(&sch_path, content)?;
     let pins = crate::tools::all_pin_endpoints(&tree);
     let (label_x, label_y, label_rot) = add_net_stub(
         &mut sch,
@@ -2599,15 +2617,17 @@ pub(crate) fn add_stub_wire(
     (x2, y2): (f64, f64),
 ) {
     // T-junction detection for the wire stub
-    let mut existing_wires = cse_wires_to_sexp(sch);
-    existing_wires.push(konnect_sexp::schematic::Wire {
-        x1,
-        y1,
-        x2,
-        y2,
-        uuid: None,
-    });
-    let junctions = find_t_junctions(&existing_wires, 0.01);
+    let existing_wires = cse_wires_to_sexp(sch);
+    let junctions = local_junctions(
+        &existing_wires,
+        &Wire {
+            x1,
+            y1,
+            x2,
+            y2,
+            uuid: None,
+        },
+    );
 
     sch.add_wire(x1, y1, x2, y2);
     add_missing_junctions(sch, &junctions);
@@ -2644,7 +2664,14 @@ async fn handle_connect_pins(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let ref1 = match require_str(args, "ref1") {
+    let ref1 = match require_str(
+        args,
+        if args.get("uuid1").is_some() {
+            "uuid1"
+        } else {
+            "ref1"
+        },
+    ) {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
@@ -2652,7 +2679,14 @@ async fn handle_connect_pins(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let ref2 = match require_str(args, "ref2") {
+    let ref2 = match require_str(
+        args,
+        if args.get("uuid2").is_some() {
+            "uuid2"
+        } else {
+            "ref2"
+        },
+    ) {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
@@ -2671,12 +2705,37 @@ async fn handle_connect_pins(
         .unwrap_or_default();
 
     // Resolve pin1 board-space endpoint
-    let (x1, y1) = resolve_pin_endpoint(&instances, &lib_syms, &ref1, &pin1)?;
+    let (x1, y1) = match resolve_pin_endpoint(&instances, &lib_syms, &ref1, &pin1) {
+        Ok(point) => point,
+        Err(error) => match ambiguous_reference_result(&error) {
+            Some(result) => return Ok(result),
+            None => return Err(error),
+        },
+    };
     // Resolve pin2 board-space endpoint
-    let (x2, y2) = resolve_pin_endpoint(&instances, &lib_syms, &ref2, &pin2)?;
+    let (x2, y2) = match resolve_pin_endpoint(&instances, &lib_syms, &ref2, &pin2) {
+        Ok(point) => point,
+        Err(error) => match ambiguous_reference_result(&error) {
+            Some(result) => return Ok(result),
+            None => return Err(error),
+        },
+    };
 
     // Route wire(s) between the two pin endpoints
-    let new_content = route_between(content, x1, y1, x2, y2);
+    let allow = match allow_join(args) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    if let Err(e) = check_route(
+        &tree,
+        &route_segments((x1, y1), (x2, y2)),
+        &[(x1, y1), (x2, y2)],
+        None,
+        allow,
+    ) {
+        return Ok(e);
+    }
+    let new_content = route_between(content, x1, y1, x2, y2)?;
 
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
@@ -2686,6 +2745,24 @@ async fn handle_connect_pins(
             "to":   { "ref": ref2, "pin": pin2, "x": x2, "y": y2 }
         }
     })))
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("ambiguous_reference: {reference}; select one of {uuids:?}")]
+struct AmbiguousPinReference {
+    reference: String,
+    uuids: Vec<String>,
+}
+
+pub(crate) fn ambiguous_reference_result(error: &anyhow::Error) -> Option<CallToolResult> {
+    let ambiguity = error.downcast_ref::<AmbiguousPinReference>()?;
+    Some(CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::AmbiguousReference {
+            reference: ambiguity.reference.clone(),
+            uuids: ambiguity.uuids.clone(),
+        },
+        error.to_string(),
+    ))
 }
 
 /// Resolve a pin's schematic-space endpoint by reference and pin number.
@@ -2718,12 +2795,23 @@ pub(crate) fn resolve_placed_pin(
     // on the unit the schematic draws separately from either amplifier.
     let placed: Vec<_> = instances
         .iter()
-        .filter(|i| i.reference == reference)
+        .filter(|i| i.reference == reference || i.uuid.as_deref() == Some(reference))
         .collect();
     let Some(first) = placed.first() else {
         anyhow::bail!("Component '{}' not found", reference);
     };
 
+    let mut units = std::collections::HashSet::new();
+    if placed
+        .iter()
+        .any(|i| !units.insert(i.unit) || i.lib_id != first.lib_id)
+    {
+        return Err(AmbiguousPinReference {
+            reference: reference.into(),
+            uuids: placed.iter().filter_map(|i| i.uuid.clone()).collect(),
+        }
+        .into());
+    }
     let mut searched = Vec::new();
     for inst in &placed {
         // find_lib_symbol, not a lib_id match: an instance carrying a
@@ -2785,7 +2873,20 @@ async fn handle_add_schematic_connection(
 
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
-    let content = route_between(content, x1, y1, x2, y2);
+    let allow = match allow_join(args) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let tree = parse_sexp(&content)?;
+    if let Err(e) = check_coordinate_route(
+        &tree,
+        &route_segments((x1, y1), (x2, y2)),
+        &[(x1, y1), (x2, y2)],
+        allow,
+    ) {
+        return Ok(e);
+    }
+    let content = route_between(content, x1, y1, x2, y2)?;
 
     write_atomic_if_unchanged(&sch_path, &expected, &content)?;
     Ok(CallToolResult::json(&json!({
@@ -2916,7 +3017,7 @@ mod unit_aware_wiring_tests {
         let result = handle_add_wire(
             &json!({
                 "schematic": path.display().to_string(),
-                "x1": 96.52, "y1": 76.2, "x2": 106.68, "y2": 76.2
+                "x1": 96.52, "y1": 76.2, "x2": 106.68, "y2": 76.2, "allow_join": true
             }),
             &test_ctx(),
         )
@@ -3746,6 +3847,25 @@ mod label_tests {
         let (_d, path) = sch_with(TWO_PLAIN);
         let result = rotate(&path, "VCC", 555.0, 555.0, 180.0).await;
         assert!(result.is_error, "must not rotate the nearest label instead");
+    }
+
+    #[tokio::test]
+    async fn label_name_with_at_text_is_preserved_and_properties_move() {
+        let (_d, path) = sch_with(
+            r#"(global_label "(at 1 2)" (at 10 20 0) (property "Intersheetrefs" "see (at 5 5)" (at 11 21 0)) (uuid "abcd"))"#,
+        );
+        assert!(!rotate(&path, "(at 1 2)", 10.0, 20.0, 180.0).await.is_error);
+        handle_move_labels_by_offset(
+            &json!({"schematic": path, "net": "(at 1 2)", "dx": 1.0, "dy": 2.0}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let after = std::fs::read_to_string(path).unwrap();
+        assert!(after.contains(r#""(at 1 2)""#));
+        assert!(after.contains("(at 11 22 180)"));
+        assert!(after.contains("(at 12 23 0)"));
+        assert!(after.contains("see (at 5 5)"));
     }
 
     // ─── move by offset ────────────────────────────────────────────────────

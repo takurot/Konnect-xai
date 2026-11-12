@@ -47,5 +47,11 @@
       ],
       "removal_criteria": "Both readers consistently select and disclose live or saved state, including stale-file regression coverage."
     }
+  ],
+  "unchecked_write_atomic": [
+    {
+      "site": "crates/konnect-core/src/tools/drc.rs:1",
+      "rationale": "DRC reports are caller-selected output artifacts, published by atomic replacement; never a read/modify/write design document."
+    }
   ]
 }
