@@ -18,6 +18,13 @@ dirs.workspace = true
 fs4.workspace = true
 sha2.workspace = true
 
+# Native atomic no-replace renames; versions already present in Cargo.lock.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 pretty_assertions = "1"
 proptest = "1"

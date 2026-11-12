@@ -558,27 +558,118 @@ fn build_konnect_jlcpcb_database(upstream_path: &Path, output_path: &Path) -> an
     Ok(part_count.try_into()?)
 }
 
+struct JlcpcbDownloadWork {
+    directory: Option<tempfile::TempDir>,
+}
+
+impl JlcpcbDownloadWork {
+    fn path(&self) -> &Path {
+        self.directory
+            .as_ref()
+            .expect("live download work owns its directory")
+            .path()
+    }
+}
+
+impl Drop for JlcpcbDownloadWork {
+    fn drop(&mut self) {
+        let Some(directory) = self.directory.as_ref() else {
+            return;
+        };
+        // A backup can be the only remaining copy after cancellation, panic,
+        // or a failed restore. Follow no symlinks and keep on unknown state.
+        if matches!(std::fs::symlink_metadata(directory.path().join("previous.db")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound)
+        {
+            return;
+        }
+        if let Some(directory) = self.directory.take() {
+            let recovery_path = directory.keep();
+            tracing::warn!(recovery_path = %recovery_path.display(),
+                "retained JLCPCB work directory because backup absence was not established");
+        }
+    }
+}
+
+fn database_install_uncertain(
+    destination: &Path,
+    backup_path: &Path,
+    staged_path: &Path,
+    reason: impl std::fmt::Display,
+) -> anyhow::Error {
+    SexpError::MutationOutcomeUncertain {
+        path: destination.to_path_buf(),
+        reason: format!("{reason}; recovery locations: work directory {}, previous-database backup {}, staged database {}. Available backup entries are retained; inspect these paths before retrying",
+            backup_path.parent().unwrap_or_else(|| Path::new(".")).display(),
+            backup_path.display(), staged_path.display()),
+    }.into()
+}
+
 fn replace_jlcpcb_database(
     staged_path: &Path,
     destination: &Path,
     backup_path: &Path,
+    after_backup: impl FnOnce(),
 ) -> anyhow::Result<()> {
-    if !destination.exists() {
-        std::fs::rename(staged_path, destination)?;
+    let existing = match std::fs::symlink_metadata(destination) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if existing.is_none() {
+        konnect_sexp::rename_noreplace(staged_path, destination)?;
         return Ok(());
     }
-
-    std::fs::rename(destination, backup_path)?;
-    if let Err(install_error) = std::fs::rename(staged_path, destination) {
-        if let Err(restore_error) = std::fs::rename(backup_path, destination) {
-            anyhow::bail!(
-                "Failed to install the new JLCPCB database ({install_error}) and restore the previous database ({restore_error})"
-            );
+    anyhow::ensure!(
+        existing.is_some_and(|metadata| metadata.is_file()),
+        "JLCPCB database destination {} must be absent or a regular file",
+        destination.display()
+    );
+    konnect_sexp::rename_noreplace(destination, backup_path)?;
+    if !std::fs::symlink_metadata(backup_path).is_ok_and(|metadata| metadata.is_file()) {
+        if let Err(restore_error) = konnect_sexp::rename_noreplace(backup_path, destination) {
+            return Err(database_install_uncertain(destination, backup_path, staged_path,
+                format!("database destination changed to a non-regular entry and restoration failed ({restore_error})")));
+        }
+        anyhow::bail!("database destination changed to a non-regular entry; restored it without installing a database");
+    }
+    after_backup();
+    if let Err(install_error) = konnect_sexp::rename_noreplace(staged_path, destination) {
+        if let Err(restore_error) = konnect_sexp::rename_noreplace(backup_path, destination) {
+            return Err(database_install_uncertain(destination, backup_path, staged_path,
+                format!("failed to install the new JLCPCB database ({install_error}) and restore the previous database ({restore_error})")));
         }
         return Err(install_error.into());
     }
-    std::fs::remove_file(backup_path)?;
+    if let Err(cleanup_error) = std::fs::remove_file(backup_path) {
+        return Err(database_install_uncertain(destination, backup_path, staged_path,
+            format!("new database installed, but previous-database backup cleanup failed ({cleanup_error})")));
+    }
     Ok(())
+}
+
+async fn finalize_jlcpcb_download(
+    work_dir: tempfile::TempDir,
+    db_path: PathBuf,
+    after_backup: impl FnOnce() + Send + 'static,
+) -> anyhow::Result<(u64, u64)> {
+    crate::tools::blocking_work::spawn_tracked_blocking(move || {
+        // Move ownership into the closure before scheduling; dropping the
+        // async waiter cannot remove the running worker's staged/backup files.
+        let work = JlcpcbDownloadWork {
+            directory: Some(work_dir),
+        };
+        let archive_path = work.path().join(JLCPCB_FEED_ARCHIVE);
+        let upstream_path = work.path().join("upstream.db");
+        let staged_path = work.path().join("konnect.db");
+        let backup_path = work.path().join("previous.db");
+        extract_jlcpcb_database(&archive_path, &upstream_path, JLCPCB_MAX_DATABASE_BYTES)?;
+        let part_count = build_konnect_jlcpcb_database(&upstream_path, &staged_path)?;
+        let size_bytes = std::fs::metadata(&staged_path)?.len();
+        replace_jlcpcb_database(&staged_path, &db_path, &backup_path, after_backup)?;
+        Ok::<_, anyhow::Error>((part_count, size_bytes))
+    })
+    .await?
 }
 
 async fn handle_download_jlcpcb(
@@ -614,22 +705,10 @@ async fn handle_download_jlcpcb(
         .prefix("konnect-jlcpcb-")
         .tempdir_in(db_parent)?;
     let archive_path = work_dir.path().join(JLCPCB_FEED_ARCHIVE);
-    let upstream_path = work_dir.path().join("upstream.db");
-    let staged_path = work_dir.path().join("konnect.db");
-    let backup_path = work_dir.path().join("previous.db");
 
     let (chunk_count, downloaded_bytes) = download_jlcpcb_archive(&client, &archive_path).await?;
-    let (part_count, size_bytes) = tokio::task::spawn_blocking({
-        let db_path = db_path.clone();
-        move || -> anyhow::Result<(u64, u64)> {
-            extract_jlcpcb_database(&archive_path, &upstream_path, JLCPCB_MAX_DATABASE_BYTES)?;
-            let part_count = build_konnect_jlcpcb_database(&upstream_path, &staged_path)?;
-            let size_bytes = std::fs::metadata(&staged_path)?.len();
-            replace_jlcpcb_database(&staged_path, &db_path, &backup_path)?;
-            Ok((part_count, size_bytes))
-        }
-    })
-    .await??;
+    let (part_count, size_bytes) =
+        finalize_jlcpcb_download(work_dir, db_path.clone(), || {}).await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
@@ -706,7 +785,7 @@ async fn handle_search_jlcpcb_parts(
 
     let tokens = jlcpcb_search_tokens(&query);
     let sql_tokens = tokens.clone();
-    let results = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<serde_json::Value>> {
+    let results = crate::tools::blocking_work::spawn_tracked_blocking(move || -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = rusqlite::Connection::open(&db_path)?;
 
         // The JLCPCB db schema has columns: LCSC, MFR_Part, Package, Solder_Joint,
@@ -813,7 +892,7 @@ async fn handle_get_jlcpcb_part(
     }
 
     let result =
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
+        crate::tools::blocking_work::spawn_tracked_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
             let conn = rusqlite::Connection::open(&db_path)?;
             let mut stmt = conn.prepare(
             "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
@@ -1083,7 +1162,7 @@ async fn handle_suggest_alternatives(
 
     let packages = package_match.packages.clone();
     let query_value = value.clone();
-    let candidates = tokio::task::spawn_blocking(move || {
+    let candidates = crate::tools::blocking_work::spawn_tracked_blocking(move || {
         query_alternative_candidates(&db_path, &query_value, &packages)
     })
     .await??;
@@ -1142,7 +1221,7 @@ async fn handle_jlcpcb_stats(
     let meta = tokio::fs::metadata(&db_path).await?;
     let size_bytes = meta.len();
 
-    let count = tokio::task::spawn_blocking({
+    let count = crate::tools::blocking_work::spawn_tracked_blocking({
         let db_path = db_path.clone();
         move || -> anyhow::Result<i64> {
             let conn = rusqlite::Connection::open(&db_path)?;
@@ -1171,7 +1250,9 @@ async fn handle_enrich_datasheets(
     let overwrite = args["overwrite_existing"].as_bool().unwrap_or(false);
 
     let read_path = sch_path.clone();
-    let content = tokio::task::spawn_blocking(move || read_consistent(&read_path)).await??;
+    let content =
+        crate::tools::blocking_work::spawn_tracked_blocking(move || read_consistent(&read_path))
+            .await??;
 
     // Only placed, top-level symbol instances are enrichment targets. Library
     // definitions, quoted text, and nested decoys must not enter the target
@@ -1608,26 +1689,29 @@ async fn datasheet_from_catalog(
     }
     let lcsc_id = lcsc_id.map(String::from);
     let mpn = mpn.map(String::from);
-    tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
-        let conn = rusqlite::Connection::open(&db_path)?;
-        let (sql, param): (&str, String) = match (&lcsc_id, &mpn) {
-            // An LCSC ID is the primary key shape, so it wins when both are
-            // given — same precedence the web path used.
-            (Some(id), _) => (
-                "SELECT Datasheet FROM components WHERE LCSC = ?1 LIMIT 1",
-                id.clone(),
-            ),
-            (None, Some(mpn)) => (
-                "SELECT Datasheet FROM components WHERE MFR_Part = ?1 LIMIT 1",
-                mpn.clone(),
-            ),
-            // Unreachable: the caller rejects both-absent before calling.
-            (None, None) => return Ok(None),
-        };
-        let mut stmt = conn.prepare(sql)?;
-        let mut rows = stmt.query_map(rusqlite::params![param], |row| row.get::<_, String>(0))?;
-        Ok(rows.next().transpose()?.filter(|url| !url.is_empty()))
-    })
+    crate::tools::blocking_work::spawn_tracked_blocking(
+        move || -> anyhow::Result<Option<String>> {
+            let conn = rusqlite::Connection::open(&db_path)?;
+            let (sql, param): (&str, String) = match (&lcsc_id, &mpn) {
+                // An LCSC ID is the primary key shape, so it wins when both are
+                // given — same precedence the web path used.
+                (Some(id), _) => (
+                    "SELECT Datasheet FROM components WHERE LCSC = ?1 LIMIT 1",
+                    id.clone(),
+                ),
+                (None, Some(mpn)) => (
+                    "SELECT Datasheet FROM components WHERE MFR_Part = ?1 LIMIT 1",
+                    mpn.clone(),
+                ),
+                // Unreachable: the caller rejects both-absent before calling.
+                (None, None) => return Ok(None),
+            };
+            let mut stmt = conn.prepare(sql)?;
+            let mut rows =
+                stmt.query_map(rusqlite::params![param], |row| row.get::<_, String>(0))?;
+            Ok(rows.next().transpose()?.filter(|url| !url.is_empty()))
+        },
+    )
     .await?
 }
 
@@ -3116,10 +3200,115 @@ mod jlcpcb_database_tests {
         std::fs::write(&destination, b"old").unwrap();
         std::fs::write(&staged, b"new").unwrap();
 
-        replace_jlcpcb_database(&staged, &destination, &backup).unwrap();
+        replace_jlcpcb_database(&staged, &destination, &backup, || {}).unwrap();
 
         assert_eq!(std::fs::read(destination).unwrap(), b"new");
         assert!(!backup.exists());
+    }
+    fn ready_download(parent: &Path) -> tempfile::TempDir {
+        let work = tempfile::tempdir_in(parent).unwrap();
+        let seed = work.path().join("seed.db");
+        seed_upstream_database(&seed);
+        let bytes = std::fs::read(seed).unwrap();
+        write_feed_archive(
+            &work.path().join(JLCPCB_FEED_ARCHIVE),
+            &[Entry::File("current-parts-fts5.db", &bytes)],
+        );
+        work
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_database_install_keeps_work_and_previous_database_until_worker_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("jlcpcb.db");
+        std::fs::write(&destination, b"original database").unwrap();
+        let work = ready_download(directory.path());
+        let work_path = work.path().to_path_buf();
+        let backup = work_path.join("previous.db");
+        let tracker = crate::tools::blocking_work::BlockingWorkTracker::default();
+        let tracked = tracker.clone();
+        let output = destination.clone();
+        let paused = std::sync::Arc::new(tokio::sync::Notify::new());
+        let observed = paused.clone();
+        let (release, receive) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            tracked
+                .scope(finalize_jlcpcb_download(work, output, move || {
+                    observed.notify_one();
+                    receive.recv().unwrap();
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), paused.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        let retained = std::fs::read(&backup).is_ok_and(|bytes| bytes == b"original database");
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), tracker.wait_idle())
+            .await
+            .unwrap();
+        assert!(
+            retained,
+            "cancelled waiter deleted the running worker's sole previous-database backup"
+        );
+        let database = rusqlite::Connection::open(&destination).unwrap();
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM components", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(database);
+        assert!(!work_path.exists());
+    }
+
+    #[tokio::test]
+    async fn database_failed_install_and_restore_preserve_previous_and_staged_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("jlcpcb.db");
+        std::fs::write(&destination, b"original database").unwrap();
+        let work = ready_download(directory.path());
+        let backup = work.path().join("previous.db");
+        let staged = work.path().join("konnect.db");
+        let obstruction = destination.clone();
+        let error = finalize_jlcpcb_download(work, destination.clone(), move || {
+            std::fs::create_dir(&obstruction).unwrap();
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(std::fs::read(&backup).unwrap(), b"original database");
+        let database = rusqlite::Connection::open(staged).unwrap();
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM components", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(destination.is_dir());
+        assert!(matches!(
+            error.downcast_ref::<SexpError>(),
+            Some(SexpError::MutationOutcomeUncertain { .. })
+        ));
+        assert!(error.to_string().contains(&backup.display().to_string()));
+    }
+
+    #[tokio::test]
+    async fn database_install_refuses_directory_destination_without_losing_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("jlcpcb.db");
+        std::fs::create_dir(&destination).unwrap();
+        let sentinel = destination.join("user-data");
+        std::fs::write(&sentinel, b"must survive").unwrap();
+        let work = ready_download(directory.path());
+        assert!(finalize_jlcpcb_download(work, destination.clone(), || {})
+            .await
+            .is_err());
+        assert!(destination.is_dir());
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"must survive");
     }
 }
 

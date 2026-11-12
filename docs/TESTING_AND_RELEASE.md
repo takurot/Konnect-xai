@@ -161,3 +161,10 @@ after filenames have changed, it returns `mutation_outcome_uncertain` with
 reconciling filenames and project references. Never blindly retry the rename or
 roll back already rewritten contents. Project names are escaped independently
 for JSON metadata and S-expression annotation keys.
+
+`rename_project` uses the shared native exclusive rename primitive for forward
+moves, rollback, backup directories and optional project-directory moves. A
+new destination appearing after planning is refused atomically. Unsupported
+platform/filesystem operations fail closed rather than falling back to a
+replacing rename or a copy/delete sequence. Regression tests inject both a
+forward collision and a newly recreated original during rollback.

@@ -3413,7 +3413,12 @@ async fn handle_annotate_schematic(
             Err(refusal) => return Ok(refusal),
         },
     };
-    Ok(tokio::task::spawn_blocking(move || annotate_file(&sch_path, options)).await?)
+    Ok(
+        crate::tools::blocking_work::spawn_tracked_blocking(move || {
+            annotate_file(&sch_path, options)
+        })
+        .await?,
+    )
 }
 
 async fn handle_get_schematic_pin_locations(

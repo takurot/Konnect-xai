@@ -1,5 +1,6 @@
 use anyhow::Result;
 use konnect_core::mcp::{handler::McpHandler, protocol::*};
+use konnect_core::tools::blocking_work::BlockingWorkTracker;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -37,6 +38,7 @@ pub async fn run_stdio(handler: McpHandler) -> Result<StdioExit> {
 struct PendingCall {
     message: Value,
     cancelled: bool,
+    blocking_work: BlockingWorkTracker,
 }
 
 impl PendingCall {
@@ -113,7 +115,8 @@ where
             if let Some(call) = calls.pop_front() {
                 let dispatch = dispatch.clone();
                 let message = call.message.clone();
-                tasks.spawn(async move { dispatch(message).await });
+                let blocking_work = call.blocking_work.clone();
+                tasks.spawn(async move { blocking_work.scope(dispatch(message)).await });
                 active = Some(call);
             } else if eof {
                 return Ok(StdioExit::Eof);
@@ -200,6 +203,7 @@ where
                     calls.push_back(PendingCall {
                         message,
                         cancelled: false,
+                        blocking_work: BlockingWorkTracker::default(),
                     });
                     continue;
                 }
@@ -236,6 +240,18 @@ where
                         ))
                     }
                 };
+                if !call.blocking_work.is_idle() {
+                    // Dropping an async waiter cannot stop started blocking
+                    // mutations. Keep its FIFO slot until their owners finish,
+                    // while this loop still serves ping and cancellation.
+                    let blocking_work = call.blocking_work.clone();
+                    tasks.spawn(async move {
+                        blocking_work.wait_idle().await;
+                        response
+                    });
+                    active = Some(call);
+                    continue;
+                }
                 let mut response_flushed = false;
                 if !call.cancelled && call.message.get("id").is_some() {
                     if let Some(response) = response {
@@ -453,5 +469,108 @@ mod tests {
         let mut remaining = String::new();
         reader.read_line(&mut remaining).await.unwrap();
         assert!(remaining.is_empty());
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdio_cancelled_blocking_mutation_drains_before_next_tool() {
+        let handler = McpHandler::new(Default::default()).await.unwrap();
+        let (client, server) = tokio::io::duplex(8192);
+        let (input, output) = tokio::io::split(server);
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first_started = Arc::new(Notify::new());
+        let second_started = Arc::new(Notify::new());
+        let (release, receive) = std::sync::mpsc::channel();
+        let receive = Arc::new(std::sync::Mutex::new(Some(receive)));
+        let recorded = events.clone();
+        let first = first_started.clone();
+        let second = second_started.clone();
+        let session = tokio::spawn(run_stdio_io(handler, input, output, move |msg: Value| {
+            let events = recorded.clone();
+            let first = first.clone();
+            let second = second.clone();
+            let receive = receive.clone();
+            async move {
+                if msg["method"] == "tools/call" && msg["id"] == 1 {
+                    let receive = receive.lock().unwrap().take().unwrap();
+                    // Exercise the actual central IPC blocking wrapper, without
+                    // contacting KiCad or mutating a real document.
+                    konnect_core::tools::with_ipc_classified(String::new(), move |_| {
+                        events.lock().unwrap().push("first started");
+                        first.notify_one();
+                        receive.recv().unwrap();
+                        events.lock().unwrap().push("first finished");
+                        Ok(())
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                } else if msg["method"] == "tools/call" {
+                    events.lock().unwrap().push("second mutation");
+                    second.notify_one();
+                }
+                Some(JsonRpcResponse::success(msg["id"].clone(), json!({})))
+            }
+        }));
+        let (input, mut output) = tokio::io::split(client);
+        let mut reader = BufReader::new(input);
+        send(
+            &mut output,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call"}),
+        )
+        .await;
+        timeout(Duration::from_secs(3), first_started.notified())
+            .await
+            .unwrap();
+        send(
+            &mut output,
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}),
+        )
+        .await;
+        // Repeated cancellation must not abort or detach the drain sentinel.
+        send(
+            &mut output,
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}),
+        )
+        .await;
+        send(
+            &mut output,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call"}),
+        )
+        .await;
+        send(&mut output, json!({"jsonrpc":"2.0","id":3,"method":"ping"})).await;
+        let mut second_response = false;
+        loop {
+            let message = response(&mut reader).await;
+            assert_ne!(message["id"], 1, "cancelled result must be suppressed");
+            if message["id"] == 3 {
+                break;
+            }
+            assert_eq!(message["id"], 2);
+            second_response = true;
+        }
+        let ran_early = timeout(Duration::from_millis(250), second_started.notified())
+            .await
+            .is_ok();
+        // Always release the blocking worker before asserting, so a RED failure
+        // cannot strand a Tokio worker during test teardown.
+        // EOF must also retain accepted work until its blocking owner drains.
+        output.shutdown().await.unwrap();
+        release.send(()).unwrap();
+        if !second_response {
+            assert_eq!(response(&mut reader).await["id"], 2);
+        }
+        output.shutdown().await.unwrap();
+        assert!(timeout(Duration::from_secs(3), session)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok());
+        assert!(
+            !ran_early,
+            "next mutation ran while cancelled blocking work was still active"
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["first started", "first finished", "second mutation"]
+        );
     }
 }

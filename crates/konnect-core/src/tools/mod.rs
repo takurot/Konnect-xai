@@ -1,5 +1,6 @@
 //! Tool trait definitions, ToolContext, and all toolset modules.
 
+pub mod blocking_work;
 #[cfg(test)]
 mod board_extents_tests;
 mod board_session;
@@ -549,7 +550,7 @@ where
     T: Send + 'static,
     F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
 {
-    match tokio::task::spawn_blocking(move || {
+    match crate::tools::blocking_work::spawn_tracked_blocking(move || {
         f(&konnect_ipc::client::KiCadIpcClient::new(&address)).map_err(|error| {
             warn_if_ipc_unreachable(&address, &error);
             konnect_ipc::IpcFailure::from_error(error)
@@ -753,7 +754,7 @@ where
     T: Send + 'static,
     F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
 {
-    match tokio::task::spawn_blocking(move || {
+    match crate::tools::blocking_work::spawn_tracked_blocking(move || {
         f(&konnect_ipc::client::KiCadIpcClient::new(&address)).map_err(|error| {
             warn_if_ipc_unreachable(&address, &error);
             format!("{error:#}")

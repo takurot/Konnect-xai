@@ -2718,6 +2718,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "fs4",
+ "libc",
  "nom",
  "pretty_assertions",
  "proptest",
@@ -2727,6 +2728,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

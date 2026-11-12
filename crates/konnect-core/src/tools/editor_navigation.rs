@@ -122,7 +122,7 @@ async fn handle_get_editor_state(
         return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
     }
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = crate::tools::blocking_work::spawn_tracked_blocking(move || {
         konnect_ipc::KiCadIpcClient::new(address).observe_editor_state()
     })
     .await?;
@@ -198,7 +198,7 @@ async fn handle_get_editor_selection(
     if address.is_empty() {
         return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
     }
-    let result = tokio::task::spawn_blocking(move || {
+    let result = crate::tools::blocking_work::spawn_tracked_blocking(move || {
         konnect_ipc::KiCadIpcClient::new(address).observe_selection(&target)
     })
     .await?;
@@ -365,7 +365,7 @@ async fn handle_resolve_navigation_target(
     if address.is_empty() {
         return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
     }
-    let observed = tokio::task::spawn_blocking(move || {
+    let observed = crate::tools::blocking_work::spawn_tracked_blocking(move || {
         konnect_ipc::KiCadIpcClient::new(address).observe_exact_open_document(&live_document)
     })
     .await?;
@@ -374,7 +374,10 @@ async fn handle_resolve_navigation_target(
         Err(error) => return Ok(selection_error_result(error)),
     };
 
-    let resolved = tokio::task::spawn_blocking(move || resolve_navigation_target(&request)).await?;
+    let resolved = crate::tools::blocking_work::spawn_tracked_blocking(move || {
+        resolve_navigation_target(&request)
+    })
+    .await?;
     match resolved {
         Ok(target) => Ok(CallToolResult::json(&json!({
             "target": target,
@@ -511,20 +514,21 @@ async fn handle_mutate_editor_selection(
     if address.is_empty() {
         return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
     }
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let resolved_targets = request
-            .structural_targets
-            .iter()
-            .map(resolve_navigation_target)
-            .collect::<Result<Vec<_>, _>>()?;
-        let mutation = konnect_ipc::KiCadIpcClient::new(address).mutate_selection(
-            &request.live_document,
-            request.operation,
-            &request.object_kiids,
-        )?;
-        Ok((resolved_targets, mutation))
-    })
-    .await?;
+    let result =
+        crate::tools::blocking_work::spawn_tracked_blocking(move || -> anyhow::Result<_> {
+            let resolved_targets = request
+                .structural_targets
+                .iter()
+                .map(resolve_navigation_target)
+                .collect::<Result<Vec<_>, _>>()?;
+            let mutation = konnect_ipc::KiCadIpcClient::new(address).mutate_selection(
+                &request.live_document,
+                request.operation,
+                &request.object_kiids,
+            )?;
+            Ok((resolved_targets, mutation))
+        })
+        .await?;
     match result {
         Ok((resolved_targets, mutation)) => Ok(CallToolResult::json(&json!({
             "resolved_targets": resolved_targets,
@@ -719,20 +723,21 @@ async fn handle_resolve_cross_probe_target(
     if address.is_empty() {
         return Ok(editor_unavailable("no KiCad IPC endpoint is configured"));
     }
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let resolution = resolve_cross_probe(&request)?;
-        let source_live = live_cross_probe_document(&request, request.source_editor);
-        let destination_editor = match request.source_editor {
-            IpcEditorKind::Schematic => IpcEditorKind::Pcb,
-            IpcEditorKind::Pcb => IpcEditorKind::Schematic,
-        };
-        let destination_live = live_cross_probe_document(&request, destination_editor);
-        let client = konnect_ipc::KiCadIpcClient::new(address);
-        let source_observed = client.observe_exact_open_document(&source_live)?;
-        let destination_observed = client.observe_exact_open_document(&destination_live)?;
-        Ok((resolution, source_observed, destination_observed))
-    })
-    .await?;
+    let result =
+        crate::tools::blocking_work::spawn_tracked_blocking(move || -> anyhow::Result<_> {
+            let resolution = resolve_cross_probe(&request)?;
+            let source_live = live_cross_probe_document(&request, request.source_editor);
+            let destination_editor = match request.source_editor {
+                IpcEditorKind::Schematic => IpcEditorKind::Pcb,
+                IpcEditorKind::Pcb => IpcEditorKind::Schematic,
+            };
+            let destination_live = live_cross_probe_document(&request, destination_editor);
+            let client = konnect_ipc::KiCadIpcClient::new(address);
+            let source_observed = client.observe_exact_open_document(&source_live)?;
+            let destination_observed = client.observe_exact_open_document(&destination_live)?;
+            Ok((resolution, source_observed, destination_observed))
+        })
+        .await?;
     match result {
         Ok((resolution, source_observed, destination_observed)) => {
             Ok(CallToolResult::json(&json!({

@@ -227,7 +227,7 @@ async fn handle_create_project(
     let pcb_path = path.join(format!("{}.kicad_pcb", name));
     let project_paths = vec![pro_path.clone(), sch_path.clone(), pcb_path.clone()];
 
-    let existing = tokio::task::spawn_blocking({
+    let existing = crate::tools::blocking_work::spawn_tracked_blocking({
         let project_paths = project_paths.clone();
         move || existing_project_paths(&project_paths)
     })
@@ -238,7 +238,7 @@ async fn handle_create_project(
 
     tokio::fs::create_dir_all(&path).await?;
 
-    let transaction = tokio::task::spawn_blocking({
+    let transaction = crate::tools::blocking_work::spawn_tracked_blocking({
         let project_dir = path.clone();
         let name = name.clone();
         let pro_path = pro_path.clone();
@@ -1420,6 +1420,14 @@ async fn rename_project_with(
     args: &serde_json::Value,
     after_rename: impl FnOnce() + Send,
 ) -> anyhow::Result<CallToolResult> {
+    rename_project_with_moves(args, after_rename, |_, _| {}).await
+}
+
+async fn rename_project_with_moves(
+    args: &serde_json::Value,
+    after_rename: impl FnOnce() + Send,
+    mut before_move: impl FnMut(&Path, &Path) + Send,
+) -> anyhow::Result<CallToolResult> {
     let pro_path = get_path(args, "project")?;
     let new_name = match require_str(args, "new_name") {
         Ok(v) => v.to_string(),
@@ -1526,18 +1534,12 @@ async fn rename_project_with(
                     &[],
                 ));
             }
-            if let Err(error) = std::fs::rename(from, to) {
+            before_move(from, to);
+            if let Err(error) = konnect_sexp::rename_noreplace(from, to) {
                 let mut rollback_failures = Vec::new();
                 for (undo_from, undo_to) in completed_renames.iter().rev() {
-                    // Never overwrite a newly created original while restoring names.
-                    let rollback = match undo_from.try_exists() {
-                        Ok(false) => std::fs::rename(undo_to, undo_from),
-                        Ok(true) => Err(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            "original path now exists",
-                        )),
-                        Err(error) => Err(error),
-                    };
+                    before_move(undo_to, undo_from);
+                    let rollback = konnect_sexp::rename_noreplace(undo_to, undo_from);
                     if let Err(error) = rollback {
                         rollback_failures.push(json!({"from":undo_to.display().to_string(),"to":undo_from.display().to_string(),"error":error.to_string()}));
                     }
@@ -1650,7 +1652,7 @@ async fn rename_project_with(
     if backups_from.is_dir() {
         let backups_to = dir.join(format!("{new_name}-backups"));
         if !dry_run && !backups_to.exists() {
-            if let Err(error) = std::fs::rename(&backups_from, &backups_to) {
+            if let Err(error) = konnect_sexp::rename_noreplace(&backups_from, &backups_to) {
                 return Ok(rename_uncertain_result(
                     &backups_to,
                     error,
@@ -1670,7 +1672,7 @@ async fn rename_project_with(
             let new_dir = parent.join(&new_name);
             if !new_dir.exists() {
                 if !dry_run {
-                    if let Err(error) = std::fs::rename(&dir, &new_dir) {
+                    if let Err(error) = konnect_sexp::rename_noreplace(&dir, &new_dir) {
                         return Ok(rename_uncertain_result(
                             &new_dir,
                             error,
@@ -2098,6 +2100,8 @@ mod rename_recovery_tests {
         assert!(std::fs::read_to_string(child).unwrap().contains("old"));
         assert!(lock.exists());
     }
+    // A quote is a valid POSIX filename but forbidden by Windows filenames.
+    #[cfg(unix)]
     #[tokio::test]
     async fn quoted_project_name_keeps_json_and_schematic_parseable() {
         let (dir, pro, _) = fixture();
@@ -2141,6 +2145,89 @@ mod rename_recovery_tests {
                 .unwrap()
                 .as_str(),
             Some("final")
+        );
+    }
+    #[tokio::test]
+    async fn intervening_destination_is_not_overwritten_after_planning() {
+        let (dir, pro, _) = fixture();
+        let target = dir.path().join("new.kicad_sch");
+        let result = rename_project_with_moves(
+            &json!({"project":pro,"new_name":"new"}),
+            || {},
+            |_, to| {
+                if to == target {
+                    std::fs::write(&target, "external").unwrap();
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "external");
+        assert!(dir.path().join("old.kicad_pro").exists());
+        assert!(dir.path().join("old.kicad_sch").exists());
+        assert!(!dir.path().join("new.kicad_pro").exists());
+    }
+
+    #[tokio::test]
+    async fn rollback_never_replaces_an_intervening_original_path() {
+        let (dir, pro, _) = fixture();
+        let original = dir.path().join("old.kicad_pro");
+        let source = dir.path().join("old.kicad_sch");
+        let result = rename_project_with_moves(
+            &json!({"project":pro,"new_name":"new"}),
+            || {},
+            |from, to| {
+                if from == source {
+                    std::fs::remove_file(&source).unwrap();
+                }
+                if to == original {
+                    std::fs::write(&original, "external").unwrap();
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&original).unwrap(), "external");
+        assert!(dir.path().join("new.kicad_pro").exists());
+        let body = body(&result);
+        assert_eq!(body["error"]["kind"], "mutation_outcome_uncertain");
+        assert_eq!(body["rollback_failures"].as_array().unwrap().len(), 1);
+        assert_eq!(body["recovery"]["retry_safe"], false);
+    }
+}
+
+#[cfg(test)]
+mod project_name_encoding_tests {
+    use super::rewrite_project_references;
+    #[test]
+    fn quoted_names_roundtrip_in_both_document_encodings() {
+        let name = "new\"name";
+        let (json, hits) = rewrite_project_references(
+            r#"{"name":"old","filename":"old.kicad_pro"}"#,
+            "old",
+            name,
+            false,
+        );
+        assert_eq!(hits, 2);
+        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(json["name"], name);
+        assert_eq!(json["filename"], format!("{name}.kicad_pro"));
+        let (sexp, hits) = rewrite_project_references(
+            r#"(instances (project "old" (path "/")))"#,
+            "old",
+            name,
+            true,
+        );
+        assert_eq!(hits, 1);
+        let node = konnect_sexp::parse_sexp(&sexp).unwrap();
+        assert_eq!(
+            node.find("project")
+                .unwrap()
+                .get(1)
+                .and_then(|n| n.as_str()),
+            Some(name)
         );
     }
 }

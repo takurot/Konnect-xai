@@ -6,6 +6,7 @@ pub mod geometry;
 pub mod layers;
 pub mod net;
 pub mod parser;
+pub mod rename;
 pub mod schematic;
 pub mod transaction;
 pub mod writer;
@@ -17,6 +18,7 @@ pub use command::{
 pub use error::SexpError;
 pub use geometry::{transform_direction, transform_pin, PinTransform};
 pub use parser::{parse_sexp, SexpNode};
+pub use rename::rename_noreplace;
 pub use transaction::{
     abandon_file_transaction, commit_file_transaction, inspect_file_transactions,
     recover_file_transaction, recover_file_transactions, AbandonedTransaction, FileTransition,

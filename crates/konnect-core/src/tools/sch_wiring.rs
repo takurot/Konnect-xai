@@ -1963,10 +1963,7 @@ async fn handle_rotate_label(
 
     let new_content = apply_edits(content, edits);
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
-    anyhow::ensure!(
-        read_consistent(&sch_path)? == new_content,
-        "stale_target: label readback differs from committed content"
-    );
+    // The shared CAS verifies committed bytes and preserves typed uncertainty.
     Ok(CallToolResult::json(&json!({
         "rotated_label": net,
         "type": label.kind,
@@ -2057,10 +2054,7 @@ async fn handle_move_labels_by_offset(
     let moved = matching.len();
     let new_content = apply_edits(content, edits);
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
-    anyhow::ensure!(
-        read_consistent(&sch_path)? == new_content,
-        "stale_target: label readback differs from committed content"
-    );
+    // The shared CAS verifies committed bytes and preserves typed uncertainty.
 
     Ok(CallToolResult::json(
         &json!({ "moved_labels": moved, "net": net }),

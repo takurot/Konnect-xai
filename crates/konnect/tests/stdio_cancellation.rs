@@ -44,7 +44,7 @@ async fn cancellation_kills_cli_keeps_ping_responsive_and_never_sends_cancelled_
     let cli = dir.path().join("fake-cli");
     std::fs::write(
         &cli,
-        "#!/bin/sh\nprintf '%s' \"$$\" > \"$KONNECT_TEST_PID\"\nexec sleep 60\n",
+        "#!/bin/sh\ncase \"$1\" in --version|-v|version) printf '10.0.8\\n'; exit 0;; esac\n[ \"$1 $2 $3\" = \"sch export pdf\" ] || exit 2\nprintf '%s' \"$$\" > \"$KONNECT_TEST_PID\"\nexec sleep 60\n",
     )
     .unwrap();
     std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -63,6 +63,16 @@ async fn cancellation_kills_cli_keeps_ping_responsive_and_never_sends_cancelled_
     )
     .unwrap();
     let pid_file = dir.path().join("cli.pid");
+    let probe = std::process::Command::new(&cli)
+        .arg("--version")
+        .env("KONNECT_TEST_PID", &pid_file)
+        .output()
+        .unwrap();
+    assert!(probe.status.success());
+    assert!(
+        !pid_file.exists(),
+        "discovery probes must not impersonate the export child"
+    );
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_konnect"))
         .current_dir(dir.path())
         .env("KONNECT_TEST_PID", &pid_file)
@@ -110,12 +120,17 @@ async fn cancellation_kills_cli_keeps_ping_responsive_and_never_sends_cancelled_
     })
     .await
     .is_ok();
+    let process_state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .unwrap_or_else(|error| format!("process state unavailable: {error}"));
     if !stopped {
         let _ = std::process::Command::new("kill")
             .args(["-KILL", &pid])
             .status();
     }
-    assert!(stopped, "cancelled CLI {pid} must terminate");
+    assert!(
+        stopped,
+        "cancelled CLI {pid} must terminate and be reaped: {process_state}"
+    );
     stdin.shutdown().await.unwrap();
     // ChildStdin owns a pipe; close its descriptor to deliver EOF.
     drop(stdin);

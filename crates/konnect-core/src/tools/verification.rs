@@ -11,7 +11,6 @@ use crate::tools::{
 use konnect_sexp::writer::{write_atomic_if_unchanged, write_new_atomic};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use tokio::task;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -850,8 +849,9 @@ async fn handle_check_kicad_ui(
     let addr = ctx.config.ipc_address.clone();
     let started = std::time::Instant::now();
     let check = async move {
-        let process_detected = task::spawn_blocking(is_kicad_running).await?;
-        let ipc = task::spawn_blocking(move || {
+        let process_detected =
+            crate::tools::blocking_work::spawn_tracked_blocking(is_kicad_running).await?;
+        let ipc = crate::tools::blocking_work::spawn_tracked_blocking(move || {
             konnect_ipc::client::KiCadIpcClient::new(&addr).ping_outcome()
         })
         .await?;
@@ -910,7 +910,7 @@ async fn handle_launch_kicad_ui(
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     let addr2 = addr.clone();
-                    let ok = task::spawn_blocking(move || {
+                    let ok = crate::tools::blocking_work::spawn_tracked_blocking(move || {
                         konnect_ipc::client::KiCadIpcClient::new(&addr2)
                             .ping()
                             .unwrap_or(false)
@@ -1140,11 +1140,11 @@ fn translate_block(
                 ));
             }
             Some("net") => {
-                if let Some(net) = node
-                    .get(1)
-                    .and_then(|n| n.as_str())
-                    .and_then(|name| net_map.get(name))
-                {
+                if let Some(net) = node.get(1).and_then(|node| match node {
+                    konnect_sexp::SexpNode::Str(name) => net_map.get(name),
+                    // Legacy numeric net codes are identities, not names.
+                    _ => None,
+                }) {
                     edits.push(konnect_sexp::writer::SexpEdit::replace(
                         start,
                         end,
@@ -2217,5 +2217,30 @@ mod routing_copy_readback_tests {
         }
         assert!(text.contains("(mid 12 23)"));
         assert!(text.contains("(at 12 22)"));
+    }
+}
+
+#[cfg(test)]
+mod net_identity_copy_tests {
+    use super::*;
+    #[test]
+    fn remapping_a_numerically_named_net_preserves_legacy_net_codes() {
+        let map = std::collections::HashMap::from([("1".to_string(), "SIGNAL".to_string())]);
+        for kind in ["segment", "arc", "via"] {
+            for (value, expected) in [
+                ("1", konnect_sexp::SexpNode::Atom("1".into())),
+                ("\"1\"", konnect_sexp::SexpNode::Str("SIGNAL".into())),
+            ] {
+                let source =
+                    format!("({kind} (start 0 0) (end 1 1) (net {value}) (uuid \"original\"))");
+                let copied = translate_block(&source, 10., 20., &map);
+                let tree = konnect_sexp::parse_sexp(&copied).unwrap();
+                assert_eq!(
+                    tree.find("net").unwrap().get(1),
+                    Some(&expected),
+                    "{copied}"
+                );
+            }
+        }
     }
 }
