@@ -21,7 +21,7 @@ use konnect_sexp::{
     parser::{parse_sexp, SexpNode},
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, new_uuid,
-        write_atomic, SexpEdit,
+        write_atomic_if_unchanged, SexpEdit,
     },
 };
 use serde_json::json;
@@ -666,11 +666,29 @@ impl GraphicFilter {
 
 // ─── S-expression format helpers ──────────────────────────────────────────────
 
+fn canonical_board_layer(layer: &str) -> Result<String, CallToolResult> {
+    let resolved = builders::try_layer_from_name(layer)
+        .map_err(|error| crate::tools::invalid_arg("layer", &error.to_string()))?;
+    builders::layer_name(resolved)
+        .map(str::to_owned)
+        .ok_or_else(|| crate::tools::invalid_arg("layer", "Layer has no canonical KiCad name"))
+}
+
+fn graphic_layer_argument(args: &serde_json::Value) -> Result<String, CallToolResult> {
+    let name = match args.get("layer") {
+        Some(serde_json::Value::String(name)) => name.as_str(),
+        None => "F.SilkS",
+        Some(_) => return Err(crate::tools::invalid_arg("layer", "must be a string")),
+    };
+    canonical_board_layer(name)
+}
+
 fn format_gr_line(x1: f64, y1: f64, x2: f64, y2: f64, layer: &str, width: f64) -> String {
     let uuid = new_uuid();
+    let layer = konnect_sexp::quoted(layer);
     format!(
         "\n  (gr_line\n    (start {x1} {y1})\n    (end {x2} {y2})\n    \
-         (stroke (width {width}) (type solid))\n    (layer \"{layer}\")\n    (uuid \"{uuid}\")\n  )"
+         (stroke (width {width}) (type solid))\n    (layer {layer})\n    (uuid \"{uuid}\")\n  )"
     )
 }
 
@@ -682,9 +700,10 @@ fn format_gr_arc(
     width: f64,
 ) -> String {
     let uuid = new_uuid();
+    let layer = konnect_sexp::quoted(layer);
     format!(
         "\n  (gr_arc\n    (start {} {})\n    (mid {} {})\n    (end {} {})\n    \
-         (stroke (width {width}) (type solid))\n    (layer \"{layer}\")\n    (uuid \"{uuid}\")\n  )",
+         (stroke (width {width}) (type solid))\n    (layer {layer})\n    (uuid \"{uuid}\")\n  )",
         start.0, start.1, mid.0, mid.1, end.0, end.1
     )
 }
@@ -706,9 +725,10 @@ fn format_outline(primitives: &[OutlinePrimitive], layer: &str, width: f64) -> S
 
 fn format_gr_text(text: &str, x: f64, y: f64, rot: f64, layer: &str, size: f64) -> String {
     let uuid = new_uuid();
-    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    let layer = konnect_sexp::quoted(layer);
+    let text = konnect_sexp::quoted(text);
     format!(
-        "\n  (gr_text \"{escaped}\"\n    (at {x} {y} {rot})\n    (layer \"{layer}\")\n    \
+        "\n  (gr_text {text}\n    (at {x} {y} {rot})\n    (layer {layer})\n    \
          (effects (font (size {size} {size}) (thickness 0.15)))\n    (uuid \"{uuid}\")\n  )"
     )
 }
@@ -967,8 +987,7 @@ fn format_zone_polygon(
     let name_node = if name.is_empty() {
         String::new()
     } else {
-        let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
-        format!("\n    (name \"{escaped}\")")
+        format!("\n    (name {})", konnect_sexp::quoted(name))
     };
     let priority_node = if priority == 0 {
         String::new()
@@ -993,6 +1012,7 @@ fn format_zone_polygon(
 /// fill — used for imported artwork rather than copper pours.
 fn format_gr_poly(points: &[(f64, f64)], layer: &str) -> String {
     let uuid = new_uuid();
+    let layer = konnect_sexp::quoted(layer);
     let pts: String = points
         .iter()
         .map(|(x, y)| format!("\n      (xy {x} {y})"))
@@ -1000,7 +1020,7 @@ fn format_gr_poly(points: &[(f64, f64)], layer: &str) -> String {
     format!(
         "\n  (gr_poly\n    (pts{pts}\n    )\n    \
          (stroke (width 0) (type solid))\n    (fill solid)\n    \
-         (layer \"{layer}\")\n    (uuid \"{uuid}\")\n  )"
+         (layer {layer})\n    (uuid \"{uuid}\")\n  )"
     )
 }
 
@@ -1139,7 +1159,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "board":       { "type": "string" },
                     "layer_name":  { "type": "string", "description": "KiCAD layer name (e.g. 'In1.Cu')" },
-                    "layer_type":  { "type": "string", "description": "Type: 'signal', 'power', 'mixed', 'jumper'", "default": "signal" }
+                    "layer_type":  { "type": "string", "description": "KiCad layer type", "enum":["signal", "power", "mixed", "jumper", "user"], "default": "signal" }
                 },
                 "required": ["board", "layer_name"]
             }),
@@ -1457,8 +1477,8 @@ async fn handle_set_board_size(
     );
     let close_pos = content.rfind(')').unwrap_or(content.len());
     edits.push(SexpEdit::insert(close_pos, lines));
-    let new_content = apply_edits(content, edits);
-    write_atomic(&board_path, &new_content)?;
+    let new_content = apply_edits(content.clone(), edits);
+    write_atomic_if_unchanged(&board_path, &content, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "width": width, "height": height,
@@ -1931,7 +1951,23 @@ async fn handle_add_layer(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let layer_type = args["layer_type"].as_str().unwrap_or("signal");
+    let layer_type = match args.get("layer_type") {
+        None => "signal",
+        Some(serde_json::Value::String(kind))
+            if matches!(
+                kind.as_str(),
+                "signal" | "power" | "mixed" | "jumper" | "user"
+            ) =>
+        {
+            kind.as_str()
+        }
+        Some(_) => {
+            return Ok(crate::tools::invalid_arg(
+                "layer_type",
+                "must be signal, power, mixed, jumper, or user",
+            ))
+        }
+    };
 
     // Fail closed on a name KiCad does not define. The layer set is closed, and
     // a board carrying an unknown name does not open at all — so writing one
@@ -1995,8 +2031,11 @@ async fn handle_add_layer(
     // hardcoding spaces into a file that may be tab-indented.
     let indent = entry_indent(&content, layers_pos).unwrap_or_else(|| "    ".to_string());
     let new_layer = format!("\n{indent}({new_id} \"{layer_name}\" {layer_type})");
-    let new_content = apply_edits(content, vec![SexpEdit::insert(insert_pos, new_layer)]);
-    write_atomic(&board_path, &new_content)?;
+    let new_content = apply_edits(
+        content.clone(),
+        vec![SexpEdit::insert(insert_pos, new_layer)],
+    );
+    write_atomic_if_unchanged(&board_path, &content, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "added_layer": layer_name, "id": new_id, "type": layer_type
@@ -2169,8 +2208,8 @@ async fn handle_add_board_outline(
 
     let content = std::fs::read_to_string(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, outline)]);
-    write_atomic(&board_path, &new_content)?;
+    let new_content = apply_edits(content.clone(), vec![SexpEdit::insert(close_pos, outline)]);
+    write_atomic_if_unchanged(&board_path, &content, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "x1": x1, "y1": y1, "x2": x2, "y2": y2,
@@ -2311,7 +2350,11 @@ async fn handle_delete_graphics(
                     .iter()
                     .map(|g| SexpEdit::delete(g.span.0, g.span.1))
                     .collect();
-                write_atomic(&board_path, &apply_edits(content, edits))?;
+                write_atomic_if_unchanged(
+                    &board_path,
+                    &content,
+                    &apply_edits(content.clone(), edits),
+                )?;
             }
             (graphics, "file", Some(reason))
         }
@@ -2484,7 +2527,10 @@ async fn handle_add_board_text(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let layer = args["layer"].as_str().unwrap_or("F.SilkS").to_string();
+    let layer = match graphic_layer_argument(args) {
+        Ok(layer) => layer,
+        Err(error) => return Ok(error),
+    };
     let size = args["size"].as_f64().unwrap_or(1.0);
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
 
@@ -2510,8 +2556,8 @@ async fn handle_add_board_text(
     let gr_text = format_gr_text(&text, x, y, rotation, &layer, size);
     let content = std::fs::read_to_string(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, gr_text)]);
-    write_atomic(&board_path, &new_content)?;
+    let new_content = apply_edits(content.clone(), vec![SexpEdit::insert(close_pos, gr_text)]);
+    write_atomic_if_unchanged(&board_path, &content, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "text": text, "x": x, "y": y, "layer": layer, "size": size,
@@ -2539,7 +2585,10 @@ pub(crate) async fn add_zone_impl(
         Err(e) => return Ok(e),
     };
     let layer = match require_str(args, "layer") {
-        Ok(v) => v.to_string(),
+        Ok(v) => match canonical_board_layer(v) {
+            Ok(layer) => layer,
+            Err(error) => return Ok(error),
+        },
         Err(e) => return Ok(e),
     };
     let clearance = args["clearance"]
@@ -2627,8 +2676,11 @@ pub(crate) async fn add_zone_impl(
     );
 
     let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, zone_sexp)]);
-    write_atomic(&board_path, &new_content)?;
+    let new_content = apply_edits(
+        content.clone(),
+        vec![SexpEdit::insert(close_pos, zone_sexp)],
+    );
+    write_atomic_if_unchanged(&board_path, &content, &new_content)?;
 
     let mut body = describe();
     body["source"] = json!("file");
@@ -2656,7 +2708,10 @@ async fn handle_import_svg_logo(
     };
     let x = args["x"].as_f64().unwrap_or(0.0);
     let y = args["y"].as_f64().unwrap_or(0.0);
-    let layer = args["layer"].as_str().unwrap_or("F.SilkS").to_string();
+    let layer = match graphic_layer_argument(args) {
+        Ok(layer) => layer,
+        Err(error) => return Ok(error),
+    };
 
     let svg_content = std::fs::read_to_string(&svg_path)?;
     let logo = crate::tools::svg_import::extract_polygons(&svg_content)?;
@@ -2695,8 +2750,8 @@ async fn handle_import_svg_logo(
     }
     let content = std::fs::read_to_string(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, sexp)]);
-    write_atomic(&board_path, &new_content)?;
+    let new_content = apply_edits(content.clone(), vec![SexpEdit::insert(close_pos, sexp)]);
+    write_atomic_if_unchanged(&board_path, &content, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "polygon_count": placed.len(),
@@ -5683,5 +5738,102 @@ mod single_board_lookup_tests {
             ],
             "every board command names the document GetOpenDocuments returned"
         );
+    }
+}
+
+#[cfg(test)]
+mod string_safety_tests {
+    use super::*;
+    #[test]
+    fn graphic_strings_roundtrip() {
+        let value = "a\"b\\c";
+        for block in [
+            format_gr_line(0., 0., 1., 1., value, 0.1),
+            format_gr_arc((0., 0.), (1., 1.), (2., 0.), value, 0.1),
+            format_gr_text(value, 0., 0., 0., value, 1.),
+            format_gr_poly(&[(0., 0.), (1., 0.), (0., 1.)], value),
+        ] {
+            let tree = parse_sexp(block.trim()).unwrap();
+            assert_eq!(tree.find_str("layer"), Some(value));
+            if tree.head() == Some("gr_text") {
+                assert_eq!(tree.get(1).and_then(|v| v.as_str()), Some(value));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn board_text_canonicalizes_alias_and_preserves_quoted_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260101))").unwrap();
+        let ctx = super::board_mock::ctx_talking_to(String::new());
+        let text = "a\"b\\c";
+        let result = handle_add_board_text(
+            &json!({"board":board,"text":text,"x":1.,"y":2.,"layer":"F.Silkscreen"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let content = std::fs::read_to_string(&board).unwrap();
+        let tree = parse_sexp(&content).unwrap();
+        let item = tree.find("gr_text").unwrap();
+        assert_eq!(item.find_str("layer"), Some("F.SilkS"));
+        assert_eq!(item.get(1).and_then(SexpNode::as_str), Some(text));
+    }
+
+    #[test]
+    fn malformed_optional_layer_is_not_defaulted() {
+        for value in [json!(null), json!(10), json!([]), json!({})] {
+            assert!(graphic_layer_argument(&json!({"layer": value})).is_err());
+        }
+        assert_eq!(graphic_layer_argument(&json!({})).unwrap(), "F.SilkS");
+    }
+
+    #[tokio::test]
+    async fn invalid_graphic_layers_refused_before_ipc_or_file_read() {
+        let ctx = super::board_mock::ctx_talking_to(String::new());
+        let invalid = "a\"b\\c";
+        let args = json!({"board":"/missing/board.kicad_pcb","svg":"/missing/logo.svg","text":"text","x":1.,"y":2.,"width_mm":10.,"net_name":"GND","layer":invalid,"points":[{"x":0.,"y":0.},{"x":1.,"y":0.},{"x":0.,"y":1.}]});
+        for result in [
+            handle_add_board_text(&args, &ctx).await,
+            add_zone_impl(&args, &ctx).await,
+            handle_import_svg_logo(&args, &ctx).await,
+        ] {
+            let result =
+                result.expect("invalid layer must be a structured refusal, before file access");
+            assert!(result.is_error);
+        }
+    }
+}
+
+#[cfg(test)]
+mod layer_type_input_tests {
+    use super::*;
+    #[tokio::test]
+    async fn invalid_layer_types_refuse_before_reading_or_writing_board() {
+        let ctx = ToolContext::new(
+            Default::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("absent.kicad_pcb");
+        for kind in [
+            json!("signal) (foo bar"),
+            json!("unknown"),
+            json!(null),
+            json!(2),
+            json!([]),
+        ] {
+            let result = handle_add_layer(
+                &json!({"board":path,"layer_name":"In1.Cu","layer_type":kind}),
+                &ctx,
+            )
+            .await
+            .expect("validation must happen before absent board read");
+            assert!(result.is_error);
+            let body = serde_json::to_value(&result).unwrap();
+            assert!(body.to_string().contains("invalid_argument"));
+            assert!(!path.exists());
+        }
     }
 }

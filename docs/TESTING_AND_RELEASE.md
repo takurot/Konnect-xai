@@ -13,6 +13,35 @@ cargo fmt --all -- --check
 `protoc` and its well-known type includes are required by
 `crates/konnect-ipc/build.rs`.
 
+## v0.14.0 file-safety acceptance map
+
+The milestone implements these contracts together; version stamping, merge and
+release are separate operations.
+
+| Issue | Contract and regression evidence |
+|---|---|
+| #3 | Same-session panic recovery, ping during slow tools, queued/active cancellation, bounded input fairness, and fake-CLI child termination (`stdio` unit tests and `stdio_cancellation`) |
+| #5 | Bus geometry snaps to 1.27 mm; resolved physical pin endpoints stay exact; all writes use source revisions (`sch_bus`) |
+| #11 | Shared quoted-string encoding; library/graphic/net readback with quotes and backslashes; canonical board-layer validation before mutation |
+| #12 | Design writes use revision checks, new assets refuse clobber, duplicate symbol names refuse; final pre-rename interleaving tests and unchecked-writer inventory ratchet |
+| #19 | Direct-child coordinate/effects edits preserve quoted values and move global-label fields; committed label readback |
+| #20 | Tab-indented library deletion and segment/arc/via routing copies use parser spans and fresh UUIDs |
+| #22 | Saved-net route preflight, explicit `allow_join`, UUID disambiguation, local-only junction insertion, malformed-source refusal and whole-batch no-write controls |
+| #27 | Every project writer refuses an existing or unreadable project lock; served-dispatch no-write test |
+| #28 | Private-field/unknown-child preservation, canonical symbol attributes, byte-preserving no-op and independent serialized-model fixture guards |
+| #29 | Attribute merge preserves mask-bridge/future flags; explicit replacement and before/after readback |
+
+For #27, the requested live/stale distinction is unavailable: KiCad 10 lock
+files carry a username and hostname without a trustworthy process identity.
+The user explicitly chose refusal for **all** remaining locks, including
+presumed stale locks; manual removal requires confirming no editor owns the
+project. Automatic stale-lock bypass is intentionally excluded.
+
+Runtime tests use temporary files/fake processes where appropriate. Ignored
+real-KiCad tests and platform-specific hosted checks are separate evidence;
+their absence never counts as a local pass. Coverage must be reported with
+its command and measured scope, including unavailable branch instrumentation.
+
 ## Coverage Map
 
 | Area | Source of tests |
@@ -121,3 +150,21 @@ icons, or release scripts require PCM assembly and
 `packaging/build-pcm.ps1` and `build-pcm.sh` enumerate the files staged into the
 PCM archive. Developer documentation stays in the repository and is not added
 to release zips.
+
+### Interrupted project rename recovery
+
+`rename_project` checks original and destination editor locks plus child-sheet
+locks before renaming. If a lock, read error, or revision conflict is observed
+after filenames have changed, it returns `mutation_outcome_uncertain` with
+`renamed_pairs`, completed `content_rewrites`, `failing_target`, and any
+`rollback_failures`. Inspect that inventory and preserve external changes before
+reconciling filenames and project references. Never blindly retry the rename or
+roll back already rewritten contents. Project names are escaped independently
+for JSON metadata and S-expression annotation keys.
+
+`rename_project` uses the shared native exclusive rename primitive for forward
+moves, rollback, backup directories and optional project-directory moves. A
+new destination appearing after planning is refused atomically. Unsupported
+platform/filesystem operations fail closed rather than falling back to a
+replacing rename or a copy/delete sequence. Regression tests inject both a
+forward collision and a newly recreated original during rollback.

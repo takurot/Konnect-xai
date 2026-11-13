@@ -138,10 +138,6 @@ fn back_side_layer_error(layer: &str) -> Option<CallToolResult> {
     ))
 }
 
-fn escape_sexp_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 fn replace_quoted_after(source: &mut String, marker: &str, value: &str) -> anyhow::Result<()> {
     let start = source
         .find(marker)
@@ -163,7 +159,7 @@ fn replace_quoted_after(source: &mut String, marker: &str, value: &str) -> anyho
             }
         })
         .ok_or_else(|| anyhow::anyhow!("unterminated quoted value after {marker}"))?;
-    source.replace_range(start..end, &escape_sexp_string(value));
+    source.replace_range(start..end, &konnect_sexp::escaped_string(value));
     Ok(())
 }
 
@@ -594,7 +590,9 @@ fn board_footprint_sexp(
     let declared = &content[name_span.start + 1..name_span.end - 1];
     let mut out = String::with_capacity(content.len() + 128);
     out.push_str(&content[..name_span.start]);
-    out.push_str(&quote_sexp_string(&board_lib_id(lib_id, &path, declared)));
+    out.push_str(&konnect_sexp::quoted(&board_lib_id(
+        lib_id, &path, declared,
+    )));
     out.push_str(&format!(
         "\n\t(at {x} {y} {rotation})\n\t(uuid \"{}\")",
         new_uuid()
@@ -791,11 +789,6 @@ fn footprint_name_span(content: &str) -> Option<std::ops::Range<usize>> {
     Some(start..end + 1)
 }
 
-/// Quote and escape `value` as an S-expression string literal.
-fn quote_sexp_string(value: &str) -> String {
-    format!("\"{}\"", escape_sexp_string(value))
-}
-
 /// Replace the footprint's own `(layer "…")` — the first `layer` block that is a
 /// direct child of the footprint, not one belonging to a pad or graphic.
 ///
@@ -818,7 +811,7 @@ fn replace_footprint_layer(content: &str, layer: &str) -> String {
 
     let mut out = String::with_capacity(content.len());
     out.push_str(&content[..bstart]);
-    out.push_str(&format!("(layer {})", quote_sexp_string(layer)));
+    out.push_str(&format!("(layer {})", konnect_sexp::quoted(layer)));
     out.push_str(&content[bend..]);
     out
 }
@@ -1379,7 +1372,7 @@ fn flip_layer_block(block: &str) -> anyhow::Result<String> {
         .context("(layer ...) has no layer name")?;
     Ok(format!(
         "(layer {})",
-        quote_sexp_string(&flipped_layer(name)?)
+        konnect_sexp::quoted(&flipped_layer(name)?)
     ))
 }
 
@@ -1394,7 +1387,7 @@ fn flip_layers_block(block: &str) -> anyhow::Result<String> {
             let name = child
                 .as_str()
                 .context("(layers ...) contains a non-atomic layer name")?;
-            flipped_layer(name).map(|flipped| quote_sexp_string(&flipped))
+            flipped_layer(name).map(|flipped| konnect_sexp::quoted(&flipped))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(format!("(layers {})", names.join(" ")))
@@ -1471,7 +1464,7 @@ fn flip_text_block(block: &str, tag: &str) -> anyhow::Result<String> {
             SexpEdit::replace(
                 layer_start,
                 layer_end,
-                format!("(layer {})", quote_sexp_string(&flipped_layer_name)),
+                format!("(layer {})", konnect_sexp::quoted(&flipped_layer_name)),
             ),
             SexpEdit::replace(effects_start, effects_end, effects),
         ],
@@ -6955,8 +6948,8 @@ mod tests {
         let expected = ['"', 'a', '\\', '"', 'b', '\\', '\\', 'c', '"']
             .iter()
             .collect::<String>();
-        assert_eq!(quote_sexp_string(&input), expected);
-        assert_eq!(quote_sexp_string("plain"), "\"plain\"");
+        assert_eq!(konnect_sexp::quoted(&input), expected);
+        assert_eq!(konnect_sexp::quoted("plain"), "\"plain\"");
     }
 
     #[test]

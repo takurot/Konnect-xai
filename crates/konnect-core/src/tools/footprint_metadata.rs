@@ -17,12 +17,13 @@ const SUPPORTED_ATTRIBUTES: &[&str] = &[
     "exclude_from_bom",
     "allow_missing_courtyard",
     "dnp",
+    "allow_soldermask_bridges",
 ];
 
 pub(super) fn tool() -> ToolDef {
     tool!(
         "set_footprint_metadata",
-        "Atomically replace a footprint's description, tags, or supported attributes while \
+        "Atomically update a footprint's description, tags, or supported attributes while \
          preserving pads, graphics, properties, groups, and models.",
         json!({
             "type": "object",
@@ -40,9 +41,10 @@ pub(super) fn tool() -> ToolDef {
                     "description": "Replacement search tags; an empty array removes the tags block",
                     "items": { "type": "string" }
                 },
+                "replace": {"type":"boolean","default":false,"description":"Explicitly replace the complete attributes list instead of merging"},
                 "attributes": {
                     "type": "array",
-                    "description": "Replacement KiCad footprint attributes; an empty array removes the attr block",
+                    "description": "Attributes to add while preserving existing flags. Set replace: true for full replacement (including clearing with []).",
                     "items": {
                         "type": "string",
                         "enum": SUPPORTED_ATTRIBUTES
@@ -61,6 +63,7 @@ struct MetadataUpdate {
     description: Option<String>,
     tags: Option<Vec<String>>,
     attributes: Option<Vec<String>>,
+    replace: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,6 +76,8 @@ struct MetadataError {
 struct PreparedMutation {
     replacement: String,
     changed_fields: Vec<&'static str>,
+    attributes_before: Vec<String>,
+    attributes_after: Vec<String>,
 }
 
 async fn handle_set_footprint_metadata(
@@ -134,11 +139,18 @@ async fn handle_set_footprint_metadata(
     Ok(CallToolResult::json(&json!({
         "success": true,
         "footprint_path": path.display().to_string(),
-        "changed_fields": prepared.changed_fields
+        "changed_fields": prepared.changed_fields,
+        "attributes": {"before":prepared.attributes_before,"after":prepared.attributes_after}
     })))
 }
 
 fn parse_update(args: &serde_json::Value) -> Result<MetadataUpdate, MetadataError> {
+    let replace = match args.get("replace") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| invalid("replace", "must be a boolean"))?,
+    };
     let description = optional_string(args, "description")?;
     let tags = optional_string_array(args, "tags")?;
     if let Some(tags) = &tags {
@@ -168,6 +180,7 @@ fn parse_update(args: &serde_json::Value) -> Result<MetadataUpdate, MetadataErro
         description,
         tags,
         attributes,
+        replace,
     })
 }
 
@@ -248,6 +261,38 @@ fn prepare_mutation(
         }
     }
 
+    // Existing file data is untrusted too: only bare KiCad attribute atoms
+    // may be replayed into an unquoted attr block. Quoted/nested nodes would
+    // otherwise turn into syntax or silently disappear during merging.
+    let attributes_before = match root.find("attr") {
+        None => Vec::new(),
+        Some(node) => node
+            .children()
+            .unwrap_or(&[])
+            .iter()
+            .skip(1)
+            .map(|node| match node {
+                konnect_sexp::SexpNode::Atom(token) => Ok(token.clone()),
+                _ => Err(invalid(
+                    "attributes",
+                    "existing attr block must contain only bare attribute tokens",
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let attributes_after = match &update.attributes {
+        None => attributes_before.clone(),
+        Some(values) if update.replace => values.clone(),
+        Some(values) => {
+            let mut merged = attributes_before.clone();
+            for value in values {
+                if !merged.contains(value) {
+                    merged.push(value.clone());
+                }
+            }
+            merged
+        }
+    };
     let indent = child_indent.unwrap_or_else(|| "  ".to_string());
     let mut edits = Vec::new();
     let mut insertions = Vec::new();
@@ -281,7 +326,8 @@ fn prepare_mutation(
     apply_metadata_field(
         source,
         attributes,
-        update.attributes.as_ref().map(|values| {
+        update.attributes.as_ref().map(|_| {
+            let values = &attributes_after;
             values
                 .is_empty()
                 .then(String::new)
@@ -319,6 +365,8 @@ fn prepare_mutation(
     Ok(PreparedMutation {
         replacement,
         changed_fields,
+        attributes_before,
+        attributes_after,
     })
 }
 
@@ -376,20 +424,7 @@ fn indent_before(source: &str, offset: usize) -> Option<String> {
 }
 
 fn quote_string(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len() + 2);
-    escaped.push('"');
-    for character in value.chars() {
-        match character {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            other => escaped.push(other),
-        }
-    }
-    escaped.push('"');
-    escaped
+    konnect_sexp::quoted(value)
 }
 
 fn invalid(field: &str, reason: impl Into<String>) -> MetadataError {
@@ -510,7 +545,8 @@ mod tests {
                 "exclude_from_pos_files",
                 "exclude_from_bom",
                 "allow_missing_courtyard",
-                "dnp"
+                "dnp",
+                "allow_soldermask_bridges"
             ])
         );
     }
@@ -552,6 +588,7 @@ mod tests {
     #[test]
     fn replaces_only_supplied_metadata_and_preserves_every_other_block() {
         let update = parse_update(&json!({
+            "replace":true,
             "attributes": ["exclude_from_pos_files"]
         }))
         .unwrap();
@@ -577,6 +614,7 @@ mod tests {
     #[test]
     fn empty_tags_and_attributes_remove_only_their_blocks() {
         let update = parse_update(&json!({
+            "replace":true,
             "tags": [],
             "attributes": []
         }))
@@ -681,5 +719,105 @@ mod tests {
             .expect_err("a stale expected source must conflict");
         assert!(matches!(error, konnect_sexp::SexpError::Conflict { .. }));
         assert_eq!(std::fs::read_to_string(path).unwrap(), newer);
+    }
+}
+
+#[cfg(test)]
+mod file_safety_tests {
+    use super::*;
+    #[test]
+    fn attribute_additions_preserve_mask_bridges_and_future_flags() {
+        let source = "(footprint \"X\" (attr smd allow_soldermask_bridges future_kicad_flag))";
+        let update = parse_update(&json!({"attributes":["exclude_from_bom"]})).unwrap();
+        let prepared = prepare_mutation(source, &update).unwrap();
+        let root = konnect_sexp::parse_sexp(&prepared.replacement).unwrap();
+        let attr = root.find("attr").unwrap();
+        let values = attr
+            .children()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                "attr",
+                "smd",
+                "allow_soldermask_bridges",
+                "future_kicad_flag",
+                "exclude_from_bom"
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod metadata_response_readback_tests {
+    use super::*;
+    #[tokio::test]
+    async fn reports_attributes_before_and_after_merging() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stock.kicad_mod");
+        std::fs::write(
+            &path,
+            "(footprint \"X\" (attr smd allow_soldermask_bridges))",
+        )
+        .unwrap();
+        let ctx = ToolContext::new(
+            Default::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_set_footprint_metadata(
+            &json!({"footprint_path":path,"attributes":["exclude_from_bom"]}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            body["attributes"]["before"],
+            json!(["smd", "allow_soldermask_bridges"])
+        );
+        assert_eq!(
+            body["attributes"]["after"],
+            json!(["smd", "allow_soldermask_bridges", "exclude_from_bom"])
+        );
+    }
+}
+
+#[cfg(test)]
+mod existing_attribute_shape_tests {
+    use super::*;
+    #[tokio::test]
+    async fn malformed_existing_attribute_nodes_refuse_every_metadata_edit_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("malformed.kicad_mod");
+        let ctx = ToolContext::new(
+            Default::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        for source in [
+            r#"(footprint "X" (attr "smd) (property Injected yes) (attr smd"))"#,
+            r#"(footprint "X" (attr smd (future flag)))"#,
+        ] {
+            for edit in [
+                json!({"attributes":["exclude_from_bom"]}),
+                json!({"description":"new"}),
+            ] {
+                std::fs::write(&path, source).unwrap();
+                let mut args = edit;
+                args["footprint_path"] = json!(path);
+                let result = handle_set_footprint_metadata(&args, &ctx).await.unwrap();
+                assert!(
+                    result.is_error,
+                    "unsupported attr structure must refuse: {source}"
+                );
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+            }
+        }
     }
 }

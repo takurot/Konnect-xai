@@ -110,13 +110,13 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
 }
 
 pub(crate) fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), SexpError> {
-    write_atomic_unlocked_with(path, content, || {})
+    write_atomic_unlocked_with(path, content, || Ok(()))
 }
 
 fn write_atomic_unlocked_with(
     path: &Path,
     content: &str,
-    before_replace: impl FnOnce(),
+    before_replace: impl FnOnce() -> Result<(), SexpError>,
 ) -> Result<(), SexpError> {
     ensure_kicad_design_document_is_closed(path)?;
     let (tmp_path, mut file) = create_scratch_file(path)?;
@@ -135,7 +135,7 @@ fn write_atomic_unlocked_with(
 
     // A lock may have appeared while the scratch file was being written.
     // Recheck at the last refusal point before replacing the document.
-    before_replace();
+    before_replace()?;
     ensure_kicad_design_document_is_closed(path)?;
     std::fs::rename(&tmp_path, path)?;
     cleanup.disarm();
@@ -153,6 +153,15 @@ pub fn write_atomic_if_unchanged(
     expected: &str,
     content: &str,
 ) -> Result<(), SexpError> {
+    write_atomic_if_unchanged_with(path, expected, content, || {})
+}
+
+fn write_atomic_if_unchanged_with(
+    path: &Path,
+    expected: &str,
+    content: &str,
+    before_replace: impl FnOnce(),
+) -> Result<(), SexpError> {
     let lock = open_document_lock(path)?;
     <std::fs::File as FileExt>::lock(&lock)?;
 
@@ -163,13 +172,32 @@ pub fn write_atomic_if_unchanged(
         });
     }
 
-    write_atomic_unlocked(path, content)?;
-    if std::fs::read_to_string(path)? != content {
-        return Err(SexpError::Conflict {
-            path: path.to_path_buf(),
-        });
-    }
-    Ok(())
+    write_atomic_unlocked_with(path, content, || {
+        before_replace();
+        if read_string_unlocked(path)? != expected {
+            return Err(SexpError::Conflict {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(())
+    })?;
+    verify_cas_readback(path, content, std::fs::read_to_string(path))
+}
+
+fn verify_cas_readback(
+    path: &Path,
+    expected: &str,
+    observed: std::io::Result<String>,
+) -> Result<(), SexpError> {
+    let reason = match observed {
+        Ok(content) if content == expected => return Ok(()),
+        Ok(_) => "atomic replacement committed, but immediate readback differs from the requested content".to_owned(),
+        Err(error) => format!("atomic replacement committed, but immediate readback failed: {error}"),
+    };
+    Err(SexpError::MutationOutcomeUncertain {
+        path: path.to_path_buf(),
+        reason,
+    })
 }
 
 /// Apply a read/modify/write transaction while holding the document lock.
@@ -214,7 +242,7 @@ pub(crate) fn open_document_lock(path: &Path) -> Result<std::fs::File, SexpError
     open_lock_file(&lock_path)
 }
 
-/// Refuse a `.kicad_sch` or `.kicad_pcb` mutation while KiCad's sibling lock
+/// Refuse a `.kicad_sch`, `.kicad_pcb`, or `.kicad_pro` mutation while KiCad's sibling lock
 /// is present.
 ///
 /// KiCad 10 writes only `username` and `hostname` into this file. There is no
@@ -222,7 +250,7 @@ pub(crate) fn open_document_lock(path: &Path) -> Result<std::fs::File, SexpError
 /// is stale, especially for another host. Its contents are therefore neither
 /// parsed nor trusted: any filesystem entry at the lock path blocks the write.
 /// Reads and non-design-document writes are unaffected.
-pub(crate) fn ensure_kicad_design_document_is_closed(path: &Path) -> Result<(), SexpError> {
+pub fn ensure_kicad_design_document_is_closed(path: &Path) -> Result<(), SexpError> {
     let Some(lock_path) = kicad_editor_lock_path(path) else {
         return Ok(());
     };
@@ -252,7 +280,7 @@ fn ensure_kicad_design_document_is_closed_with(
     }
 }
 
-/// KiCad's sibling editor-lock path for a schematic or board document:
+/// KiCad's sibling editor-lock path for a schematic, board, or project document:
 /// `~<filename>.lck` in the same directory.
 ///
 /// This derives identity only; callers decide what an observed or unreadable
@@ -272,6 +300,7 @@ pub fn kicad_editor_lock_path(path: &Path) -> Option<PathBuf> {
             .is_some_and(|extension| {
                 extension.eq_ignore_ascii_case("kicad_sch")
                     || extension.eq_ignore_ascii_case("kicad_pcb")
+                    || extension.eq_ignore_ascii_case("kicad_pro")
             });
     if !is_design_document {
         return None;
@@ -1424,7 +1453,7 @@ mod atomic_write_tests {
         );
         assert_eq!(
             kicad_editor_lock_path(Path::new("project/design.kicad_pro")),
-            None
+            Some(PathBuf::from("project/~design.kicad_pro.lck"))
         );
     }
 
@@ -1541,6 +1570,7 @@ mod atomic_write_tests {
 
         let error = write_atomic_unlocked_with(&path, "replacement", || {
             std::fs::write(&lock, "appeared during write").unwrap();
+            Ok(())
         })
         .unwrap_err();
 
@@ -1710,5 +1740,90 @@ mod atomic_write_tests {
         );
         let final_content = std::fs::read_to_string(path).unwrap();
         assert!(final_content == "first" || final_content == "second");
+    }
+}
+
+#[cfg(test)]
+mod project_lock_safety_tests {
+    use super::*;
+    #[test]
+    fn project_lock_refuses_writes_even_without_board_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("demo.kicad_pro");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::write(
+            dir.path().join("~demo.kicad_pro.lck"),
+            r#"{"username":"user","hostname":"host"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            write_atomic_if_unchanged(&path, "{}", "edited"),
+            Err(SexpError::KiCadEditorLocked { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "{}");
+    }
+}
+
+#[cfg(test)]
+mod revision_interleaving_tests {
+    use super::*;
+    #[test]
+    fn external_save_during_scratch_write_is_preserved_for_every_design_format() {
+        for extension in [
+            "kicad_sch",
+            "kicad_pcb",
+            "kicad_pro",
+            "kicad_dru",
+            "kicad_sym",
+            "kicad_mod",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(format!("design.{extension}"));
+            std::fs::write(&path, "read revision").unwrap();
+            let error =
+                write_atomic_if_unchanged_with(&path, "read revision", "prepared edit", || {
+                    std::fs::write(&path, "external save").unwrap();
+                })
+                .unwrap_err();
+            assert!(matches!(error, SexpError::Conflict { .. }));
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "external save");
+        }
+    }
+}
+
+#[cfg(test)]
+mod committed_readback_tests {
+    use super::*;
+    #[test]
+    fn mismatched_or_unreadable_committed_state_is_uncertain_not_a_prewrite_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("design.kicad_sch");
+        std::fs::write(&path, "before").unwrap();
+        write_atomic_if_unchanged(&path, "before", "committed").unwrap();
+        std::fs::write(&path, "another saved revision").unwrap();
+        let mismatch =
+            verify_cas_readback(&path, "committed", std::fs::read_to_string(&path)).unwrap_err();
+        assert!(
+            mismatch.to_string().contains("outcome uncertain"),
+            "{mismatch}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "another saved revision"
+        );
+        let unavailable = verify_cas_readback(
+            &path,
+            "committed",
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "readback unavailable",
+            )),
+        )
+        .unwrap_err();
+        assert!(
+            unavailable.to_string().contains("outcome uncertain"),
+            "{unavailable}"
+        );
+        assert!(verify_cas_readback(&path, "committed", Ok("committed".into())).is_ok());
     }
 }

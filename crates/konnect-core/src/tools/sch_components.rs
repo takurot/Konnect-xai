@@ -1116,11 +1116,14 @@ fn component_target_from_source(
             .map_err(|error| ComponentDeleteTargetError::from_sexp(path, error))?;
         let mut fields = BTreeMap::new();
         for property in node.find_all("property") {
-            let Some(name) = property.get(1).and_then(|value| value.as_str()) else {
+            let offset = usize::from(
+                matches!(property.get(1), Some(konnect_sexp::parser::SexpNode::Atom(flag)) if flag == "private"),
+            );
+            let Some(name) = property.get(1 + offset).and_then(|value| value.as_str()) else {
                 continue;
             };
             let value = property
-                .get(2)
+                .get(2 + offset)
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
             if fields.insert(name.to_owned(), value.to_owned()).is_some() {
@@ -1403,7 +1406,8 @@ fn component_mutation_readback_from_schematic(
                         "x": at.x,
                         "y": at.y,
                         "rotation": at.rotation.unwrap_or(0.0),
-                        "hide": hidden
+                        "hide": hidden,
+                        "private": property.private
                     }),
                 );
             }
@@ -1419,6 +1423,7 @@ fn component_mutation_readback_from_schematic(
             "mirror_y": unit_mirror.contains('y'),
             "lib_id": symbol.lib_id,
             "fields": fields,
+            "private_fields": symbol.properties.iter().filter(|p| p.private).map(|p| (&p.name, true)).collect::<std::collections::BTreeMap<_, _>>(),
             "field_placements": field_placements,
             "instance_paths": instance_paths,
             "instance_references": instance_references
@@ -2256,15 +2261,6 @@ pub(crate) struct PropertyWriteCounts {
     pub(crate) added: usize,
 }
 
-fn escape_property_text(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
-}
-
 fn closing_quote(content: &str, value_start: usize) -> Option<usize> {
     let mut escaped = false;
     for (offset, ch) in content[value_start..].char_indices() {
@@ -2318,8 +2314,8 @@ fn property_insert_edit(
         })
         .unwrap_or_else(|| "\t\t".to_string());
 
-    let escaped_name = escape_property_text(name);
-    let escaped_value = escape_property_text(value);
+    let escaped_name = konnect_sexp::escaped_string(name);
+    let escaped_value = konnect_sexp::escaped_string(value);
     let newline = if content.contains("\r\n") {
         "\r\n"
     } else {
@@ -2363,16 +2359,22 @@ pub(crate) fn set_property_value(
         return Err(format!("symbol '{reference}' not found in this schematic"));
     }
 
-    let escaped_field = escape_property_text(field);
+    let escaped_field = konnect_sexp::escaped_string(field);
     let field_search = format!(r#"(property "{escaped_field}" ""#);
-    let escaped_value = escape_property_text(new_value);
+    let private_search = format!(r#"(property private "{escaped_field}" ""#);
+    let escaped_value = konnect_sexp::escaped_string(new_value);
     let mut edits = Vec::new();
     let mut updated = 0;
     let mut added = 0;
 
     for (start, end) in blocks {
         let block = &content[start..end];
-        if let Some(relative) = block.find(&field_search) {
+        let field_search = if block.contains(&private_search) {
+            &private_search
+        } else {
+            &field_search
+        };
+        if let Some(relative) = block.find(field_search) {
             let value_start = start + relative + field_search.len();
             let value_end = closing_quote(content, value_start)
                 .ok_or_else(|| format!("'{field}' property on '{reference}' is malformed"))?;
@@ -2491,8 +2493,9 @@ fn set_property_placement(
             "symbol '{reference}' not found in this schematic"
         )));
     }
-    let escaped_field = escape_property_text(field);
+    let escaped_field = konnect_sexp::escaped_string(field);
     let field_search = format!(r#"(property "{escaped_field}" ""#);
+    let private_search = format!(r#"(property private "{escaped_field}" ""#);
     let mut edits = Vec::new();
     let mut touched = 0usize;
 
@@ -2512,7 +2515,12 @@ fn set_property_placement(
                 continue;
             }
         }
-        let Some(relative) = block.find(&field_search) else {
+        let field_search = if block.contains(&private_search) {
+            &private_search
+        } else {
+            &field_search
+        };
+        let Some(relative) = block.find(field_search) else {
             return Err(PlacementRefusal::TargetMissing(format!(
                 "'{reference}' has no '{field}' property on one of its placed units"
             )));
@@ -3405,7 +3413,12 @@ async fn handle_annotate_schematic(
             Err(refusal) => return Ok(refusal),
         },
     };
-    Ok(tokio::task::spawn_blocking(move || annotate_file(&sch_path, options)).await?)
+    Ok(
+        crate::tools::blocking_work::spawn_tracked_blocking(move || {
+            annotate_file(&sch_path, options)
+        })
+        .await?,
+    )
 }
 
 async fn handle_get_schematic_pin_locations(
@@ -4112,7 +4125,7 @@ async fn handle_replace_component(
     // Replace the library id in every unit block. Shared component identity
     // must not leave one unit pointing at the old symbol (#182).
     let lib_id_pat = "(lib_id \"";
-    let escaped_lib_id = escape_property_text(&new_lib_id);
+    let escaped_lib_id = konnect_sexp::escaped_string(&new_lib_id);
     let mut edits = Vec::new();
     let mut old_lib_ids = Vec::new();
     for (start, end) in &blocks {

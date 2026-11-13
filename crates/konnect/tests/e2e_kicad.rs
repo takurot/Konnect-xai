@@ -267,7 +267,10 @@ fn full_design_loop_with_real_kicad() {
         "add_schematic_component",
         json!({
             "schematic": sch.to_string_lossy(), "lib_id": "Device:C",
-            "reference": "C1", "value": "100n", "x": 120.0, "y": 100.0
+            // Pin 1 faces the incoming R1.2 route; the opposite orientation
+            // passes over C1.2 first and would short the capacitor (#22).
+            "reference": "C1", "value": "100n", "x": 120.0, "y": 100.0,
+            "rotation": 180.0
         }),
     );
     p.tool(

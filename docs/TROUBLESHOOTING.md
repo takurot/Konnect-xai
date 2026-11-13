@@ -591,3 +591,38 @@ remove the surrounding `(setup ...)` block. Konnect versions containing the
 fix for #610 refuse `set_active_layer` with `unsupported_capability` and leave
 the file byte-identical until stable KiCad IPC exposes a native operation with
 readback.
+
+## A stdio tool call is slow or was cancelled
+
+`ping` remains responsive while a stdio tool call is running. Tool calls,
+including cheap reads, run in arrival order with at most 128 additional calls
+queued. The transport rejects excess queued requests instead of growing an
+unbounded work queue.
+
+A client can cancel an active or queued request using
+`notifications/cancelled` with its exact `requestId` (numeric and string IDs
+are distinct). Konnect suppresses the cancelled response, drops the running
+future, and terminates an owned `kicad-cli` or Freerouting Java child. Cancellation
+does not undo changes already made to a file or live document: inspect the
+document before retrying a mutation. A tool panic returns a JSON-RPC internal
+error and leaves the stdio session available for the next request; the same
+readback rule applies before retrying it.
+
+A cancelled call can still own a blocking KiCad or file-publication worker.
+Konnect keeps that call's FIFO slot until the worker finishes; ping remains
+responsive while later tool calls wait. Export publication retains its staging
+files and previous-output backup through this drain. Owned CLI children are
+killed and waited before the slot is released, rather than relying on eventual
+background reaping.
+
+An export's destination must be absent or a regular file. Publication refuses
+existing directories and other non-regular entries. If a previous-output
+backup cannot be restored or safely cleaned up, the tool reports
+`mutation_outcome_uncertain` and preserves its staging directory; inspect the
+reported backup and staged-output paths before retrying.
+
+Downloaded JLCPCB database installation follows the same rule: its worker owns
+the staging directory through completion. A cancelled caller cannot remove
+`previous.db` while installation or restoration is running. Failed restoration
+reports `mutation_outcome_uncertain` with recovery paths and retains any
+remaining backup. Database replacement also refuses non-regular destinations.

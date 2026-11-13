@@ -180,3 +180,39 @@ async fn each_writer_still_writes_while_kicad_holds_a_different_board() {
         }
     }
 }
+
+/// A project lock exists when Eeschema is open even without a board lock.
+/// Locks have no trustworthy PID; presumed-stale locks are also refused.
+#[tokio::test]
+async fn all_project_writers_refuse_an_eeschema_project_lock() {
+    let project = project();
+    let before = std::fs::read(&project.project_file).unwrap();
+    let lock = project
+        .project_file
+        .with_file_name("~placement_fixture.kicad_pro.lck");
+    std::fs::write(&lock, r#"{"username":"test","hostname":"test-host"}"#).unwrap();
+    let handler = handler_talking_to("").await;
+    for (tool, arguments) in [
+        ("set_design_rules", json!({"min_clearance":0.25})),
+        ("set_predefined_sizes", json!({"track_widths":[0.25]})),
+        ("create_netclass", json!({"name":"Signal","clearance":0.25})),
+        (
+            "assign_net_to_class",
+            json!({"net_name":"GND","netclass":"Default"}),
+        ),
+    ] {
+        let result = call(&handler, tool, &project.board, &arguments).await;
+        assert!(result.is_error, "{tool}: {}", text_of(&result));
+        assert!(
+            text_of(&result).contains(".kicad_pro.lck"),
+            "{tool}: {}",
+            text_of(&result)
+        );
+        assert_eq!(
+            std::fs::read(&project.project_file).unwrap(),
+            before,
+            "{tool}"
+        );
+        assert!(lock.exists());
+    }
+}

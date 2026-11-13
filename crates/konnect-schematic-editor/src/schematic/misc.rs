@@ -71,6 +71,8 @@ pub struct Text {
     pub at: At,
     pub uuid: String,
     pub effects: Option<Effects>,
+    pub exclude_from_sim: Option<SexpNode>,
+    pub raw_sub_nodes: Vec<SexpNode>,
 }
 
 impl Text {
@@ -80,6 +82,8 @@ impl Text {
             at: At::new(x, y),
             uuid: uuid::Uuid::new_v4().to_string(),
             effects: None,
+            exclude_from_sim: None,
+            raw_sub_nodes: vec![],
         }
     }
 
@@ -99,15 +103,28 @@ impl Text {
             at,
             uuid,
             effects,
+            exclude_from_sim: node.find("exclude_from_sim").cloned(),
+            raw_sub_nodes: super::unmodelled_children(
+                node,
+                &["at", "effects", "uuid", "exclude_from_sim"],
+            )
+            .into_iter()
+            .filter(|n| n.is_list())
+            .collect(),
         })
     }
 
     pub fn to_sexp(&self) -> SexpNode {
-        let mut c = vec![atom("text"), qstr(self.text.clone()), self.at.to_sexp()];
+        let mut c = vec![atom("text"), qstr(self.text.clone())];
+        if let Some(value) = &self.exclude_from_sim {
+            c.push(value.clone());
+        }
+        c.push(self.at.to_sexp());
         if let Some(e) = &self.effects {
             c.push(e.to_sexp());
         }
         c.push(tagged("uuid", vec![qstr(self.uuid.clone())]));
+        c.extend(self.raw_sub_nodes.iter().cloned());
         SexpNode::List(c)
     }
 

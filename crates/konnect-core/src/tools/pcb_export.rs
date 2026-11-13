@@ -11,7 +11,6 @@ use crate::tools::{get_path, require_array, with_ipc, ToolContext, ToolDef};
 use anyhow::Context;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use tokio::task;
 
 use super::cli;
 
@@ -861,7 +860,7 @@ async fn handle_export_specctra_dsn(
     let manifest_for_write = manifest_output_path.clone();
     let dsn_for_write = export.dsn.clone();
     let manifest_text_for_write = export.manifest.clone();
-    task::spawn_blocking(move || {
+    crate::tools::blocking_work::spawn_tracked_blocking(move || {
         write_specctra_export_pair(
             &output_for_write,
             &dsn_for_write,

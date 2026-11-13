@@ -14,7 +14,7 @@ pub(crate) async fn write_report(output: &str, contents: &str) -> anyhow::Result
     use anyhow::Context;
     let path = std::path::PathBuf::from(output);
     let contents = contents.to_string();
-    tokio::task::spawn_blocking(move || {
+    crate::tools::blocking_work::spawn_tracked_blocking(move || {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("could not create report directory {}", parent.display())

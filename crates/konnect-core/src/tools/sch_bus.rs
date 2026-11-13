@@ -19,16 +19,18 @@
 //!   - vector  `X_DIG[1..6]`   — members `X_DIG1` … `X_DIG6`
 //!   - group   `{A B C}`       — members named individually
 
+use super::sch_route_safety::{allow_join, check_route};
+use super::sch_wiring::{ambiguous_reference_result, resolve_pin_endpoint};
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, opt_f64, opt_str, require_f64, ToolContext, ToolDef};
 use konnect_sexp::{
     parser::parse_sexp,
     schematic::{
-        extract_lib_pins_for_unit, extract_symbol_instances, format_bus, format_bus_entry,
-        format_net_label, format_wire, pin_endpoint, BusEntryDirection,
+        extract_symbol_instances, format_bus, format_bus_entry, format_net_label, format_wire,
+        BusEntryDirection,
     },
-    writer::write_atomic,
+    writer::write_atomic_if_unchanged,
 };
 use serde_json::json;
 
@@ -108,6 +110,7 @@ pub fn tools() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
+                    "allow_join": {"type":"boolean","default":false,"description":"Explicitly permit stub routes to touch additional nets; otherwise the complete batch is refused."},
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "bus_y": { "type": "number", "description": "Y of a horizontal bus (omit if vertical)" },
                     "bus_x": { "type": "number", "description": "X of a vertical bus (omit if horizontal)" },
@@ -152,7 +155,7 @@ async fn handle_add_bus(
     let content = std::fs::read_to_string(&sch_path)?;
     let new_content =
         crate::tools::sch_wiring::insert_before_close(&content, &format_bus(x1, y1, x2, y2));
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &content, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "added": "bus",
@@ -195,7 +198,7 @@ async fn handle_batch_add_bus(
 
     let content = std::fs::read_to_string(&sch_path)?;
     let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &content, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "added_count": added.len(),
@@ -217,6 +220,7 @@ async fn handle_add_bus_entry(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    let (x, y) = konnect_sexp::geometry::snap_point(x, y, 1.27);
     let raw = opt_str(args, "direction").unwrap_or("down_right");
     let direction = match parse_direction(raw) {
         Some(d) => d,
@@ -230,7 +234,7 @@ async fn handle_add_bus_entry(
     let content = std::fs::read_to_string(&sch_path)?;
     let new_content =
         crate::tools::sch_wiring::insert_before_close(&content, &format_bus_entry(x, y, direction));
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &content, &new_content)?;
 
     // Which end is the bus side is a fact about the sheet, not about the
     // request: the entry's `at` corner is wherever the caller put it. The
@@ -294,12 +298,16 @@ async fn handle_connect_pins_to_bus(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    let allow = match allow_join(args) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
     let conns = match args["connections"].as_array() {
         Some(a) => a.clone(),
         None => return Ok(CallToolResult::error("Missing 'connections' array")),
     };
-    let bus_y = opt_f64(args, "bus_y");
-    let bus_x = opt_f64(args, "bus_x");
+    let bus_y = opt_f64(args, "bus_y").map(snap_coordinate);
+    let bus_x = opt_f64(args, "bus_x").map(snap_coordinate);
     let size = 2.54; // BusEntryDirection fixes the tick at one grid step
 
     let horizontal = match (bus_y, bus_x) {
@@ -340,42 +348,45 @@ async fn handle_connect_pins_to_bus(
             }
         };
 
-        // Resolve against the unit that actually owns the pin — a multi-unit
-        // part repeats its reference on every unit.
-        let ep = instances
-            .iter()
-            .filter(|i| i.reference == reference)
-            .find_map(|inst| {
-                let sym = lib_syms
-                    .iter()
-                    .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))?;
-                extract_lib_pins_for_unit(sym, inst.unit)
-                    .into_iter()
-                    .find(|p| p.number == pin_number)
-                    .map(|p| pin_endpoint(&p, inst.pin_transform()))
-            });
-
-        let (px, py) = match ep {
-            Some(v) => v,
-            None => {
-                errors.push(format!("Pin {pin_number} of '{reference}' not found"));
+        let (px, py) = match resolve_pin_endpoint(&instances, &lib_syms, reference, pin_number) {
+            Ok(point) => point,
+            Err(error) => {
+                if let Some(refusal) = ambiguous_reference_result(&error) {
+                    return Ok(refusal);
+                }
+                errors.push(error.to_string());
                 continue;
             }
         };
 
+        // Pin coordinates are observed geometry, not caller placement requests.
+        // Half-grid pins (0.635 mm) must stay at their real endpoints. Only
+        // caller-supplied bus geometry is snapped to the 1.27 mm default grid.
         // The entry bridges the last `size` before the bus; the stub covers the
         // rest of the way from the pin.
         let (entry_x, entry_y, dx, dy, sx, sy) = if horizontal {
             let by = bus_y.unwrap();
             let dir = if by > py { 1.0 } else { -1.0 };
-            let ey = by - dir * size;
+            let ey = konnect_sexp::geometry::round6(by - dir * size);
             (px, ey, dir * size, dir * size, px, py)
         } else {
             let bx = bus_x.unwrap();
             let dir = if bx > px { 1.0 } else { -1.0 };
-            let ex = bx - dir * size;
+            let ex = konnect_sexp::geometry::round6(bx - dir * size);
             (ex, py, dir * size, dir * size, px, py)
         };
+
+        let staged_source = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
+        let staged_tree = parse_sexp(&staged_source)?;
+        if let Err(refusal) = check_route(
+            &staged_tree,
+            &[((sx, sy), (entry_x, entry_y))],
+            &[(px, py)],
+            Some(net),
+            allow,
+        ) {
+            return Ok(refusal);
+        }
 
         // Stub from the pin up to the entry's wire-side end. Zero-length when
         // the pin already sits there; KiCad rejects a degenerate wire.
@@ -398,7 +409,7 @@ async fn handle_connect_pins_to_bus(
     }
 
     let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &content, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "connected_count": added.len(),
@@ -429,12 +440,16 @@ fn parse_direction(s: &str) -> Option<BusEntryDirection> {
     })
 }
 
+fn snap_coordinate(value: f64) -> f64 {
+    konnect_sexp::geometry::snap_to_grid(value, 1.27)
+}
+
 fn read_xy_pair(v: &serde_json::Value) -> Result<(f64, f64, f64, f64), CallToolResult> {
     Ok((
-        require_f64(v, "x1")?,
-        require_f64(v, "y1")?,
-        require_f64(v, "x2")?,
-        require_f64(v, "y2")?,
+        snap_coordinate(require_f64(v, "x1")?),
+        snap_coordinate(require_f64(v, "y1")?),
+        snap_coordinate(require_f64(v, "x2")?),
+        snap_coordinate(require_f64(v, "y2")?),
     ))
 }
 
@@ -512,8 +527,8 @@ mod tests {
     async fn a_floating_entry_reports_the_convention_and_says_so() {
         let (_directory, path) = sheet_with_bus();
         let response = entry_response(&path, 30.0, 30.0).await;
-        assert_eq!(response["wire_side"]["x"], 30.0, "{response}");
-        assert_eq!(response["bus_side"]["x"], 32.54);
+        assert_eq!(response["wire_side"]["x"], 30.48, "{response}");
+        assert_eq!(response["bus_side"]["x"], 33.02);
         let note = response["note"].as_str().expect("note present");
         assert!(note.contains("no bus touches"), "{note}");
     }
@@ -567,5 +582,130 @@ mod tests {
                 "connect_pins_to_bus"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod file_safety_tests {
+    use super::*;
+    #[tokio::test]
+    async fn bus_coordinates_snap_before_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grid.kicad_sch");
+        std::fs::write(&path, "(kicad_sch)").unwrap();
+        let ctx = ToolContext::new(
+            Default::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_add_bus(
+            &json!({"schematic":path,"x1":50.8001,"y1":25.4001,"x2":76.2001,"y2":25.4001}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        let text = std::fs::read_to_string(path).unwrap();
+        let root = parse_sexp(&text).unwrap();
+        let bus = konnect_sexp::schematic::extract_buses(&root).remove(0);
+        assert_eq!((bus.x1, bus.y1, bus.x2, bus.y2), (50.8, 25.4, 76.2, 25.4));
+    }
+}
+
+#[cfg(test)]
+mod fine_grid_pin_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bus_fanout_preserves_the_actual_half_grid_pin_endpoint() {
+        for horizontal in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("fine-grid.kicad_sch");
+            std::fs::write(
+                &path,
+                r#"(kicad_sch
+              (lib_symbols (symbol "Test:P" (symbol "P_1_1"
+                (pin passive line (at 0 0 0) (length 0) (name "P") (number "1")))))
+              (symbol (lib_id "Test:P") (at 50.165 50.165 0) (unit 1)
+                (uuid "22222222-2222-4222-8222-222222222222")
+                (property "Reference" "U1")))"#,
+            )
+            .unwrap();
+            let mut args = json!({"schematic":path,"connections":[{"reference":"U1","pin_number":"1","net":"SIGNAL"}]});
+            args[if horizontal { "bus_y" } else { "bus_x" }] = json!(76.2001);
+            let ctx = ToolContext::new(
+                Default::default(),
+                std::sync::Arc::new(crate::router::ToolRouter::new()),
+            );
+            let result = handle_connect_pins_to_bus(&args, &ctx).await.unwrap();
+            assert!(!result.is_error, "{result:?}");
+            let text = std::fs::read_to_string(path).unwrap();
+            let root = parse_sexp(&text).unwrap();
+            let wire = konnect_sexp::schematic::extract_wires(&root).remove(0);
+            assert_eq!((wire.x1, wire.y1), (50.165, 50.165), "{text}");
+            let labels = konnect_sexp::schematic::extract_labels(&root);
+            assert_eq!((labels[0].x, labels[0].y), (50.165, 50.165));
+            let entry = root.find("bus_entry").unwrap();
+            let at = entry.find("at").unwrap();
+            let size = entry.find("size").unwrap();
+            let bus_coordinate = if horizontal {
+                at.get_f64(2).unwrap() + size.get_f64(2).unwrap()
+            } else {
+                at.get_f64(1).unwrap() + size.get_f64(1).unwrap()
+            };
+            assert!(
+                (bus_coordinate - 76.2).abs() < 1e-9,
+                "caller bus geometry must still snap"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fanout_safety_tests {
+    use super::*;
+
+    fn sheet(points: &[(&str, f64, f64)]) -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bus-safety.kicad_sch");
+        let mut text = String::from(
+            r#"(kicad_sch
+          (lib_symbols (symbol "Test:P" (symbol "P_1_1"
+            (pin passive line (at 0 0 0) (length 0) (name "P") (number "1")))))"#,
+        );
+        for (index, &(reference, x, y)) in points.iter().enumerate() {
+            text.push_str(&format!(
+                r#"(symbol (lib_id "Test:P") (at {x} {y} 0) (unit 1)
+          (uuid "22222222-2222-4222-8222-{index:012}") (property "Reference" "{reference}"))"#
+            ));
+        }
+        text.push(')');
+        std::fs::write(&path, &text).unwrap();
+        (dir, path, text)
+    }
+    fn ctx() -> ToolContext {
+        ToolContext::new(
+            Default::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+    #[tokio::test]
+    async fn bus_fanout_refuses_a_foreign_pin_without_writing() {
+        let (_dir, path, before) = sheet(&[("R1", 0., 0.), ("C1", 0., 5.)]);
+        let result=handle_connect_pins_to_bus(&json!({"schematic":path,"bus_y":10.16,"connections":[{"reference":"R1","pin_number":"1","net":"SIGNAL"}]}),&ctx()).await.unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert!(serde_json::to_string(&result)
+            .unwrap()
+            .contains("would_join_nets"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+    }
+    #[tokio::test]
+    async fn bus_fanout_refuses_duplicate_references_without_writing() {
+        let (_dir, path, before) = sheet(&[("R1", 0., 0.), ("R1", 10., 0.)]);
+        let result=handle_connect_pins_to_bus(&json!({"schematic":path,"bus_y":10.16,"connections":[{"reference":"R1","pin_number":"1","net":"SIGNAL"}]}),&ctx()).await.unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert!(serde_json::to_string(&result)
+            .unwrap()
+            .contains("ambiguous_reference"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
     }
 }

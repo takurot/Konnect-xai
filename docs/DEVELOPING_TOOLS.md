@@ -37,8 +37,17 @@ transport because KiCad may already hold or have changed the target document.
 7. Update `router/registry.rs`, `tool-directory.md`, and the guarded documentation
    named by `CONTRIBUTING.md`.
 
-For an IPC write that accepts a layer name, use `try_layer_from_name` so an
-unknown layer is refused before it becomes an invalid KiCad message.
+For a write that accepts a layer name, use `try_layer_from_name` before IPC or
+file mutation, then `builders::layer_name` to obtain KiCad's canonical spelling.
+For example, `F.Silkscreen` must be written as `F.SilkS`; unknown names are an
+argument error.
+
+Encode every interpolated S-expression string with `konnect_sexp::quoted`, which
+returns the complete quoted token and escapes quotes, backslashes and control
+characters. Use `escaped_string` only when an existing serializer already owns
+the surrounding quotes. Even a formatter whose caller validates layer names
+must quote them defensively. Verify by parsing the emitted content and reading
+the original string back, including values such as `a"b\c`.
 
 ## Evidence Rules
 

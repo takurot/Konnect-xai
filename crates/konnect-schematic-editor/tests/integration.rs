@@ -844,3 +844,188 @@ fn editing_a_tab_indented_sheet_reindents_nothing() {
     }
     assert!(after.contains("(at 30 30)"), "{after}");
 }
+
+#[test]
+fn private_property_retains_name_value_and_flag() {
+    let node = parser::parse(r#"(property private "MPN" "X" (at 1 2 0))"#).unwrap();
+    let property = konnect_schematic_editor::Property::from_sexp(&node).unwrap();
+    assert_eq!(property.name, "MPN");
+    assert_eq!(property.value, "X");
+    assert_eq!(property.to_sexp(), node);
+}
+
+#[test]
+fn text_preserves_unmodelled_children() {
+    let node = parser::parse(r#"(text "note" (exclude_from_sim no) (at 1 2 0) (effects (font (size 1 1))) (uuid "abc") (future "data"))"#).unwrap();
+    let text = konnect_schematic_editor::Text::from_sexp(&node).unwrap();
+    assert_eq!(text.to_sexp(), node);
+}
+
+#[test]
+fn kicad10_fixtures_noop_overwrite_is_byte_identical() {
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../konnect-core/tests/fixtures");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(fixtures).unwrap() {
+        let path = entry.unwrap().path();
+        if !path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("_kicad10.kicad_sch")
+        {
+            continue;
+        }
+        let source = std::fs::read(&path).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let copy = temp.path().join("fixture.kicad_sch");
+        std::fs::write(&copy, &source).unwrap();
+        Schematic::load(&copy).unwrap().overwrite().unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), source, "{}", path.display());
+        checked += 1;
+    }
+    assert!(checked > 0);
+}
+
+#[test]
+fn unrelated_edit_preserves_private_fields_and_unknown_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("private.kicad_sch");
+    std::fs::write(&path, r#"(kicad_sch (version 20250114) (generator "eeschema") (uuid "root") (paper "A4") (lib_symbols) (text "note" (exclude_from_sim no) (at 1 2 0) (uuid "text") (future "keep")) (symbol (lib_id "Device:R") (at 10 20 0) (unit 1) (body_style 1) (in_bom yes) (in_pos_files yes) (on_board yes) (dnp no) (fields_autoplaced yes) (uuid "symbol") (property "Reference" "R1") (property private "MPN" "X")))"#).unwrap();
+    let mut sch = Schematic::load(&path).unwrap();
+    sch.add_symbol(konnect_schematic_editor::Symbol::new(
+        "Device:C", 30.0, 40.0,
+    ));
+    sch.overwrite().unwrap();
+    let loaded = Schematic::load(path).unwrap();
+    let resistor = loaded.symbols.by_reference("R1").unwrap();
+    let property = resistor
+        .properties
+        .iter()
+        .find(|p| p.name == "MPN")
+        .unwrap();
+    assert!(property.private);
+    assert_eq!(property.value, "X");
+    assert_eq!(
+        resistor
+            .to_sexp()
+            .find("fields_autoplaced")
+            .unwrap()
+            .value(),
+        Some("yes")
+    );
+    assert!(loaded.texts[0].to_sexp().find("future").is_some());
+}
+
+#[test]
+fn kicad10_serialized_model_retains_every_original_symbol_and_text_child() {
+    // Compare individual direct children: canonical order/default insertion is
+    // allowed, but no unknown child, private flag or field value may disappear.
+    // Numeric atoms may normalize decimal spelling (1.000 -> 1).
+    fn equivalent(
+        a: &konnect_schematic_editor::sexp::SexpNode,
+        b: &konnect_schematic_editor::sexp::SexpNode,
+    ) -> bool {
+        use konnect_schematic_editor::sexp::SexpNode;
+        match (a, b) {
+            (SexpNode::Atom(a), SexpNode::Atom(b)) => {
+                a == b
+                    || a.parse::<f64>()
+                        .ok()
+                        .zip(b.parse::<f64>().ok())
+                        .is_some_and(|(a, b)| a == b)
+            }
+            (SexpNode::List(a), SexpNode::List(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(a, b)| equivalent(a, b))
+            }
+            _ => a == b,
+        }
+    }
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../konnect-core/tests/fixtures");
+    for entry in std::fs::read_dir(fixtures).unwrap() {
+        let path = entry.unwrap().path();
+        if !path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("_kicad10.kicad_sch")
+        {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).unwrap();
+        let root = parser::parse(&source).unwrap();
+        for original in root
+            .args()
+            .iter()
+            .filter(|n| matches!(n.tag(), Some("symbol" | "text")))
+        {
+            let written = if original.tag() == Some("symbol") {
+                konnect_schematic_editor::Symbol::from_sexp(original)
+                    .unwrap()
+                    .to_sexp()
+            } else {
+                konnect_schematic_editor::Text::from_sexp(original)
+                    .unwrap()
+                    .to_sexp()
+            };
+            for child in original.args() {
+                // Older KiCad emits bare fields_autoplaced; canonical form adds yes.
+                if child.tag() == Some("fields_autoplaced") && child.args().is_empty() {
+                    continue;
+                }
+                assert!(
+                    written
+                        .args()
+                        .iter()
+                        .any(|candidate| equivalent(child, candidate)),
+                    "{}: lost {:?} from {:?}",
+                    path.display(),
+                    child,
+                    original.tag()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn symbol_flags_keep_kicad_canonical_order() {
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../konnect-core/tests/fixtures");
+    let original = std::fs::read_dir(fixtures)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("_kicad10.kicad_sch")
+        })
+        .find_map(|path| {
+            let source = std::fs::read_to_string(path).unwrap();
+            let root = parser::parse(&source).unwrap();
+            root.find_all("symbol")
+                .into_iter()
+                .find(|symbol| symbol.find("in_pos_files").is_some())
+                .cloned()
+        })
+        .expect("native fixture must contain in_pos_files");
+    let flags = |node: &konnect_schematic_editor::sexp::SexpNode| {
+        node.args()
+            .iter()
+            .filter_map(|child| child.tag())
+            .filter(|tag| matches!(*tag, "in_bom" | "on_board" | "in_pos_files" | "dnp"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        flags(&original),
+        vec!["in_bom", "on_board", "in_pos_files", "dnp"]
+    );
+    let output = konnect_schematic_editor::Symbol::from_sexp(&original)
+        .unwrap()
+        .to_sexp();
+    assert_eq!(flags(&output), flags(&original));
+}

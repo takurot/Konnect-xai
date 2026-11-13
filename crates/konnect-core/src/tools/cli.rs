@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
@@ -391,14 +393,62 @@ async fn run_cli(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<Stri
     Ok(run_cli_captured(cli, args, timeout_dur).await?.stdout)
 }
 
+/// Own a child until it is waited, including after its async caller is cancelled.
+struct OwnedCliChild {
+    child: Option<tokio::process::Child>,
+    work: Option<super::blocking_work::BlockingWorkGuard>,
+}
+
+impl OwnedCliChild {
+    async fn terminate(&mut self) -> std::io::Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            // Always wait even if signalling reports an already-exited child.
+            let _ = child.start_kill();
+            child.wait().await?;
+        }
+        self.disarm();
+        Ok(())
+    }
+
+    fn disarm(&mut self) {
+        self.child.take();
+        self.work.take();
+    }
+}
+
+impl Drop for OwnedCliChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let work = self.work.take();
+        let _ = child.start_kill();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // The guard was captured before spawning the child. The request
+            // cannot leave its FIFO slot until this wait reaps it.
+            runtime.spawn(async move {
+                let _work = work;
+                if let Err(error) = child.wait().await {
+                    warn!(%error, "failed to reap cancelled kicad-cli child");
+                }
+            });
+        }
+        // Without a live runtime, Child's kill_on_drop remains the fallback.
+    }
+}
+
 /// [`run_cli`], keeping stderr as well.
 async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<CliOutput> {
     info!("[BETA] kicad-cli {} {}", cli, args.join(" "));
 
     let exe = resolve_cli_executable(cli);
     let mut cmd = Command::new(&exe);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
+    let work = super::blocking_work::track_current_work();
     #[cfg(test)]
     let child = test_support::spawn_cli(&mut cmd)
         .with_context(|| format!("Failed to spawn kicad-cli: {}", cli))?;
@@ -407,10 +457,46 @@ async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Re
         .spawn()
         .with_context(|| format!("Failed to spawn kicad-cli: {}", cli))?;
 
-    let output = timeout(timeout_dur, child.wait_with_output())
-        .await
-        .with_context(|| format!("kicad-cli timed out after {:?}", timeout_dur))?
-        .with_context(|| "kicad-cli process failed")?;
+    let mut owned = OwnedCliChild {
+        child: Some(child),
+        work,
+    };
+    let child = owned.child.as_mut().expect("new child is owned");
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("kicad-cli stdout pipe missing")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("kicad-cli stderr pipe missing")?;
+    let mut output_stdout = Vec::new();
+    let mut output_stderr = Vec::new();
+    let completion = timeout(timeout_dur, async {
+        tokio::try_join!(
+            owned.child.as_mut().expect("child remains owned").wait(),
+            stdout.read_to_end(&mut output_stdout),
+            stderr.read_to_end(&mut output_stderr),
+        )
+    })
+    .await;
+    let status = match completion {
+        Ok(result) => result.context("kicad-cli process failed")?.0,
+        Err(elapsed) => {
+            owned
+                .terminate()
+                .await
+                .context("failed to stop timed-out kicad-cli")?;
+            return Err(elapsed)
+                .with_context(|| format!("kicad-cli timed out after {:?}", timeout_dur));
+        }
+    };
+    owned.disarm();
+    let output = std::process::Output {
+        status,
+        stdout: output_stdout,
+        stderr: output_stderr,
+    };
 
     if !output.stderr.is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -462,7 +548,43 @@ async fn verify_nonempty_file(path: &Path, artifact: &str) -> Result<u64> {
     Ok(metadata.len())
 }
 
-fn export_staging_dir(destination: &Path) -> Result<tempfile::TempDir> {
+struct ExportStaging {
+    directory: Option<tempfile::TempDir>,
+    preserve: std::sync::atomic::AtomicBool,
+}
+
+impl ExportStaging {
+    fn new(directory: tempfile::TempDir) -> Self {
+        Self {
+            directory: Some(directory),
+            preserve: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.directory
+            .as_ref()
+            .expect("live staging owner has its directory")
+            .path()
+    }
+
+    fn preserve_for_recovery(&self) {
+        self.preserve
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for ExportStaging {
+    fn drop(&mut self) {
+        if self.preserve.load(std::sync::atomic::Ordering::Acquire) {
+            if let Some(directory) = self.directory.take() {
+                let _preserved_path = directory.keep();
+            }
+        }
+    }
+}
+
+fn export_staging_dir(destination: &Path) -> Result<Arc<ExportStaging>> {
     let parent = destination
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -471,42 +593,139 @@ fn export_staging_dir(destination: &Path) -> Result<tempfile::TempDir> {
     tempfile::Builder::new()
         .prefix(".konnect-export-")
         .tempdir_in(parent)
+        .map(|directory| Arc::new(ExportStaging::new(directory)))
         .context("failed to create an export staging directory")
 }
 
 /// Publish a verified artifact without letting a stale destination stand in
 /// for output from the current command. The staging directory is a sibling of
 /// the destination, so every rename remains on the same filesystem.
-async fn publish_verified_file(staged: &Path, destination: &Path, artifact: &str) -> Result<u64> {
-    let size = verify_nonempty_file(staged, artifact).await?;
-    if let Some(parent) = destination.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+async fn publish_verified_file(
+    staged: &Path,
+    destination: &Path,
+    artifact: &str,
+    staging: &Arc<ExportStaging>,
+) -> Result<u64> {
+    publish_verified_file_with(
+        staged.to_path_buf(),
+        destination.to_path_buf(),
+        artifact.into(),
+        staging.clone(),
+        || {},
+    )
+    .await
+}
 
-    if !destination.exists() {
-        tokio::fs::rename(staged, destination).await?;
+async fn publish_verified_file_with(
+    staged: PathBuf,
+    destination: PathBuf,
+    artifact: String,
+    staging: Arc<ExportStaging>,
+    before_install: impl FnOnce() + Send + 'static,
+) -> Result<u64> {
+    super::blocking_work::spawn_tracked_blocking(move || {
+        // Cancellation may drop every caller frame; retain the staged file and
+        // previous-output backup through the entire synchronous publication.
+        publish_verified_file_blocking(&staged, &destination, &artifact, &staging, before_install)
+    })
+    .await
+    .context("export publication worker failed")?
+}
+
+fn publication_uncertain(
+    destination: &Path,
+    backup: &Path,
+    staged: &Path,
+    staging: &ExportStaging,
+    reason: impl std::fmt::Display,
+) -> anyhow::Error {
+    staging.preserve_for_recovery();
+    konnect_sexp::SexpError::MutationOutcomeUncertain {
+        path: destination.to_path_buf(),
+        reason: format!("{reason}; staging retained for recovery at {}. Inspect previous-output backup path {} and staged output path {} before retrying", staging.path().display(), backup.display(), staged.display()),
+    }.into()
+}
+
+fn ensure_regular_backup(
+    backup: &Path,
+    destination: &Path,
+    staged: &Path,
+    staging: &ExportStaging,
+) -> Result<()> {
+    if std::fs::symlink_metadata(backup).is_ok_and(|metadata| metadata.is_file()) {
+        return Ok(());
+    }
+    // The entry may have changed type after preflight. Do not recursively
+    // delete an unexpected directory when the staging owner is released.
+    if let Err(restore_error) = konnect_sexp::rename_noreplace(backup, destination) {
+        return Err(publication_uncertain(destination, backup, staged, staging,
+            format!("output destination changed to a non-regular entry before publication and could not be restored ({restore_error})")));
+    }
+    anyhow::bail!(
+        "output destination changed to a non-regular entry; restored {} without publishing",
+        destination.display()
+    )
+}
+
+fn publish_verified_file_blocking(
+    staged: &Path,
+    destination: &Path,
+    artifact: &str,
+    staging: &ExportStaging,
+    before_install: impl FnOnce(),
+) -> Result<u64> {
+    let metadata = std::fs::metadata(staged).with_context(|| {
+        format!(
+            "{artifact} export reported success but did not create {}",
+            staged.display()
+        )
+    })?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{artifact} export output {} is not a file",
+        staged.display()
+    );
+    anyhow::ensure!(
+        metadata.len() > 0,
+        "{artifact} export created an empty file at {}",
+        staged.display()
+    );
+    let size = metadata.len();
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let existing = match std::fs::symlink_metadata(destination) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("could not inspect export destination"),
+    };
+    if existing.is_none() {
+        before_install();
+        konnect_sexp::rename_noreplace(staged, destination)?;
         return Ok(size);
     }
-
+    anyhow::ensure!(
+        existing.is_some_and(|metadata| metadata.is_file()),
+        "export destination {} must be absent or a regular file",
+        destination.display()
+    );
     let file_name = destination
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("artifact");
     let backup = staged.with_file_name(format!(".konnect-previous-{file_name}"));
-    tokio::fs::rename(destination, &backup)
-        .await
-        .with_context(|| {
-            format!(
-                "cannot preserve the previous artifact at {} before publishing",
-                destination.display()
-            )
-        })?;
-    if let Err(install_error) = tokio::fs::rename(staged, destination).await {
-        if let Err(restore_error) = tokio::fs::rename(&backup, destination).await {
-            anyhow::bail!(
-                "failed to publish {} ({install_error}) and restore its previous contents ({restore_error})",
-                destination.display()
-            );
+    konnect_sexp::rename_noreplace(destination, &backup).with_context(|| {
+        format!(
+            "cannot preserve the previous artifact at {} before publishing",
+            destination.display()
+        )
+    })?;
+    ensure_regular_backup(&backup, destination, staged, staging)?;
+    before_install();
+    if let Err(install_error) = konnect_sexp::rename_noreplace(staged, destination) {
+        if let Err(restore_error) = konnect_sexp::rename_noreplace(&backup, destination) {
+            return Err(publication_uncertain(destination, &backup, staged, staging,
+                format!("failed to publish {} ({install_error}) and restore its previous contents ({restore_error})", destination.display())));
         }
         return Err(install_error).with_context(|| {
             format!(
@@ -515,7 +734,10 @@ async fn publish_verified_file(staged: &Path, destination: &Path, artifact: &str
             )
         });
     }
-    tokio::fs::remove_file(backup).await?;
+    if let Err(cleanup_error) = std::fs::remove_file(&backup) {
+        return Err(publication_uncertain(destination, &backup, staged, staging,
+            format!("verified output was installed, but previous-output backup cleanup failed ({cleanup_error})")));
+    }
     Ok(size)
 }
 
@@ -532,7 +754,7 @@ pub(crate) async fn publish_verified_bytes(
         .path()
         .join(output.file_name().context("output has no file name")?);
     tokio::fs::write(&staged, bytes).await?;
-    publish_verified_file(&staged, output, artifact).await?;
+    publish_verified_file(&staged, output, artifact, &staging).await?;
     Ok(())
 }
 
@@ -540,6 +762,7 @@ async fn publish_verified_files(
     staged_files: &[PathBuf],
     output_dir: &Path,
     artifact: &str,
+    staging: &Arc<ExportStaging>,
 ) -> Result<Vec<PathBuf>> {
     for staged in staged_files {
         verify_nonempty_file(staged, artifact).await?;
@@ -551,7 +774,7 @@ async fn publish_verified_files(
             .file_name()
             .context("export produced a path without a file name")?;
         let destination = output_dir.join(file_name);
-        publish_verified_file(staged, &destination, artifact).await?;
+        publish_verified_file(staged, &destination, artifact, staging).await?;
         published.push(destination);
     }
     Ok(published)
@@ -1238,7 +1461,7 @@ pub async fn export_schematic_svg(
     }
     staged_files.sort();
     verify_nonempty_file(&staged_root, "schematic SVG").await?;
-    publish_verified_files(&staged_files, output_dir, "schematic SVG").await?;
+    publish_verified_files(&staged_files, output_dir, "schematic SVG", &staging).await?;
     Ok(output_dir.join(format!("{}.svg", stem)))
 }
 
@@ -1293,7 +1516,7 @@ pub async fn export_schematic_pdf(
         options,
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    publish_verified_file(&staged, output, "schematic PDF").await?;
+    publish_verified_file(&staged, output, "schematic PDF", &staging).await?;
     Ok(())
 }
 
@@ -1402,7 +1625,7 @@ async fn export_bom_with_options(
         ref_range_delimiter,
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    publish_verified_file(&staged, output, "BOM").await?;
+    publish_verified_file(&staged, output, "BOM", &staging).await?;
     Ok(())
 }
 
@@ -1503,7 +1726,7 @@ pub async fn export_gerber(
             staging.path().display()
         );
     }
-    publish_verified_files(&files, output_dir, "Gerber").await
+    publish_verified_files(&files, output_dir, "Gerber", &staging).await
 }
 
 /// `--output` for a drill export names a *directory*, and some kicad-cli
@@ -1575,7 +1798,7 @@ pub async fn export_drill(cli: &str, pcb: &Path, output_dir: &Path) -> Result<Ve
     for file in &files {
         verify_nonempty_file(file, "drill").await?;
     }
-    publish_verified_files(&files, output_dir, "drill").await
+    publish_verified_files(&files, output_dir, "drill", &staging).await
 }
 
 fn single_file_pcb_export_args(
@@ -1628,7 +1851,7 @@ pub async fn export_pdf(
     );
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    publish_verified_file(&staged, output, "PCB PDF").await?;
+    publish_verified_file(&staged, output, "PCB PDF", &staging).await?;
     Ok(())
 }
 
@@ -1783,7 +2006,7 @@ async fn export_position_file_with_options(
         exclude_dnp,
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    publish_verified_file(&staged, output, "position file").await?;
+    publish_verified_file(&staged, output, "position file", &staging).await?;
     Ok(())
 }
 
@@ -3806,5 +4029,264 @@ mod cli_discovery_tests {
             "resolved path is not a file: {}",
             resolved.display()
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod cancellation_tests {
+    use super::*;
+
+    async fn wait_for_pid(path: &Path) -> String {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(path) {
+                    if !pid.is_empty() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fake CLI must start")
+    }
+
+    fn is_running(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    async fn assert_terminated(pid: &str) {
+        let terminated = timeout(Duration::from_secs(3), async {
+            while is_running(pid) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !terminated {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", pid])
+                .status();
+        }
+        assert!(terminated, "cancelled/timed-out CLI {pid} was left running");
+    }
+
+    async fn start_cli(
+        timeout_dur: Duration,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        tokio::task::JoinHandle<Result<CliOutput>>,
+        super::super::blocking_work::BlockingWorkTracker,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_support::write_script(
+            dir.path(),
+            "slow-cli",
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$1\"\nexec sleep 60\n",
+            "",
+        );
+        let pid_path = dir.path().join("pid");
+        let pid_arg = pid_path.clone();
+        let tracker = super::super::blocking_work::BlockingWorkTracker::default();
+        let owned = tracker.clone();
+        let task = tokio::spawn(async move {
+            owned
+                .scope(run_cli_captured(
+                    cli.to_str().unwrap(),
+                    &[pid_arg.to_str().unwrap()],
+                    timeout_dur,
+                ))
+                .await
+        });
+        (dir, pid_path, task, tracker)
+    }
+
+    #[tokio::test]
+    async fn dropping_cli_future_terminates_child() {
+        let (_dir, pid_path, task, _tracker) = start_cli(Duration::from_secs(60)).await;
+        let pid = wait_for_pid(&pid_path).await;
+        assert!(is_running(&pid));
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert_terminated(&pid).await;
+    }
+
+    #[tokio::test]
+    async fn cli_timeout_terminates_child() {
+        let (_dir, pid_path, task, _tracker) = start_cli(Duration::from_millis(500)).await;
+        let pid = wait_for_pid(&pid_path).await;
+        assert!(
+            matches!(task.await.unwrap(), Err(error) if error.to_string().contains("timed out"))
+        );
+        assert_terminated(&pid).await;
+    }
+    #[tokio::test]
+    async fn cancelled_cli_remains_request_owned_until_child_is_reaped() {
+        let (_dir, pid_path, task, tracker) = start_cli(Duration::from_secs(60)).await;
+        let pid = wait_for_pid(&pid_path).await;
+        let tracked_while_running = !tracker.is_idle();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        timeout(Duration::from_secs(3), tracker.wait_idle())
+            .await
+            .unwrap();
+        assert_terminated(&pid).await;
+        assert!(
+            tracked_while_running,
+            "an owned CLI child must retain the request's work guard"
+        );
+    }
+}
+
+#[cfg(test)]
+mod publication_cancellation_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_publication_keeps_staging_and_backup_until_worker_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("export.pdf");
+        std::fs::write(&destination, b"previous export").unwrap();
+        let staging = Arc::new(ExportStaging::new(
+            tempfile::tempdir_in(directory.path()).unwrap(),
+        ));
+        let staging_path = staging.path().to_path_buf();
+        let staged = staging.path().join("export.pdf");
+        std::fs::write(&staged, b"verified export").unwrap();
+        let tracker = super::super::blocking_work::BlockingWorkTracker::default();
+        let tracked = tracker.clone();
+        let owned_staging = staging.clone();
+        let output = destination.clone();
+        let paused = Arc::new(Notify::new());
+        let observed = paused.clone();
+        let (release, receive) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            tracked
+                .scope(publish_verified_file_with(
+                    staged,
+                    output,
+                    "fixture PDF".into(),
+                    owned_staging,
+                    move || {
+                        observed.notify_one();
+                        receive.recv().unwrap();
+                    },
+                ))
+                .await
+        });
+        timeout(Duration::from_secs(3), paused.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        drop(staging);
+        let retained = staging_path.exists() && !tracker.is_idle();
+        release.send(()).unwrap();
+        timeout(Duration::from_secs(3), tracker.wait_idle())
+            .await
+            .unwrap();
+        assert!(
+            retained,
+            "cancelled publication dropped its staging/backup ownership"
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"verified export");
+        assert!(
+            !staging_path.exists(),
+            "worker must release its staging owner"
+        );
+    }
+    #[tokio::test]
+    async fn failed_install_and_restore_keep_the_original_backup_for_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("export.pdf");
+        std::fs::write(&destination, b"previous export").unwrap();
+        let staging = export_staging_dir(&destination).unwrap();
+        let staging_path = staging.path().to_path_buf();
+        let staged = staging.path().join("export.pdf");
+        std::fs::write(&staged, b"verified export").unwrap();
+        let obstruction = destination.clone();
+        let result = publish_verified_file_with(
+            staged.clone(),
+            destination.clone(),
+            "fixture PDF".into(),
+            staging.clone(),
+            move || std::fs::create_dir(&obstruction).unwrap(),
+        )
+        .await;
+        drop(staging);
+        let error = result.unwrap_err();
+        let backup = staging_path.join(".konnect-previous-export.pdf");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"previous export");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"verified export");
+        assert!(
+            destination.is_dir(),
+            "external obstruction must remain untouched"
+        );
+        assert!(matches!(
+            error.downcast_ref::<konnect_sexp::SexpError>(),
+            Some(konnect_sexp::SexpError::MutationOutcomeUncertain { .. })
+        ));
+        assert!(error.to_string().contains(&backup.display().to_string()));
+    }
+
+    #[tokio::test]
+    async fn publication_refuses_a_directory_destination_without_moving_its_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("export.pdf");
+        std::fs::create_dir(&destination).unwrap();
+        let sentinel = destination.join("user-data");
+        std::fs::write(&sentinel, b"must survive").unwrap();
+        let staging = export_staging_dir(&destination).unwrap();
+        let staged = staging.path().join("export.pdf");
+        std::fs::write(&staged, b"verified export").unwrap();
+        assert!(
+            publish_verified_file(&staged, &destination, "fixture PDF", &staging)
+                .await
+                .is_err()
+        );
+        drop(staging);
+        assert!(destination.is_dir());
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"must survive");
+    }
+
+    #[test]
+    fn an_unexpected_directory_backup_is_restored_or_preserved_without_clobber() {
+        for obstruction in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("export.pdf");
+            let staging = export_staging_dir(&destination).unwrap();
+            let backup = staging.path().join(".konnect-previous-export.pdf");
+            let staged = staging.path().join("export.pdf");
+            std::fs::create_dir(&backup).unwrap();
+            std::fs::write(backup.join("user-data"), b"directory payload").unwrap();
+            std::fs::write(&staged, b"verified export").unwrap();
+            if obstruction {
+                std::fs::write(&destination, b"external output").unwrap();
+            }
+            let result = ensure_regular_backup(&backup, &destination, &staged, &staging);
+            assert!(result.is_err());
+            drop(staging);
+            if obstruction {
+                assert_eq!(std::fs::read(destination).unwrap(), b"external output");
+                assert_eq!(
+                    std::fs::read(backup.join("user-data")).unwrap(),
+                    b"directory payload"
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read(destination.join("user-data")).unwrap(),
+                    b"directory payload"
+                );
+            }
+        }
     }
 }

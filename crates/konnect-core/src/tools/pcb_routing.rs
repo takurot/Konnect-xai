@@ -12,7 +12,7 @@ use crate::tools::{
     with_bound_board_ipc_classified, BoardBinding, ToolContext, ToolDef,
 };
 use anyhow::Context;
-use konnect_sexp::writer::{apply_edits, write_atomic, write_atomic_if_unchanged, SexpEdit};
+use konnect_sexp::writer::{apply_edits, write_atomic_if_unchanged, SexpEdit};
 use prost::Message;
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
@@ -233,7 +233,7 @@ pub fn tools() -> Vec<ToolDef> {
             "Create or update a netclass in the project's design rules. Writes \
              net_settings in the sibling .kicad_pro (where KiCad keeps netclasses \
              since v7); the board file is never touched. Requires the project file \
-             to exist. Refuses while KiCad holds the board open, because KiCad's next \
+             to exist. Refuses while KiCad holds the board or project lock, because KiCad's next \
              save rewrites the project file from its own copy. An update changes only \
              the settings you name. To see what a \
              class holds, call get_netclasses rather than this tool: naming a class \
@@ -294,7 +294,7 @@ pub fn tools() -> Vec<ToolDef> {
             "Assign a net to an existing netclass, as a netclass_patterns entry in \
              the sibling .kicad_pro. The class must already exist (create_netclass). \
              Reassigning moves the net's entry to the new class. Refuses while KiCad \
-             holds the board open, because KiCad's next save rewrites the project \
+             holds the board or project lock, because KiCad's next save rewrites the project \
              file from its own copy.",
             json!({
                 "type": "object",
@@ -1301,7 +1301,7 @@ fn project_settings_path(board_path: &std::path::Path) -> std::path::PathBuf {
 /// reads) when it is absent.
 fn load_project_settings(
     board_path: &std::path::Path,
-) -> anyhow::Result<Result<(std::path::PathBuf, serde_json::Value), CallToolResult>> {
+) -> anyhow::Result<Result<(std::path::PathBuf, serde_json::Value, String), CallToolResult>> {
     let pro = project_settings_path(board_path);
     if !pro.exists() {
         return Ok(Err(CallToolResult::error(format!(
@@ -1311,9 +1311,10 @@ fn load_project_settings(
             pro.display()
         ))));
     }
-    let settings: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&pro)?)
+    let source = konnect_sexp::writer::read_consistent(&pro)?;
+    let settings: serde_json::Value = serde_json::from_str(&source)
         .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", pro.display()))?;
-    Ok(Ok((pro, settings)))
+    Ok(Ok((pro, settings, source)))
 }
 
 /// The netclass writers' guard. Saving the board in KiCad also rewrites the
@@ -1332,11 +1333,13 @@ async fn refuse_while_kicad_holds_the_board(
 fn save_project_settings(
     pro: &std::path::Path,
     settings: &serde_json::Value,
+    expected: &str,
 ) -> anyhow::Result<()> {
     // KiCad's own writer emits 2-space-indented JSON with alphabetical keys;
     // serde_json's pretty printer matches both, so the diff stays minimal.
-    write_atomic(
+    write_atomic_if_unchanged(
         pro,
+        expected,
         &format!("{}\n", serde_json::to_string_pretty(settings)?),
     )?;
     Ok(())
@@ -1401,7 +1404,10 @@ async fn handle_create_netclass(
     // Only the Default must be complete. Every other class may stay sparse.
     let is_default = name == DEFAULT_CLASS_NAME;
 
-    let (pro, mut settings) = match load_project_settings(&board_path)? {
+    konnect_sexp::writer::ensure_kicad_design_document_is_closed(&project_settings_path(
+        &board_path,
+    ))?;
+    let (pro, mut settings, source) = match load_project_settings(&board_path)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -1488,7 +1494,7 @@ async fn handle_create_netclass(
     // whole project file — the serialiser re-emits the document rather than
     // patching it — for a call that decided nothing.
     if changed {
-        save_project_settings(&pro, &settings)?;
+        save_project_settings(&pro, &settings, &source)?;
     }
 
     let note = if backfilled.is_empty() {
@@ -1592,7 +1598,7 @@ async fn handle_get_netclasses(
         Ok(source) => source,
         Err(refusal) => return Ok(refusal),
     };
-    let (pro, settings) = match load_project_settings(&board_path)? {
+    let (pro, settings, _source) = match load_project_settings(&board_path)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -1828,7 +1834,10 @@ async fn handle_assign_net_to_class(
         return Ok(refusal);
     }
 
-    let (pro, mut settings) = match load_project_settings(&board_path)? {
+    konnect_sexp::writer::ensure_kicad_design_document_is_closed(&project_settings_path(
+        &board_path,
+    ))?;
+    let (pro, mut settings, source) = match load_project_settings(&board_path)? {
         Ok(v) => v,
         Err(refusal) => return Ok(refusal),
     };
@@ -1889,7 +1898,7 @@ async fn handle_assign_net_to_class(
     } else {
         patterns.push(json!({ "netclass": netclass, "pattern": net_name }));
     }
-    save_project_settings(&pro, &settings)?;
+    save_project_settings(&pro, &settings, &source)?;
 
     Ok(CallToolResult::json(&json!({
         "assigned": true,

@@ -257,7 +257,7 @@ impl SchematicCommand {
             vec![SexpEdit::replace(
                 property_range.0 + value_range.0,
                 property_range.0 + value_range.1,
-                escape_quoted(value),
+                crate::escaped_string(value),
             )],
         );
         Self::replace_item(source, id, replacement, label)
@@ -899,14 +899,6 @@ fn quoted_string_contents(source: &str) -> Vec<(usize, usize)> {
     ranges
 }
 
-fn escape_quoted(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\t', "\\t")
-}
-
 fn line_indent(source: &str, offset: usize) -> String {
     let line_start = source[..offset].rfind('\n').map_or(0, |index| index + 1);
     source[line_start..offset]
@@ -960,9 +952,9 @@ fn insert_symbol_instance_path(
             .filter(|node| node.head() == Some("instances"))
             .map(|_| (*start, *end))
     });
-    let project_name_escaped = escape_quoted(project_name);
-    let path_escaped = escape_quoted(path);
-    let reference_escaped = escape_quoted(reference);
+    let project_name_escaped = crate::escaped_string(project_name);
+    let path_escaped = crate::escaped_string(path);
+    let reference_escaped = crate::escaped_string(reference);
 
     if let Some((instances_start, instances_end)) = instances {
         let instances_source = &symbol[instances_start..instances_end];
