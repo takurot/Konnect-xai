@@ -182,13 +182,14 @@ fn native_assembly_attributes_survive_real_kicad_bom_export() {
             .map(|line| line.trim_matches('"').to_string())
             .collect::<Vec<_>>()
     };
+    let resistor_control = "R1-R4";
     let before = export_references("before.csv");
     assert!(
         before.iter().any(|reference| reference == "U1"),
         "{before:?}"
     );
     assert!(
-        before.iter().any(|reference| reference == "R1"),
+        before.iter().any(|reference| reference == resistor_control),
         "{before:?}"
     );
 
@@ -219,7 +220,10 @@ fn native_assembly_attributes_survive_real_kicad_bom_export() {
         !after.iter().any(|reference| reference == "U1"),
         "{after:?}"
     );
-    assert!(after.iter().any(|reference| reference == "R1"), "{after:?}");
+    assert!(
+        after.iter().any(|reference| reference == resistor_control),
+        "{after:?}"
+    );
 
     let project = dir.path().join("mounting-hole");
     mcp.tool(
