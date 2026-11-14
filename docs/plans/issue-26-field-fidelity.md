@@ -109,3 +109,17 @@ branch coverage for this source are still unmeasured. No 80-percent claim is
 made. Independent review of the final source and real KiCad acceptance remain
 required before treating the issue as complete. Manual cleanup covered only the
 changed code because the deslop tool is unavailable.
+
+
+A final independent review found that KiCad 10.0.5's rectangle serializer always
+emits `corner_radius`, including zero, while the local rectangle builder omits
+that default. Shared presentation verification now treats an omitted radius and
+an explicit zero as the same geometry. Nonzero radii remain significant.
+
+The new regression failed before the correction and all five presentation
+tests passed afterward in an exact-source harness using this worktree's own
+previously built IPC types and builders. This is source-level evidence, not a
+real KiCad session. The four normal gates for this correction are pending.
+
+Serializer evidence is
+[KiCad 10.0.5 `EDA_SHAPE::Serialize`](https://github.com/KiCad/kicad/blob/10.0.5/common/eda_shape.cpp#L234-L240).

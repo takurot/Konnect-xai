@@ -127,6 +127,17 @@ impl Presentation {
                     | common::StrokeLineStyle::SlsSolid => common::StrokeLineStyle::SlsSolid as i32,
                     other => other as i32,
                 };
+                if let Some(common::graphic_shape::Geometry::Rectangle(rectangle)) =
+                    shape.geometry.as_mut()
+                {
+                    if rectangle
+                        .corner_radius
+                        .as_ref()
+                        .is_some_and(|radius| radius.value_nm == 0)
+                    {
+                        rectangle.corner_radius = None;
+                    }
+                }
                 strokes.push((
                     item.layer,
                     shape.encode_to_vec(),
@@ -429,6 +440,32 @@ mod tests {
                 expected.verify(&[actual]).is_err(),
                 "missed stroke change {change}"
             );
+        }
+    }
+
+    #[test]
+    fn presentation_accepts_native_zero_rectangle_radius_but_checks_nonzero_radius() {
+        let mut footprint = board::FootprintInstance::decode(item().value.as_slice()).unwrap();
+        let rectangle = crate::builders::board_rectangle("F.CrtYd", 0.1, 0.0, 0.0, 1.0, 2.0, false);
+        footprint.definition.as_mut().unwrap().items = vec![crate::builders::pack_any(
+            &rectangle,
+            "kiapi.board.types.BoardGraphicShape",
+        )];
+        let wanted = crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+        let expected = FootprintPresentation::from_items([&wanted]).unwrap();
+        for radius in [0, 1] {
+            let mut graphic = rectangle.clone();
+            let Some(common::graphic_shape::Geometry::Rectangle(rectangle)) =
+                graphic.shape.as_mut().unwrap().geometry.as_mut()
+            else {
+                panic!("expected rectangle geometry");
+            };
+            rectangle.corner_radius = Some(common::Distance { value_nm: radius });
+            footprint.definition.as_mut().unwrap().items[0] =
+                crate::builders::pack_any(&graphic, "kiapi.board.types.BoardGraphicShape");
+            let actual =
+                crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+            assert_eq!(expected.verify(&[actual]).is_ok(), radius == 0);
         }
     }
 
