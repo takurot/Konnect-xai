@@ -101,3 +101,26 @@ Earlier Cargo runs used a shared target directory and may contain another
 worktree's workspace artifacts. They are not final validation evidence. All
 Cargo tests, four quality gates, coverage and real KiCad checks require fresh
 results from this worktree's isolated target.
+
+## Verify the published identity
+
+After publication, one exact-document footprint response supplies both the
+complete symbol-path/reference check and the existing geometry warnings.
+Readback refusal, malformed data, missing or ambiguous identity, and changed
+paths return a typed uncertain outcome. The published commit is not blindly
+dropped. Existing native unknown and recovered markers remain intact.
+
+The registered-tool regression injects nine faults only after `CmaCommit`.
+It requires `ipc_outcome_unknown`, `retry_safe=false`, one committed action,
+no drop, and the updated mock board state. The prior pre-publication mismatch
+tests still require the normal drop attempt.
+
+The old post-publication call expression failed an isolated refusal assertion.
+The corrected error-context expression passed two checks, and neutralizing
+that classification made the ordinary-error assertion fail. Those checks use
+stand-in transport marker types and do not prove the registered handler.
+The registered post-publication fault test then passed all nine modes through
+this worktree's isolated Cargo target. Its historical log name is
+`issue15-postpublish-red.log`, but that queued run executed the corrected code
+and is Green evidence. Final-head workspace gates and real KiCad verification
+remain required.

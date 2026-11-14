@@ -519,8 +519,31 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                     error
                 }
             })?;
-            for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected)?
-            {
+            let readback = (|| {
+                let items = client.get_items_in(
+                    snapshot.document.clone(),
+                    konnect_ipc::gen::kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+                )?;
+                symbol_paths.verify_items(&items)?;
+                verify_board_matches_what_was_sent(&items, &expected)
+            })()
+            .map_err(|error: anyhow::Error| {
+                if error.downcast_ref::<konnect_ipc::client::IpcOutcomeUnknown>().is_some()
+                    || error.downcast_ref::<konnect_ipc::client::IpcBatchRecovered>().is_some()
+                {
+                    error.context(format!("published PCB sync readback failed on {}", ipc_board.display()))
+                } else {
+                    let reason = format!(
+                        "published PCB sync readback failed on {}: {error:#}; inspect the board before retrying",
+                        ipc_board.display()
+                    );
+                    error.context(konnect_ipc::client::IpcOutcomeUnknown {
+                        command: "GetItems".to_string(),
+                        reason,
+                    })
+                }
+            })?;
+            for detail in readback {
                 plan.diagnostics.push(conflict(
                     "board_readback_differs",
                     format!(
@@ -1687,7 +1710,7 @@ fn footprint_shapes<'a>(
     out
 }
 
-/// Read the board back and hold it to what was just sent.
+/// Compare the board readback with what was just sent.
 ///
 /// `create_items`/`update_items` only confirm that KiCad *accepted* each item,
 /// and the counts this tool reports are copied from the plan — so when #244
@@ -1709,19 +1732,12 @@ fn footprint_shapes<'a>(
 /// error over that is worse than the warning. Tighten it once it has been
 /// watched against a live KiCad; see the note on #244.
 fn verify_board_matches_what_was_sent(
-    client: &konnect_ipc::KiCadIpcClient,
-    document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+    items: &[prost_types::Any],
     expected: &BTreeMap<String, FootprintShape>,
 ) -> Result<Vec<String>> {
-    use konnect_ipc::gen::kiapi;
-
     if expected.is_empty() {
         return Ok(Vec::new());
     }
-    let items = client.get_items_in(
-        document.clone(),
-        kiapi::common::types::KiCadObjectType::KotPcbFootprint,
-    )?;
     let actual = footprint_shapes(items.iter());
 
     let mut corrupted = Vec::new();
@@ -4746,13 +4762,15 @@ mod tests {
         WrongReference,
         MissingPath,
         MissingFootprint,
+        DuplicateFootprint,
         MalformedFootprint,
+        RejectedReadback,
         NativeUnknown,
     }
 
     #[tokio::test]
     async fn issue_474_apply_preserves_every_board_only_object() {
-        sync_with_symbol_path_readback(SymbolPathReadback::AsSent).await;
+        sync_with_symbol_path_readback(SymbolPathReadback::AsSent, false).await;
     }
 
     #[tokio::test]
@@ -4765,16 +4783,36 @@ mod tests {
             SymbolPathReadback::MissingFootprint,
             SymbolPathReadback::MalformedFootprint,
         ] {
-            sync_with_symbol_path_readback(readback).await;
+            sync_with_symbol_path_readback(readback, false).await;
         }
     }
 
     #[tokio::test]
     async fn symbol_path_readback_native_unknown_never_blindly_drops_the_commit() {
-        sync_with_symbol_path_readback(SymbolPathReadback::NativeUnknown).await;
+        sync_with_symbol_path_readback(SymbolPathReadback::NativeUnknown, false).await;
     }
 
-    async fn sync_with_symbol_path_readback(path_readback: SymbolPathReadback) {
+    #[tokio::test]
+    async fn published_symbol_path_readback_never_reports_preflight_conflict() {
+        for readback in [
+            SymbolPathReadback::WrongUuid,
+            SymbolPathReadback::WrongHumanReadable,
+            SymbolPathReadback::WrongReference,
+            SymbolPathReadback::MissingPath,
+            SymbolPathReadback::MissingFootprint,
+            SymbolPathReadback::DuplicateFootprint,
+            SymbolPathReadback::MalformedFootprint,
+            SymbolPathReadback::RejectedReadback,
+            SymbolPathReadback::NativeUnknown,
+        ] {
+            sync_with_symbol_path_readback(readback, true).await;
+        }
+    }
+
+    async fn sync_with_symbol_path_readback(
+        path_readback: SymbolPathReadback,
+        after_publish: bool,
+    ) {
         use crate::router::ToolRouter;
         use crate::tools::cli::test_support::write_script;
         use crate::tools::{ServerConfig, ToolContext};
@@ -4787,6 +4825,7 @@ mod tests {
             footprints: Arc<Mutex<Vec<prost_types::Any>>>,
             zones: Arc<Mutex<Vec<prost_types::Any>>>,
             mutated: Arc<std::sync::atomic::AtomicBool>,
+            published: Arc<std::sync::atomic::AtomicBool>,
             commit_actions: Arc<Mutex<Vec<i32>>>,
         }
 
@@ -4889,6 +4928,7 @@ mod tests {
             footprints: Arc::new(Mutex::new(vec![schematic_backed, logo, fiducial])),
             zones: Arc::new(Mutex::new(vec![copper_zone, keepout])),
             mutated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            published: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             commit_actions: Arc::new(Mutex::new(Vec::new())),
         };
         let footprints_before = state.footprints.lock().unwrap().clone();
@@ -4928,6 +4968,10 @@ mod tests {
                             if responder_state
                                 .mutated
                                 .load(std::sync::atomic::Ordering::SeqCst)
+                                && (!after_publish
+                                    || responder_state
+                                        .published
+                                        .load(std::sync::atomic::Ordering::SeqCst))
                             {
                                 match path_readback {
                                     SymbolPathReadback::MissingFootprint => {
@@ -4935,6 +4979,19 @@ mod tests {
                                     }
                                     SymbolPathReadback::MalformedFootprint => {
                                         items[0].value = vec![0xff];
+                                    }
+                                    SymbolPathReadback::DuplicateFootprint => {
+                                        items.push(items[0].clone());
+                                    }
+                                    SymbolPathReadback::RejectedReadback => {
+                                        return Some(konnect_ipc::builders::pack_any(
+                                            &kiapi::common::commands::GetItemsResponse {
+                                                header: None,
+                                                status: kiapi::common::types::ItemRequestStatus::IrsDocumentNotFound as i32,
+                                                items: Vec::new(),
+                                            },
+                                            "kiapi.common.commands.GetItemsResponse",
+                                        ));
                                     }
                                     SymbolPathReadback::AsSent
                                     | SymbolPathReadback::NativeUnknown => {}
@@ -5080,6 +5137,12 @@ mod tests {
                         responder_state
                             .mutated
                             .store(false, std::sync::atomic::Ordering::SeqCst);
+                    } else if request.action
+                        == kiapi::common::commands::CommitAction::CmaCommit as i32
+                    {
+                        responder_state
+                            .published
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                     return Some(konnect_ipc::builders::pack_any(
                         &kiapi::common::commands::EndCommitResponse {},
@@ -5095,6 +5158,10 @@ mod tests {
                     && transport_state
                         .mutated
                         .load(std::sync::atomic::Ordering::SeqCst)
+                    && (!after_publish
+                        || transport_state
+                            .published
+                            .load(std::sync::atomic::Ordering::SeqCst))
                 {
                     let request =
                         kiapi::common::commands::GetItems::decode(command.value.as_slice())
@@ -5170,7 +5237,21 @@ mod tests {
                 Some("ipc_outcome_unknown"),
                 "{path_readback:?}: {applied:?}"
             );
-            if path_readback == SymbolPathReadback::NativeUnknown {
+            if after_publish {
+                let ToolContent::Text { text } = &applied.content[0] else {
+                    panic!("uncertain response was not JSON text");
+                };
+                let uncertain: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(uncertain["error"]["retry_safe"], false);
+                assert_eq!(uncertain["error"]["board_state"], "unknown");
+                assert_eq!(
+                    *state.commit_actions.lock().unwrap(),
+                    vec![kiapi::common::commands::CommitAction::CmaCommit as i32],
+                    "{path_readback:?}"
+                );
+                assert!(state.mutated.load(std::sync::atomic::Ordering::SeqCst));
+                assert_ne!(*state.footprints.lock().unwrap(), footprints_before);
+            } else if path_readback == SymbolPathReadback::NativeUnknown {
                 assert!(state.commit_actions.lock().unwrap().is_empty());
                 assert!(state.mutated.load(std::sync::atomic::Ordering::SeqCst));
             } else {
