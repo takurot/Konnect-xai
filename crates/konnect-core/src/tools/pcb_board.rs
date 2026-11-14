@@ -2233,7 +2233,7 @@ async fn handle_add_board_outline(
         BoardWrite::Ipc(()) => {
             return Ok(CallToolResult::json(&json!({
                 "x1": round6(x1), "y1": round6(y1), "x2": round6(x2), "y2": round6(y2),
-                "width": (x2-x1).abs(), "height": (y2-y1).abs(),
+                "width": round6((x2-x1).abs()), "height": round6((y2-y1).abs()),
                 "corner_radius": corner_radius,
                 "line_count": line_count, "arc_count": arc_count,
                 "source": "ipc"
@@ -2252,7 +2252,7 @@ async fn handle_add_board_outline(
 
     Ok(CallToolResult::json(&json!({
         "x1": round6(x1), "y1": round6(y1), "x2": round6(x2), "y2": round6(y2),
-        "width": (x2-x1).abs(), "height": (y2-y1).abs(),
+        "width": round6((x2-x1).abs()), "height": round6((y2-y1).abs()),
         "corner_radius": corner_radius,
         "line_count": line_count, "arc_count": arc_count,
         "source": "file",
@@ -4994,6 +4994,66 @@ mod board_write_gate_tests {
             4,
             "expected four outline segments: {updated}"
         );
+    }
+
+    #[tokio::test]
+    async fn outline_responses_round_derived_millimetre_dimensions() {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+
+        for live in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let board = blank_board(directory.path());
+            let server = live.then(|| {
+                super::board_mock::spawn_kicad_holding_board(&board, |command| {
+                    if !konnect_ipc::builders::any_is(command, "kiapi.common.commands.CreateItems")
+                    {
+                        return None;
+                    }
+                    let request =
+                        kiapi::common::commands::CreateItems::decode(command.value.as_slice())
+                            .unwrap();
+                    assert_eq!(request.items.len(), 4);
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::CreateItemsResponse {
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            created_items: request
+                                .items
+                                .into_iter()
+                                .map(|item| kiapi::common::commands::ItemCreationResult {
+                                    status: Some(kiapi::common::commands::ItemStatus {
+                                        code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                        ..Default::default()
+                                    }),
+                                    item: Some(item),
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.CreateItemsResponse",
+                    ))
+                })
+            });
+            let ctx = ctx_with_ipc(
+                server
+                    .as_ref()
+                    .map_or_else(String::new, |server| server.address().to_string()),
+            );
+            let result = handle_add_board_outline(
+                &json!({
+                    "board": board.to_string_lossy(),
+                    "x1": 0.1, "y1": 0.2, "x2": 0.3, "y2": 0.4,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{:?}", result.content);
+            let response: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+            assert_eq!(response["source"], if live { "ipc" } else { "file" });
+            assert_eq!(response["width"], json!(0.2));
+            assert_eq!(response["height"], json!(0.2));
+        }
     }
 
     #[tokio::test]

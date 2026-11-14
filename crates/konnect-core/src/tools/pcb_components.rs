@@ -4625,6 +4625,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fallback_preserves_legacy_unlocked_text_without_rotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = legacy_fallback_fixture(tmp.path());
+        let footprint = tmp.path().join("Legacy.pretty/Socket.kicad_mod");
+        let source = std::fs::read_to_string(&footprint).unwrap();
+        let source = source.replace("(at 0 8.5)", "(at 0 8.5 unlocked)");
+        assert!(source.contains("(at 0 8.5 unlocked)"));
+        std::fs::write(footprint, source).unwrap();
+
+        let result = handle_place_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "footprint": "Legacy:Socket",
+                "reference": "SW1",
+                "x": 20.0,
+                "y": 30.0,
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let written = std::fs::read_to_string(board).unwrap();
+        assert!(written.contains("(at 0 8.5 unlocked)"), "{written}");
+        assert!(written.contains("(fp_text reference \"SW1\""), "{written}");
+    }
+
+    #[tokio::test]
     async fn fallback_rejects_a_duplicate_reference_without_writing() {
         let tmp = tempfile::tempdir().unwrap();
         let board = fallback_fixture(tmp.path());

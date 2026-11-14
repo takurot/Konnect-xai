@@ -192,7 +192,9 @@ fn validate_coordinate_nodes(node: &crate::SexpNode, parent: &str) -> Result<(),
         "at" => {
             check(1, Millimetres)?;
             check(2, Millimetres)?;
-            if node.get(3).is_some() {
+            let unlocked_text = parent == "fp_text"
+                && node.get(3).and_then(crate::SexpNode::as_str) == Some("unlocked");
+            if node.get(3).is_some() && !unlocked_text {
                 check(3, Finite)?;
             }
         }
@@ -1131,6 +1133,53 @@ mod tests {
             std::fs::read_to_string(artifact).unwrap(),
             "(kicad_pcb (at inf 0))"
         );
+    }
+
+    #[test]
+    fn coordinate_guard_preserves_legacy_unlocked_text_without_rotation() {
+        let board = include_str!("../tests/fixtures/placement/placement_fixture.kicad_pcb");
+        let (start, end) = find_balanced_block(board, board.find("(footprint ").unwrap()).unwrap();
+        let original = &board[start..end];
+        for at in ["(at 0 0 unlocked)", "(at 0 0 45 unlocked)"] {
+            let text = format!(
+                "(fp_text value \"**VAL\" {at} (layer \"F.Fab\") (effects (font (size 1 1))))"
+            );
+            let mut source = original.to_string();
+            source.insert_str(source.rfind(')').unwrap(), &text);
+            let directory = tempfile::tempdir().unwrap();
+            for extension in ["kicad_mod", "kicad_pcb"] {
+                let path = directory.path().join(format!("legacy.{extension}"));
+                let content = if extension == "kicad_pcb" {
+                    format!("(kicad_pcb {source})")
+                } else {
+                    source.clone()
+                };
+                write_new_atomic(&path, &content).unwrap();
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+                write_atomic_if_unchanged(&path, &content, &content).unwrap();
+                assert_eq!(std::fs::read_to_string(path).unwrap(), content);
+            }
+        }
+    }
+
+    #[test]
+    fn coordinate_guard_rejects_invalid_text_angles_and_misplaced_flags() {
+        for text in [
+            "(fp_text value x (at 0 0 NaN))",
+            "(fp_text value x (at 0 0 inf))",
+            "(fp_text value x (at 0 0 unknown))",
+            "(pad 1 smd rect (at 0 0 unlocked))",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("invalid.kicad_mod");
+            let content = format!("(footprint part {text})");
+            assert!(write_new_atomic(&path, &content).is_err());
+            assert!(!path.exists());
+            let before = "(footprint part)";
+            std::fs::write(&path, before).unwrap();
+            assert!(write_atomic_if_unchanged(&path, before, &content).is_err());
+            assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+        }
     }
 
     #[test]

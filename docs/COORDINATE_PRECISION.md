@@ -107,3 +107,20 @@ checks and do not replace isolated workspace gates. All earlier shared-target
 Cargo results are superseded because that target could reuse another worktree's
 workspace artifacts. Final compilation, all four gates, coverage and real KiCad
 remain unverified until the isolated-target runs complete.
+
+## Legacy text and reported outline dimensions
+
+Footprint text can retain `unlocked` when its optional angle is omitted, as in
+this [KiCad legacy footprint example](https://gitlab.com/kicad/code/kicad/-/issues/12617).
+The coordinate boundary recognizes that flag only inside `fp_text`. Non-finite
+angles, unknown angle tokens and misplaced flags still refuse both create and
+replacement writes. Closed-board placement preserves the authored clause.
+
+Both IPC and file outline responses round the computed millimetre width and
+height. For endpoints `0.1` and `0.3`, the reported width is `0.2`.
+
+Actual-source runtime checks reproduced the legacy refusal and both noisy
+outline expressions before correction. The writer checks and both response
+expressions pass afterward. Neutralizing angle validation fails the invalid
+angle regression. These checks do not replace the pending registered-tool and
+workspace runs at the final committed head.
