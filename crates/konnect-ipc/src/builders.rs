@@ -190,6 +190,50 @@ pub fn try_layer_from_name(name: &str) -> anyhow::Result<kiapi::board::types::Bo
     }
 }
 
+pub fn flip_layer(name: &str, copper_layer_count: usize) -> anyhow::Result<String> {
+    if let Some(number) = name.strip_prefix("In").and_then(|v| v.strip_suffix(".Cu")) {
+        let inner = number
+            .parse::<usize>()
+            .ok()
+            .filter(|inner| (1..=30).contains(inner) && !number.starts_with('0'))
+            .ok_or_else(|| anyhow::anyhow!("invalid inner copper layer '{name}'"))?;
+        if !(2..=32).contains(&copper_layer_count)
+            || !copper_layer_count.is_multiple_of(2)
+            || inner > copper_layer_count - 2
+        {
+            anyhow::bail!(
+                "inner copper layer '{name}' is not present on a {copper_layer_count}-layer board"
+            );
+        }
+        return Ok(format!("In{}.Cu", copper_layer_count - 1 - inner));
+    }
+    if matches!(name, "*.Cu" | "F&B.Cu" | "*.Mask" | "*.Paste") {
+        return Ok(name.to_string());
+    }
+    use kiapi::board::types::BoardLayer as Layer;
+    let layer = try_layer_from_name(name)?;
+    let mirrored = match layer {
+        Layer::BlFCu => Layer::BlBCu,
+        Layer::BlBCu => Layer::BlFCu,
+        Layer::BlFAdhes => Layer::BlBAdhes,
+        Layer::BlBAdhes => Layer::BlFAdhes,
+        Layer::BlFPaste => Layer::BlBPaste,
+        Layer::BlBPaste => Layer::BlFPaste,
+        Layer::BlFSilkS => Layer::BlBSilkS,
+        Layer::BlBSilkS => Layer::BlFSilkS,
+        Layer::BlFMask => Layer::BlBMask,
+        Layer::BlBMask => Layer::BlFMask,
+        Layer::BlFCrtYd => Layer::BlBCrtYd,
+        Layer::BlBCrtYd => Layer::BlFCrtYd,
+        Layer::BlFFab => Layer::BlBFab,
+        Layer::BlBFab => Layer::BlFFab,
+        _ => return Ok(name.to_string()),
+    };
+    Ok(layer_name(mirrored)
+        .expect("mirrored side layers have names")
+        .to_string())
+}
+
 /// Build a Track protobuf message.
 #[allow(clippy::too_many_arguments)]
 pub fn build_track(
@@ -706,6 +750,74 @@ pub(crate) mod tests {
         );
     }
     use kiapi::common::types::graphic_shape::Geometry;
+
+    #[test]
+    fn flip_layer_mirrors_inner_copper_for_each_stack() {
+        for (count, pairs) in [
+            (4, vec![("In1.Cu", "In2.Cu")]),
+            (6, vec![("In1.Cu", "In4.Cu"), ("In2.Cu", "In3.Cu")]),
+            (
+                8,
+                vec![
+                    ("In1.Cu", "In6.Cu"),
+                    ("In2.Cu", "In5.Cu"),
+                    ("In3.Cu", "In4.Cu"),
+                ],
+            ),
+        ] {
+            for (front, back) in pairs {
+                assert_eq!(flip_layer(front, count).unwrap(), back);
+                assert_eq!(flip_layer(back, count).unwrap(), front);
+            }
+        }
+        for count in [2, 4, 6, 8, 32] {
+            for layer in [
+                "F.Cu",
+                "F.Adhes",
+                "F.Paste",
+                "F.SilkS",
+                "F.Mask",
+                "F.CrtYd",
+                "F.Fab",
+                "Dwgs.User",
+                "User.45",
+                "*.Cu",
+                "F&B.Cu",
+                "*.Mask",
+                "*.Paste",
+            ] {
+                let once = flip_layer(layer, count).unwrap();
+                assert_eq!(flip_layer(&once, count).unwrap(), layer);
+            }
+        }
+        for (alias, expected) in [
+            ("F.Silkscreen", "B.SilkS"),
+            ("B.Courtyard", "F.CrtYd"),
+            ("F.Adhesive", "B.Adhes"),
+        ] {
+            assert_eq!(flip_layer(alias, 8).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn flip_layer_refuses_absent_or_invalid_inner_layers() {
+        for (name, count) in [
+            ("In1.Cu", 0),
+            ("In1.Cu", 2),
+            ("In3.Cu", 4),
+            ("In1.Cu", 3),
+            ("In1.Cu", 34),
+            ("In0.Cu", 8),
+            ("In01.Cu", 8),
+            ("In31.Cu", 32),
+            ("Inwhat.Cu", 8),
+            ("F.Unknown", 8),
+        ] {
+            let error = flip_layer(name, count).unwrap_err().to_string();
+            assert!(error.contains(name), "{error}");
+        }
+        assert_eq!(flip_layer("In30.Cu", 32).unwrap(), "In1.Cu");
+    }
 
     /// `layer_name` is the exact inverse of `layer_from_name` over every
     /// representable layer — computed runs included. The forward map was

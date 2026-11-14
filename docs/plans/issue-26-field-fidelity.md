@@ -160,3 +160,31 @@ geometry evidence is
 The latest four normal gates for all three native-geometry corrections are
 pending. Earlier queued gate wrappers were stopped before acquiring the build
 lane and did not execute checks.
+
+
+## Dependency integration
+
+This branch now builds on Issue17 parent
+`b5c3297ee7c925771b0af2ee3daeb4b29823da68`, which includes the Issue14
+placement-fidelity foundation. The ordinary local merge preserves library
+fields, styles, reset-text and live-loss refusals alongside copper-stack-aware
+pad/graphic/text transforms and geometry-associated readback. Both chamfer and
+layer checks use one in-transaction GetItems snapshot; presentation is still
+verified after publication. Both independent mock fault suites remain.
+
+New custom-field callers carry the actual live copper count. Their glyph mirror
+uses the same side-specific layer mask as ordinary footprint text, including
+inner copper. A new regression first failed for a drawing-layer property that
+was mirrored incorrectly. After the correction it passes inner-copper mapping,
+drawing-layer glyph preservation, reflected positions and invalid inner-layer
+refusal in the exact-source harness. This does not execute native KiCad.
+
+The preceding standalone source05931ad passed formatting, workspace tests and
+doctests, but Clippy found two clone-on-Copy expressions in a new test. Those
+two expressions were corrected in200a2e6. No full-gate pass is attributed to
+05931ad. All four normal gates for this merged candidate are pending.
+
+The checked IPC-builder Result migration remains owned by Issue18, which will
+build on this candidate. This branch does not introduce that API migration.
+The child PR remains Draft because its non-main base does not trigger regular
+CI and real KiCad acceptance and measured coverage remain separate gates.
