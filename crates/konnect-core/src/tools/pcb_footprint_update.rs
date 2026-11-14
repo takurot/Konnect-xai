@@ -2092,9 +2092,7 @@ mod tests {
                 false,
                 2,
             );
-            let error = result
-                .err()
-                .expect("nonfinite field rotation prepared a write");
+            let error = result.expect_err("nonfinite field rotation prepared a write");
             let message = format!("{error:#}");
             assert!(
                 message.contains("LCSC")
