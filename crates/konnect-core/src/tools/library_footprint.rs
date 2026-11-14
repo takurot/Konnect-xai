@@ -376,7 +376,10 @@ fn validate_graphic(graphic: &konnect_sexp::SexpNode, kind: &str) -> Result<()> 
                                 .get(1)
                                 .and_then(konnect_sexp::SexpNode::as_str)
                                 .context("graphic stroke type is missing")?;
-                            if !matches!(stroke_type, "solid" | "default") {
+                            if !matches!(
+                                stroke_type,
+                                "solid" | "default" | "dash" | "dot" | "dash_dot" | "dash_dot_dot"
+                            ) {
                                 bail!(
                                     "graphic stroke type '{stroke_type}' is not supported losslessly"
                                 );
@@ -578,5 +581,799 @@ mod tests {
         assert!(!models(&with("(hide yes)")).unwrap()[0].visible);
         assert!(!models(&with("hide")).unwrap()[0].visible);
         assert!(models(&with("(hide maybe)")).is_err());
+    }
+}
+
+fn parse_library_property(
+    property: &konnect_sexp::SexpNode,
+    require_typed_field: bool,
+) -> Result<Option<kiapi::board::types::Field>> {
+    use kiapi::common::types::LockedState;
+
+    let name = property
+        .get(1)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .context("property is missing its name")?;
+    let value = property
+        .get(2)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .with_context(|| format!("property '{name}' is missing its value"))?;
+    let mut position = None;
+    let mut rotation = 0.0;
+    let mut layer = None;
+    let mut hidden = None;
+    let mut knockout = None;
+    let mut attributes = None;
+    let mut identifier = None;
+
+    for clause in property.children().unwrap_or_default().iter().skip(3) {
+        let tag = clause
+            .head()
+            .with_context(|| format!("property '{name}' contains an unsupported atom"))?;
+        match tag {
+            "at" => {
+                if position.is_some() {
+                    bail!("property '{name}' contains duplicate 'at' clauses");
+                }
+                let count = clause.children().map_or(0, |children| children.len());
+                if !matches!(count, 3 | 4) {
+                    bail!("property '{name}' 'at' must contain x, y, and optional rotation");
+                }
+                let x = clause
+                    .get_f64(1)
+                    .with_context(|| format!("property '{name}' has an invalid X position"))?;
+                let y = clause
+                    .get_f64(2)
+                    .with_context(|| format!("property '{name}' has an invalid Y position"))?;
+                rotation = clause.get_f64(3).unwrap_or(0.0);
+                if !x.is_finite() || !y.is_finite() || !rotation.is_finite() {
+                    bail!("property '{name}' position and rotation must be finite");
+                }
+                position = Some(konnect_ipc::builders::vec2(x, y));
+            }
+            "layer" => {
+                if layer.is_some() {
+                    bail!("property '{name}' contains duplicate 'layer' clauses");
+                }
+                let layer_name = clause
+                    .get(1)
+                    .and_then(konnect_sexp::SexpNode::as_str)
+                    .filter(|name| !name.is_empty())
+                    .with_context(|| format!("property '{name}' has no layer name"))?;
+                if clause.children().map_or(0, |children| children.len()) != 2 {
+                    bail!("property '{name}' 'layer' must name exactly one layer");
+                }
+                layer = Some(
+                    konnect_ipc::builders::try_layer_from_name(layer_name)
+                        .with_context(|| format!("property '{name}' has an unsupported layer"))?
+                        as i32,
+                );
+            }
+            "hide" => {
+                if hidden.is_some() {
+                    bail!("property '{name}' contains duplicate 'hide' clauses");
+                }
+                hidden = Some(property_yes_no(clause, name, "hide")?);
+            }
+            "knockout" => {
+                if knockout.is_some() {
+                    bail!("property '{name}' contains duplicate 'knockout' clauses");
+                }
+                knockout = Some(property_yes_no(clause, name, "knockout")?);
+            }
+            "uuid" | "tstamp" => {
+                if let Some(previous) = identifier {
+                    bail!(
+                        "property '{name}' contains multiple identifier clauses ('{previous}' and '{tag}')"
+                    );
+                }
+                identifier = Some(tag);
+                if clause.children().map_or(0, |children| children.len()) != 2
+                    || clause
+                        .get(1)
+                        .and_then(konnect_sexp::SexpNode::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    bail!("property '{name}' '{tag}' must contain exactly one identifier");
+                }
+            }
+            "effects" => {
+                if attributes.is_some() {
+                    bail!("property '{name}' contains duplicate 'effects' clauses");
+                }
+                attributes = Some(parse_property_effects(clause, name)?);
+            }
+            unsupported => {
+                bail!("property '{name}' clause '{unsupported}' is not supported losslessly")
+            }
+        }
+    }
+
+    let position = match position {
+        Some(position) => position,
+        None if !require_typed_field => konnect_ipc::builders::vec2(0.0, 0.0),
+        None => bail!("property '{name}' is missing its 'at' clause"),
+    };
+    let layer = match layer {
+        Some(layer) => layer,
+        None if !require_typed_field => kiapi::board::types::BoardLayer::BlFFab as i32,
+        None => bail!("property '{name}' is missing its 'layer' clause"),
+    };
+    let mut attributes = match attributes {
+        Some(attributes) => attributes,
+        None if !require_typed_field => kiapi::common::types::TextAttributes {
+            size: Some(konnect_ipc::builders::vec2(1.0, 1.0)),
+            stroke_width: Some(konnect_ipc::builders::distance(0.15)),
+            line_spacing: 1.0,
+            keep_upright: true,
+            multiline: true,
+            visible: true,
+            horizontal_alignment: kiapi::common::types::HorizontalAlignment::HaCenter as i32,
+            vertical_alignment: kiapi::common::types::VerticalAlignment::VaCenter as i32,
+            ..Default::default()
+        },
+        None => bail!("property '{name}' is missing its 'effects' clause"),
+    };
+    attributes.angle = Some(kiapi::common::types::Angle {
+        value_degrees: rotation,
+    });
+    Ok(Some(kiapi::board::types::Field {
+        id: None,
+        name: name.to_string(),
+        text: Some(kiapi::board::types::BoardText {
+            // A library child's UUID is definition-local and cannot be reused
+            // across placed instances. Let KiCad assign the board child ID.
+            id: None,
+            text: Some(kiapi::common::types::Text {
+                position: Some(position),
+                attributes: Some(attributes),
+                text: value.to_string(),
+                hyperlink: String::new(),
+            }),
+            layer,
+            knockout: knockout.unwrap_or(false),
+            locked: LockedState::LsUnlocked as i32,
+            parent: None,
+        }),
+        visible: !hidden.unwrap_or(false),
+    }))
+}
+
+fn property_yes_no(clause: &konnect_sexp::SexpNode, name: &str, tag: &str) -> Result<bool> {
+    if clause.children().map_or(0, |children| children.len()) != 2 {
+        bail!("property '{name}' '{tag}' must contain exactly one yes/no value");
+    }
+    match clause.get(1).and_then(konnect_sexp::SexpNode::as_str) {
+        Some("yes") => Ok(true),
+        Some("no") => Ok(false),
+        _ => bail!("property '{name}' '{tag}' must be yes or no"),
+    }
+}
+
+fn parse_property_effects(
+    effects: &konnect_sexp::SexpNode,
+    name: &str,
+) -> Result<kiapi::common::types::TextAttributes> {
+    use kiapi::common::types::{HorizontalAlignment, VerticalAlignment};
+
+    let mut font = None;
+    let mut horizontal = HorizontalAlignment::HaCenter;
+    let mut vertical = VerticalAlignment::VaCenter;
+    let mut mirrored = false;
+    for clause in effects.children().unwrap_or_default().iter().skip(1) {
+        let tag = clause
+            .head()
+            .with_context(|| format!("property '{name}' effects contain an unsupported atom"))?;
+        match tag {
+            "font" => {
+                if font.replace(clause).is_some() {
+                    bail!("property '{name}' contains duplicate font clauses");
+                }
+            }
+            "justify" => {
+                for value in clause.children().unwrap_or_default().iter().skip(1) {
+                    match value.as_str().with_context(|| {
+                        format!("property '{name}' justify contains a non-atom")
+                    })? {
+                        "left" if horizontal == HorizontalAlignment::HaCenter => {
+                            horizontal = HorizontalAlignment::HaLeft
+                        }
+                        "right" if horizontal == HorizontalAlignment::HaCenter => {
+                            horizontal = HorizontalAlignment::HaRight
+                        }
+                        "top" if vertical == VerticalAlignment::VaCenter => {
+                            vertical = VerticalAlignment::VaTop
+                        }
+                        "bottom" if vertical == VerticalAlignment::VaCenter => {
+                            vertical = VerticalAlignment::VaBottom
+                        }
+                        "mirror" if !mirrored => mirrored = true,
+                        "left" | "right" => bail!(
+                            "property '{name}' has conflicting horizontal justification"
+                        ),
+                        "top" | "bottom" => {
+                            bail!("property '{name}' has conflicting vertical justification")
+                        }
+                        "mirror" => bail!("property '{name}' repeats mirrored justification"),
+                        unsupported => bail!(
+                            "property '{name}' justification '{unsupported}' is not supported losslessly"
+                        ),
+                    }
+                }
+            }
+            unsupported => bail!(
+                "property '{name}' effects clause '{unsupported}' is not supported losslessly"
+            ),
+        }
+    }
+    let font =
+        font.with_context(|| format!("property '{name}' effects are missing the font clause"))?;
+
+    let mut font_name = String::new();
+    let mut size = None;
+    let mut thickness = None;
+    let mut bold = None;
+    let mut italic = None;
+    let mut line_spacing = None;
+    for clause in font.children().unwrap_or_default().iter().skip(1) {
+        let tag = clause
+            .head()
+            .with_context(|| format!("property '{name}' font contains an unsupported atom"))?;
+        match tag {
+            "face" => {
+                if !font_name.is_empty() {
+                    bail!("property '{name}' contains duplicate font face clauses");
+                }
+                font_name = clause
+                    .get(1)
+                    .and_then(konnect_sexp::SexpNode::as_str)
+                    .filter(|face| !face.is_empty())
+                    .with_context(|| format!("property '{name}' font face is invalid"))?
+                    .to_string();
+            }
+            "size" => {
+                if size.is_some() {
+                    bail!("property '{name}' contains duplicate font size clauses");
+                }
+                if clause.children().map_or(0, |children| children.len()) != 3 {
+                    bail!("property '{name}' font size must contain width and height");
+                }
+                let width = clause
+                    .get_f64(1)
+                    .with_context(|| format!("property '{name}' font width is invalid"))?;
+                let height = clause
+                    .get_f64(2)
+                    .with_context(|| format!("property '{name}' font height is invalid"))?;
+                if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+                    bail!("property '{name}' font size must be finite and positive");
+                }
+                size = Some((width, height));
+            }
+            "thickness" => {
+                if thickness.is_some() {
+                    bail!("property '{name}' contains duplicate font thickness clauses");
+                }
+                let value = clause
+                    .get_f64(1)
+                    .with_context(|| format!("property '{name}' font thickness is invalid"))?;
+                if clause.children().map_or(0, |children| children.len()) != 2
+                    || !value.is_finite()
+                    || value <= 0.0
+                {
+                    bail!("property '{name}' font thickness must be finite and positive");
+                }
+                thickness = Some(value);
+            }
+            "bold" => {
+                if bold.is_some() {
+                    bail!("property '{name}' contains duplicate font 'bold' clauses");
+                }
+                bold = Some(property_yes_no(clause, name, "font bold")?);
+            }
+            "italic" => {
+                if italic.is_some() {
+                    bail!("property '{name}' contains duplicate font 'italic' clauses");
+                }
+                italic = Some(property_yes_no(clause, name, "font italic")?);
+            }
+            "line_spacing" => {
+                if line_spacing.is_some() {
+                    bail!("property '{name}' contains duplicate font 'line_spacing' clauses");
+                }
+                let value = clause
+                    .get_f64(1)
+                    .with_context(|| format!("property '{name}' line spacing is invalid"))?;
+                if clause.children().map_or(0, |children| children.len()) != 2
+                    || !value.is_finite()
+                    || value <= 0.0
+                {
+                    bail!("property '{name}' line spacing must be finite and positive");
+                }
+                line_spacing = Some(value);
+            }
+            unsupported => {
+                bail!("property '{name}' font clause '{unsupported}' is not supported losslessly")
+            }
+        }
+    }
+    let (width, height) =
+        size.with_context(|| format!("property '{name}' font is missing its size"))?;
+    Ok(kiapi::common::types::TextAttributes {
+        font_name,
+        horizontal_alignment: horizontal as i32,
+        vertical_alignment: vertical as i32,
+        angle: None,
+        line_spacing: line_spacing.unwrap_or(1.0),
+        stroke_width: Some(konnect_ipc::builders::distance(
+            thickness.unwrap_or(width * 0.15),
+        )),
+        italic: italic.unwrap_or(false),
+        bold: bold.unwrap_or(false),
+        underlined: false,
+        visible: true,
+        mirrored,
+        multiline: true,
+        keep_upright: true,
+        size: Some(konnect_ipc::builders::vec2(width, height)),
+    })
+}
+
+pub(crate) fn fields(root: &SexpNode) -> Result<Vec<kiapi::board::types::Field>> {
+    let mut fields = Vec::new();
+    let mut names = std::collections::BTreeSet::new();
+    for property in root.find_all("property") {
+        let name = property
+            .get(1)
+            .and_then(SexpNode::as_str)
+            .context("property is missing its name")?;
+        if name == SCHEMATIC_FIELDS {
+            bail!("library property '{name}' is reserved for schematic ownership");
+        }
+        let mandatory = matches!(name, "Reference" | "Value" | "Datasheet" | "Description");
+        let field =
+            parse_library_property(property, !mandatory)?.context("missing typed library field")?;
+        if !names.insert(name.to_string()) {
+            bail!("property '{name}' appears more than once in the library footprint");
+        }
+        fields.push(field);
+    }
+    for text in root.find_all("fp_text") {
+        let name = match text.get(1).and_then(SexpNode::as_str) {
+            Some("reference") => "Reference",
+            Some("value") => "Value",
+            _ => continue,
+        };
+        if !names.insert(name.to_string()) {
+            bail!("property '{name}' appears more than once in the library footprint");
+        }
+        let mut property = vec![
+            SexpNode::Atom("property".into()),
+            SexpNode::Str(name.into()),
+        ];
+        property.extend_from_slice(&text.children().context("invalid fp_text")?[2..]);
+        let mut hidden = false;
+        let mut index = 0;
+        property.retain(|node| {
+            let is_clause = index >= 3;
+            index += 1;
+            if is_clause && node.as_str() == Some("hide") {
+                hidden = true;
+                false
+            } else {
+                true
+            }
+        });
+        if hidden {
+            property.push(SexpNode::List(vec![
+                SexpNode::Atom("hide".into()),
+                SexpNode::Atom("yes".into()),
+            ]));
+        }
+        let field = parse_library_property(&SexpNode::List(property), false)?
+            .context("missing typed library field")?;
+        fields.push(field);
+    }
+    Ok(fields)
+}
+
+pub(crate) const SCHEMATIC_FIELDS: &str = "Konnect:schematic_fields";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchematicFields {
+    version: u8,
+    fields: Vec<(String, String)>,
+}
+
+pub(crate) fn field_values(
+    instance: &kiapi::board::types::FootprintInstance,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    use prost::Message;
+    let mut values = std::collections::BTreeMap::new();
+    if let Some(definition) = &instance.definition {
+        for item in &definition.items {
+            if !konnect_ipc::builders::any_is(item, "kiapi.board.types.Field") {
+                continue;
+            }
+            let field = kiapi::board::types::Field::decode(item.value.as_slice())
+                .context("unreadable footprint field")?;
+            if field.name.is_empty()
+                || values
+                    .insert(field.name.clone(), text_value(&field))
+                    .is_some()
+            {
+                bail!("duplicate or unnamed footprint property '{}'", field.name);
+            }
+        }
+        for (name, primary, fallback) in [
+            (
+                "Datasheet",
+                &instance.datasheet_field,
+                &definition.datasheet_field,
+            ),
+            (
+                "Description",
+                &instance.description_field,
+                &definition.description_field,
+            ),
+        ] {
+            if let Some(field) = primary.as_ref().or(fallback.as_ref()) {
+                if values.insert(name.into(), text_value(field)).is_some() {
+                    bail!("duplicate footprint property '{name}'");
+                }
+            }
+        }
+    }
+    Ok(values)
+}
+
+fn text_value(field: &kiapi::board::types::Field) -> String {
+    field
+        .text
+        .as_ref()
+        .and_then(|text| text.text.as_ref())
+        .map_or_else(String::new, |text| text.text.clone())
+}
+
+pub(crate) fn schematic_properties(
+    existing: &std::collections::BTreeMap<String, String>,
+    desired: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let valid_name = |name: &str| {
+        !name.is_empty() && !matches!(name, SCHEMATIC_FIELDS | "Reference" | "Value" | "Footprint")
+    };
+    for name in desired.keys() {
+        if !valid_name(name) {
+            bail!("reserved schematic field '{name}'");
+        }
+    }
+    let mut merged = existing.clone();
+    if let Some(record) = existing.get(SCHEMATIC_FIELDS) {
+        if record.len() > 65_536 {
+            bail!("schematic field ownership record is too large");
+        }
+        let previous: SchematicFields =
+            serde_json::from_str(record).context("invalid schematic field ownership record")?;
+        if previous.version != 1 {
+            bail!(
+                "unsupported schematic field ownership version {}",
+                previous.version
+            );
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for (name, value) in previous.fields {
+            if !valid_name(&name) || !names.insert(name.clone()) {
+                bail!("invalid or duplicate managed schematic field '{name}'");
+            }
+            if !desired.contains_key(&name) && existing.get(&name) == Some(&value) {
+                if matches!(name.as_str(), "Datasheet" | "Description") {
+                    merged.insert(name, String::new());
+                } else {
+                    merged.remove(&name);
+                }
+            }
+        }
+    }
+    merged.extend(desired.clone());
+    if !desired.is_empty() || existing.contains_key(SCHEMATIC_FIELDS) {
+        let record = SchematicFields {
+            version: 1,
+            fields: desired
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        };
+        let record = serde_json::to_string(&record)?;
+        if record.len() > 65_536 {
+            bail!("schematic field ownership record is too large");
+        }
+        merged.insert(SCHEMATIC_FIELDS.into(), record);
+    }
+    Ok(merged)
+}
+
+pub(crate) fn apply_properties(
+    instance: &mut kiapi::board::types::FootprintInstance,
+    values: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    use prost::Message;
+    let template = instance.value_field.clone().unwrap_or_default();
+    let definition = instance
+        .definition
+        .as_mut()
+        .context("footprint has no definition")?;
+    let mut fields = std::collections::BTreeMap::new();
+    let mut retained = Vec::new();
+    for item in std::mem::take(&mut definition.items) {
+        if konnect_ipc::builders::any_is(&item, "kiapi.board.types.Field") {
+            let field = kiapi::board::types::Field::decode(item.value.as_slice())?;
+            if fields.insert(field.name.clone(), field).is_some() {
+                bail!("duplicate footprint custom property");
+            }
+        } else {
+            retained.push(item);
+        }
+    }
+    let make = |name: &str, value: &str, mut field: kiapi::board::types::Field| {
+        field.name = name.into();
+        field
+            .text
+            .get_or_insert_with(Default::default)
+            .text
+            .get_or_insert_with(Default::default)
+            .text = value.into();
+        field
+    };
+    for (name, value) in values {
+        match name.as_str() {
+            "Datasheet" | "Description" => {}
+            _ => {
+                let field = match fields.remove(name) {
+                    Some(field) => field,
+                    None => {
+                        let mut field = template.clone();
+                        field.id = None;
+                        field.visible = false;
+                        if let Some(text) = field.text.as_mut() {
+                            text.id = None;
+                        }
+                        field
+                    }
+                };
+                let mut field = make(name, value, field);
+                if name == SCHEMATIC_FIELDS {
+                    field.visible = false;
+                }
+                retained.push(konnect_ipc::builders::pack_any(
+                    &field,
+                    "kiapi.board.types.Field",
+                ));
+            }
+        }
+    }
+    definition.items = retained;
+    for (name, instance_field, definition_field) in [
+        (
+            "Datasheet",
+            &mut instance.datasheet_field,
+            &mut definition.datasheet_field,
+        ),
+        (
+            "Description",
+            &mut instance.description_field,
+            &mut definition.description_field,
+        ),
+    ] {
+        if let Some(value) = values.get(name) {
+            let field = instance_field
+                .as_ref()
+                .or(definition_field.as_ref())
+                .cloned()
+                .unwrap_or_else(|| {
+                    let mut field = template.clone();
+                    field.visible = false;
+                    field.id = None;
+                    field
+                });
+            let field = make(name, value, field);
+            *instance_field = Some(field.clone());
+            *definition_field = Some(field);
+        } else {
+            *instance_field = None;
+            *definition_field = None;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn live_loss_diagnostics(
+    source: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let root = konnect_sexp::parse_sexp(source).context("live PCB snapshot could not be parsed")?;
+    if root.head() != Some("kicad_pcb") {
+        bail!("live snapshot is not a PCB");
+    }
+    let mut blocked = std::collections::BTreeMap::new();
+    fn unsupported(node: &SexpNode) -> Option<&str> {
+        if matches!(
+            node.head(),
+            Some("group" | "point" | "variant" | "variants")
+        ) {
+            return node.head();
+        }
+        node.children()
+            .unwrap_or_default()
+            .iter()
+            .find_map(unsupported)
+    }
+    for footprint in root.find_all("footprint") {
+        let id = footprint
+            .find_str("uuid")
+            .or_else(|| footprint.find_str("tstamp"))
+            .context("live footprint has no UUID")?;
+        if let Some(clause) = footprint
+            .children()
+            .unwrap_or_default()
+            .iter()
+            .skip(2)
+            .find_map(unsupported)
+        {
+            blocked.insert(
+                id.into(),
+                format!("footprint {id} contains unsupported '{clause}' state"),
+            );
+        }
+    }
+    for group in root.find_all("group") {
+        let name = group.get(1).and_then(SexpNode::as_str).unwrap_or("unnamed");
+        if let Some(members) = group.find("members") {
+            for id in members.children().unwrap_or_default().iter().skip(1) {
+                let id = id
+                    .as_str()
+                    .context("live group contains an invalid member")?;
+                blocked.insert(
+                    id.into(),
+                    format!("footprint {id} belongs to group '{name}'"),
+                );
+            }
+        }
+    }
+    Ok(blocked)
+}
+
+#[cfg(test)]
+mod issue26_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn ownership_removes_only_unchanged_managed_fields() {
+        let initial = BTreeMap::from([("BoardOnly".into(), "keep".into())]);
+        let desired = BTreeMap::from([
+            ("LCSC".into(), "C25804".into()),
+            ("MPN".into(), "old".into()),
+        ]);
+        let first = schematic_properties(&initial, &desired).unwrap();
+        assert_eq!(first["BoardOnly"], "keep");
+        assert_eq!(first["LCSC"], "C25804");
+        let desired = BTreeMap::from([("LCSC".into(), "C25805".into())]);
+        let second = schematic_properties(&first, &desired).unwrap();
+        assert_eq!(second["LCSC"], "C25805");
+        assert!(!second.contains_key("MPN"));
+        assert_eq!(second["BoardOnly"], "keep");
+        assert_eq!(schematic_properties(&second, &desired).unwrap(), second);
+        let mut edited = first;
+        edited.insert("MPN".into(), "board edit".into());
+        assert_eq!(
+            schematic_properties(&edited, &desired).unwrap()["MPN"],
+            "board edit"
+        );
+    }
+
+    #[test]
+    fn first_sync_preserves_unknown_fields_and_empty_sync_is_noop() {
+        let initial = BTreeMap::from([("BoardOnly".into(), "keep".into())]);
+        assert_eq!(
+            schematic_properties(&initial, &BTreeMap::new()).unwrap(),
+            initial
+        );
+        assert_eq!(
+            schematic_properties(&BTreeMap::new(), &BTreeMap::new()).unwrap(),
+            BTreeMap::new()
+        );
+    }
+
+    #[test]
+    fn corrupt_or_colliding_ownership_is_refused() {
+        for record in [
+            "invalid",
+            r#"{"version":2,"fields":[]}"#,
+            r#"{"version":1,"fields":[["LCSC","a"],["LCSC","b"]]}"#,
+            r#"{"version":1,"fields":[["Reference","R1"]]}"#,
+            r#"{"version":1,"fields":[],"extra":true}"#,
+        ] {
+            let values = BTreeMap::from([(SCHEMATIC_FIELDS.into(), record.into())]);
+            assert!(
+                schematic_properties(&values, &BTreeMap::new()).is_err(),
+                "{record}"
+            );
+        }
+        assert!(schematic_properties(
+            &BTreeMap::new(),
+            &BTreeMap::from([(SCHEMATIC_FIELDS.into(), "collision".into())])
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn native_field_roundtrip_keeps_board_only_values_and_hides_ownership() {
+        let root = konnect_sexp::parse_sexp(include_str!(
+            "../../tests/fixtures/socket_kicad10.kicad_mod"
+        ))
+        .unwrap();
+        let mut instance = kiapi::board::types::FootprintInstance {
+            definition: Some(kiapi::board::types::Footprint::default()),
+            ..Default::default()
+        };
+        let parsed = fields(&root).unwrap();
+        instance.value_field = parsed.iter().find(|field| field.name == "Value").cloned();
+        let wanted = schematic_properties(
+            &BTreeMap::from([("BoardOnly".into(), "keep".into())]),
+            &BTreeMap::from([
+                ("LCSC".into(), "C25804".into()),
+                ("Datasheet".into(), "https://example.test/a?x=\"1\"".into()),
+            ]),
+        )
+        .unwrap();
+        apply_properties(&mut instance, &wanted).unwrap();
+        assert_eq!(field_values(&instance).unwrap(), wanted);
+        use prost::Message;
+        let ownership = instance
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| konnect_ipc::builders::any_is(item, "kiapi.board.types.Field"))
+            .map(|item| kiapi::board::types::Field::decode(item.value.as_slice()).unwrap())
+            .find(|field| field.name == SCHEMATIC_FIELDS)
+            .unwrap();
+        assert!(!ownership.visible);
+        let position = ownership.text.unwrap().text.unwrap().position.unwrap();
+        assert_eq!(position.y_nm, 4_000_000);
+    }
+
+    #[test]
+    fn live_loss_findings_cover_unsaved_groups_points_and_variants() {
+        let source = r#"(kicad_pcb
+            (footprint "Test:One" (uuid "one") (point (at 0 0)))
+            (footprint "Test:Two" (uuid "two") (instances (variant (name "Lite"))))
+            (footprint "Test:Three" (uuid "three"))
+            (footprint "Test:Safe" (uuid "safe"))
+            (group "Assembly" (members "three")))"#;
+        let blocked = live_loss_diagnostics(source).unwrap();
+        assert!(blocked["one"].contains("point"));
+        assert!(blocked["two"].contains("variant"));
+        assert!(blocked["three"].contains("Assembly"));
+        assert!(!blocked.contains_key("safe"));
+        assert!(live_loss_diagnostics("(not_a_board)").is_err());
+        assert!(live_loss_diagnostics("(kicad_pcb (footprint \"MissingUuid\"))").is_err());
+    }
+
+    #[test]
+    fn library_fields_preserve_authored_effects_layers_and_defaults() {
+        let root = konnect_sexp::parse_sexp(include_str!(
+            "../../tests/fixtures/socket_kicad10.kicad_mod"
+        ))
+        .unwrap();
+        let fields = fields(&root).unwrap();
+        let value = fields.iter().find(|field| field.name == "Value").unwrap();
+        let text = value.text.as_ref().unwrap();
+        assert_eq!(text.layer, kiapi::board::types::BoardLayer::BlFFab as i32);
+        let attributes = text.text.as_ref().unwrap().attributes.as_ref().unwrap();
+        assert_eq!(attributes.stroke_width.as_ref().unwrap().value_nm, 150_000);
+        assert_eq!(attributes.line_spacing, 1.0);
+        assert!(attributes.keep_upright);
+        assert!(fields.iter().any(|field| field.name == "KiLib_Generator"));
     }
 }

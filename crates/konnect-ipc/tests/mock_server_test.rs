@@ -775,6 +775,7 @@ fn place_footprint_sends_graphics_children() {
     }];
     let graphics = vec![
         IpcGraphicDefinition::Rect {
+            style: konnect_ipc::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
             start: (-0.8, -0.7),
             end: (0.8, 0.7),
             layer: "F.CrtYd".to_string(),
@@ -782,6 +783,7 @@ fn place_footprint_sends_graphics_children() {
             filled: false,
         },
         IpcGraphicDefinition::Line {
+            style: konnect_ipc::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
             start: (-0.6, -0.5),
             end: (0.6, -0.5),
             layer: "F.SilkS".to_string(),
@@ -1626,6 +1628,7 @@ fn footprint_with_a_pad_and_a_line(pad_uuid: &str, line_uuid: &str) -> prost_typ
             chamfered_corners: None,
         }],
         &[konnect_ipc::IpcGraphicDefinition::Poly {
+            style: konnect_ipc::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
             points: vec![(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0)],
             layer: "F.SilkS".to_string(),
             width: 0.12,
@@ -3289,6 +3292,159 @@ fn place_footprint_reports_uncertain_when_readback_loses_chamfer_corners() {
             );
         } else {
             assert_eq!(result.unwrap().reference, "U1");
+        }
+    }
+}
+
+#[test]
+fn issue26_placement_checks_field_presentation_and_stroke_readback() {
+    for mode in 0..4 {
+        let observed = Arc::new(Mutex::new(Vec::<prost_types::Any>::new()));
+        let state = observed.clone();
+        let mock = spawn_mock(move |request| {
+            let message = request.message.unwrap();
+            if message.type_url.ends_with("GetOpenDocuments") {
+                return Some(open_board_response());
+            }
+            if message.type_url.ends_with("GetItems") {
+                return Some(reply_with(builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: state.lock().unwrap().clone(),
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                )));
+            }
+            assert!(message.type_url.ends_with("CreateItems"));
+            let create =
+                kiapi::common::commands::CreateItems::decode(message.value.as_slice()).unwrap();
+            let mut held = create.items.clone();
+            if matches!(mode, 1 | 2) {
+                let mut instance =
+                    kiapi::board::types::FootprintInstance::decode(held[0].value.as_slice())
+                        .unwrap();
+                let kind = if mode == 1 {
+                    "kiapi.board.types.Field"
+                } else {
+                    "kiapi.board.types.BoardGraphicShape"
+                };
+                let child = instance
+                    .definition
+                    .as_mut()
+                    .unwrap()
+                    .items
+                    .iter_mut()
+                    .find(|item| builders::any_is(item, kind))
+                    .unwrap();
+                if mode == 1 {
+                    let mut field =
+                        kiapi::board::types::Field::decode(child.value.as_slice()).unwrap();
+                    field
+                        .text
+                        .as_mut()
+                        .unwrap()
+                        .text
+                        .as_mut()
+                        .unwrap()
+                        .attributes
+                        .as_mut()
+                        .unwrap()
+                        .size = None;
+                    *child = builders::pack_any(&field, kind);
+                } else {
+                    let mut graphic =
+                        kiapi::board::types::BoardGraphicShape::decode(child.value.as_slice())
+                            .unwrap();
+                    graphic
+                        .shape
+                        .as_mut()
+                        .unwrap()
+                        .attributes
+                        .as_mut()
+                        .unwrap()
+                        .stroke
+                        .as_mut()
+                        .unwrap()
+                        .style = kiapi::common::types::StrokeLineStyle::SlsSolid as i32;
+                    *child = builders::pack_any(&graphic, kind);
+                }
+                held[0] = builders::pack_any(&instance, "kiapi.board.types.FootprintInstance");
+            }
+            if mode == 3 {
+                held.clear();
+            }
+            *state.lock().unwrap() = held;
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::CreateItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    created_items: create
+                        .items
+                        .into_iter()
+                        .map(|item| kiapi::common::commands::ItemCreationResult {
+                            status: Some(kiapi::common::commands::ItemStatus {
+                                code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                error_message: String::new(),
+                            }),
+                            item: Some(item),
+                        })
+                        .collect(),
+                },
+                "kiapi.common.commands.CreateItemsResponse",
+            )))
+        });
+        let fields = konnect_ipc::IpcFieldPlacement {
+            fields: vec![kiapi::board::types::Field {
+                name: "LCSC".into(),
+                visible: false,
+                text: Some(kiapi::board::types::BoardText {
+                    layer: kiapi::board::types::BoardLayer::BlFFab as i32,
+                    text: Some(kiapi::common::types::Text {
+                        text: "C25804".into(),
+                        position: Some(builders::vec2(0.0, 0.0)),
+                        attributes: Some(kiapi::common::types::TextAttributes {
+                            size: Some(builders::vec2(0.8, 0.8)),
+                            stroke_width: Some(builders::distance(0.12)),
+                            line_spacing: 1.0,
+                            keep_upright: true,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let graphic = konnect_ipc::IpcGraphicDefinition::Line {
+            start: (0.0, 0.0),
+            end: (1.0, 1.0),
+            layer: "F.CrtYd".into(),
+            width: 0.1,
+            style: kiapi::common::types::StrokeLineStyle::SlsDash,
+        };
+        let result = KiCadIpcClient::new(&mock.url).place_footprint(
+            &mock_board("test.kicad_pcb"),
+            "L:F",
+            "U1",
+            "F",
+            &[],
+            &[graphic],
+            &fields,
+            10.0,
+            20.0,
+            0.0,
+            "F.Cu",
+        );
+        if mode == 0 {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(matches!(
+                konnect_ipc::IpcFailure::from_error(result.unwrap_err()),
+                konnect_ipc::IpcFailure::Uncertain(_)
+            ));
         }
     }
 }
