@@ -8,7 +8,7 @@ The prepared placement owns the original board S-expression and a separate resul
 
 The existing library-refresh validator moves into the shared library-footprint module. Single placement, footprint arrays, schematic synchronization and library refresh use the same supported subset. Diagnostics identify the footprint, reference and clause. The typed pad model adds chamfer ratio and four named corners. IPC builders reject unknown pad shapes. Native and saved pad reads expose the same corner representation. Back-side refresh mirrors the top and bottom corner selections with the pad geometry.
 
-Placement, arrays, schematic sync and library refresh compare native chamfer geometry after writing. The comparison binds each chamfer to the transmitted pad coordinates, normalized angle, layer set, per-layer shape, size and offset. Repeated pad numbers and reordered child messages remain valid. Existing footprint KIIDs must stay unchanged. New placements accept KiCad-assigned KIIDs. A placement or sync readback mismatch returns an uncertain outcome that requires inspection before retrying.
+Placement, arrays, schematic sync and library refresh compare native chamfer geometry after writing. The comparison binds each chamfer to the transmitted pad coordinates, normalized angle, layer set, per-layer shape, size, offset and corner-rounding ratio. Repeated pad numbers and reordered child messages remain valid. Existing footprint KIIDs must stay unchanged. New placements accept KiCad-assigned KIIDs. A placement or sync readback mismatch returns an uncertain outcome that requires inspection before retrying.
 
 Library refresh verifies its chamfers inside the existing commit. A known readback failure drops the commit and returns an error that explicitly states rollback. A native unknown outcome or failed rollback retains its structured uncertain result. These results never become a preflight conflict or an applied result.
 
@@ -40,3 +40,18 @@ Real KiCad is unavailable on this host, so native-editor verification remains un
 The original chamfer multiset accepted swapped corner selections on physically different pads sharing a number. A new regression failed against the actual original `chamfer.rs` module. Binding the geometry to its physical pad makes that regression pass while retaining valid reordering.
 
 The original refresh commit block also accepted an update response without observing its chamfers. An extracted original commit-block harness failed the dropped-corner predicate. The current exact callback and chamfer module pass seven isolated checks, including confirmed drop on mismatched or missing readback. Neutralizing only the position binding makes the new corner-swap regression fail again. These harnesses use compiled protobuf types and builders with a reference-accessor shim or a stub commit client. They do not replace the full served IPC regressions or the workspace gates, which remain pending in the serialized verification lane.
+
+## Coincident pad geometry review correction
+
+Chamfer signatures include the supported corner-rounding ratio. Two pads may
+share a number, position, layer, size and angle while using different rounded
+corners. Exchanging their chamfer masks must fail, while reordering intact pads
+remains valid. Non-finite rounding ratios are refused.
+
+The isolated-target Cargo regression failed before the correction, with one
+failed assertion that the exchanged masks must be rejected. The exact current
+module harness passes that case after the correction. Neutralizing the rounding
+association in a temporary module makes the same regression fail again. The
+harness uses vendored protocol types and does not prove the complete branch.
+All previous shared-target Cargo results are superseded. Final isolated-target
+quality gates, coverage and real KiCad verification remain pending.
