@@ -203,3 +203,10 @@ and borrows a one-item slice. The active verification of1a8782d was canceled
 with its verified descendant processes before merging this correction. That
 run is recorded as canceled, not passed. A fresh four-gate run is required at
 the resulting immutable merged head.
+
+
+The08ec0f9 merged candidate passed formatting, the complete workspace test suite
+and doctests. Its final Clippy check found one nonminimal boolean in the merged
+mock's missing-readback fault condition. Factoring the shared update-applied
+condition preserves both fault modes and the separate postpublication case.
+This is test-only cleanup; a fresh four-gate run verifies the resulting head.

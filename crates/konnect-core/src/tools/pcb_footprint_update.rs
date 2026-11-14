@@ -4365,8 +4365,9 @@ mod tests {
                         == vec![kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32]
                     {
                         let fault = *live_readback_fault.lock().unwrap();
-                        if (update_applied && matches!(fault, ReadbackFault::MissingFootprint))
-                            || (update_applied && matches!(readback, ChamferReadback::Missing))
+                        if (update_applied
+                            && (matches!(fault, ReadbackFault::MissingFootprint)
+                                || matches!(readback, ChamferReadback::Missing)))
                             || (published
                                 && matches!(readback, ChamferReadback::MissingAfterCommit))
                         {
