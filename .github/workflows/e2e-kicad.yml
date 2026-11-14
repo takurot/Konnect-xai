@@ -62,6 +62,7 @@ jobs:
                  Select-Object -First 1 -ExpandProperty FullName }
           if (-not $cli) { throw "kicad-cli.exe not found after install" }
           "KICAD_CLI=$cli" | Out-File $env:GITHUB_ENV -Append
+          (Split-Path $cli) | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
           $demos = Join-Path (Split-Path (Split-Path $cli)) "share\kicad\demos"
           if (Test-Path $demos) { "KICAD_DEMOS=$demos" | Out-File $env:GITHUB_ENV -Append }
           & $cli --version
@@ -79,7 +80,9 @@ jobs:
       # KiCad update that changes variant handling is noticed here, not by a
       # user. kicad-cli-only — no GUI session required.
       - name: Variant-grammar adjudication (kicad-cli acceptance)
-        run: cargo test -p konnect-sexp --test variant_fixture_test -- --ignored --nocapture
+        run: |
+          Get-Command kicad-cli -ErrorAction Stop | Out-Null
+          cargo test -p konnect-sexp --test variant_fixture_test -- --ignored --nocapture
 
       - name: IPC wedge timeout regression
         run: cargo test -p konnect-ipc --test mock_server_test -- --ignored --nocapture
