@@ -195,3 +195,11 @@ style under Issue26's graphic type. Compiling that exact literal against this
 worktree's IPC types reproduced E0063; adding the fixture's solid style compiled
 successfully. This changes test construction only. The waiting merged gate
 lease was canceled before acquiring the lane, so it provided no gate result.
+
+
+The branch also includes the subsequent Issue17 test-only Clippy correction
+`2c869f996d9e07717b7d6e2450edc4ade5173e17`. It removes a needless struct update
+and borrows a one-item slice. The active verification of1a8782d was canceled
+with its verified descendant processes before merging this correction. That
+run is recorded as canceled, not passed. A fresh four-gate run is required at
+the resulting immutable merged head.

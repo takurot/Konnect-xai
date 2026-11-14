@@ -2638,7 +2638,7 @@ mod tests {
             vec![kiapi::board::types::BoardLayer::BlIn2Cu as i32];
         *pad = builders::pack_any(&inner_pad, "kiapi.board.types.Pad");
         let packed = builders::pack_any(&expected, "kiapi.board.types.FootprintInstance");
-        let signature = footprint_layer_states(&[packed.clone()]).unwrap();
+        let signature = footprint_layer_states(std::slice::from_ref(&packed)).unwrap();
         assert!(verify_footprint_layer_readback(&signature, &[packed.clone(), packed]).is_err());
         let mut observed = expected.clone();
         let pad = observed
@@ -4274,7 +4274,6 @@ mod tests {
                             ],
                             copper_layer_count: live_copper_count
                                 .load(std::sync::atomic::Ordering::Relaxed),
-                            ..Default::default()
                         },
                         "kiapi.board.commands.BoardEnabledLayersResponse",
                     ))
