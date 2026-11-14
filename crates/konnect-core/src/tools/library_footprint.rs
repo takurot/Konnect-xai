@@ -919,7 +919,8 @@ fn parse_property_effects(
 }
 
 pub(crate) fn fields(root: &SexpNode) -> Result<Vec<kiapi::board::types::Field>> {
-    let mut fields = std::collections::BTreeMap::new();
+    let mut fields = Vec::new();
+    let mut names = std::collections::BTreeSet::new();
     for property in root.find_all("property") {
         let name = property
             .get(1)
@@ -931,9 +932,10 @@ pub(crate) fn fields(root: &SexpNode) -> Result<Vec<kiapi::board::types::Field>>
         let mandatory = matches!(name, "Reference" | "Value" | "Datasheet" | "Description");
         let field =
             parse_library_property(property, !mandatory)?.context("missing typed library field")?;
-        if fields.insert(name.to_string(), field).is_some() {
-            bail!("duplicate library property '{name}'");
+        if !names.insert(name.to_string()) {
+            bail!("property '{name}' appears more than once in the library footprint");
         }
+        fields.push(field);
     }
     for text in root.find_all("fp_text") {
         let name = match text.get(1).and_then(SexpNode::as_str) {
@@ -941,8 +943,8 @@ pub(crate) fn fields(root: &SexpNode) -> Result<Vec<kiapi::board::types::Field>>
             Some("value") => "Value",
             _ => continue,
         };
-        if fields.contains_key(name) {
-            bail!("duplicate library field '{name}'");
+        if !names.insert(name.to_string()) {
+            bail!("property '{name}' appears more than once in the library footprint");
         }
         let mut property = vec![
             SexpNode::Atom("property".into()),
@@ -969,9 +971,9 @@ pub(crate) fn fields(root: &SexpNode) -> Result<Vec<kiapi::board::types::Field>>
         }
         let field = parse_library_property(&SexpNode::List(property), false)?
             .context("missing typed library field")?;
-        fields.insert(name.into(), field);
+        fields.push(field);
     }
-    Ok(fields.into_values().collect())
+    Ok(fields)
 }
 
 pub(crate) const SCHEMATIC_FIELDS: &str = "Konnect:schematic_fields";

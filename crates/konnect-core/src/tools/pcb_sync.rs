@@ -4552,7 +4552,7 @@ mod tests {
             _ => panic!("sync response was not JSON text"),
         })
         .unwrap();
-        assert_eq!(applied["status"], "applied");
+        assert_eq!(applied["status"], "applied", "{applied:#}");
         assert_eq!(applied["coverage"]["conflicts"]["planned"], 0);
         assert_eq!(applied["coverage"]["conflicts"]["applied"], 0);
         assert_eq!(applied["coverage"]["board_only_preserved"]["applied"], 2);
@@ -5434,8 +5434,8 @@ mod tests {
                 {
                     "code": "unsupported_library_footprint",
                     "message": format!(
-                        "{TEXAS_VQFN} cannot be placed (needed by U1, U2): custom-shape pads \
-                         are not supported by KiCad 10's typed placement path"
+                        "{TEXAS_VQFN} cannot be placed (needed by U1, U2): pad shape 'custom' is not supported by typed IPC footprint rebuild. \
+                         Close the PCB editor and use closed-board file placement to preserve unsupported clauses"
                     ),
                     "reference": null,
                     "references": ["U1", "U2"],
@@ -5444,8 +5444,8 @@ mod tests {
                 {
                     "code": "unsupported_library_footprint",
                     "message": format!(
-                        "{GENERIC_VQFN} cannot be placed (needed by U3): custom-shape pads \
-                         are not supported by KiCad 10's typed placement path"
+                        "{GENERIC_VQFN} cannot be placed (needed by U3): pad shape 'custom' is not supported by typed IPC footprint rebuild. \
+                         Close the PCB editor and use closed-board file placement to preserve unsupported clauses"
                     ),
                     "reference": "U3",
                     "references": ["U3"],

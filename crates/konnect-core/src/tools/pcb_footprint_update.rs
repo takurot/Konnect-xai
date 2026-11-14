@@ -2570,11 +2570,11 @@ mod tests {
 
     #[test]
     fn parser_rejects_lossy_graphic_and_pad_clauses() {
-        let dashed = LIBRARY_FOOTPRINT.replace(
+        let unsupported_stroke = LIBRARY_FOOTPRINT.replace(
             "(stroke (width 0.12) (type solid))",
-            "(stroke (width 0.12) (type dash))",
+            "(stroke (width 0.12) (type invalid_style))",
         );
-        let error = parse_library_footprint("Test:Socket", &dashed).unwrap_err();
+        let error = parse_library_footprint("Test:Socket", &unsupported_stroke).unwrap_err();
         assert!(error.to_string().contains("stroke type"), "{error:#}");
 
         let solder_margin = LIBRARY_FOOTPRINT.replace(
