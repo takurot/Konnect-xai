@@ -304,8 +304,11 @@ pub(crate) async fn handle_update_footprints_from_library(
             }
 
             let update_count = plan.prepared_items.len();
+            let expected_layers = footprint_layer_states(&plan.prepared_items)?;
             client.run_commit("Update footprints from libraries", |client| {
-                client.update_items_in(document, std::mem::take(&mut plan.prepared_items))
+                client.update_items_in(document.clone(), std::mem::take(&mut plan.prepared_items))?;
+                let observed = client.get_items_in(document.clone(), ObjectType::KotPcbFootprint)?;
+                verify_footprint_layer_readback(&expected_layers, &observed)
             })?;
             plan.coverage.selected.applied = plan.coverage.selected.planned;
             plan.coverage.changed.applied = update_count;
@@ -324,6 +327,12 @@ pub(crate) async fn handle_update_footprints_from_library(
             reason.premise()
         )),
         BoardWrite::Refused(result) => {
+            if matches!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("ipc_outcome_unknown" | "ipc_batch_recovered")
+            ) {
+                return Ok(result);
+            }
             let message = result
                 .content
                 .into_iter()
@@ -335,6 +344,226 @@ pub(crate) async fn handle_update_footprints_from_library(
             preflight_conflict(message)
         }
     })
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum LayerState {
+    Footprint(i32),
+    Pad {
+        number: String,
+        position: Option<(i64, i64)>,
+        pad_type: i32,
+        rotation: i64,
+        layers: Vec<i32>,
+        copper_layers: Vec<(i32, i32, Option<(i64, i64)>)>,
+        drill_layers: Option<(i32, i32)>,
+    },
+    Graphic {
+        geometry: Vec<u8>,
+        layer: i32,
+    },
+    Text {
+        value: String,
+        position: Option<(i64, i64)>,
+        layer: i32,
+        mirrored: bool,
+    },
+    Field {
+        name: String,
+        layer: i32,
+        mirrored: bool,
+    },
+}
+
+fn text_layer_state(text: &kiapi::board::types::BoardText) -> Result<LayerState> {
+    let content = text
+        .text
+        .as_ref()
+        .context("footprint readback text has no content")?;
+    Ok(LayerState::Text {
+        value: content.text.clone(),
+        position: content.position.as_ref().map(|p| (p.x_nm, p.y_nm)),
+        layer: text.layer,
+        mirrored: content.attributes.as_ref().is_some_and(|a| a.mirrored),
+    })
+}
+
+fn append_field_layer_state(
+    states: &mut Vec<LayerState>,
+    name: &str,
+    field: &kiapi::board::types::Field,
+) -> Result<()> {
+    let text = field
+        .text
+        .as_ref()
+        .context("footprint readback field has no text")?;
+    let content = text
+        .text
+        .as_ref()
+        .context("footprint readback field text has no content")?;
+    states.push(LayerState::Field {
+        name: name.to_string(),
+        layer: text.layer,
+        mirrored: content.attributes.as_ref().is_some_and(|a| a.mirrored),
+    });
+    Ok(())
+}
+
+fn footprint_layer_state(
+    instance: &kiapi::board::types::FootprintInstance,
+) -> Result<Vec<LayerState>> {
+    let definition = instance
+        .definition
+        .as_ref()
+        .context("footprint readback has no definition")?;
+    let mut states = vec![LayerState::Footprint(instance.layer)];
+    for (name, field) in [
+        ("Reference", &instance.reference_field),
+        ("Value", &instance.value_field),
+        ("Datasheet", &instance.datasheet_field),
+        ("Description", &instance.description_field),
+        ("definition.Reference", &definition.reference_field),
+        ("definition.Value", &definition.value_field),
+        ("definition.Datasheet", &definition.datasheet_field),
+        ("definition.Description", &definition.description_field),
+    ] {
+        if let Some(field) = field {
+            append_field_layer_state(&mut states, name, field)?;
+        }
+    }
+    for item in &definition.items {
+        if konnect_ipc::builders::any_is(item, "kiapi.board.types.Pad") {
+            let pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
+            let stack = pad
+                .pad_stack
+                .as_ref()
+                .context("footprint readback pad has no padstack")?;
+            let mut layers = stack.layers.clone();
+            layers.sort_unstable();
+            let mut copper_layers = stack
+                .copper_layers
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.layer,
+                        entry.shape,
+                        entry.size.as_ref().map(|size| (size.x_nm, size.y_nm)),
+                    )
+                })
+                .collect::<Vec<_>>();
+            copper_layers.sort_unstable();
+            let angle = stack
+                .angle
+                .as_ref()
+                .map_or(0.0, |angle| angle.value_degrees);
+            anyhow::ensure!(
+                angle.is_finite(),
+                "footprint readback pad has invalid rotation"
+            );
+            states.push(LayerState::Pad {
+                number: pad.number,
+                pad_type: pad.r#type,
+                rotation: (angle.rem_euclid(360.0) * 1_000_000.0).round() as i64,
+                position: pad.position.as_ref().map(|p| (p.x_nm, p.y_nm)),
+                layers,
+                copper_layers,
+                drill_layers: stack
+                    .drill
+                    .as_ref()
+                    .filter(|drill| {
+                        !(drill.start_layer == kiapi::board::types::BoardLayer::BlUndefined as i32
+                            && drill.end_layer
+                                == kiapi::board::types::BoardLayer::BlUndefined as i32
+                            && drill
+                                .diameter
+                                .as_ref()
+                                .is_none_or(|size| size.x_nm == 0 && size.y_nm == 0))
+                    })
+                    .map(|drill| (drill.start_layer, drill.end_layer)),
+            });
+        } else if konnect_ipc::builders::any_is(item, "kiapi.board.types.BoardGraphicShape") {
+            let mut graphic =
+                kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())?;
+            let layer = graphic.layer;
+            graphic.layer = kiapi::board::types::BoardLayer::BlUndefined as i32;
+            if let Some(shape) = graphic.shape.as_mut() {
+                shape.attributes = None;
+            }
+            let definition = kiapi::board::types::Footprint {
+                items: vec![konnect_ipc::builders::pack_any(
+                    &graphic,
+                    "kiapi.board.types.BoardGraphicShape",
+                )],
+                ..Default::default()
+            };
+            let geometry = normalized_graphics(&definition)?
+                .pop()
+                .context("footprint readback graphic has no geometry")?;
+            states.push(LayerState::Graphic { geometry, layer });
+        } else if konnect_ipc::builders::any_is(item, "kiapi.board.types.BoardText") {
+            states.push(text_layer_state(&kiapi::board::types::BoardText::decode(
+                item.value.as_slice(),
+            )?)?);
+        } else if konnect_ipc::builders::any_is(item, "kiapi.board.types.Field") {
+            let field = kiapi::board::types::Field::decode(item.value.as_slice())?;
+            append_field_layer_state(&mut states, &format!("custom.{}", field.name), &field)?;
+        }
+    }
+    states.sort();
+    Ok(states)
+}
+
+fn footprint_layer_states(items: &[prost_types::Any]) -> Result<BTreeMap<String, Vec<LayerState>>> {
+    let mut states = BTreeMap::new();
+    for item in items {
+        anyhow::ensure!(
+            konnect_ipc::builders::any_is(item, "kiapi.board.types.FootprintInstance"),
+            "footprint layer readback returned an unexpected item type"
+        );
+        let instance = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+        let id = instance
+            .id
+            .as_ref()
+            .map(|id| id.value.as_str())
+            .filter(|id| !id.is_empty())
+            .context("footprint layer readback has no KIID")?;
+        anyhow::ensure!(
+            states
+                .insert(id.to_string(), footprint_layer_state(&instance)?)
+                .is_none(),
+            "footprint layer readback returned duplicate KIID '{id}'"
+        );
+    }
+    Ok(states)
+}
+
+fn verify_footprint_layer_readback(
+    expected: &BTreeMap<String, Vec<LayerState>>,
+    observed: &[prost_types::Any],
+) -> Result<()> {
+    let mut selected = Vec::new();
+    for item in observed {
+        anyhow::ensure!(
+            konnect_ipc::builders::any_is(item, "kiapi.board.types.FootprintInstance"),
+            "footprint layer readback returned an unexpected item type"
+        );
+        let instance = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+        if instance
+            .id
+            .as_ref()
+            .is_some_and(|id| expected.contains_key(&id.value))
+        {
+            selected.push(item.clone());
+        }
+    }
+    let observed = footprint_layer_states(&selected)?;
+    for (id, layers) in expected {
+        anyhow::ensure!(
+            observed.get(id) == Some(layers),
+            "footprint '{id}' layer or mirrored-text readback differs from the reviewed update"
+        );
+    }
+    Ok(())
 }
 
 fn snapshot_routed_nets(
@@ -1889,12 +2118,17 @@ fn mirror_graphic(
 fn is_side_specific_layer(layer: i32) -> bool {
     use kiapi::board::types::BoardLayer;
 
+    if BoardLayer::try_from(layer)
+        .ok()
+        .and_then(konnect_ipc::builders::layer_name)
+        .is_some_and(|name| name.ends_with(".Cu"))
+    {
+        return true;
+    }
     matches!(
         BoardLayer::try_from(layer).ok(),
         Some(
-            BoardLayer::BlFCu
-                | BoardLayer::BlBCu
-                | BoardLayer::BlFAdhes
+            BoardLayer::BlFAdhes
                 | BoardLayer::BlBAdhes
                 | BoardLayer::BlFPaste
                 | BoardLayer::BlBPaste
@@ -2594,6 +2828,16 @@ mod tests {
                 layer: "In2.Cu".to_string(),
                 width: 0.1,
             });
+        library
+            .graphics
+            .push(konnect_ipc::IpcGraphicDefinition::Text {
+                text: "inner text".to_string(),
+                position: (1.0, 2.0),
+                rotation: 0.0,
+                layer: "In2.Cu".to_string(),
+                size: 1.0,
+                stroke_width_mm: 0.15,
+            });
         let field = library
             .properties
             .first_mut()
@@ -2630,7 +2874,20 @@ mod tests {
                 .layer,
             kiapi::board::types::BoardLayer::BlIn5Cu as i32
         );
-        let graphic = mirror_graphic(library.graphics.last().unwrap(), 8).unwrap();
+        let text = definition
+            .items
+            .iter()
+            .filter(|item| konnect_ipc::builders::any_is(item, "kiapi.board.types.BoardText"))
+            .map(|item| kiapi::board::types::BoardText::decode(item.value.as_slice()).unwrap())
+            .find(|item| {
+                item.text
+                    .as_ref()
+                    .is_some_and(|text| text.text == "inner text")
+            })
+            .unwrap();
+        assert_eq!(text.layer, kiapi::board::types::BoardLayer::BlIn5Cu as i32);
+        assert!(text.text.unwrap().attributes.unwrap().mirrored);
+        let graphic = mirror_graphic(&library.graphics[library.graphics.len() - 2], 8).unwrap();
         assert!(
             matches!(graphic, konnect_ipc::IpcGraphicDefinition::Line { layer, .. } if layer == "In5.Cu")
         );
@@ -2638,6 +2895,156 @@ mod tests {
             build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new(), 2)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn layer_readback_ignores_generated_ids_and_item_order_but_preserves_multiplicity() {
+        let expected = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+        let packed = builders::pack_any(&expected, "kiapi.board.types.FootprintInstance");
+        let signature = footprint_layer_states(&[packed]).unwrap();
+        let mut observed = expected.clone();
+        let definition = observed.definition.as_mut().unwrap();
+        definition.items.reverse();
+        for item in &mut definition.items {
+            if builders::any_is(item, "kiapi.board.types.Pad") {
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                pad.id = Some(kiapi::common::types::Kiid {
+                    value: "assigned-by-kicad".into(),
+                });
+                *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+            }
+        }
+        verify_footprint_layer_readback(
+            &signature,
+            &[builders::pack_any(
+                &observed,
+                "kiapi.board.types.FootprintInstance",
+            )],
+        )
+        .unwrap();
+        let duplicate = expected
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .find(|item| builders::any_is(item, "kiapi.board.types.Pad"))
+            .unwrap()
+            .clone();
+        observed.definition.as_mut().unwrap().items.push(duplicate);
+        let duplicate_signature = footprint_layer_states(&[builders::pack_any(
+            &observed,
+            "kiapi.board.types.FootprintInstance",
+        )])
+        .unwrap();
+        assert!(verify_footprint_layer_readback(
+            &duplicate_signature,
+            &[builders::pack_any(
+                &expected,
+                "kiapi.board.types.FootprintInstance"
+            )]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn layer_readback_rejects_lost_inner_pad_layer_and_duplicate_footprints() {
+        let expected = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+        let packed = builders::pack_any(&expected, "kiapi.board.types.FootprintInstance");
+        let signature = footprint_layer_states(&[packed.clone()]).unwrap();
+        assert!(verify_footprint_layer_readback(&signature, &[packed.clone(), packed]).is_err());
+        let mut observed = expected.clone();
+        let pad = observed
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .iter_mut()
+            .find(|item| builders::any_is(item, "kiapi.board.types.Pad"))
+            .unwrap();
+        let mut changed = kiapi::board::types::Pad::decode(pad.value.as_slice()).unwrap();
+        changed.pad_stack.as_mut().unwrap().layers =
+            vec![kiapi::board::types::BoardLayer::BlIn5Cu as i32];
+        *pad = builders::pack_any(&changed, "kiapi.board.types.Pad");
+        assert!(verify_footprint_layer_readback(
+            &signature,
+            &[builders::pack_any(
+                &observed,
+                "kiapi.board.types.FootprintInstance"
+            )]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn layer_readback_rejects_swapped_layers_on_same_number_pads() {
+        for same_position in [false, true] {
+            let mut expected = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+            let pads = expected
+                .definition
+                .as_mut()
+                .unwrap()
+                .items
+                .iter_mut()
+                .filter(|item| builders::any_is(item, "kiapi.board.types.Pad"))
+                .take(2)
+                .collect::<Vec<_>>();
+            assert_eq!(pads.len(), 2);
+            for (index, item) in pads.into_iter().enumerate() {
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                pad.number = "1".into();
+                pad.position = Some(kiapi::common::types::Vector2 {
+                    x_nm: if same_position { 0 } else { index as i64 * 100 },
+                    y_nm: 0,
+                });
+                let stack = pad.pad_stack.as_mut().unwrap();
+                stack.layers = vec![if index == 0 {
+                    kiapi::board::types::BoardLayer::BlIn2Cu as i32
+                } else {
+                    kiapi::board::types::BoardLayer::BlIn5Cu as i32
+                }];
+                stack.angle = Some(kiapi::common::types::Angle {
+                    value_degrees: index as f64 * 90.0,
+                });
+                stack.copper_layers[0].size = Some(kiapi::common::types::Vector2 {
+                    x_nm: 100 + index as i64 * 100,
+                    y_nm: 100,
+                });
+                *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+            }
+            let signature = footprint_layer_states(&[builders::pack_any(
+                &expected,
+                "kiapi.board.types.FootprintInstance",
+            )])
+            .unwrap();
+            let mut observed = expected;
+            for item in observed
+                .definition
+                .as_mut()
+                .unwrap()
+                .items
+                .iter_mut()
+                .filter(|item| builders::any_is(item, "kiapi.board.types.Pad"))
+                .take(2)
+            {
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                let layer = &mut pad.pad_stack.as_mut().unwrap().layers[0];
+                *layer = if *layer == kiapi::board::types::BoardLayer::BlIn2Cu as i32 {
+                    kiapi::board::types::BoardLayer::BlIn5Cu as i32
+                } else {
+                    kiapi::board::types::BoardLayer::BlIn2Cu as i32
+                };
+                *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+            }
+            assert!(verify_footprint_layer_readback(
+                &signature,
+                &[builders::pack_any(
+                    &observed,
+                    "kiapi.board.types.FootprintInstance"
+                )]
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -3645,8 +4052,20 @@ mod tests {
         commit_actions: Vec<kiapi::common::commands::CommitAction>,
     }
 
+    #[derive(Clone, Copy, Default)]
+    enum ReadbackFault {
+        #[default]
+        None,
+        WrongLayer,
+        MissingTextMirror,
+        MissingFootprint,
+        Unavailable,
+        RollbackFailure,
+    }
+
     struct PlannerMock {
         url: String,
+        readback_fault: std::sync::Arc<std::sync::Mutex<ReadbackFault>>,
         copper_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
         capture: std::sync::Arc<std::sync::Mutex<MutationCapture>>,
         _thread: std::thread::JoinHandle<()>,
@@ -3693,7 +4112,12 @@ mod tests {
         let captured = capture.clone();
         let copper_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2));
         let live_copper_count = copper_count.clone();
+        let readback_fault = std::sync::Arc::new(std::sync::Mutex::new(ReadbackFault::None));
+        let live_readback_fault = readback_fault.clone();
         let thread = std::thread::spawn(move || {
+            let original = footprint.clone();
+            let mut footprint = footprint;
+            let mut update_applied = false;
             while let Ok(message) = socket.recv() {
                 let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
                 let message = request.message.expect("request message");
@@ -3729,21 +4153,97 @@ mod tests {
                     let command =
                         kiapi::common::commands::GetItems::decode(message.value.as_slice())
                             .unwrap();
+                    assert_eq!(
+                        command
+                            .header
+                            .as_ref()
+                            .unwrap()
+                            .document
+                            .as_ref()
+                            .unwrap()
+                            .identifier,
+                        Some(
+                            kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                board_name.clone()
+                            )
+                        )
+                    );
                     let items = if command.types
                         == vec![kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32]
                     {
-                        vec![footprint.clone()]
+                        let fault = *live_readback_fault.lock().unwrap();
+                        if update_applied && matches!(fault, ReadbackFault::MissingFootprint) {
+                            Vec::new()
+                        } else {
+                            let mut observed = footprint.clone();
+                            if update_applied
+                                && matches!(
+                                    fault,
+                                    ReadbackFault::WrongLayer | ReadbackFault::RollbackFailure
+                                )
+                            {
+                                let mut decoded = kiapi::board::types::FootprintInstance::decode(
+                                    observed.value.as_slice(),
+                                )
+                                .unwrap();
+                                decoded.layer = kiapi::board::types::BoardLayer::BlFCu as i32;
+                                observed = builders::pack_any(
+                                    &decoded,
+                                    "kiapi.board.types.FootprintInstance",
+                                );
+                            }
+                            if update_applied && matches!(fault, ReadbackFault::MissingTextMirror) {
+                                let mut decoded = kiapi::board::types::FootprintInstance::decode(
+                                    observed.value.as_slice(),
+                                )
+                                .unwrap();
+                                decoded
+                                    .reference_field
+                                    .as_mut()
+                                    .unwrap()
+                                    .text
+                                    .as_mut()
+                                    .unwrap()
+                                    .text
+                                    .as_mut()
+                                    .unwrap()
+                                    .attributes
+                                    .as_mut()
+                                    .unwrap()
+                                    .mirrored = false;
+                                observed = builders::pack_any(
+                                    &decoded,
+                                    "kiapi.board.types.FootprintInstance",
+                                );
+                            }
+                            vec![observed]
+                        }
                     } else {
                         Vec::new()
                     };
-                    api_reply(builders::pack_any(
-                        &kiapi::common::commands::GetItemsResponse {
-                            header: None,
-                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                            items,
-                        },
-                        "kiapi.common.commands.GetItemsResponse",
-                    ))
+                    if update_applied
+                        && matches!(
+                            *live_readback_fault.lock().unwrap(),
+                            ReadbackFault::Unavailable
+                        )
+                    {
+                        kiapi::common::ApiResponse {
+                            status: Some(kiapi::common::ApiResponseStatus {
+                                status: kiapi::common::ApiStatusCode::AsUnhandled as i32,
+                                error_message: "readback unavailable".to_string(),
+                            }),
+                            ..api_ok()
+                        }
+                    } else {
+                        api_reply(builders::pack_any(
+                            &kiapi::common::commands::GetItemsResponse {
+                                header: None,
+                                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                                items,
+                            },
+                            "kiapi.common.commands.GetItemsResponse",
+                        ))
+                    }
                 } else if message.type_url.ends_with("GetNets") {
                     api_reply(builders::pack_any(
                         &kiapi::board::commands::NetsResponse {
@@ -3770,6 +4270,10 @@ mod tests {
                         .unwrap()
                         .update_batches
                         .push(update.items.len());
+                    if !fail_update {
+                        footprint = update.items[0].clone();
+                        update_applied = true;
+                    }
                     let updated_items = update
                         .items
                         .into_iter()
@@ -3801,6 +4305,30 @@ mod tests {
                     let end = kiapi::common::commands::EndCommit::decode(message.value.as_slice())
                         .unwrap();
                     captured.lock().unwrap().commit_actions.push(end.action());
+                    if end.action() == kiapi::common::commands::CommitAction::CmaDrop {
+                        if matches!(
+                            *live_readback_fault.lock().unwrap(),
+                            ReadbackFault::RollbackFailure
+                        ) {
+                            socket
+                                .send(nng::Message::from(
+                                    kiapi::common::ApiResponse {
+                                        status: Some(kiapi::common::ApiResponseStatus {
+                                            status: kiapi::common::ApiStatusCode::AsUnhandled
+                                                as i32,
+                                            error_message: "rollback unavailable".to_string(),
+                                        }),
+                                        ..api_ok()
+                                    }
+                                    .encode_to_vec()
+                                    .as_slice(),
+                                ))
+                                .unwrap();
+                            continue;
+                        }
+                        footprint = original.clone();
+                        update_applied = false;
+                    }
                     api_reply(builders::pack_any(
                         &kiapi::common::commands::EndCommitResponse {},
                         "kiapi.common.commands.EndCommitResponse",
@@ -3816,6 +4344,7 @@ mod tests {
         });
         PlannerMock {
             url,
+            readback_fault,
             copper_count,
             capture,
             _thread: thread,
@@ -3936,6 +4465,99 @@ mod tests {
             capture.commit_actions,
             vec![kiapi::common::commands::CommitAction::CmaCommit]
         );
+    }
+
+    #[tokio::test]
+    async fn library_refresh_readback_failure_drops_the_commit() {
+        for fault in [
+            ReadbackFault::WrongLayer,
+            ReadbackFault::MissingTextMirror,
+            ReadbackFault::MissingFootprint,
+            ReadbackFault::Unavailable,
+        ] {
+            let (_temp, board, items) = plan_fixture();
+            let mut current =
+                kiapi::board::types::FootprintInstance::decode(items[2].value.as_slice()).unwrap();
+            current.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
+            current
+                .reference_field
+                .as_mut()
+                .unwrap()
+                .text
+                .as_mut()
+                .unwrap()
+                .text
+                .as_mut()
+                .unwrap()
+                .attributes
+                .as_mut()
+                .unwrap()
+                .mirrored = true;
+            let mock = spawn_planner_mock(
+                &board,
+                builders::pack_any(&current, "kiapi.board.types.FootprintInstance"),
+                false,
+            );
+            let context = test_context(&mock.url);
+            let dry_run = handle_update_footprints_from_library(
+                &serde_json::json!({ "board": board }),
+                &context,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result_json(&dry_run)["status"], "ready");
+            *mock.readback_fault.lock().unwrap() = fault;
+            let failed = handle_update_footprints_from_library(
+                &serde_json::json!({
+                    "board": board, "dry_run": false,
+                    "expected_plan_revision": result_json(&dry_run)["plan_revision"]
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result_json(&failed)["status"], "conflict");
+            let capture = mock.capture.lock().unwrap();
+            assert_eq!(capture.update_batches, [1]);
+            assert_eq!(
+                capture.commit_actions,
+                [kiapi::common::commands::CommitAction::CmaDrop]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn library_refresh_rollback_failure_preserves_uncertain_outcome() {
+        let (_temp, board, items) = plan_fixture();
+        let mut current =
+            kiapi::board::types::FootprintInstance::decode(items[2].value.as_slice()).unwrap();
+        current.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
+        let mock = spawn_planner_mock(
+            &board,
+            builders::pack_any(&current, "kiapi.board.types.FootprintInstance"),
+            false,
+        );
+        let context = test_context(&mock.url);
+        let dry_run =
+            handle_update_footprints_from_library(&serde_json::json!({ "board": board }), &context)
+                .await
+                .unwrap();
+        *mock.readback_fault.lock().unwrap() = ReadbackFault::RollbackFailure;
+        let failed = handle_update_footprints_from_library(
+            &serde_json::json!({
+                "board": board, "dry_run": false,
+                "expected_plan_revision": result_json(&dry_run)["plan_revision"]
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(failed.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&failed).as_deref(),
+            Some("ipc_outcome_unknown")
+        );
+        assert_eq!(mock.capture.lock().unwrap().update_batches, [1]);
     }
 
     #[tokio::test]
