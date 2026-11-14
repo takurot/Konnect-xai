@@ -438,6 +438,18 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 client.update_items_in(snapshot.document.clone(), updates)?;
                 verify_native_assembly_attributes(client, &snapshot.document, &expected)?;
                 Ok(())
+            }).map_err(|error| {
+                if error.downcast_ref::<NativeAssemblyVerificationError>().is_some()
+                    && error.downcast_ref::<konnect_ipc::client::IpcOutcomeUnknown>().is_none()
+                    && error.downcast_ref::<konnect_ipc::client::IpcBatchRecovered>().is_none()
+                {
+                    error.context(konnect_ipc::client::IpcOutcomeUnknown {
+                        command: "update_pcb_from_schematic native assembly verification".to_owned(),
+                        reason: "native attribute verification failed after mutation; rollback was attempted, but complete live-state restoration has not been independently verified".to_owned(),
+                    })
+                } else {
+                    error
+                }
             })?;
             for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected)?
             {
@@ -1465,13 +1477,21 @@ fn footprint_shapes<'a>(
     out
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct NativeAssemblyVerificationError(String);
+
 fn verify_native_assembly_attributes(
     client: &konnect_ipc::KiCadIpcClient,
     document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
     expected: &BTreeMap<String, FootprintShape>,
 ) -> Result<()> {
     use konnect_ipc::gen::kiapi::common::types::KiCadObjectType;
-    let items = client.get_items_in(document.clone(), KiCadObjectType::KotPcbFootprint)?;
+    let items = client
+        .get_items_in(document.clone(), KiCadObjectType::KotPcbFootprint)
+        .context(NativeAssemblyVerificationError(
+            "native assembly readback is unavailable".to_owned(),
+        ))?;
     let actual = footprint_shapes(items.iter());
     verify_native_assembly_snapshot(expected, &actual)
 }
@@ -1481,14 +1501,16 @@ fn verify_native_assembly_snapshot(
     actual: &BTreeMap<String, FootprintShape>,
 ) -> Result<()> {
     for (reference, want) in expected {
-        let got = actual.get(reference).with_context(|| {
-            format!("cannot verify native assembly attributes for missing footprint {reference}")
+        let got = actual.get(reference).ok_or_else(|| {
+            NativeAssemblyVerificationError(format!(
+                "cannot verify native assembly attributes for missing footprint {reference}"
+            ))
         })?;
         for attribute in ["dnp", "exclude_from_bom", "exclude_from_pos_files"] {
             let sent = want.attributes.0.contains(attribute);
             let observed = got.attributes.0.contains(attribute);
             if sent != observed {
-                bail!("{reference}: native assembly attribute {attribute} was sent as {sent}, but KiCad reads back {observed}");
+                return Err(NativeAssemblyVerificationError(format!("{reference}: native assembly attribute {attribute} was sent as {sent}, but KiCad reads back {observed}")).into());
             }
         }
     }
@@ -5697,7 +5719,7 @@ mod tests {
     /// schematic set it, the final value sent, not the library's: the 0603's
     /// library footprint is not DNP.
     #[tokio::test]
-    async fn issue25_a_lost_native_dnp_flag_aborts_and_restores_the_batch() {
+    async fn issue25_a_lost_native_dnp_flag_aborts_and_attempts_rollback() {
         let served = ServedSync::reading_back(Readback::WithoutDnp).await;
         let netlist = with_dnp(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]), "C1");
         let plan = served.dry_run(&netlist).await;
@@ -5709,7 +5731,8 @@ mod tests {
             }))
             .await;
         assert!(is_error, "{result}");
-        assert_eq!(result["error"]["kind"], "ipc_batch_recovered", "{result}");
+        assert_eq!(result["error"]["kind"], "ipc_outcome_unknown", "{result}");
+        assert_eq!(result["error"]["retry_safe"], false, "{result}");
         assert_ne!(result["status"], "applied", "{result}");
         assert!(
             result.to_string().contains("native assembly attribute dnp"),
@@ -5750,7 +5773,8 @@ mod tests {
                     }))
                     .await;
                 assert!(is_error, "{result}");
-                assert_eq!(result["error"]["kind"], "ipc_batch_recovered", "{result}");
+                assert_eq!(result["error"]["kind"], "ipc_outcome_unknown", "{result}");
+                assert_eq!(result["error"]["retry_safe"], false, "{result}");
                 assert_ne!(result["status"], "applied", "{result}");
                 assert!(result.to_string().contains(attribute), "{result}");
                 assert!(served.sent_footprints().is_empty());
