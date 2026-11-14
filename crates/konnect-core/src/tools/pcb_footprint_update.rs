@@ -2214,6 +2214,21 @@ fn normalized_items(
                 pad.pad_to_die_delay = None;
                 if let Some(stack) = pad.pad_stack.as_mut() {
                     stack.layers.sort_unstable();
+                    for layer in &mut stack.copper_layers {
+                        if !matches!(
+                            layer.shape(),
+                            kiapi::board::types::PadStackShape::PssRoundrect
+                                | kiapi::board::types::PadStackShape::PssChamferedrect
+                        ) {
+                            layer.corner_rounding_ratio = 0.0;
+                        }
+                        if layer.shape
+                            != kiapi::board::types::PadStackShape::PssChamferedrect as i32
+                        {
+                            layer.chamfer_ratio = 0.0;
+                            layer.chamfered_corners = None;
+                        }
+                    }
                     if stack.drill.as_ref().is_some_and(|drill| {
                         drill.start_layer == kiapi::board::types::BoardLayer::BlUndefined as i32
                             && drill.end_layer
@@ -3097,6 +3112,102 @@ mod tests {
                 ..Default::default()
             }),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn native_pad_normalization_ignores_inactive_corner_defaults() {
+        use kiapi::board::types::PadStackShape;
+
+        let original = kiapi::board::types::FootprintInstance::decode(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/issue_474_r1.ipc.bin"
+            ))
+            .as_slice(),
+        )
+        .unwrap();
+        let mut observed = original.clone();
+        let mut captured_unused_chamfer = false;
+        for item in &mut observed.definition.as_mut().unwrap().items {
+            if !builders::any_is(item, "kiapi.board.types.Pad") {
+                continue;
+            }
+            let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+            for layer in &mut pad.pad_stack.as_mut().unwrap().copper_layers {
+                if layer.shape != PadStackShape::PssChamferedrect as i32 {
+                    captured_unused_chamfer |= layer.chamfer_ratio != 0.0;
+                    layer.chamfer_ratio = 0.0;
+                    layer.chamfered_corners = Some(kiapi::board::types::ChamferedRectCorners {
+                        top_left: true,
+                        ..Default::default()
+                    });
+                }
+                if !matches!(
+                    layer.shape(),
+                    PadStackShape::PssRoundrect | PadStackShape::PssChamferedrect
+                ) {
+                    layer.corner_rounding_ratio = 0.4;
+                }
+            }
+            *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+        }
+        assert!(captured_unused_chamfer);
+        assert_ne!(original.encode_to_vec(), observed.encode_to_vec());
+        assert_eq!(
+            normalized_items(original.definition.as_ref().unwrap(), "Pad").unwrap(),
+            normalized_items(observed.definition.as_ref().unwrap(), "Pad").unwrap()
+        );
+        assert_eq!(
+            footprint_layer_state(&original).unwrap(),
+            footprint_layer_state(&observed).unwrap()
+        );
+    }
+
+    #[test]
+    fn native_pad_normalization_retains_active_corner_geometry() {
+        use kiapi::board::types::PadStackShape;
+
+        for (shape, change) in [
+            (PadStackShape::PssRoundrect, "rounding"),
+            (PadStackShape::PssChamferedrect, "rounding"),
+            (PadStackShape::PssChamferedrect, "chamfer"),
+            (PadStackShape::PssChamferedrect, "corners"),
+        ] {
+            let pad = kiapi::board::types::Pad {
+                number: "1".into(),
+                position: Some(Default::default()),
+                pad_stack: Some(kiapi::board::types::PadStack {
+                    copper_layers: vec![kiapi::board::types::PadStackLayer {
+                        shape: shape as i32,
+                        corner_rounding_ratio: 0.25,
+                        chamfer_ratio: 0.2,
+                        chamfered_corners: Some(kiapi::board::types::ChamferedRectCorners {
+                            top_left: true,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut observed = pad.clone();
+            let layer = &mut observed.pad_stack.as_mut().unwrap().copper_layers[0];
+            match change {
+                "rounding" => layer.corner_rounding_ratio = 0.1,
+                "chamfer" => layer.chamfer_ratio = 0.3,
+                "corners" => {
+                    layer.chamfered_corners.as_mut().unwrap().top_left = false;
+                    layer.chamfered_corners.as_mut().unwrap().top_right = true;
+                }
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                pad_layer_state(pad).unwrap(),
+                pad_layer_state(observed).unwrap(),
+                "{shape:?} {change}"
+            );
         }
     }
 

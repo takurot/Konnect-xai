@@ -115,3 +115,23 @@ passes all three committed regressions. This targeted result does not establish
 the full quality gates or native KiCad acceptance. Earlier shared-target Cargo
 results are superseded for final validation. Final-head gates and coverage
 remain pending.
+
+## Inactive native pad geometry
+
+KiCad's recorded R1 footprint carries a chamfer ratio of 0.2 on ordinary pads.
+The vendored `PadStackLayer` protocol declares chamfer ratio and corners active
+only for `PSS_CHAMFEREDRECT`, and corner rounding active only for roundrect and
+chamferedrect shapes. Comparison now clears these inactive values in the shared
+pad normalizer. The transmitted footprint data is unchanged.
+
+The exact current normalizer and layer-readback helpers failed a regression
+derived from the real R1 capture before this correction. Changing only inactive
+corner values is now equivalent in both comparisons. Four active corner cases
+remain unequal. All five extracted helper regressions, including the existing
+coincident pad, text and stroke cases, pass. Removing only the inactive-value
+normalization makes the native-capture regression fail again.
+
+These helper checks link protobuf types from this worktree's isolated target.
+They do not establish the complete crate, workspace gates, coverage or live
+KiCad acceptance. Those checks remain required at the final head. Manual scoped
+diff cleanup and direct pinned rustfmt were used before this checkpoint.
