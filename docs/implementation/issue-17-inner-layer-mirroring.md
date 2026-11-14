@@ -84,3 +84,13 @@ A negative control disabled only the layer-readback equality in the extracted
 harness. Wrong-layer and duplicate-pad checks then both failed. The committed
 guard remains enabled. Full pending workspace results must be rerun against this
 checkpoint because an earlier build may have read the previous source.
+
+The first full workspace test run reached the core suite and reported 1,775
+passed, three failed and 20 ignored tests. The three new layer-readback tests
+used the older planning fixture, whose pads intentionally omit padstack data.
+The strict observation checker refused that incomplete evidence. Those tests
+now rebuild the existing KiCad-authored socket fixture to obtain complete typed
+pads. The inner-layer loss test explicitly starts on `In2.Cu` before injecting
+`In5.Cu`. A separate test requires missing padstack evidence to remain a refusal.
+Production validation is unchanged. The targeted `layer_readback_` rerun is
+queued; its result and the final-head full gates remain pending.

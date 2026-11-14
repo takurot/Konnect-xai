@@ -2897,9 +2897,29 @@ mod tests {
         );
     }
 
+    fn instance_for_layer_readback() -> kiapi::board::types::FootprintInstance {
+        let current = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+        let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+        let prepared =
+            build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new(), 8)
+                .unwrap();
+        kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap()
+    }
+
+    #[test]
+    fn layer_readback_refuses_missing_padstack_evidence() {
+        let incomplete = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+        let error = footprint_layer_states(&[builders::pack_any(
+            &incomplete,
+            "kiapi.board.types.FootprintInstance",
+        )])
+        .unwrap_err();
+        assert!(error.to_string().contains("pad has no padstack"));
+    }
+
     #[test]
     fn layer_readback_ignores_generated_ids_and_item_order_but_preserves_multiplicity() {
-        let expected = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+        let expected = instance_for_layer_readback();
         let packed = builders::pack_any(&expected, "kiapi.board.types.FootprintInstance");
         let signature = footprint_layer_states(&[packed]).unwrap();
         let mut observed = expected.clone();
@@ -2949,7 +2969,19 @@ mod tests {
 
     #[test]
     fn layer_readback_rejects_lost_inner_pad_layer_and_duplicate_footprints() {
-        let expected = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+        let mut expected = instance_for_layer_readback();
+        let pad = expected
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .iter_mut()
+            .find(|item| builders::any_is(item, "kiapi.board.types.Pad"))
+            .unwrap();
+        let mut inner_pad = kiapi::board::types::Pad::decode(pad.value.as_slice()).unwrap();
+        inner_pad.pad_stack.as_mut().unwrap().layers =
+            vec![kiapi::board::types::BoardLayer::BlIn2Cu as i32];
+        *pad = builders::pack_any(&inner_pad, "kiapi.board.types.Pad");
         let packed = builders::pack_any(&expected, "kiapi.board.types.FootprintInstance");
         let signature = footprint_layer_states(&[packed.clone()]).unwrap();
         assert!(verify_footprint_layer_readback(&signature, &[packed.clone(), packed]).is_err());
@@ -2979,7 +3011,7 @@ mod tests {
     #[test]
     fn layer_readback_rejects_swapped_layers_on_same_number_pads() {
         for same_position in [false, true] {
-            let mut expected = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+            let mut expected = instance_for_layer_readback();
             let pads = expected
                 .definition
                 .as_mut()
