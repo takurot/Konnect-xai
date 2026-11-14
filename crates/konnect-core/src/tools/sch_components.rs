@@ -9360,3 +9360,87 @@ mod rotate_junction_reconciliation_tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
     }
 }
+
+
+#[cfg(test)]
+mod issue25_native_attributes_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn context() -> ToolContext {
+        ToolContext::new(ServerConfig {
+            kicad_cli: String::new(), kicad_binary: String::new(), ipc_address: String::new(),
+            project_dir: None, jlcpcb_db_path: None, auto_load_toolsets: false, eager_toolsets: false,
+        }, Arc::new(crate::router::ToolRouter::new()))
+    }
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ecc83.kicad_sch");
+        std::fs::write(&path, include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch")).unwrap();
+        (dir, path)
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let ToolContent::Text { text } = &result.content[0] else { panic!("expected text") };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_attributes_reach_every_unit_and_query_readback() {
+        let (_dir, path) = fixture();
+        let original = cse::Schematic::load(&path).unwrap();
+        let reference = original.symbols.iter().filter_map(|s| s.reference())
+            .max_by_key(|reference| original.symbols.iter().filter(|s| s.reference() == Some(*reference)).count()).unwrap().to_owned();
+        let count = original.symbols.iter().filter(|s| s.reference() == Some(&reference)).count();
+        assert!(count > 1, "fixture must exercise all placed units");
+        let response = handle_edit_schematic_component(&json!({
+            "schematic": path, "reference": reference,
+            "dnp": true, "in_bom": false, "on_board": false,
+            "exclude_from_sim": true, "in_pos_files": false
+        }), &context()).await.unwrap();
+        assert!(!response.is_error, "{response:?}");
+        let saved = cse::Schematic::load(&path).unwrap();
+        for unit in saved.symbols.iter().filter(|s| s.reference() == Some(&reference)) {
+            assert!(unit.dnp, "DNP is a native symbol flag");
+            assert!(!unit.in_bom);
+            assert!(!unit.on_board);
+            assert_eq!(unit.exclude_from_sim, Some(true));
+            assert_eq!(unit.in_pos_files.as_ref().and_then(|n| n.bool_value()), Some(false));
+        }
+        let queried = handle_get_schematic_component(&json!({"schematic": path, "reference": reference}), &context()).await.unwrap();
+        assert_eq!(body(&queried)["attributes"]["dnp"], true);
+        assert_eq!(body(&queried)["attributes"]["in_pos_files"], false);
+    }
+
+    #[tokio::test]
+    async fn a_misleading_dnp_property_is_refused_before_other_updates() {
+        let (_dir, path) = fixture();
+        let source = std::fs::read_to_string(&path).unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        let reference = sch.symbols[0].reference().unwrap();
+        let response = handle_edit_schematic_component(&json!({"schematic": path, "reference": reference,
+            "value": "MUST_NOT_WRITE", "fields": {"DNP": "yes"}}), &context()).await.unwrap();
+        assert!(response.is_error, "{response:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
+    #[test]
+    fn mounting_hole_placement_inherits_native_library_flags() {
+        let source = r#"(kicad_sch (version 20250114) (generator "eeschema") (uuid "root")
+            (lib_symbols (symbol "MountingHole:MountingHole_3.2mm_M3"
+                (in_bom no) (on_board yes) (exclude_from_sim yes) (in_pos_files no)
+                (property "Reference" "H" (at 0 0 0))
+                (property "Value" "MountingHole_3.2mm_M3" (at 0 0 0))
+                (property "Footprint" "MountingHole:MountingHole_3.2mm_M3" (at 0 0 0)))))"#;
+        let mut sch = cse::Schematic::from_source("mount.kicad_sch", source.to_owned()).unwrap();
+        place_one_component(&mut sch, &["/root".to_owned()], "mount", "MountingHole:MountingHole_3.2mm_M3",
+            100.0, 100.0, 0.0, None, Some("H1"), None, None, 1, &|_: &str| Vec::new()).unwrap();
+        let symbol = &sch.symbols[0];
+        assert!(!symbol.in_bom, "mounting holes belong on board without a BOM line");
+        assert!(symbol.on_board);
+        assert_eq!(symbol.exclude_from_sim, Some(true));
+        assert_eq!(symbol.in_pos_files.as_ref().and_then(|node| node.bool_value()), Some(false));
+    }
+
+}

@@ -4792,3 +4792,52 @@ mod private_anchor_regression {
 #[cfg(test)]
 #[path = "sch_batch_route_safety_tests.rs"]
 mod route_safety_tests;
+
+#[cfg(test)]
+mod issue25_batch_native_attributes_tests {
+    use super::*;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn context() -> ToolContext {
+        ToolContext::new(ServerConfig {
+            kicad_cli: String::new(), kicad_binary: String::new(), ipc_address: String::new(),
+            project_dir: None, jlcpcb_db_path: None, auto_load_toolsets: false, eager_toolsets: false,
+        }, Arc::new(crate::router::ToolRouter::new()))
+    }
+
+    #[tokio::test]
+    async fn batch_native_attributes_are_written_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ecc83.kicad_sch");
+        std::fs::write(&path, include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch")).unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        let reference = sch.symbols[0].reference().unwrap();
+        let response = handle_batch_edit(&json!({"schematic": path,
+            "edits": [{"reference": reference, "dnp": true, "in_bom": false, "in_pos_files": false}]
+        }), &context()).await.unwrap();
+        assert!(!response.is_error, "{response:?}");
+        let saved = cse::Schematic::load(&path).unwrap();
+        for symbol in saved.symbols.iter().filter(|s| s.reference() == Some(reference)) {
+            assert!(symbol.dnp);
+            assert!(!symbol.in_bom);
+            assert_eq!(symbol.in_pos_files.as_ref().and_then(|node| node.bool_value()), Some(false));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_native_attribute_refuses_the_entire_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ecc83.kicad_sch");
+        let source = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+        std::fs::write(&path, source).unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        let reference = sch.symbols[0].reference().unwrap();
+        let response = handle_batch_edit(&json!({"schematic": path, "edits": [
+            {"reference": reference, "value": "MUST_NOT_WRITE"},
+            {"reference": reference, "dnp": "yes"}
+        ]}), &context()).await.unwrap();
+        assert!(response.is_error, "{response:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
+}

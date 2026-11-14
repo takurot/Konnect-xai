@@ -2711,6 +2711,20 @@ mod tests {
         assert!(!component.dnp);
     }
 
+
+    #[test]
+    fn issue25_bom_exclusion_never_removes_a_part_from_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mount.kicad_sch");
+        std::fs::write(&file, r#"(kicad_sch (uuid "sheet-uuid")
+            (symbol (uuid "symbol-uuid") (in_bom no) (on_board yes) (in_pos_files no) (dnp yes)
+                (instances (project "mount" (path "/sheet-uuid" (reference "R1") (unit 1))))))"#).unwrap();
+        let mut design = parse_exported_netlist(ONE_RESISTOR).unwrap();
+        apply_saved_symbol_flags(&[file], &mut design).unwrap();
+        assert_eq!(design.components.len(), 1, "BOM exclusion is independent from board membership");
+        assert!(design.components[0].dnp);
+    }
+
     /// Real `kicad-cli sch export netlist` output: `R1` never had a footprint
     /// assigned, so the export carries no `(footprint …)` node for it and
     /// still nets its pin 1 to `C1`. Provenance in
