@@ -706,6 +706,10 @@ fn parse_library_property(
             stroke_width: Some(konnect_ipc::builders::distance(0.15)),
             line_spacing: 1.0,
             keep_upright: true,
+            multiline: true,
+            visible: true,
+            horizontal_alignment: kiapi::common::types::HorizontalAlignment::HaCenter as i32,
+            vertical_alignment: kiapi::common::types::VerticalAlignment::VaCenter as i32,
             ..Default::default()
         },
         None => bail!("property '{name}' is missing its 'effects' clause"),
@@ -908,7 +912,7 @@ fn parse_property_effects(
         underlined: false,
         visible: true,
         mirrored,
-        multiline: false,
+        multiline: true,
         keep_upright: true,
         size: Some(konnect_ipc::builders::vec2(width, height)),
     })
@@ -946,8 +950,11 @@ pub(crate) fn fields(root: &SexpNode) -> Result<Vec<kiapi::board::types::Field>>
         ];
         property.extend_from_slice(&text.children().context("invalid fp_text")?[2..]);
         let mut hidden = false;
+        let mut index = 0;
         property.retain(|node| {
-            if node.as_str() == Some("hide") {
+            let is_clause = index >= 3;
+            index += 1;
+            if is_clause && node.as_str() == Some("hide") {
                 hidden = true;
                 false
             } else {

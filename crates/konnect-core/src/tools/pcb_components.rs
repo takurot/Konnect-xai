@@ -3832,9 +3832,11 @@ async fn handle_place_array(
                 .with_context(|| format!("failed to prepare {reference}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let presentation = konnect_ipc::FootprintPresentation::from_items(&items)?;
         let chamfers = konnect_ipc::FootprintChamfers::from_items(&items)?;
         c.run_commit("Place footprint array", |c| c.create_items(items))?;
-        c.verify_footprint_chamfers_in(document, &chamfers)?;
+        c.verify_footprint_chamfers_in(document.clone(), &chamfers)?;
+        c.verify_footprint_presentation_in(document, &presentation)?;
 
         let mut created = c
             .list_footprints()?

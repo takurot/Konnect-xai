@@ -322,7 +322,7 @@ pub(crate) async fn handle_update_footprints_from_library(
             }
 
             let update_count = plan.prepared_items.len();
-            let expected = plan.prepared_items.clone();
+            let presentation = konnect_ipc::FootprintPresentation::from_items(&plan.prepared_items)?;
             let chamfers = konnect_ipc::FootprintChamfers::from_items(&plan.prepared_items)?;
             let mutation = client.run_commit("Update footprints from libraries", |client| {
                 client.update_items_in(document.clone(), std::mem::take(&mut plan.prepared_items))?;
@@ -346,8 +346,7 @@ pub(crate) async fn handle_update_footprints_from_library(
                 }
                 return Err(error);
             }
-            let observed = client.get_items_in(document, ObjectType::KotPcbFootprint)?;
-            verify_library_readback(&expected, &observed)?;
+            client.verify_footprint_presentation_in(document, &presentation)?;
             plan.coverage.selected.applied = plan.coverage.selected.planned;
             plan.coverage.changed.applied = update_count;
             plan.coverage.unchanged.applied = plan.coverage.unchanged.planned;
@@ -382,44 +381,6 @@ pub(crate) async fn handle_update_footprints_from_library(
             preflight_conflict(message)
         }
     })
-}
-
-fn verify_library_readback(
-    expected: &[prost_types::Any],
-    observed: &[prost_types::Any],
-) -> Result<()> {
-    let observed = observed
-        .iter()
-        .map(|item| kiapi::board::types::FootprintInstance::decode(item.value.as_slice()))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    for item in expected {
-        let want = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
-        let got = observed.iter().find(|instance| instance.id == want.id);
-        let matches = got.is_some_and(|got| {
-            normalized_field(&got.reference_field) == normalized_field(&want.reference_field)
-                && normalized_field(&got.value_field) == normalized_field(&want.value_field)
-                && super::library_footprint::field_values(got).ok()
-                    == super::library_footprint::field_values(&want).ok()
-                && got
-                    .definition
-                    .as_ref()
-                    .and_then(|definition| normalized_graphics(definition).ok())
-                    == want
-                        .definition
-                        .as_ref()
-                        .and_then(|definition| normalized_graphics(definition).ok())
-        });
-        if !matches {
-            return Err(anyhow::Error::new(konnect_ipc::client::IpcOutcomeUnknown {
-                command: "footprint library readback".into(),
-                reason: format!(
-                    "{} fields or stroke styles differ after update; inspect before retrying",
-                    field_text(&want.reference_field)
-                ),
-            }));
-        }
-    }
-    Ok(())
 }
 
 fn snapshot_routed_nets(
@@ -1434,8 +1395,8 @@ fn changed_domains(
     }
     let current_graphics = normalized_graphics(current_definition)?;
     let updated_graphics = normalized_graphics(updated_definition)?;
-    if normalized_field(&current.reference_field) != normalized_field(&updated.reference_field)
-        || normalized_field(&current.value_field) != normalized_field(&updated.value_field)
+    if normalized_field(&current.reference_field)? != normalized_field(&updated.reference_field)?
+        || normalized_field(&current.value_field)? != normalized_field(&updated.value_field)?
     {
         changed.insert(ChangedDomain::Text);
     }
@@ -1467,14 +1428,11 @@ fn changed_domains(
 
 fn normalized_field(
     field: &Option<kiapi::board::types::Field>,
-) -> Option<kiapi::board::types::Field> {
-    field.clone().map(|mut field| {
-        field.id = None;
-        if let Some(text) = field.text.as_mut() {
-            text.id = None;
-        }
-        field
-    })
+) -> Result<Option<kiapi::board::types::Field>> {
+    field
+        .as_ref()
+        .map(konnect_ipc::normalize_footprint_field)
+        .transpose()
 }
 
 fn normalized_items(
@@ -1515,12 +1473,8 @@ fn normalized_items(
                 }
                 Ok(pad.encode_to_vec())
             } else if suffix == "Field" {
-                let mut field = kiapi::board::types::Field::decode(item.value.as_slice())?;
-                field.id = None;
-                if let Some(text) = field.text.as_mut() {
-                    text.id = None;
-                }
-                Ok(field.encode_to_vec())
+                let field = kiapi::board::types::Field::decode(item.value.as_slice())?;
+                Ok(konnect_ipc::normalize_footprint_field(&field)?.encode_to_vec())
             } else {
                 Ok(item.value.clone())
             }
@@ -3250,6 +3204,9 @@ mod tests {
         Unreadable,
         Unavailable,
         RollbackFailure,
+        MissingAfterCommit,
+        FieldsAfterCommit,
+        StyleAfterCommit,
     }
 
     fn api_refused(message: &str) -> kiapi::common::ApiResponse {
@@ -3356,13 +3313,71 @@ mod tests {
                             .unwrap();
                         continue;
                     }
+                    let published = captured
+                        .lock()
+                        .unwrap()
+                        .commit_actions
+                        .contains(&kiapi::common::commands::CommitAction::CmaCommit);
+                    let mut returned = footprint.clone();
+                    if published
+                        && matches!(
+                            readback,
+                            ChamferReadback::FieldsAfterCommit | ChamferReadback::StyleAfterCommit
+                        )
+                    {
+                        let mut instance = kiapi::board::types::FootprintInstance::decode(
+                            returned.value.as_slice(),
+                        )
+                        .unwrap();
+                        let wanted = if matches!(readback, ChamferReadback::FieldsAfterCommit) {
+                            "kiapi.board.types.Field"
+                        } else {
+                            "kiapi.board.types.BoardGraphicShape"
+                        };
+                        let child = instance
+                            .definition
+                            .as_mut()
+                            .unwrap()
+                            .items
+                            .iter_mut()
+                            .find(|item| builders::any_is(item, wanted))
+                            .unwrap();
+                        if matches!(readback, ChamferReadback::FieldsAfterCommit) {
+                            let mut field =
+                                kiapi::board::types::Field::decode(child.value.as_slice()).unwrap();
+                            field.visible = !field.visible;
+                            *child = builders::pack_any(&field, wanted);
+                        } else {
+                            let mut shape = kiapi::board::types::BoardGraphicShape::decode(
+                                child.value.as_slice(),
+                            )
+                            .unwrap();
+                            shape
+                                .shape
+                                .as_mut()
+                                .unwrap()
+                                .attributes
+                                .as_mut()
+                                .unwrap()
+                                .stroke
+                                .as_mut()
+                                .unwrap()
+                                .style = kiapi::common::types::StrokeLineStyle::SlsDash as i32;
+                            *child = builders::pack_any(&shape, wanted);
+                        }
+                        returned =
+                            builders::pack_any(&instance, "kiapi.board.types.FootprintInstance");
+                    }
                     let items = if command.types
                         == vec![kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32]
                     {
-                        if has_update && matches!(readback, ChamferReadback::Missing) {
+                        if (has_update && matches!(readback, ChamferReadback::Missing))
+                            || (published
+                                && matches!(readback, ChamferReadback::MissingAfterCommit))
+                        {
                             Vec::new()
                         } else {
-                            vec![footprint.clone()]
+                            vec![returned]
                         }
                     } else {
                         Vec::new()
@@ -3443,26 +3458,20 @@ mod tests {
                     let updated_items = update
                         .items
                         .into_iter()
-                        .map(|item| {
-                            if !fail_update {
-                                footprint = item.clone();
-                            }
-                            kiapi::common::commands::ItemUpdateResult {
-                                status: Some(kiapi::common::commands::ItemStatus {
-                                    code: if fail_update {
-                                        kiapi::common::commands::ItemStatusCode::IscInvalidData
-                                            as i32
-                                    } else {
-                                        kiapi::common::commands::ItemStatusCode::IscOk as i32
-                                    },
-                                    error_message: if fail_update {
-                                        "mock update failure".to_string()
-                                    } else {
-                                        String::new()
-                                    },
-                                }),
-                                item: Some(item),
-                            }
+                        .map(|item| kiapi::common::commands::ItemUpdateResult {
+                            status: Some(kiapi::common::commands::ItemStatus {
+                                code: if fail_update {
+                                    kiapi::common::commands::ItemStatusCode::IscInvalidData as i32
+                                } else {
+                                    kiapi::common::commands::ItemStatusCode::IscOk as i32
+                                },
+                                error_message: if fail_update {
+                                    "mock update failure".to_string()
+                                } else {
+                                    String::new()
+                                },
+                            }),
+                            item: Some(item),
                         })
                         .collect();
                     api_reply(builders::pack_any(
@@ -3509,6 +3518,43 @@ mod tests {
             live_source,
             capture,
             _thread: thread,
+        }
+    }
+
+    #[tokio::test]
+    async fn issue26_postpublication_missing_fields_or_styles_remain_uncertain() {
+        for mode in [
+            ChamferReadback::MissingAfterCommit,
+            ChamferReadback::FieldsAfterCommit,
+            ChamferReadback::StyleAfterCommit,
+        ] {
+            let (_temp, board, items) = plan_fixture();
+            let server = spawn_planner_mock_readback(&board, items[2].clone(), false, mode);
+            let context = test_context(&server.url);
+            let dry = handle_update_footprints_from_library(&json!({"board":board}), &context)
+                .await
+                .unwrap();
+            let revision = result_json(&dry)["plan_revision"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let result = handle_update_footprints_from_library(
+                &json!({"board":board,"dry_run":false,"expected_plan_revision":revision}),
+                &context,
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error);
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("ipc_outcome_unknown")
+            );
+            let capture = server.capture.lock().unwrap();
+            assert_eq!(capture.update_batches, vec![1]);
+            assert_eq!(
+                capture.commit_actions,
+                vec![kiapi::common::commands::CommitAction::CmaCommit]
+            );
         }
     }
 

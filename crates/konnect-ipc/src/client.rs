@@ -4045,6 +4045,15 @@ impl KiCadIpcClient {
                             angle: Some(kiapi::common::types::Angle {
                                 value_degrees: readable_text_angle(rotation + frot),
                             }),
+                            stroke_width: Some(crate::builders::distance(0.15)),
+                            line_spacing: 1.0,
+                            horizontal_alignment:
+                                kiapi::common::types::HorizontalAlignment::HaCenter as i32,
+                            vertical_alignment: kiapi::common::types::VerticalAlignment::VaCenter
+                                as i32,
+                            visible: true,
+                            multiline: true,
+                            keep_upright: true,
                             ..Default::default()
                         }),
                         text: text.to_string(),
@@ -4305,9 +4314,11 @@ impl KiCadIpcClient {
         let item = Self::build_footprint_item(
             lib_id, reference, value, pads, graphics, fields, x, y, rotation, layer,
         )?;
+        let presentation = crate::FootprintPresentation::from_items([&item])?;
         let chamfers = crate::FootprintChamfers::from_items([&item])?;
         self.create_items_in(document.clone(), vec![item])?;
         self.verify_footprint_chamfers_in(document.clone(), &chamfers)?;
+        self.verify_footprint_presentation_in(document.clone(), &presentation)?;
         let footprints = self.list_footprints_in(document)?;
         footprints
             .iter()
@@ -4323,6 +4334,29 @@ impl KiCadIpcClient {
                     "KiCad created the footprint but reference '{reference}' was not found (board references: {references})"
                 )
             })
+    }
+
+    pub fn verify_footprint_presentation_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        expected: &crate::FootprintPresentation,
+    ) -> Result<()> {
+        if expected.is_empty() {
+            return Ok(());
+        }
+        self.get_items_in(
+            document,
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+        )
+        .and_then(|items| expected.verify(&items))
+        .map_err(|error| {
+            anyhow::Error::new(IpcOutcomeUnknown {
+                command: "footprint presentation readback".into(),
+                reason: format!(
+                    "{error:#}. A write already occurred; inspect the live board before retrying"
+                ),
+            })
+        })
     }
 
     pub fn verify_footprint_chamfers_in(

@@ -439,6 +439,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             let (creates, updates) = build_mutation_items(&plan, &prepared, &snapshot)?;
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
+            let presentation = konnect_ipc::FootprintPresentation::from_items(creates.iter().chain(updates.iter()))?;
             let chamfers = konnect_ipc::FootprintChamfers::from_items(creates.iter().chain(updates.iter()))?;
             client.run_commit_recovering_in(snapshot.document.clone(), "Update PCB from saved schematic", |client| {
                 create_sync_items_in(client, &snapshot.document, &creates)?;
@@ -446,7 +447,8 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 Ok(())
             })?;
             client.verify_footprint_chamfers_in(snapshot.document.clone(), &chamfers)?;
-            for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected)?
+            client.verify_footprint_presentation_in(snapshot.document.clone(), &presentation)?;
+            for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected).map_err(|error| anyhow::Error::new(konnect_ipc::client::IpcOutcomeUnknown { command: "schematic footprint readback".into(), reason: format!("{error:#}. The sync was already published; inspect before retrying") }))?
             {
                 plan.diagnostics.push(conflict(
                     "board_readback_differs",
@@ -1397,7 +1399,6 @@ fn apply_footprint_fields(
 /// to leave off.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct FootprintShape {
-    properties: BTreeMap<String, String>,
     pads: usize,
     drawings: usize,
     attributes: AttributeSet,
@@ -1483,7 +1484,6 @@ fn footprint_shapes<'a>(
             continue;
         }
         let mut shape = FootprintShape {
-            properties: super::library_footprint::field_values(&footprint).unwrap_or_default(),
             attributes: AttributeSet::of(footprint.attributes.as_ref()),
             ..Default::default()
         };
@@ -1563,12 +1563,6 @@ fn verify_board_matches_what_was_sent(
             corrupted.push(detail);
         } else if (got.pads, got.drawings) != (want.pads, want.drawings) {
             suspicious.push(detail);
-        }
-        if got.properties != want.properties {
-            return Err(anyhow::Error::new(konnect_ipc::client::IpcOutcomeUnknown {
-                command: "schematic field readback".into(),
-                reason: format!("{reference}: board fields differ from the synchronized fields; inspect the live board before retrying"),
-            }));
         }
         if got.attributes != want.attributes {
             suspicious.push(format!(

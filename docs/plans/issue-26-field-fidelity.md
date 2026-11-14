@@ -20,9 +20,15 @@ Native Datasheet and Description fields clear to empty text when removed.
 Other board-only fields remain unchanged. Malformed, oversized, duplicate, or
 unsupported ownership records refuse synchronization before mutation.
 
-Ownership and field values affect the reviewed plan revision. Independent live
-readback checks the values that were sent. A mismatch reports an uncertain
-outcome and requires inspection before another mutation.
+Ownership and field values affect the reviewed plan revision. A shared live
+readback signature checks the native and custom field text, effects, layers,
+visibility, and the stroke style attached to each graphic's geometry and layer.
+It also checks the footprint's reference, library identity, position, side, and
+existing UUID. Assigned child IDs and full-turn angles do not change the
+presentation. Known parent links must identify the containing footprint.
+Placement, arrays, schematic sync, and library refresh use this same check.
+Missing, ambiguous, unreadable, or changed results after publication report an
+uncertain outcome and require inspection before another mutation.
 
 ## Preserve authored fields and strokes
 
@@ -56,8 +62,8 @@ The unchanged native stroke builder was executed in a pinned-rustc harness.
 It returned unknown style `0` where explicit solid `2` was required. This is
 extracted-source reproduction, not a real KiCad session.
 
-The six new shared-library regressions pass in an isolated build of the exact
-source with pinned Rust. Disabling ownership removal and live loss findings in
+At the pre-review checkpoint, the six new shared-library regressions passed in
+an isolated build of the exact source with pinned Rust. Disabling ownership removal and live loss findings in
 temporary source copies makes their two regressions fail. The checkout keeps
 both guards enabled. These checks do not verify served IPC behavior.
 
@@ -65,5 +71,10 @@ Regression tests cover field ownership, first-sync preservation, corruption,
 roundtrip values, live loss findings, field presentation, all native stroke
 styles, reset-text convergence, and revision changes. Full workspace gates,
 coverage, and real KiCad acceptance remain pending until recorded here.
+Earlier Cargo results used a shared worktree target and are superseded because
+that cache could reuse another worktree's workspace artifact. Final verification
+must use this worktree's isolated target and exact source. The source harnesses
+are supporting evidence only.
+
 No KiCad installation is available on this host. No real IPC acceptance or
 80-percent coverage claim is made.
