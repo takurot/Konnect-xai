@@ -393,6 +393,15 @@ mod tests {
         let mut unreadable = item.clone();
         unreadable.value = vec![0xff];
         assert!(FootprintChamfers::from_items([&unreadable]).is_err());
+        let mut invalid_rounding =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        let child = &mut invalid_rounding.definition.as_mut().unwrap().items[0];
+        let mut pad = kiapi::board::types::Pad::decode(child.value.as_slice()).unwrap();
+        pad.pad_stack.as_mut().unwrap().copper_layers[0].corner_rounding_ratio = f64::NAN;
+        *child = crate::builders::pack_any(&pad, "kiapi.board.types.Pad");
+        let invalid_rounding =
+            crate::builders::pack_any(&invalid_rounding, "kiapi.board.types.FootprintInstance");
+        assert!(FootprintChamfers::from_items([&invalid_rounding]).is_err());
         let mut missing_reference =
             kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
         missing_reference.reference_field = None;

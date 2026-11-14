@@ -55,3 +55,9 @@ association in a temporary module makes the same regression fail again. The
 harness uses vendored protocol types and does not prove the complete branch.
 All previous shared-target Cargo results are superseded. Final isolated-target
 quality gates, coverage and real KiCad verification remain pending.
+
+The served two-unusable-footprints regression retains its exact diagnostic
+objects, both footprint IDs and all three affected references. Its golden text
+now matches the shared validator's named custom-pad refusal and closed-file
+recovery guidance. The previous string-only failure was observed in the
+isolated descendant suite. Parent-branch rerun remains part of the final gates.
