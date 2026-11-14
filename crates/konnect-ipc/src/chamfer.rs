@@ -16,6 +16,7 @@ struct PadChamfer {
     offset: (i64, i64),
     shape: i32,
     ratio_bits: u64,
+    rounding_ratio_bits: u64,
     corner_mask: u8,
 }
 
@@ -62,9 +63,11 @@ impl FootprintChamfers {
                         || layer.chamfer_ratio != 0.0
                         || corners != 0
                     {
-                        if !layer.chamfer_ratio.is_finite() {
+                        if !layer.chamfer_ratio.is_finite()
+                            || !layer.corner_rounding_ratio.is_finite()
+                        {
                             bail!(
-                                "footprint '{reference}' pad '{}' has an invalid chamfer ratio",
+                                "footprint '{reference}' pad '{}' has an invalid chamfer or rounding ratio",
                                 pad.number
                             );
                         }
@@ -108,6 +111,11 @@ impl FootprintChamfers {
                                 .map_or((0, 0), |offset| (offset.x_nm, offset.y_nm)),
                             shape: layer.shape,
                             ratio_bits: ratio,
+                            rounding_ratio_bits: if layer.corner_rounding_ratio == 0.0 {
+                                0
+                            } else {
+                                layer.corner_rounding_ratio.to_bits()
+                            },
                             corner_mask: corners,
                         });
                     }
@@ -269,6 +277,42 @@ mod tests {
         let expected = FootprintChamfers::from_items([&pack(expected)]).unwrap();
         assert!(expected.verify(&[pack(reordered)]).is_ok());
         assert!(expected.verify(&[pack(swapped)]).is_err());
+    }
+
+    #[test]
+    fn chamfer_verification_binds_corners_to_coincident_pad_rounding() {
+        let with_rounding = |item: prost_types::Any| {
+            let mut footprint =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            for (index, child) in footprint
+                .definition
+                .as_mut()
+                .unwrap()
+                .items
+                .iter_mut()
+                .enumerate()
+            {
+                let mut pad = kiapi::board::types::Pad::decode(child.value.as_slice()).unwrap();
+                pad.pad_stack.as_mut().unwrap().copper_layers[0].corner_rounding_ratio =
+                    [0.1, 0.25][index];
+                *child = crate::builders::pack_any(&pad, "kiapi.board.types.Pad");
+            }
+            crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+        };
+        let item = with_rounding(footprint(&[1, 8]));
+        let expected = FootprintChamfers::from_items([&item]).unwrap();
+        let mut reordered =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        reordered.definition.as_mut().unwrap().items.reverse();
+        assert!(expected
+            .verify(&[crate::builders::pack_any(
+                &reordered,
+                "kiapi.board.types.FootprintInstance",
+            )])
+            .is_ok());
+        assert!(expected
+            .verify(&[with_rounding(footprint(&[8, 1]))])
+            .is_err());
     }
 
     #[test]
