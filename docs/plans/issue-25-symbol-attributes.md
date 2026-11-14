@@ -21,7 +21,7 @@ PCB synchronization honors `on_board` for placement and carries DNP, BOM exclusi
 - An excluded BOM component remains eligible for PCB placement.
 - Sync adds and updates the native DNP, BOM, and position attributes and notices their changes in plan revisions.
 - Wrong native flags, replaced update KIIDs, duplicate references or KIIDs, malformed or mistyped messages, and rejected final readback never report applied success.
-- Real `kicad-cli sch export bom --exclude-dnp` remains unverified until KiCad is available.
+- The ignored native CLI acceptance test exports a Reference-only BOM before and after a served MCP edit of all three U1 units in the KiCad-authored ECC83 fixture. It requires U1 to disappear under `--exclude-dnp` while R1 remains. It also places the installed `Mechanical:MountingHole` symbol and checks the embedded library and saved instance retain `in_bom=no` and `on_board=yes`. Native execution remains unverified until the KiCad E2E workflow runs at the new head.
 
 ## Verification record
 
@@ -32,3 +32,5 @@ A pinned-compiler check also passed library attribute inheritance and native sym
 The first complete `cargo test -p konnect-core --locked --lib issue25 -- --nocapture` build found two placement test constructors that omitted the new attribute model. Both constructors now bind the fixture symbol's attributes. Subsequent shared-target runs remain diagnostic evidence only because the shared build target could reuse workspace artifacts from another worktree. An isolated-target run subsequently passed the native tests, served query tests, all four Rust gates, and an assembly-guard negative control with an exact source restoration. Independent review then identified final-readback identity and error-classification gaps. Four new served regressions failed for the intended reason before the strict readback fix; malformed-payload readback was already uncertain. The final code requires a fresh isolated-target run of the focused tests and all four gates. Coverage was interrupted for these functional fixes, so no line or branch percentage is claimed. Real KiCad export and IPC checks are unavailable on this host.
 
 The `deslop` skill is unavailable in this installation. The implementation receives a manual scoped diff cleanup and independent review instead.
+
+The native BOM acceptance test pins `--group-by Reference` and a quote delimiter so its single-reference row comparisons do not depend on grouping presets. These options and `--exclude-dnp` are supported by [KiCad 10.0.5’s BOM command](https://github.com/KiCad/kicad/blob/10.0.5/kicad/cli/command_sch_export_bom.cpp). A missing CLI fails an explicitly requested E2E run. Normal Rust gates only compile this ignored test and cannot establish the native acceptance result.

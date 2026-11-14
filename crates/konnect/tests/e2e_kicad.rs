@@ -140,6 +140,118 @@ fn body(result: &Value) -> Value {
 }
 
 #[test]
+#[ignore = "requires kicad-cli and standard symbol libraries; run via e2e workflow"]
+fn native_assembly_attributes_survive_real_kicad_bom_export() {
+    let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
+    let dir = tempfile::tempdir().unwrap();
+    let sch = dir.path().join("ecc83-pp.kicad_sch");
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../konnect-core/tests/fixtures/ecc83_multiunit.kicad_sch"),
+        &sch,
+    )
+    .unwrap();
+    let export_references = |name: &str| {
+        let output_path = dir.path().join(name);
+        let output = Command::new(&kicad_cli)
+            .args(["sch", "export", "bom", "--output"])
+            .arg(&output_path)
+            .args([
+                "--fields",
+                "Reference",
+                "--labels",
+                "Reference",
+                "--group-by",
+                "Reference",
+                "--string-delimiter",
+                "\"",
+                "--exclude-dnp",
+            ])
+            .arg(&sch)
+            .output()
+            .expect("failed to run KiCad BOM exporter");
+        assert!(
+            output.status.success(),
+            "KiCad BOM export failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::read_to_string(output_path)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|line| line.trim_matches('"').to_string())
+            .collect::<Vec<_>>()
+    };
+    let before = export_references("before.csv");
+    assert!(
+        before.iter().any(|reference| reference == "U1"),
+        "{before:?}"
+    );
+    assert!(
+        before.iter().any(|reference| reference == "R1"),
+        "{before:?}"
+    );
+
+    let mut mcp = Mcp::spawn(&kicad_cli);
+    mcp.load("sch_components");
+    mcp.tool(
+        "edit_schematic_component",
+        json!({"schematic": sch.to_string_lossy(), "reference": "U1", "dnp": true}),
+    );
+    let saved = std::fs::read_to_string(&sch).unwrap();
+    let tree = konnect_sexp::parse_sexp(&saved).unwrap();
+    let units: Vec<_> = tree
+        .find_all("symbol")
+        .into_iter()
+        .filter(|symbol| {
+            symbol.find_all("property").iter().any(|property| {
+                property.get(1).and_then(|value| value.as_str()) == Some("Reference")
+                    && property.get(2).and_then(|value| value.as_str()) == Some("U1")
+            })
+        })
+        .collect();
+    assert_eq!(units.len(), 3, "all three U1 units must remain placed");
+    for unit in units {
+        assert_eq!(unit.find_str("dnp"), Some("yes"));
+    }
+    let after = export_references("after.csv");
+    assert!(
+        !after.iter().any(|reference| reference == "U1"),
+        "{after:?}"
+    );
+    assert!(after.iter().any(|reference| reference == "R1"), "{after:?}");
+
+    let project = dir.path().join("mounting-hole");
+    mcp.tool(
+        "create_project",
+        json!({"name": "mounting-hole", "path": project.to_string_lossy()}),
+    );
+    let hole_sch = project.join("mounting-hole.kicad_sch");
+    mcp.tool(
+        "add_schematic_component",
+        json!({"schematic": hole_sch.to_string_lossy(), "lib_id": "Mechanical:MountingHole",
+            "reference": "H1", "x": 100.0, "y": 100.0}),
+    );
+    let saved = std::fs::read_to_string(hole_sch).unwrap();
+    let tree = konnect_sexp::parse_sexp(&saved).unwrap();
+    let placed = tree.find_all("symbol");
+    assert_eq!(placed.len(), 1);
+    let library = tree
+        .find("lib_symbols")
+        .unwrap()
+        .find_all("symbol")
+        .into_iter()
+        .find(|symbol| {
+            symbol.get(1).and_then(|value| value.as_str()) == Some("Mechanical:MountingHole")
+        })
+        .expect("the real installed MountingHole definition must be embedded");
+    for symbol in [library, placed[0]] {
+        assert_eq!(symbol.find_str("in_bom"), Some("no"));
+        assert_eq!(symbol.find_str("on_board"), Some("yes"));
+    }
+}
+
+#[test]
 #[ignore = "requires kicad-cli; run via e2e workflow"]
 fn selected_layer_pcb_svg_export_through_mcp() {
     let Some(kicad_cli) = find_kicad_cli() else {
