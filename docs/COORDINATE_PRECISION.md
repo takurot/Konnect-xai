@@ -76,3 +76,34 @@ Exact-source isolated regressions reproduced the zone formatter and translated
 property boundary failures before these corrections and pass after them. They
 are supporting evidence only. Full direct-handler and served no-write
 regressions have been added and remain queued with the workspace checks.
+
+
+## Bounded persistence validation
+
+The shared atomic replacement and create-only helpers validate recognized KiCad
+schematic, board, footprint, and symbol-library coordinate clauses before creating
+a scratch file. Known two-dimensional positions and dimensions must fit signed
+64-bit nanometres. Rotations must be finite. Three-dimensional model offsets use
+distance validation, while model scale and rotation remain dimensionless and
+angular values. Quoted property text and unrelated output formats are unchanged.
+
+The validator parses and traverses the proposed design once. It neither rewrites
+existing bytes nor rounds arbitrary numeric fields. This is a bounded coordinate
+check, not a complete syntax validator. The existing parser can ignore malformed
+trailing nodes. Existing lock, revision, no-clobber and readback checks remain.
+
+`round6` avoids intermediate overflow when a large finite non-distance value is
+routed through the existing shared numeric formatter. Such scales and angles do
+not become infinity merely because formatting multiplies by one million.
+
+An isolated harness compiles the actual writer, parser, error and geometry source
+modules against registry dependencies. Before the guard, it persisted `(at inf 0)`.
+Afterward it refuses the replacement and preserves the original bytes. Five
+expanded source checks cover 72 invalid cases, each through create and CAS paths,
+valid model geometry, and the existing S-expression fixture corpus. The corpus
+includes custom-pad symbolic clearance options, which are kept distinct from
+numeric distance clauses. These are narrow runtime
+checks and do not replace isolated workspace gates. All earlier shared-target
+Cargo results are superseded because that target could reuse another worktree's
+workspace artifacts. Final compilation, all four gates, coverage and real KiCad
+remain unverified until the isolated-target runs complete.

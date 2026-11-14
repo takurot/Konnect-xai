@@ -301,7 +301,11 @@ pub fn arc_bbox(start: (f64, f64), mid: (f64, f64), end: (f64, f64)) -> (f64, f6
 /// Round to the six decimals KiCAD writes, so arithmetic noise never reaches
 /// the file. `+ 0.0` turns `-0` into the `0` KiCAD writes.
 pub fn round6(v: f64) -> f64 {
-    (v * 1_000_000.0).round() / 1_000_000.0 + 0.0
+    let scaled = v * 1_000_000.0;
+    if v.is_finite() && !scaled.is_finite() {
+        return v;
+    }
+    scaled.round() / 1_000_000.0 + 0.0
 }
 
 /// Format a millimetre value at KiCad's nanometre precision.
@@ -356,6 +360,14 @@ pub fn point_on_segment(px: f64, py: f64, x1: f64, y1: f64, x2: f64, y2: f64, to
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_finite_non_mm_values_do_not_overflow_while_rounding() {
+        for value in [1e308, -1e308, f64::MAX, -f64::MAX] {
+            assert_eq!(round6(value), value);
+            assert!(!fmt_mm(value).contains("inf"));
+        }
+    }
 
     #[test]
     fn millimetre_text_trims_zeros_and_rounds_arithmetic_noise() {

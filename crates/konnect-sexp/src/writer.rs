@@ -119,6 +119,7 @@ fn write_atomic_unlocked_with(
     before_replace: impl FnOnce() -> Result<(), SexpError>,
 ) -> Result<(), SexpError> {
     ensure_kicad_design_document_is_closed(path)?;
+    validate_design_coordinates(path, content)?;
     let (tmp_path, mut file) = create_scratch_file(path)?;
 
     // Remove the scratch file unless the rename below succeeds.
@@ -140,6 +141,165 @@ fn write_atomic_unlocked_with(
     std::fs::rename(&tmp_path, path)?;
     cleanup.disarm();
     sync_parent_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum CoordinateUnit {
+    Millimetres,
+    Finite,
+}
+
+fn validate_design_coordinates(path: &Path, content: &str) -> Result<(), SexpError> {
+    if !matches!(
+        path.extension().and_then(OsStr::to_str),
+        Some("kicad_sch" | "kicad_pcb" | "kicad_mod" | "kicad_sym")
+    ) {
+        return Ok(());
+    }
+    let Ok(root) = crate::parse_sexp(content) else {
+        return Ok(());
+    };
+    let is_design = |node: &crate::SexpNode| {
+        matches!(
+            node.head(),
+            Some("kicad_sch" | "kicad_pcb" | "footprint" | "kicad_symbol_lib")
+        )
+    };
+    if is_design(&root) {
+        validate_coordinate_nodes(&root, "")?;
+    } else {
+        for node in root
+            .children()
+            .unwrap_or_default()
+            .iter()
+            .filter(|node| is_design(node))
+        {
+            validate_coordinate_nodes(node, "")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_coordinate_nodes(node: &crate::SexpNode, parent: &str) -> Result<(), SexpError> {
+    use CoordinateUnit::{Finite, Millimetres};
+    let Some(head) = node.head() else {
+        return Ok(());
+    };
+    let check = |index, unit| validate_coordinate_value(node, index, unit);
+    match head {
+        "at" if node.get(1).is_some_and(|value| value.head() == Some("xyz")) => {}
+        "at" => {
+            check(1, Millimetres)?;
+            check(2, Millimetres)?;
+            if node.get(3).is_some() {
+                check(3, Finite)?;
+            }
+        }
+        "xy" | "start" | "end" | "mid" | "center" | "rect_delta" | "aux_axis_origin"
+        | "grid_origin" | "text_position" => {
+            check(1, Millimetres)?;
+            check(2, Millimetres)?;
+        }
+        "paper" if node.get(1).and_then(crate::SexpNode::as_str) == Some("User") => {
+            check(2, Millimetres)?;
+            check(3, Millimetres)?;
+        }
+        "hatch"
+            if matches!(
+                node.get(1).and_then(crate::SexpNode::as_str),
+                Some("edge" | "full" | "none")
+            ) =>
+        {
+            check(2, Millimetres)?
+        }
+        "size" => {
+            check(1, Millimetres)?;
+            if node.get(2).is_some() {
+                check(2, Millimetres)?;
+            }
+        }
+        "offset" if parent == "drill" => {
+            check(1, Millimetres)?;
+            check(2, Millimetres)?;
+        }
+        "offset" if parent == "pin_names" => check(1, Millimetres)?,
+        "xyz" if matches!(parent, "offset" | "at" | "scale" | "rotate") => {
+            let unit = if matches!(parent, "scale" | "rotate") {
+                Finite
+            } else {
+                Millimetres
+            };
+            for index in 1..=3 {
+                check(index, unit)?;
+            }
+        }
+        "drill" => {
+            let start = if node.get(1).and_then(crate::SexpNode::as_str) == Some("oval") {
+                2
+            } else {
+                1
+            };
+            check(start, Millimetres)?;
+            if start == 2 {
+                check(3, Millimetres)?;
+            }
+        }
+        "clearance" if parent == "options" => {}
+        "width"
+        | "height"
+        | "thickness"
+        | "clearance"
+        | "solder_mask_margin"
+        | "solder_paste_margin"
+        | "thermal_bridge_width"
+        | "thermal_gap"
+        | "min_thickness"
+        | "min_width"
+        | "length"
+        | "radius"
+        | "diameter"
+        | "pad_to_mask_clearance"
+        | "pad_to_paste_clearance"
+        | "solder_mask_min_width"
+        | "hatch_thickness"
+        | "hatch_gap" => check(1, Millimetres)?,
+        "angle" | "thermal_bridge_angle" => check(1, Finite)?,
+        "scale" | "rotate" if matches!(node.get(1), Some(crate::SexpNode::Atom(_))) => {
+            check(1, Finite)?
+        }
+        _ => {}
+    }
+    for child in node.children().unwrap_or_default().iter().skip(1) {
+        validate_coordinate_nodes(child, head)?;
+    }
+    Ok(())
+}
+
+fn validate_coordinate_value(
+    node: &crate::SexpNode,
+    index: usize,
+    unit: CoordinateUnit,
+) -> Result<(), SexpError> {
+    let head = node.head().unwrap_or_default();
+    let invalid = || {
+        SexpError::InvalidValue(format!(
+            "coordinate clause '{head}' value {index} is not finite or representable"
+        ))
+    };
+    let value = match node.get(index) {
+        Some(crate::SexpNode::Atom(value)) => value.parse::<f64>().map_err(|_| invalid())?,
+        _ => return Err(invalid()),
+    };
+    if !value.is_finite() {
+        return Err(invalid());
+    }
+    if matches!(unit, CoordinateUnit::Millimetres) {
+        let nanometres = (value * 1_000_000.0).round();
+        if !(i64::MIN as f64..-(i64::MIN as f64)).contains(&nanometres) {
+            return Err(invalid());
+        }
+    }
     Ok(())
 }
 
@@ -463,6 +623,7 @@ fn write_new_atomic_unlocked_with_mode(
     _mode: NewFileMode,
 ) -> Result<(), SexpError> {
     ensure_kicad_design_document_is_closed(path)?;
+    validate_design_coordinates(path, content)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut builder = tempfile::Builder::new();
     builder.prefix(".konnect-");
@@ -905,6 +1066,129 @@ pub(crate) mod mode_probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_design_coordinates_never_publish_or_replace() {
+        for (extension, root) in [
+            ("kicad_sch", "kicad_sch"),
+            ("kicad_pcb", "kicad_pcb"),
+            ("kicad_mod", "footprint"),
+            ("kicad_sym", "kicad_symbol_lib"),
+        ] {
+            for clause in [
+                "(at inf 0)",
+                "(at 0 NaN)",
+                "(at 0 0 inf)",
+                "(xy 1e308 0)",
+                "(start -1e308 0)",
+                "(end 0 inf)",
+                "(mid NaN 0)",
+                "(center 0 inf)",
+                "(size 1e308 1)",
+                "(aux_axis_origin inf 0)",
+                "(grid_origin 0 NaN)",
+                "(paper \"User\" 1e308 10)",
+                "(hatch edge inf)",
+                "(width inf)",
+                "(clearance NaN)",
+                "(drill oval 1 inf)",
+                "(drill 1 (offset inf 0))",
+                "(model x (offset (xyz 0 inf 0)))",
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join(format!("design.{extension}"));
+                let before = format!("({root} (at 0 0))");
+                let after = format!("({root} {clause})");
+                let error = write_new_atomic(&path, &after).unwrap_err();
+                assert!(matches!(error, SexpError::InvalidValue(_)), "{clause}");
+                assert!(!path.exists());
+                std::fs::write(&path, &before).unwrap();
+                let error = write_atomic_if_unchanged(&path, &before, &after).unwrap_err();
+                assert!(matches!(error, SexpError::InvalidValue(_)), "{clause}");
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+                assert!(!leftover_scratch_files(directory.path()));
+            }
+        }
+    }
+
+    #[test]
+    fn coordinate_guard_distinguishes_distances_from_other_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("part.kicad_mod");
+        let source = r#"(footprint "part"
+            (property "Price" "1e308") (property "Description" "NaN")
+            (at 54.61 -162.56 1e308) (size 2 1)
+            (pad "1" thru_hole oval (at 0 0) (size 2 3)
+                (drill oval 0.8 1.2 (offset 0.1 -0.2)))
+            (model "part.step" (offset (xyz 1 2 3))
+                (scale (xyz 1e308 1 1)) (rotate (xyz 0 1e308 0)))
+            (model "legacy.step" (at (xyz 1 2 3))))"#;
+        write_new_atomic(&path, source).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        let artifact = directory.path().join("report.json");
+        write_new_atomic(&artifact, "(kicad_pcb (at inf 0))").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(artifact).unwrap(),
+            "(kicad_pcb (at inf 0))"
+        );
+    }
+
+    #[test]
+    fn coordinate_guard_keeps_fixture_bytes_and_existing_write_guards() {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, source) in [
+            (
+                "placement.kicad_pcb",
+                include_str!("../tests/fixtures/placement/placement_fixture.kicad_pcb"),
+            ),
+            (
+                "hierarchy.kicad_sch",
+                include_str!("../tests/fixtures/kicad10_repaired_hierarchy.kicad_sch"),
+            ),
+            (
+                "variants.kicad_sch",
+                include_str!("../tests/fixtures/variants/ecc83-pp.kicad_sch"),
+            ),
+        ] {
+            let path = directory.path().join(name);
+            write_new_atomic(&path, source).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+            assert!(write_new_atomic(&path, source).is_err());
+            assert!(matches!(
+                write_atomic_if_unchanged(&path, "stale", source),
+                Err(SexpError::Conflict { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn coordinate_guard_preserves_existing_fixture_corpus() {
+        fn copy_designs(source: &Path, destination: &Path) -> usize {
+            std::fs::create_dir_all(destination).unwrap();
+            let mut count = 0;
+            for entry in std::fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let target = destination.join(entry.file_name());
+                if path.is_dir() {
+                    count += copy_designs(&path, &target);
+                } else if matches!(
+                    path.extension().and_then(OsStr::to_str),
+                    Some("kicad_sch" | "kicad_pcb" | "kicad_mod" | "kicad_sym")
+                ) {
+                    let content = std::fs::read_to_string(&path).unwrap();
+                    write_new_atomic(&target, &content)
+                        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+                    assert_eq!(std::fs::read_to_string(target).unwrap(), content);
+                    count += 1;
+                }
+            }
+            count
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        assert!(copy_designs(&fixtures, directory.path()) >= 3);
+    }
 
     #[test]
     fn apply_edits_reverse_order() {
