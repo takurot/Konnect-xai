@@ -439,11 +439,13 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             let (creates, updates) = build_mutation_items(&plan, &prepared, &snapshot)?;
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
+            let chamfers = konnect_ipc::FootprintChamfers::from_items(creates.iter().chain(updates.iter()))?;
             client.run_commit_recovering_in(snapshot.document.clone(), "Update PCB from saved schematic", |client| {
                 create_sync_items_in(client, &snapshot.document, &creates)?;
                 client.update_items_in(snapshot.document.clone(), updates)?;
                 Ok(())
             })?;
+            client.verify_footprint_chamfers_in(snapshot.document.clone(), &chamfers)?;
             for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected)?
             {
                 plan.diagnostics.push(conflict(
@@ -4702,7 +4704,7 @@ mod tests {
         assert!(
             texas.message.contains(TEXAS_VQFN)
                 && texas.message.contains("U1, U2")
-                && texas.message.contains("custom-shape pads"),
+                && texas.message.contains("pad shape 'custom'"),
             "{}",
             texas.message
         );

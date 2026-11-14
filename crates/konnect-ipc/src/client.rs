@@ -4305,7 +4305,9 @@ impl KiCadIpcClient {
         let item = Self::build_footprint_item(
             lib_id, reference, value, pads, graphics, fields, x, y, rotation, layer,
         )?;
+        let chamfers = crate::FootprintChamfers::from_items([&item])?;
         self.create_items_in(document.clone(), vec![item])?;
+        self.verify_footprint_chamfers_in(document.clone(), &chamfers)?;
         let footprints = self.list_footprints_in(document)?;
         footprints
             .iter()
@@ -4321,6 +4323,30 @@ impl KiCadIpcClient {
                     "KiCad created the footprint but reference '{reference}' was not found (board references: {references})"
                 )
             })
+    }
+
+    pub fn verify_footprint_chamfers_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        expected: &crate::FootprintChamfers,
+    ) -> Result<()> {
+        if expected.is_empty() {
+            return Ok(());
+        }
+        let result = self
+            .get_items_in(
+                document,
+                kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+            )
+            .and_then(|items| expected.verify(&items));
+        result.map_err(|error| {
+            anyhow::Error::new(IpcOutcomeUnknown {
+                command: "footprint chamfer readback".to_string(),
+                reason: format!(
+                    "{error:#}. A write already occurred; inspect the live board before retrying"
+                ),
+            })
+        })
     }
 
     /// Measure every item of an exact open board (#688).
@@ -4916,7 +4942,7 @@ fn build_graphic_child(
 
 /// The reference designator text of a placed footprint, or `""` when the
 /// instance carries no reference field.
-fn footprint_reference(footprint: &kiapi::board::types::FootprintInstance) -> &str {
+pub(crate) fn footprint_reference(footprint: &kiapi::board::types::FootprintInstance) -> &str {
     footprint
         .reference_field
         .as_ref()
