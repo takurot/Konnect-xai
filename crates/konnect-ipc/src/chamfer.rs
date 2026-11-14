@@ -8,13 +8,25 @@ use crate::gen::kiapi;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PadChamfer {
     number: String,
+    position: (i64, i64),
+    angle_bits: u64,
+    layers: Vec<i32>,
+    layer: i32,
+    size: (i64, i64),
+    offset: (i64, i64),
     shape: i32,
     ratio_bits: u64,
     corner_mask: u8,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct FootprintChamfers(BTreeMap<String, Vec<PadChamfer>>);
+pub struct FootprintChamfers(BTreeMap<String, ChamferFootprint>);
+
+#[derive(Debug, Clone)]
+struct ChamferFootprint {
+    id: Option<String>,
+    pads: Vec<PadChamfer>,
+}
 
 impl FootprintChamfers {
     pub fn from_items<'a>(items: impl IntoIterator<Item = &'a prost_types::Any>) -> Result<Self> {
@@ -39,7 +51,7 @@ impl FootprintChamfers {
                 let Some(stack) = pad.pad_stack else {
                     continue;
                 };
-                for layer in stack.copper_layers {
+                for layer in &stack.copper_layers {
                     let corners = layer.chamfered_corners.as_ref().map_or(0, |corners| {
                         u8::from(corners.top_left)
                             | (u8::from(corners.top_right) << 1)
@@ -61,8 +73,39 @@ impl FootprintChamfers {
                         } else {
                             layer.chamfer_ratio.to_bits()
                         };
+                        let position = pad.position.as_ref().with_context(|| {
+                            format!(
+                                "footprint '{reference}' pad '{}' has no position",
+                                pad.number
+                            )
+                        })?;
+                        let size = layer.size.as_ref().with_context(|| {
+                            format!("footprint '{reference}' pad '{}' has no size", pad.number)
+                        })?;
+                        let angle = stack
+                            .angle
+                            .as_ref()
+                            .map_or(0.0, |angle| angle.value_degrees);
+                        if !angle.is_finite() {
+                            bail!(
+                                "footprint '{reference}' pad '{}' has an invalid angle",
+                                pad.number
+                            );
+                        }
+                        let angle = angle.rem_euclid(360.0);
+                        let mut layers = stack.layers.clone();
+                        layers.sort_unstable();
                         chamfers.push(PadChamfer {
                             number: pad.number.clone(),
+                            position: (position.x_nm, position.y_nm),
+                            angle_bits: if angle == 0.0 { 0 } else { angle.to_bits() },
+                            layers,
+                            layer: layer.layer,
+                            size: (size.x_nm, size.y_nm),
+                            offset: layer
+                                .offset
+                                .as_ref()
+                                .map_or((0, 0), |offset| (offset.x_nm, offset.y_nm)),
                             shape: layer.shape,
                             ratio_bits: ratio,
                             corner_mask: corners,
@@ -75,7 +118,11 @@ impl FootprintChamfers {
                     bail!("a chamfered footprint has no reference");
                 }
                 chamfers.sort_unstable();
-                if footprints.insert(reference.clone(), chamfers).is_some() {
+                let evidence = ChamferFootprint {
+                    id: footprint.id.as_ref().map(|id| id.value.clone()),
+                    pads: chamfers,
+                };
+                if footprints.insert(reference.clone(), evidence).is_some() {
                     bail!("footprint reference '{reference}' is duplicated during chamfer verification");
                 }
             }
@@ -90,8 +137,13 @@ impl FootprintChamfers {
     pub fn verify(&self, items: &[prost_types::Any]) -> Result<()> {
         let observed = Self::from_items(items)?;
         for (reference, expected) in &self.0 {
-            if observed.0.get(reference) != Some(expected) {
-                bail!("footprint '{reference}' chamfer ratio, corners or pad multiplicity differ from what was sent");
+            let Some(observed) = observed.0.get(reference) else {
+                bail!("footprint '{reference}' chamfer readback is missing");
+            };
+            if observed.pads != expected.pads
+                || (expected.id.is_some() && observed.id != expected.id)
+            {
+                bail!("footprint '{reference}' chamfer geometry or identity differs from what was sent");
             }
         }
         Ok(())
@@ -109,10 +161,17 @@ mod tests {
                 crate::builders::pack_any(
                     &kiapi::board::types::Pad {
                         number: "1".to_string(),
+                        position: Some(Default::default()),
                         pad_stack: Some(kiapi::board::types::PadStack {
+                            layers: vec![kiapi::board::types::BoardLayer::BlFCu as i32],
                             copper_layers: vec![kiapi::board::types::PadStackLayer {
+                                layer: kiapi::board::types::BoardLayer::BlFCu as i32,
                                 shape: kiapi::board::types::PadStackShape::PssChamferedrect as i32,
                                 chamfer_ratio: 0.2,
+                                size: Some(kiapi::common::types::Vector2 {
+                                    x_nm: 2_000_000,
+                                    y_nm: 1_000_000,
+                                }),
                                 chamfered_corners: Some(
                                     kiapi::board::types::ChamferedRectCorners {
                                         top_left: mask & 1 != 0,
@@ -178,6 +237,110 @@ mod tests {
                 "kiapi.board.types.FootprintInstance"
             )])
             .is_err());
+    }
+
+    #[test]
+    fn chamfer_verification_binds_corners_to_physical_pads() {
+        let place = |item: prost_types::Any| {
+            let mut footprint =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            for (index, child) in footprint
+                .definition
+                .as_mut()
+                .unwrap()
+                .items
+                .iter_mut()
+                .enumerate()
+            {
+                let mut pad = kiapi::board::types::Pad::decode(child.value.as_slice()).unwrap();
+                pad.position = Some(kiapi::common::types::Vector2 {
+                    x_nm: index as i64 * 1_000_000,
+                    y_nm: 0,
+                });
+                *child = crate::builders::pack_any(&pad, "kiapi.board.types.Pad");
+            }
+            footprint
+        };
+        let expected = place(footprint(&[1, 8]));
+        let mut reordered = expected.clone();
+        reordered.definition.as_mut().unwrap().items.reverse();
+        let swapped = place(footprint(&[8, 1]));
+        let pack = |value| crate::builders::pack_any(&value, "kiapi.board.types.FootprintInstance");
+        let expected = FootprintChamfers::from_items([&pack(expected)]).unwrap();
+        assert!(expected.verify(&[pack(reordered)]).is_ok());
+        assert!(expected.verify(&[pack(swapped)]).is_err());
+    }
+
+    #[test]
+    fn chamfer_verification_preserves_existing_footprint_identity() {
+        let assign_id = |id: &str| {
+            let item = footprint(&[1]);
+            let mut value =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            value.id = Some(kiapi::common::types::Kiid {
+                value: id.to_string(),
+            });
+            crate::builders::pack_any(&value, "kiapi.board.types.FootprintInstance")
+        };
+        let existing = assign_id("existing");
+        let expected = FootprintChamfers::from_items([&existing]).unwrap();
+        assert!(expected.verify(&[assign_id("existing")]).is_ok());
+        assert!(expected.verify(&[assign_id("different")]).is_err());
+        let creation = footprint(&[1]);
+        let expected = FootprintChamfers::from_items([&creation]).unwrap();
+        assert!(expected.verify(&[assign_id("assigned-by-kicad")]).is_ok());
+    }
+
+    #[test]
+    fn chamfer_verification_binds_layer_and_pad_geometry() {
+        let item = footprint(&[1]);
+        let expected = FootprintChamfers::from_items([&item]).unwrap();
+        for change in 0..7 {
+            let mut value =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            let child = &mut value.definition.as_mut().unwrap().items[0];
+            let mut pad = kiapi::board::types::Pad::decode(child.value.as_slice()).unwrap();
+            match change {
+                0 => pad.position = None,
+                1 => {
+                    pad.pad_stack.as_mut().unwrap().angle = Some(kiapi::common::types::Angle {
+                        value_degrees: 90.0,
+                    })
+                }
+                2 => pad
+                    .pad_stack
+                    .as_mut()
+                    .unwrap()
+                    .layers
+                    .push(kiapi::board::types::BoardLayer::BlBCu as i32),
+                3 => {
+                    pad.pad_stack.as_mut().unwrap().copper_layers[0].layer =
+                        kiapi::board::types::BoardLayer::BlBCu as i32
+                }
+                4 => pad.pad_stack.as_mut().unwrap().copper_layers[0].size = None,
+                5 => {
+                    pad.pad_stack.as_mut().unwrap().copper_layers[0]
+                        .size
+                        .as_mut()
+                        .unwrap()
+                        .x_nm += 1
+                }
+                _ => {
+                    pad.pad_stack.as_mut().unwrap().copper_layers[0].offset =
+                        Some(kiapi::common::types::Vector2 { x_nm: 1, y_nm: 0 })
+                }
+            }
+            *child = crate::builders::pack_any(&pad, "kiapi.board.types.Pad");
+            assert!(
+                expected
+                    .verify(&[crate::builders::pack_any(
+                        &value,
+                        "kiapi.board.types.FootprintInstance"
+                    )])
+                    .is_err(),
+                "change {change}"
+            );
+        }
     }
     #[test]
     fn chamfer_verification_refuses_unreadable_or_ambiguous_evidence() {
