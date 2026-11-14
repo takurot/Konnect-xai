@@ -1943,7 +1943,23 @@ mod zone_net_tests {
     use super::*;
     use crate::tools::pcb_zone_nets::test_support::{
         captured_zones, copper, invalid_zones, mock_zones, rule_area,
+        serializer_shaped_graphical_zones,
     };
+
+    #[test]
+    fn graphical_zone_does_not_block_the_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("zones.kicad_pcb");
+        for zone in serializer_shaped_graphical_zones() {
+            let (server, _) = mock_zones(&board, vec![zone]);
+            let client = konnect_ipc::KiCadIpcClient::new(server.address().to_string());
+            assert!(snapshot_board(&client, &board)
+                .unwrap()
+                .state
+                .routed_nets
+                .is_empty());
+        }
+    }
 
     #[test]
     fn zone_snapshot_counts_only_its_copper_net() {

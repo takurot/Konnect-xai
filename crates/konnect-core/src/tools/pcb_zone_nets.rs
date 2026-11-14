@@ -102,6 +102,35 @@ pub(super) mod test_support {
         .collect()
     }
 
+    pub fn serializer_shaped_graphical_zones() -> Vec<prost_types::Any> {
+        let mut zone =
+            kiapi::board::types::Zone::decode(captured_zones()[0].value.as_slice()).unwrap();
+        zone.r#type = kiapi::board::types::ZoneType::ZtGraphical as i32;
+        zone.layers = vec![kiapi::board::types::BoardLayer::BlFSilkS as i32];
+        [
+            Some(kiapi::board::types::Net {
+                name: "GND".to_string(),
+                ..Default::default()
+            }),
+            None,
+            Some(kiapi::board::types::Net {
+                name: "UNUSED".to_string(),
+                code: Some(kiapi::board::types::NetCode { value: -1 }),
+            }),
+        ]
+        .into_iter()
+        .map(|net| {
+            let Some(kiapi::board::types::zone::Settings::CopperSettings(settings)) =
+                &mut zone.settings
+            else {
+                panic!("captured copper settings")
+            };
+            settings.net = net;
+            pack_any(&zone, "kiapi.board.types.Zone")
+        })
+        .collect()
+    }
+
     pub fn missing_net() -> prost_types::Any {
         let mut item =
             kiapi::board::types::Zone::decode(copper("GND", 1).value.as_slice()).unwrap();
@@ -204,7 +233,9 @@ pub(super) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{captured_zones, copper, invalid_zones, rule_area};
+    use super::test_support::{
+        captured_zones, copper, invalid_zones, rule_area, serializer_shaped_graphical_zones,
+    };
     use super::*;
 
     #[test]
@@ -231,6 +262,13 @@ mod tests {
         };
         let item = konnect_ipc::builders::pack_any(&graphical, "kiapi.board.types.Zone");
         assert_eq!(routed_net(&item).unwrap(), None);
+    }
+
+    #[test]
+    fn graphical_zone_ignores_serializer_copper_settings_and_stale_nets() {
+        for zone in serializer_shaped_graphical_zones() {
+            assert_eq!(routed_net(&zone).unwrap(), None);
+        }
     }
 
     #[test]
