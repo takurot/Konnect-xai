@@ -78,3 +78,11 @@ are supporting evidence only.
 
 No KiCad installation is available on this host. No real IPC acceptance or
 80-percent coverage claim is made.
+
+The real R1 protocol capture reproduces a further no-op failure: native pads
+carry an inactive chamfer ratio of `0.2`, while the library builder supplies
+`0`. Pad comparison now clears only attributes that the protocol declares
+inactive for that shape. Roundrect radii and chamfered-rectangle radii, ratios,
+and corner selections remain significant. The exact-source harness fails
+before this correction and passes afterward; a native-fixture regression also
+checks these active-value counterexamples. Final Cargo verification is pending.
