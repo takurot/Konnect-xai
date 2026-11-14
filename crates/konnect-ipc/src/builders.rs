@@ -198,7 +198,7 @@ pub fn flip_layer(name: &str, copper_layer_count: usize) -> anyhow::Result<Strin
             .filter(|inner| (1..=30).contains(inner) && !number.starts_with('0'))
             .ok_or_else(|| anyhow::anyhow!("invalid inner copper layer '{name}'"))?;
         if !(2..=32).contains(&copper_layer_count)
-            || copper_layer_count % 2 != 0
+            || !copper_layer_count.is_multiple_of(2)
             || inner > copper_layer_count - 2
         {
             anyhow::bail!(
