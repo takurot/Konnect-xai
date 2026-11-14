@@ -13,6 +13,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+#[derive(Debug, thiserror::Error)]
+#[error("footprint chamfer readback failed")]
+struct ChamferReadbackFailed;
+
 #[derive(Debug, Clone)]
 struct LibraryFootprint {
     library_id: String,
@@ -296,9 +300,29 @@ pub(crate) async fn handle_update_footprints_from_library(
             }
 
             let update_count = plan.prepared_items.len();
-            client.run_commit("Update footprints from libraries", |client| {
-                client.update_items_in(document, std::mem::take(&mut plan.prepared_items))
-            })?;
+            let chamfers = konnect_ipc::FootprintChamfers::from_items(&plan.prepared_items)?;
+            let mutation = client.run_commit("Update footprints from libraries", |client| {
+                client.update_items_in(document.clone(), std::mem::take(&mut plan.prepared_items))?;
+                if !chamfers.is_empty() {
+                    (|| {
+                        let observed = client.get_items_in(document.clone(), ObjectType::KotPcbFootprint)?;
+                        chamfers.verify(&observed)
+                    })().context(ChamferReadbackFailed)?;
+                }
+                Ok(())
+            });
+            if let Err(error) = mutation {
+                if error.downcast_ref::<ChamferReadbackFailed>().is_some()
+                    && error.downcast_ref::<konnect_ipc::client::IpcOutcomeUnknown>().is_none()
+                    && error.downcast_ref::<konnect_ipc::client::IpcBatchRecovered>().is_none()
+                {
+                    return Ok(CallToolResult::error_kind(
+                        crate::mcp::error::ToolErrorKind::HandlerError { reason: format!("{error:#}") },
+                        format!("Footprint library update for '{}' was rolled back after chamfer readback failed: {error:#}. Rerun dry run before retrying.", planning_board_path.display()),
+                    ));
+                }
+                return Err(error);
+            }
             plan.coverage.selected.applied = plan.coverage.selected.planned;
             plan.coverage.changed.applied = update_count;
             plan.coverage.unchanged.applied = plan.coverage.unchanged.planned;
@@ -316,6 +340,12 @@ pub(crate) async fn handle_update_footprints_from_library(
             reason.premise()
         )),
         BoardWrite::Refused(result) => {
+            if matches!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("ipc_outcome_unknown" | "ipc_batch_recovered")
+            ) {
+                return Ok(result);
+            }
             let message = result
                 .content
                 .into_iter()
@@ -740,7 +770,7 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         bail!("library source root must be a footprint");
     }
 
-    validate_supported_children(&root)?;
+    super::library_footprint::validate_supported_children(&root)?;
     let properties = parse_library_properties(&root)?;
     let pads = super::pcb_components::extract_pad_definitions(source)?;
     // Custom properties travel as typed Field items below. Treating visible
@@ -1133,325 +1163,6 @@ fn parse_property_effects(
     })
 }
 
-fn validate_supported_children(root: &konnect_sexp::SexpNode) -> Result<()> {
-    for child in root.children().unwrap_or_default().iter().skip(2) {
-        let Some(tag) = child.head() else {
-            continue;
-        };
-        match tag {
-            "version" | "generator" | "generator_version" | "layer" | "descr" | "tags" | "attr"
-            | "property" | "fp_text" | "fp_line" | "fp_rect" | "fp_circle" | "fp_arc"
-            | "fp_poly" | "pad" | "model" => {}
-            // KiCad 10 writes these two flags into every footprint it saves
-            // (all 15,428 official library files carry them, every one at its
-            // default). At the default the typed rebuild loses nothing;
-            // a non-default value carries semantics it cannot represent.
-            "embedded_fonts" | "duplicate_pad_numbers_are_jumpers" => {
-                let value = child.get(1).and_then(konnect_sexp::SexpNode::as_str);
-                if value != Some("no") {
-                    bail!(
-                        "footprint '{tag} {}' is not supported by typed library refresh",
-                        value.unwrap_or("")
-                    );
-                }
-            }
-            unsupported => {
-                bail!("footprint child '{unsupported}' is not supported by typed library refresh")
-            }
-        }
-        match tag {
-            "pad" => validate_pad(child)?,
-            "fp_line" | "fp_rect" | "fp_circle" | "fp_arc" | "fp_poly" => {
-                validate_graphic(child, tag)?
-            }
-            "fp_text" => {
-                let kind = child
-                    .get(1)
-                    .and_then(konnect_sexp::SexpNode::as_str)
-                    .context("fp_text is missing its kind")?;
-                match kind {
-                    "reference" | "value" => {}
-                    "user" => validate_user_text(child)?,
-                    _ => {
-                        bail!(
-                            "fp_text kind '{kind}' is not supported losslessly by typed library refresh"
-                        );
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-/// Accept only the `fp_text user` subset the typed IPC rebuild can reproduce.
-/// Refusing an unknown clause is intentional: silently dropping even a visual
-/// modifier would make a refreshed board differ from its library definition.
-fn validate_user_text(text: &konnect_sexp::SexpNode) -> Result<()> {
-    text.get(2)
-        .and_then(konnect_sexp::SexpNode::as_str)
-        .context("fp_text user is missing its text")?;
-
-    let mut saw_at = false;
-    let mut saw_layer = false;
-    let mut saw_effects = false;
-    let mut identifier = None;
-    for clause in text.children().unwrap_or_default().iter().skip(3) {
-        let tag = clause
-            .head()
-            .context("fp_text user contains an unsupported atom")?;
-        match tag {
-            "at" => {
-                if saw_at {
-                    bail!("fp_text user contains duplicate 'at' clauses");
-                }
-                saw_at = true;
-                let count = clause.children().map_or(0, |children| children.len());
-                if !matches!(count, 3 | 4) {
-                    bail!("fp_text user 'at' must contain x, y, and optional rotation");
-                }
-                for index in 1..count {
-                    let value = clause
-                        .get_f64(index)
-                        .with_context(|| format!("fp_text user 'at' value {index} is invalid"))?;
-                    if !value.is_finite() {
-                        bail!("fp_text user 'at' values must be finite");
-                    }
-                }
-            }
-            "layer" => {
-                if saw_layer {
-                    bail!("fp_text user contains duplicate 'layer' clauses");
-                }
-                saw_layer = true;
-                if clause.children().map_or(0, |children| children.len()) != 2
-                    || clause
-                        .get(1)
-                        .and_then(konnect_sexp::SexpNode::as_str)
-                        .is_none_or(str::is_empty)
-                {
-                    bail!("fp_text user 'layer' must name exactly one layer");
-                }
-            }
-            "uuid" | "tstamp" => {
-                if let Some(previous) = identifier {
-                    bail!(
-                        "fp_text user contains multiple identifier clauses ('{previous}' and '{tag}')"
-                    );
-                }
-                identifier = Some(tag);
-                if clause.children().map_or(0, |children| children.len()) != 2
-                    || clause
-                        .get(1)
-                        .and_then(konnect_sexp::SexpNode::as_str)
-                        .is_none_or(str::is_empty)
-                {
-                    bail!("fp_text user '{tag}' must contain exactly one identifier");
-                }
-            }
-            "effects" => {
-                if saw_effects {
-                    bail!("fp_text user contains duplicate 'effects' clauses");
-                }
-                saw_effects = true;
-                validate_user_text_effects(clause)?;
-            }
-            unsupported => {
-                bail!("fp_text user clause '{unsupported}' is not supported losslessly");
-            }
-        }
-    }
-
-    if !saw_at {
-        bail!("fp_text user is missing its 'at' clause");
-    }
-    if !saw_layer {
-        bail!("fp_text user is missing its 'layer' clause");
-    }
-    if !saw_effects {
-        bail!("fp_text user is missing its 'effects' clause");
-    }
-    Ok(())
-}
-
-fn validate_user_text_effects(effects: &konnect_sexp::SexpNode) -> Result<()> {
-    let mut font = None;
-    for clause in effects.children().unwrap_or_default().iter().skip(1) {
-        let tag = clause
-            .head()
-            .context("fp_text user effects contain an unsupported atom")?;
-        if tag != "font" {
-            bail!("fp_text user effects clause '{tag}' is not supported losslessly");
-        }
-        if font.replace(clause).is_some() {
-            bail!("fp_text user contains duplicate font clauses");
-        }
-    }
-    let font = font.context("fp_text user effects are missing the font clause")?;
-
-    let mut size = None;
-    let mut thickness = None;
-    for clause in font.children().unwrap_or_default().iter().skip(1) {
-        let tag = clause
-            .head()
-            .context("fp_text user font contains an unsupported atom")?;
-        match tag {
-            "size" => {
-                if size.is_some() {
-                    bail!("fp_text user contains duplicate font size clauses");
-                }
-                if clause.children().map_or(0, |children| children.len()) != 3 {
-                    bail!("fp_text user font size must contain width and height");
-                }
-                let width = clause
-                    .get_f64(1)
-                    .context("fp_text user font width is invalid")?;
-                let height = clause
-                    .get_f64(2)
-                    .context("fp_text user font height is invalid")?;
-                if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
-                    bail!("fp_text user font size must be finite and positive");
-                }
-                if width != height {
-                    bail!("fp_text user non-square font size is not supported losslessly");
-                }
-                size = Some(width);
-            }
-            "thickness" => {
-                if thickness.is_some() {
-                    bail!("fp_text user contains duplicate font thickness clauses");
-                }
-                if clause.children().map_or(0, |children| children.len()) != 2 {
-                    bail!("fp_text user font thickness must contain exactly one value");
-                }
-                let value = clause
-                    .get_f64(1)
-                    .context("fp_text user font thickness is invalid")?;
-                if !value.is_finite() || value <= 0.0 {
-                    bail!("fp_text user font thickness must be finite and positive");
-                }
-                thickness = Some(value);
-            }
-            unsupported => {
-                bail!("fp_text user font clause '{unsupported}' is not supported losslessly");
-            }
-        }
-    }
-    size.context("fp_text user font is missing its size")?;
-    thickness.context("fp_text user font is missing its thickness")?;
-    Ok(())
-}
-
-fn validate_graphic(graphic: &konnect_sexp::SexpNode, kind: &str) -> Result<()> {
-    let allowed: &[&str] = match kind {
-        "fp_line" => &["start", "end", "stroke", "layer", "uuid", "tstamp"],
-        "fp_rect" => &["start", "end", "stroke", "fill", "layer", "uuid", "tstamp"],
-        "fp_circle" => &["center", "end", "stroke", "fill", "layer", "uuid", "tstamp"],
-        "fp_arc" => &["start", "mid", "end", "stroke", "layer", "uuid", "tstamp"],
-        "fp_poly" => &["pts", "stroke", "fill", "layer", "uuid", "tstamp"],
-        _ => bail!("unsupported footprint graphic '{kind}'"),
-    };
-    for child in graphic.children().unwrap_or_default().iter().skip(1) {
-        let Some(tag) = child.head() else {
-            bail!("{kind} contains an unsupported atom");
-        };
-        if !allowed.contains(&tag) {
-            bail!("{kind} clause '{tag}' is not supported by typed library refresh");
-        }
-        match tag {
-            "stroke" => {
-                for stroke_child in child.children().unwrap_or_default().iter().skip(1) {
-                    let stroke_tag = stroke_child
-                        .head()
-                        .context("graphic stroke contains an unsupported atom")?;
-                    match stroke_tag {
-                        "width" => {}
-                        "type" => {
-                            let stroke_type = stroke_child
-                                .get(1)
-                                .and_then(konnect_sexp::SexpNode::as_str)
-                                .context("graphic stroke type is missing")?;
-                            if !matches!(stroke_type, "solid" | "default") {
-                                bail!(
-                                    "graphic stroke type '{stroke_type}' is not supported losslessly"
-                                );
-                            }
-                        }
-                        unsupported => bail!(
-                            "graphic stroke clause '{unsupported}' is not supported losslessly"
-                        ),
-                    }
-                }
-            }
-            "fill" => {
-                let fill = child
-                    .get(1)
-                    .and_then(konnect_sexp::SexpNode::as_str)
-                    .context("graphic fill is missing")?;
-                if !matches!(fill, "none" | "no" | "solid" | "yes") {
-                    bail!("graphic fill '{fill}' is not supported losslessly");
-                }
-            }
-            "pts"
-                if child
-                    .children()
-                    .unwrap_or_default()
-                    .iter()
-                    .skip(1)
-                    .any(|point| point.head() != Some("xy")) =>
-            {
-                bail!("fp_poly contains a non-xy point");
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn validate_pad(pad: &konnect_sexp::SexpNode) -> Result<()> {
-    let shape = pad
-        .get(3)
-        .and_then(konnect_sexp::SexpNode::as_str)
-        .context("footprint pad is missing its shape")?;
-    if !matches!(shape, "circle" | "rect" | "oval" | "roundrect") {
-        bail!("pad shape '{shape}' is not supported by typed library refresh");
-    }
-    for child in pad.children().unwrap_or_default().iter().skip(4) {
-        let Some(tag) = child.head() else {
-            continue;
-        };
-        if !matches!(
-            tag,
-            "at" | "size"
-                | "layers"
-                | "drill"
-                | "roundrect_rratio"
-                | "uuid"
-                | "tstamp"
-                | "remove_unused_layers"
-        ) {
-            bail!("pad clause '{tag}' is not supported by typed library refresh");
-        }
-        if tag == "remove_unused_layers" {
-            // The typed rebuild always keeps unused layers (`UlrKeep`), so a
-            // pad that actually removes them cannot be rebuilt losslessly.
-            let value = child.get(1).and_then(konnect_sexp::SexpNode::as_str);
-            if value != Some("no") {
-                bail!("pad 'remove_unused_layers yes' is not supported by typed library refresh");
-            }
-        }
-        if tag == "drill" {
-            for nested in child.children().unwrap_or_default().iter().skip(1) {
-                if nested.head().is_some() {
-                    bail!("nested drill clauses are not supported by typed library refresh");
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 fn build_updated_instance(
     current: &kiapi::board::types::FootprintInstance,
     library: &LibraryFootprint,
@@ -1763,6 +1474,10 @@ fn mirror_pad(pad: &konnect_ipc::IpcPadDefinition) -> Result<konnect_ipc::IpcPad
     let mut mirrored = pad.clone();
     mirrored.y = -mirrored.y;
     mirrored.rotation = -mirrored.rotation;
+    if let Some(corners) = mirrored.chamfered_corners.as_mut() {
+        std::mem::swap(&mut corners.top_left, &mut corners.bottom_left);
+        std::mem::swap(&mut corners.top_right, &mut corners.bottom_right);
+    }
     mirrored.layers = mirrored
         .layers
         .iter()
@@ -3558,10 +3273,39 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum ChamferReadback {
+        Faithful,
+        DropCorners,
+        Missing,
+        Unreadable,
+        Unavailable,
+        RollbackFailure,
+    }
+
+    fn api_refused(message: &str) -> kiapi::common::ApiResponse {
+        kiapi::common::ApiResponse {
+            status: Some(kiapi::common::ApiResponseStatus {
+                status: kiapi::common::ApiStatusCode::AsBadRequest as i32,
+                error_message: message.to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
     fn spawn_planner_mock(
         board: &Path,
         footprint: prost_types::Any,
         fail_update: bool,
+    ) -> PlannerMock {
+        spawn_planner_mock_readback(board, footprint, fail_update, ChamferReadback::Faithful)
+    }
+
+    fn spawn_planner_mock_readback(
+        board: &Path,
+        footprint: prost_types::Any,
+        fail_update: bool,
+        readback: ChamferReadback,
     ) -> PlannerMock {
         use nng::options::Options;
 
@@ -3580,6 +3324,9 @@ mod tests {
         let capture = std::sync::Arc::new(std::sync::Mutex::new(MutationCapture::default()));
         let captured = capture.clone();
         let thread = std::thread::spawn(move || {
+            let original = footprint.clone();
+            let mut footprint = footprint;
+            let mut has_update = false;
             while let Ok(message) = socket.recv() {
                 let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
                 let message = request.message.expect("request message");
@@ -3602,10 +3349,36 @@ mod tests {
                     let command =
                         kiapi::common::commands::GetItems::decode(message.value.as_slice())
                             .unwrap();
+                    assert_eq!(
+                        command
+                            .header
+                            .as_ref()
+                            .and_then(|header| header.document.as_ref())
+                            .and_then(|document| document.identifier.as_ref()),
+                        Some(
+                            &kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                board_name.clone()
+                            )
+                        ),
+                    );
+                    if has_update && matches!(readback, ChamferReadback::Unavailable) {
+                        socket
+                            .send(nng::Message::from(
+                                api_refused("readback unavailable")
+                                    .encode_to_vec()
+                                    .as_slice(),
+                            ))
+                            .unwrap();
+                        continue;
+                    }
                     let items = if command.types
                         == vec![kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32]
                     {
-                        vec![footprint.clone()]
+                        if has_update && matches!(readback, ChamferReadback::Missing) {
+                            Vec::new()
+                        } else {
+                            vec![footprint.clone()]
+                        }
                     } else {
                         Vec::new()
                     };
@@ -3643,6 +3416,45 @@ mod tests {
                         .unwrap()
                         .update_batches
                         .push(update.items.len());
+                    if !fail_update {
+                        has_update = true;
+                        footprint = update.items[0].clone();
+                        if matches!(
+                            readback,
+                            ChamferReadback::DropCorners
+                                | ChamferReadback::RollbackFailure
+                                | ChamferReadback::Unreadable
+                        ) {
+                            let mut instance = kiapi::board::types::FootprintInstance::decode(
+                                footprint.value.as_slice(),
+                            )
+                            .unwrap();
+                            for child in &mut instance.definition.as_mut().unwrap().items {
+                                if builders::any_is(child, "kiapi.board.types.Pad") {
+                                    let mut pad =
+                                        kiapi::board::types::Pad::decode(child.value.as_slice())
+                                            .unwrap();
+                                    if pad.number == "4" {
+                                        if matches!(readback, ChamferReadback::Unreadable) {
+                                            child.value = vec![0xff];
+                                        } else {
+                                            for layer in
+                                                &mut pad.pad_stack.as_mut().unwrap().copper_layers
+                                            {
+                                                layer.chamfered_corners = None;
+                                            }
+                                            *child =
+                                                builders::pack_any(&pad, "kiapi.board.types.Pad");
+                                        }
+                                    }
+                                }
+                            }
+                            footprint = builders::pack_any(
+                                &instance,
+                                "kiapi.board.types.FootprintInstance",
+                            );
+                        }
+                    }
                     let updated_items = update
                         .items
                         .into_iter()
@@ -3674,6 +3486,20 @@ mod tests {
                     let end = kiapi::common::commands::EndCommit::decode(message.value.as_slice())
                         .unwrap();
                     captured.lock().unwrap().commit_actions.push(end.action());
+                    if end.action() == kiapi::common::commands::CommitAction::CmaDrop {
+                        if matches!(readback, ChamferReadback::RollbackFailure) {
+                            socket
+                                .send(nng::Message::from(
+                                    api_refused("rollback unavailable")
+                                        .encode_to_vec()
+                                        .as_slice(),
+                                ))
+                                .unwrap();
+                            continue;
+                        }
+                        footprint = original.clone();
+                        has_update = false;
+                    }
                     api_reply(builders::pack_any(
                         &kiapi::common::commands::EndCommitResponse {},
                         "kiapi.common.commands.EndCommitResponse",
@@ -3764,6 +3590,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_verifies_back_side_chamfer_readback_before_committing() {
+        for behavior in [
+            ChamferReadback::Faithful,
+            ChamferReadback::DropCorners,
+            ChamferReadback::Missing,
+            ChamferReadback::Unreadable,
+            ChamferReadback::Unavailable,
+            ChamferReadback::RollbackFailure,
+        ] {
+            let (temp, board, items) = plan_fixture();
+            let source = KICAD_LIBRARY_FOOTPRINT;
+            let end = source.rfind(')').unwrap();
+            let source = format!("{} (pad \"4\" smd chamfered_rect (at 1 2 30) (size 2 1) (layers \"F.Cu\") (chamfer_ratio 0.2) (chamfer top_left)){}", &source[..end], &source[end..]);
+            std::fs::write(temp.path().join("Test.pretty/Socket.kicad_mod"), source).unwrap();
+            let mut instance =
+                kiapi::board::types::FootprintInstance::decode(items[2].value.as_slice()).unwrap();
+            instance.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
+            let item = builders::pack_any(&instance, "kiapi.board.types.FootprintInstance");
+            let original = item.clone();
+            let mock = spawn_planner_mock_readback(&board, item, false, behavior);
+            let context = test_context(&mock.url);
+            let dry_run = handle_update_footprints_from_library(&json!({"board": board}), &context)
+                .await
+                .unwrap();
+            let dry_run = result_json(&dry_run);
+            assert_eq!(dry_run["status"], "ready", "{dry_run}");
+            let applied = handle_update_footprints_from_library(
+                &json!({
+                    "board": board, "dry_run": false,
+                    "expected_plan_revision": dry_run["plan_revision"],
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+            let observed = result_json(&applied);
+            if matches!(behavior, ChamferReadback::Faithful) {
+                assert_eq!(observed["status"], "applied", "{observed}");
+            } else {
+                assert!(applied.is_error, "{observed}");
+                if matches!(behavior, ChamferReadback::RollbackFailure) {
+                    assert_eq!(
+                        crate::mcp::error::extract_error_kind(&applied).as_deref(),
+                        Some("ipc_outcome_unknown")
+                    );
+                } else {
+                    assert!(
+                        observed["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("rolled back"),
+                        "{observed}"
+                    );
+                    let client = konnect_ipc::KiCadIpcClient::new(mock.url.clone());
+                    let document = client.find_open_board(&board).unwrap();
+                    let restored = client
+                        .get_items_in(
+                            document,
+                            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+                        )
+                        .unwrap();
+                    assert_eq!(restored, vec![original]);
+                }
+            }
+            let capture = mock.capture.lock().unwrap();
+            assert_eq!(capture.update_batches, vec![1]);
+            assert_eq!(
+                capture.commit_actions,
+                vec![if matches!(behavior, ChamferReadback::Faithful) {
+                    kiapi::common::commands::CommitAction::CmaCommit
+                } else {
+                    kiapi::common::commands::CommitAction::CmaDrop
+                }]
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn failed_update_drops_the_single_commit() {
         let (_temp, board, items) = plan_fixture();
         let mock = spawn_planner_mock(&board, items[2].clone(), true);
@@ -3796,5 +3700,43 @@ mod tests {
             capture.commit_actions,
             vec![kiapi::common::commands::CommitAction::CmaDrop]
         );
+    }
+}
+
+#[cfg(test)]
+mod issue14_chamfer_tests {
+    use super::*;
+
+    #[test]
+    fn back_side_refresh_mirrors_chamfer_corners() {
+        let source = r#"(footprint "F" (layer "F.Cu")
+            (pad "1" smd chamfered_rect (at 1 2 30) (size 2 1)
+                (layers "F.Cu") (chamfer_ratio 0.2) (chamfer top_left)))"#;
+        let pad = super::super::pcb_components::extract_pad_definitions(source)
+            .unwrap()
+            .remove(0);
+        let mirrored = mirror_pad(&pad).unwrap();
+        let item = konnect_ipc::KiCadIpcClient::build_footprint_item(
+            "L:F",
+            "U1",
+            "F",
+            &[mirrored],
+            &[],
+            &Default::default(),
+            0.0,
+            0.0,
+            0.0,
+            "B.Cu",
+        )
+        .unwrap();
+        let footprint =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        let item = &footprint.definition.unwrap().items[0];
+        let pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+        let copper = &pad.pad_stack.unwrap().copper_layers[0];
+        assert_eq!(copper.chamfer_ratio, 0.2);
+        let corners = copper.chamfered_corners.as_ref().unwrap();
+        assert!(corners.bottom_left);
+        assert!(!corners.top_left && !corners.top_right && !corners.bottom_right);
     }
 }

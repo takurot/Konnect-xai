@@ -932,6 +932,8 @@ fn mounting_hole_pad(drill_diameter_mm: f64) -> konnect_ipc::IpcPadDefinition {
         drill_oval: false,
         layers: vec!["*.Cu".to_string(), "*.Mask".to_string()],
         roundrect_ratio: 0.0,
+        chamfer_ratio: 0.0,
+        chamfered_corners: None,
     }
 }
 
@@ -2460,14 +2462,15 @@ async fn handle_add_mounting_hole(
     let reference_ipc = spec.reference.clone();
     let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board_path, "mounting hole", move |c| {
+        let geometry = prepared_ipc.ipc()?;
         c.place_footprint(
             &requested_board,
             &lib_id_ipc,
             &reference_ipc,
             &prepared_ipc.value,
-            &prepared_ipc.pads,
-            &prepared_ipc.graphics,
-            &prepared_ipc.fields,
+            &geometry.pads,
+            &geometry.graphics,
+            &geometry.fields,
             x,
             y,
             0.0,
