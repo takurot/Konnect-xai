@@ -194,6 +194,7 @@ fn prepare_footprint_source(
              supported because a correct flip must mirror the geometry), got '{layer}'"
         );
     }
+    validate_placement_values(x, y, rotation)?;
     let mut prepared = source.to_string();
     replace_quoted_after(&mut prepared, "(footprint \"", lib_id)?;
     replace_reference(&mut prepared, reference)?;
@@ -575,6 +576,7 @@ fn board_footprint_sexp(
     reference: Option<&str>,
     project_dir: Option<&Path>,
 ) -> Result<String, String> {
+    validate_placement_values(x, y, rotation).map_err(|error| error.to_string())?;
     let path = resolve_footprint_path(lib_id, project_dir)?;
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("Cannot read footprint {}: {}", path.display(), e))?;
@@ -602,6 +604,7 @@ fn board_footprint_sexp(
     out.push_str(&content[name_span.end..]);
 
     if rotation != 0.0 {
+        validate_child_rotation(&out, rotation).map_err(|error| error.to_string())?;
         out = apply_rotation_to_children(&out, rotation);
     }
     if let Some(reference) = reference {
@@ -1168,6 +1171,33 @@ fn prepare_closed_board_footprint_update(
     Ok(updated)
 }
 
+fn validate_placement_values(x: f64, y: f64, rotation: f64) -> anyhow::Result<()> {
+    konnect_ipc::builders::mm_to_nm(x).context("invalid footprint X coordinate")?;
+    konnect_ipc::builders::mm_to_nm(y).context("invalid footprint Y coordinate")?;
+    anyhow::ensure!(
+        rotation.is_finite() && round6(rotation).is_finite(),
+        "footprint rotation must remain finite when formatted"
+    );
+    Ok(())
+}
+
+fn validate_child_rotation(source: &str, delta: f64) -> anyhow::Result<()> {
+    anyhow::ensure!(delta.is_finite(), "footprint rotation delta must be finite");
+    for start in find_block_starts(source, "at") {
+        let (_, end) = find_balanced_block(source, start).context("invalid footprint anchor")?;
+        let at = konnect_sexp::parse_sexp(&source[start..end])?;
+        let x = at
+            .get_f64(1)
+            .context("invalid footprint child X coordinate")?;
+        let y = at
+            .get_f64(2)
+            .context("invalid footprint child Y coordinate")?;
+        let angle = at.get_f64(3).unwrap_or(0.0);
+        validate_placement_values(x, y, angle + delta)?;
+    }
+    Ok(())
+}
+
 fn update_footprint_placement(
     footprint: &str,
     update: FootprintPlacementUpdate,
@@ -1191,6 +1221,16 @@ fn update_footprint_placement(
         .get_f64(2)
         .context("footprint root placement has an invalid Y position")?;
     let old_rotation = at.get_f64(3).unwrap_or(0.0);
+    validate_placement_values(old_x, old_y, old_rotation)?;
+    match update {
+        FootprintPlacementUpdate::Move { x, y } => validate_placement_values(x, y, old_rotation)?,
+        FootprintPlacementUpdate::Rotate { rotation } => {
+            validate_placement_values(old_x, old_y, rotation)?
+        }
+        FootprintPlacementUpdate::Set { x, y, rotation } => {
+            validate_placement_values(x, y, rotation)?
+        }
+    }
 
     // A move preserves the existing orientation *exactly as spelled* — it is
     // not this tool's business to renormalise an angle the caller did not ask
@@ -1232,6 +1272,7 @@ fn update_footprint_placement(
         FootprintPlacementUpdate::Move { .. } => updated,
         FootprintPlacementUpdate::Rotate { rotation }
         | FootprintPlacementUpdate::Set { rotation, .. } => {
+            validate_child_rotation(&updated, rotation - old_rotation)?;
             apply_rotation_to_children(&updated, rotation - old_rotation)
         }
     };
@@ -3930,6 +3971,28 @@ async fn handle_get_board_2d_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinate_review_closed_placement_refuses_overflow_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("placement.kicad_pcb");
+        let source = board_with_a_property_before_the_root_at("");
+        std::fs::write(&path, &source).unwrap();
+        for update in [
+            FootprintPlacementUpdate::Move { x: 1e308, y: 20.0 },
+            FootprintPlacementUpdate::Set {
+                x: 10.0,
+                y: 1e308,
+                rotation: 90.0,
+            },
+            FootprintPlacementUpdate::Rotate {
+                rotation: f64::INFINITY,
+            },
+        ] {
+            assert!(update_closed_board_footprint(&path, "R1", update).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        }
+    }
 
     const FOOTPRINT: &str = r#"(footprint "R_0402"
   (version 20240108)

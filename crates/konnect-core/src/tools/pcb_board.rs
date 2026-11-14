@@ -1019,8 +1019,6 @@ fn format_zone_polygon(
     let name_node = if name.is_empty() {
         String::new()
     } else {
-        let clearance = fmt_mm(clearance);
-        let min_width = fmt_mm(min_width);
         format!("\n    (name {})", konnect_sexp::quoted(name))
     };
     let priority_node = if priority == 0 {
@@ -1028,6 +1026,8 @@ fn format_zone_polygon(
     } else {
         format!("\n    (priority {priority})")
     };
+    let clearance = fmt_mm(clearance);
+    let min_width = fmt_mm(min_width);
     let connect = connection.sexp_token();
     let thermal = konnect_ipc::builders::ZONE_THERMAL_RELIEF_MM;
     let hatch_pitch = konnect_ipc::builders::ZONE_BORDER_PITCH_MM;
@@ -1763,14 +1763,19 @@ fn board_extents_body(
     evidence: serde_json::Value,
 ) -> CallToolResult {
     let (x_min, y_min, x_max, y_max) = match bounds {
-        Some((x0, y0, x1, y1)) => (json!(x0), json!(y0), json!(x1), json!(y1)),
+        Some((x0, y0, x1, y1)) => (
+            json!(round6(x0)),
+            json!(round6(y0)),
+            json!(round6(x1)),
+            json!(round6(y1)),
+        ),
         None => (json!(null), json!(null), json!(null), json!(null)),
     };
     let mut body = json!({
-        "x_min": round6(x_min), "y_min": round6(y_min),
-        "x_max": round6(x_max), "y_max": round6(y_max),
-        "width": bounds.map(|(x0, _, x1, _)| x1 - x0),
-        "height": bounds.map(|(_, y0, _, y1)| y1 - y0),
+        "x_min": x_min, "y_min": y_min,
+        "x_max": x_max, "y_max": y_max,
+        "width": bounds.map(|(x0, _, x1, _)| round6(x1 - x0)),
+        "height": bounds.map(|(_, y0, _, y1)| round6(y1 - y0)),
         "item_count": counts.item_count,
         "measured_item_counts": counts.measured,
         "unmeasured_item_counts": counts.unmeasured,
@@ -2575,6 +2580,12 @@ async fn handle_add_board_text(
         Err(error) => return Ok(error),
     };
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
+    if !round6(rotation).is_finite() {
+        return Ok(super::invalid_arg(
+            "rotation",
+            "must remain finite when formatted",
+        ));
+    }
 
     let text_ipc = text.clone();
     let layer_ipc = layer.clone();
@@ -4052,6 +4063,26 @@ mod svg_logo_tests {
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
             <path d="M0 0 L100 0 L100 100 L0 100 Z" fill="black"/>
         </svg>"##
+    }
+
+    #[test]
+    fn coordinate_review_zone_dimensions_use_mm_formatter_with_and_without_name() {
+        let board = parse_sexp("(kicad_pcb (version 20250610) (net 1 \"GND\"))").unwrap();
+        let net = konnect_sexp::net::net_ref_for_write(&board, "GND").unwrap();
+        for name in ["", "pour"] {
+            let source = format_zone_polygon(
+                &net,
+                "F.Cu",
+                0.1 + 0.2,
+                0.1 + 0.2,
+                &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+                name,
+                0,
+                PadConnection::Thermal,
+            );
+            assert!(source.contains("(clearance 0.3)"), "{source}");
+            assert!(source.contains("(min_thickness 0.3)"), "{source}");
+        }
     }
 
     #[test]
@@ -5877,6 +5908,45 @@ mod layer_type_input_tests {
             let body = serde_json::to_value(&result).unwrap();
             assert!(body.to_string().contains("invalid_argument"));
             assert!(!path.exists());
+        }
+    }
+}
+
+#[cfg(test)]
+mod coordinate_review_extents_tests {
+    use super::*;
+
+    fn response(bounds: Option<konnect_sexp::bounds::Bbox>) -> serde_json::Value {
+        let result = board_extents_body(
+            bounds,
+            BoardExtentsCounts {
+                item_count: 0,
+                measured: json!({}),
+                unmeasured: json!({}),
+                unavailable: Vec::new(),
+                skipped: 0,
+                shared_kiids: 0,
+            },
+            "file",
+            "saved_board_file",
+            json!({}),
+        );
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected JSON text")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn coordinate_review_mm_extents_round_before_json_and_preserve_null() {
+        let body = response(Some((0.0, 0.0, 50.8 * 1.075, 167.64 - 5.08)));
+        assert_eq!(body["x_max"], 54.61);
+        assert_eq!(body["y_max"], 162.56);
+        assert_eq!(body["width"], 54.61);
+        assert_eq!(body["height"], 162.56);
+        let absent = response(None);
+        for field in ["x_min", "y_min", "x_max", "y_max", "width", "height"] {
+            assert!(absent[field].is_null(), "{absent}");
         }
     }
 }

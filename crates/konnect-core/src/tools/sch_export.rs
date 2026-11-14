@@ -477,7 +477,7 @@ async fn handle_baseline_compare(
         "total_pixels": diff.total_pixels,
         "threshold_pct": DRIFT_THRESHOLD_PCT,
         "changed_bbox_px": diff.changed_bbox.map(|(x0, y0, x1, y1)| json!({
-            "x_min": round6(x0), "y_min": round6(y0), "x_max": round6(x1), "y_max": round6(y1)
+            "x_min": x0, "y_min": y0, "x_max": x1, "y_max": y1
         })),
         "source_changed_since_baseline": source_changed,
         "baseline_renderer": meta["renderer"],

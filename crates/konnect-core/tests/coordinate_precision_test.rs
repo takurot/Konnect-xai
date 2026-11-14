@@ -112,3 +112,52 @@ async fn served_label_and_text_writers_use_nanometre_precision() {
         assert_eq!(std::fs::read(path).unwrap(), original);
     }
 }
+
+#[tokio::test]
+async fn served_coordinate_review_overflow_refuses_without_file_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let schematic = directory.path().join("overflow.kicad_sch");
+    let board = directory.path().join("overflow.kicad_pcb");
+    std::fs::write(
+        &schematic,
+        include_str!("fixtures/no_connect_carry_kicad10.kicad_sch"),
+    )
+    .unwrap();
+    std::fs::write(
+        &board,
+        include_str!("fixtures/specctra_two_resistors.kicad_pcb"),
+    )
+    .unwrap();
+    let handler = McpHandler::new(ServerConfig {
+        kicad_cli: String::new(),
+        kicad_binary: String::new(),
+        ipc_address: String::new(),
+        eager_toolsets: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    for (name, path, arguments) in [
+        (
+            "bulk_move_schematic_components",
+            &schematic,
+            json!({"schematic":schematic,"references":["R5"],"dx":1e308,"dy":0.0}),
+        ),
+        (
+            "move_component",
+            &board,
+            json!({"board":board,"reference":"R1","x":1e308,"y":0.0}),
+        ),
+        (
+            "add_schematic_text",
+            &schematic,
+            json!({"schematic":schematic,"text":"invalid font","x":10.0,"y":10.0,"thickness":1e308}),
+        ),
+    ] {
+        let before = std::fs::read(path).unwrap();
+        let response = handler.handle_message(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":name,"arguments":arguments}})).await.unwrap();
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], true, "{name}: {result}");
+        assert_eq!(std::fs::read(path).unwrap(), before, "{name}");
+    }
+}

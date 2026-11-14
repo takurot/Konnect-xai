@@ -1995,6 +1995,12 @@ async fn handle_move_labels_by_offset(
         Err(e) => return Ok(e),
     };
 
+    for (field, value) in [("dx", dx), ("dy", dy)] {
+        if let Err(error) = super::checked_mm(value, field) {
+            return Ok(error);
+        }
+    }
+
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
     let labels = find_label_blocks(&content);
@@ -2061,8 +2067,14 @@ async fn handle_move_labels_by_offset(
                 block_start + start + b,
                 format!(
                     "(at {} {} {})",
-                    cse::types::fmt_f64(px + dx),
-                    cse::types::fmt_f64(py + dy),
+                    cse::types::fmt_f64(match super::checked_mm(px + dx, "property.x") {
+                        Ok(value) => value,
+                        Err(error) => return Ok(error),
+                    }),
+                    cse::types::fmt_f64(match super::checked_mm(py + dy, "property.y") {
+                        Ok(value) => value,
+                        Err(error) => return Ok(error),
+                    }),
                     rot
                 ),
             ));
@@ -3902,6 +3914,22 @@ mod label_tests {
             after.contains("(at 202.54 98.73 0)"),
             "second label moved: {after}"
         );
+    }
+
+    #[tokio::test]
+    async fn coordinate_review_label_property_overflow_leaves_file_unchanged() {
+        let (_d, path) = sch_with(
+            r#"(global_label "EN" (at 10 20 0) (property "Intersheetrefs" "text" (at 10000000000000 21 0)) (uuid "abcd"))"#,
+        );
+        let before = std::fs::read(&path).unwrap();
+        let result = handle_move_labels_by_offset(
+            &json!({"schematic": path, "net": "EN", "dx": 1.0, "dy": 2.0}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
     #[tokio::test]

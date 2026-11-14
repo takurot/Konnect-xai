@@ -57,3 +57,22 @@ quoted text that happens to contain a long decimal.
 
 Real KiCad IPC and CLI verification requires an installed KiCad and remains
 unverified. Mock payload tests do not establish real KiCad readback.
+
+## Review corrections
+
+The independent review identified pixel and JSON-value expressions incorrectly
+passed to the millimetre rounder. Pixel bounding boxes remain integers. Board
+extents round millimetre values before JSON conversion and retain null when the
+bounds were not measured. Zone clearance and minimum width now use the shared
+formatter in both named and unnamed zones.
+
+Bulk symbol movement validates the computed anchor before and after grid
+snapping. Translated property anchors receive the same check. Closed-board
+placement validates requested and saved coordinates plus child rotation sums
+before constructing a replacement. Text thickness and formatted rotations also
+refuse values that cannot be represented safely.
+
+Exact-source isolated regressions reproduced the zone formatter and translated
+property boundary failures before these corrections and pass after them. They
+are supporting evidence only. Full direct-handler and served no-write
+regressions have been added and remain queued with the workspace checks.

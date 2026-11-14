@@ -979,9 +979,9 @@ fn property_translation_edits(
     sym_end: usize,
     ddx: f64,
     ddy: f64,
-) -> Vec<SexpEdit> {
+) -> Result<Vec<SexpEdit>, CallToolResult> {
     if ddx == 0.0 && ddy == 0.0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut edits = Vec::new();
     for prop_start in konnect_sexp::writer::find_block_starts(content, "property") {
@@ -1022,12 +1022,12 @@ fn property_translation_edits(
             at_end,
             format!(
                 "{} {} {rot}",
-                cse::types::fmt_f64(px + ddx),
-                cse::types::fmt_f64(py + ddy)
+                cse::types::fmt_f64(super::checked_mm(px + ddx, "property.x")?),
+                cse::types::fmt_f64(super::checked_mm(py + ddy, "property.y")?)
             ),
         ));
     }
-    edits
+    Ok(edits)
 }
 
 async fn handle_bulk_move(
@@ -1047,6 +1047,12 @@ async fn handle_bulk_move(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+
+    for (field, value) in [("dx", dx), ("dy", dy)] {
+        if let Err(error) = super::checked_mm(value, field) {
+            return Ok(error);
+        }
+    }
 
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
@@ -1099,7 +1105,25 @@ async fn handle_bulk_move(
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(0.0);
 
-            let (new_x, new_y) = snap_point(x + dx, y + dy, 1.27);
+            let moved_x = x + dx;
+            let moved_y = y + dy;
+            for (field, value) in [("x", moved_x), ("y", moved_y)] {
+                if let Err(error) = super::checked_mm(value, field) {
+                    return Ok(error);
+                }
+            }
+            let (new_x, new_y) = snap_point(moved_x, moved_y, 1.27);
+            let new_x = match super::checked_mm(new_x, "x") {
+                Ok(value) => value,
+                Err(error) => return Ok(error),
+            };
+            let new_y = match super::checked_mm(new_y, "y") {
+                Ok(value) => value,
+                Err(error) => return Ok(error),
+            };
+            if !rot.is_finite() {
+                return Ok(super::invalid_arg("rotation", "must be finite"));
+            }
             edits.push(SexpEdit::replace(
                 at_abs,
                 at_end,
@@ -1116,13 +1140,10 @@ async fn handle_bulk_move(
             // location (#202). Shift them by the delta the symbol *actually*
             // moved, which is the snapped one, or they drift relative to the
             // part. `Symbol::translate` does the same on the typed path.
-            edits.extend(property_translation_edits(
-                &content,
-                sym_start,
-                sym_end,
-                new_x - x,
-                new_y - y,
-            ));
+            match property_translation_edits(&content, sym_start, sym_end, new_x - x, new_y - y) {
+                Ok(property_edits) => edits.extend(property_edits),
+                Err(error) => return Ok(error),
+            }
             placements.push(json!({
                 "old_x": x, "old_y": y,
                 "new_x": new_x, "new_y": new_y
@@ -1606,6 +1627,7 @@ fn schematic_text_font(args: &serde_json::Value, size: f64) -> Result<String, St
                 "thickness must be a positive number, got {thickness}"
             ));
         }
+        konnect_ipc::builders::mm_to_nm(thickness).map_err(|error| error.to_string())?;
         font.push_str(&format!(" (thickness {})", cse::types::fmt_f64(thickness)));
     }
     // KiCad writes the token only when it is on, and omits it otherwise.
@@ -1753,6 +1775,12 @@ async fn handle_add_schematic_text(
         Err(error) => return Ok(error),
     };
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
+    if !round6(rotation).is_finite() {
+        return Ok(super::invalid_arg(
+            "rotation",
+            "must remain finite when formatted",
+        ));
+    }
     let justify = args["justify"].as_str().unwrap_or(DEFAULT_TEXT_JUSTIFY);
     // Without a justify token KiCad centres the text on `x`, so a long line
     // crosses the page edge and is dropped from the PDF export while the
@@ -4166,6 +4194,25 @@ mod bulk_move_coordinate_text_tests {
     /// `#PWR002` exposed the noise and `R8` is the control. Expected text is
     /// what `kicad-cli sch upgrade --force` writes for the moved sheet.
     #[tokio::test]
+    async fn coordinate_review_bulk_move_refuses_overflow_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("move.kicad_sch");
+        std::fs::write(&path, SCH).unwrap();
+        let context = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_bulk_move(
+            &json!({"schematic": path, "references": ["R8"], "dx": 1e308, "dy": 0.0}),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), SCH);
+    }
+
+    #[tokio::test]
     async fn bulk_move_writes_kicad_coordinate_text() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("move.kicad_sch");
@@ -4798,7 +4845,7 @@ mod private_anchor_regression {
     #[test]
     fn translation_preserves_property_text_with_at() {
         let source = r#"(symbol (property "Description" "see (at 5 5) note" (at 10 20 0)))"#;
-        let edits = property_translation_edits(source, 0, source.len(), 1.0, 2.0);
+        let edits = property_translation_edits(source, 0, source.len(), 1.0, 2.0).unwrap();
         let after = apply_edits(source.to_owned(), edits);
         assert!(after.contains("see (at 5 5) note"));
         assert!(after.contains("(at 11 22 0)"));
