@@ -4,7 +4,7 @@ Issue #25 separates board membership from BOM and position-file membership. A mo
 
 The change extends the existing library metadata and component mutation paths. A typed attribute set represents effective values. Optional patches distinguish omitted parameters from explicit false. New placements inherit library attributes before applying overrides. The specialized power-symbol placer also copies the same library attribute set so its bound placement intent matches the saved instance. Existing edits change only the requested native clauses on every placed unit. Queries and saved-file readback report effective native attributes.
 
-PCB synchronization honors `on_board` for placement and carries DNP, BOM exclusion, and position exclusion independently. Its plan, revision identity, and readback cover these values. A native assembly mismatch inside the transaction attempts rollback. A mismatch observed after publication returns an uncertain outcome and forbids a blind retry. Components omitted through `on_board=no` remain visible with a reason. Components without an assigned footprint remain in the existing per-component unassigned report.
+PCB synchronization honors `on_board` for placement and carries DNP, BOM exclusion, and position exclusion independently. Its plan, revision identity, and readback cover these values. Native assembly readback requires the exact footprint message type, decodable payloads, nonempty unique KIIDs, and an unambiguous expected reference. Updates must retain the planned KIID; additions must receive a server-assigned KIID. A native assembly mismatch inside the transaction attempts rollback and remains uncertain until restoration can be independently verified. Any readback failure after publication returns an uncertain outcome and forbids a blind retry. Components omitted through `on_board=no` remain visible with a reason. Components without an assigned footprint remain in the existing per-component unassigned report.
 
 ## Throughput checkpoint
 
@@ -20,6 +20,7 @@ PCB synchronization honors `on_board` for placement and carries DNP, BOM exclusi
 - Invalid native booleans and misleading custom DNP properties refuse before mutation.
 - An excluded BOM component remains eligible for PCB placement.
 - Sync adds and updates the native DNP, BOM, and position attributes and notices their changes in plan revisions.
+- Wrong native flags, replaced update KIIDs, duplicate references or KIIDs, malformed or mistyped messages, and rejected final readback never report applied success.
 - Real `kicad-cli sch export bom --exclude-dnp` remains unverified until KiCad is available.
 
 ## Verification record
@@ -28,6 +29,6 @@ The original `apply_saved_symbol_flags` function was extracted without changes a
 
 A pinned-compiler check also passed library attribute inheritance and native symbol serialization readback. A second extracted-source check passed multi-unit attribute edits against the KiCad-authored `ecc83_multiunit.kicad_sch` fixture, explicit false, omitted attributes, and malformed boolean refusal. These are function-level checks, not a substitute for the complete served tool or real KiCad.
 
-The first complete `cargo test -p konnect-core --locked --lib issue25 -- --nocapture` build found two placement test constructors that omitted the new attribute model. Both constructors now bind the fixture symbol's attributes. Subsequent shared-target runs remain diagnostic evidence only because the shared build target could reuse workspace artifacts from another worktree. All focused tests, workspace gates, and line and branch coverage require an isolated-target rerun. Real KiCad export and IPC checks are unavailable on this host.
+The first complete `cargo test -p konnect-core --locked --lib issue25 -- --nocapture` build found two placement test constructors that omitted the new attribute model. Both constructors now bind the fixture symbol's attributes. Subsequent shared-target runs remain diagnostic evidence only because the shared build target could reuse workspace artifacts from another worktree. An isolated-target run subsequently passed the native tests, served query tests, all four Rust gates, and an assembly-guard negative control with an exact source restoration. Independent review then identified final-readback identity and error-classification gaps. Four new served regressions failed for the intended reason before the strict readback fix; malformed-payload readback was already uncertain. The final code requires a fresh isolated-target run of the focused tests and all four gates. Coverage was interrupted for these functional fixes, so no line or branch percentage is claimed. Real KiCad export and IPC checks are unavailable on this host.
 
 The `deslop` skill is unavailable in this installation. The implementation receives a manual scoped diff cleanup and independent review instead.
