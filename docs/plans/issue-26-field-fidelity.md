@@ -69,8 +69,7 @@ both guards enabled. These checks do not verify served IPC behavior.
 
 Regression tests cover field ownership, first-sync preservation, corruption,
 roundtrip values, live loss findings, field presentation, all native stroke
-styles, reset-text convergence, and revision changes. Full workspace gates,
-coverage, and real KiCad acceptance remain pending until recorded here.
+styles, reset-text convergence, and revision changes.
 Earlier Cargo results used a shared worktree target and are superseded because
 that cache could reuse another worktree's workspace artifact. Final verification
 must use this worktree's isolated target and exact source. The source harnesses
@@ -85,4 +84,28 @@ carry an inactive chamfer ratio of `0.2`, while the library builder supplies
 inactive for that shape. Roundrect radii and chamfered-rectangle radii, ratios,
 and corner selections remain significant. The exact-source harness fails
 before this correction and passes afterward; a native-fixture regression also
-checks these active-value counterexamples. Final Cargo verification is pending.
+checks these active-value counterexamples. This regression passes in the final
+isolated Cargo run recorded below.
+
+
+Final functional verification at source commit
+`3ff761cc2ebc6080c8dd1111a663d78b2e3358a4` used this worktree's isolated
+`target`, with all workspace packages rebuilt under the serialized verifier:
+
+- Targeted presentation, builder, NNG placement and core tests: 21 passed.
+- `cargo fmt --all -- --check`: passed.
+- `cargo test --workspace --locked --lib --tests`: 2,581 passed, 45 ignored.
+- `cargo test --workspace --locked --doc`: 9 passed, 2 ignored.
+- `cargo clippy --workspace --locked --all-targets -- -D warnings`: passed.
+- Bypassing presentation verification makes its regression fail; restoring the
+  source passes all four presentation tests.
+- Disabling ownership removal and live loss findings makes two of six metadata
+  regressions fail; restoring the source passes all six.
+- `git diff --exit-code` after restoration: passed.
+
+The ignored tests remain unverified. The report and individual logs are in
+`/tmp/konnect-v015/issue26-final/`; the serialized batch exited zero. Line and
+branch coverage for this source are still unmeasured. No 80-percent claim is
+made. Independent review of the final source and real KiCad acceptance remain
+required before treating the issue as complete. Manual cleanup covered only the
+changed code because the deslop tool is unavailable.
