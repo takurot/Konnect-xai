@@ -2464,6 +2464,7 @@ mod tests {
                 end: (3.0, 4.0),
                 layer: "In2.Cu".to_string(),
                 width: 0.1,
+                style: kiapi::common::types::StrokeLineStyle::SlsSolid,
             });
         library
             .graphics

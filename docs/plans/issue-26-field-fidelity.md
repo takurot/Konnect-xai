@@ -188,3 +188,10 @@ The checked IPC-builder Result migration remains owned by Issue18, which will
 build on this candidate. This branch does not introduce that API migration.
 The child PR remains Draft because its non-main base does not trigger regular
 CI and real KiCad acceptance and measured coverage remain separate gates.
+
+
+The merged inner-layer regression's new line literal required an explicit solid
+style under Issue26's graphic type. Compiling that exact literal against this
+worktree's IPC types reproduced E0063; adding the fixture's solid style compiled
+successfully. This changes test construction only. The waiting merged gate
+lease was canceled before acquiring the lane, so it provided no gate result.
