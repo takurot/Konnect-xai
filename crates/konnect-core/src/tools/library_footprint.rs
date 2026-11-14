@@ -584,7 +584,7 @@ mod tests {
     }
 }
 
-pub(crate) fn parse_library_property(
+fn parse_library_property(
     property: &konnect_sexp::SexpNode,
     require_typed_field: bool,
 ) -> Result<Option<kiapi::board::types::Field>> {
@@ -1057,7 +1057,11 @@ pub(crate) fn schematic_properties(
                 bail!("invalid or duplicate managed schematic field '{name}'");
             }
             if !desired.contains_key(&name) && existing.get(&name) == Some(&value) {
-                merged.remove(&name);
+                if matches!(name.as_str(), "Datasheet" | "Description") {
+                    merged.insert(name, String::new());
+                } else {
+                    merged.remove(&name);
+                }
             }
         }
     }

@@ -16,6 +16,7 @@ list of names and values last supplied by the schematic. Initial synchronization
 preserves fields of unknown origin. Later synchronization removes a missing
 schematic field only if its current value still matches the recorded value.
 A field edited only on the board is preserved when the schematic drops it.
+Native Datasheet and Description fields clear to empty text when removed.
 Other board-only fields remain unchanged. Malformed, oversized, duplicate, or
 unsupported ownership records refuse synchronization before mutation.
 
@@ -54,6 +55,11 @@ state. Unrelated footprints and no-op selections do not cause a refusal.
 The unchanged native stroke builder was executed in a pinned-rustc harness.
 It returned unknown style `0` where explicit solid `2` was required. This is
 extracted-source reproduction, not a real KiCad session.
+
+The six new shared-library regressions pass in an isolated build of the exact
+source with pinned Rust. Disabling ownership removal and live loss findings in
+temporary source copies makes their two regressions fail. The checkout keeps
+both guards enabled. These checks do not verify served IPC behavior.
 
 Regression tests cover field ownership, first-sync preservation, corruption,
 roundtrip values, live loss findings, field presentation, all native stroke

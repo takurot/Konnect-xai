@@ -1233,14 +1233,21 @@ fn exported_properties(component: &SexpNode) -> Result<BTreeMap<String, String>>
             if name == super::library_footprint::SCHEMATIC_FIELDS || name.is_empty() {
                 bail!("reserved or empty schematic field '{name}'");
             }
-            let value = field
-                .children()
-                .unwrap_or_default()
-                .iter()
-                .skip(1)
-                .filter_map(SexpNode::as_str)
-                .next_back()
-                .unwrap_or("");
+            let children = field.children().context("netlist field is not a list")?;
+            if !matches!(children.len(), 2 | 3)
+                || children.get(1).is_none_or(|node| {
+                    node.head() != Some("name")
+                        || node.children().is_none_or(|children| children.len() != 2)
+                })
+            {
+                bail!("malformed schematic field '{name}'");
+            }
+            let value = match children.get(2) {
+                None => "",
+                Some(value) => value
+                    .as_str()
+                    .with_context(|| format!("schematic field '{name}' has an invalid value"))?,
+            };
             if properties.insert(name.into(), value.into()).is_some() {
                 bail!("duplicate schematic field '{name}'");
             }
@@ -2765,6 +2772,19 @@ mod chunk_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue26_malformed_duplicate_and_reserved_fields_refuse() {
+        for fields in [
+            "(fields (field (name \"LCSC\") (value \"wrong grammar\")))",
+            "(fields (field (name \"LCSC\") \"a\") (field (name \"LCSC\") \"b\"))",
+            "(fields (field (name \"Konnect:schematic_fields\") \"collision\"))",
+        ] {
+            let netlist =
+                ONE_RESISTOR.replace("(value \"10k\")", &format!("(value \"10k\") {fields}"));
+            assert!(parse_exported_netlist(&netlist).is_err(), "{fields}");
+        }
+    }
 
     #[test]
     fn issue26_schematic_custom_fields_plan_an_update_and_bind_revision() {
