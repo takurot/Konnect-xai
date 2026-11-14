@@ -349,43 +349,44 @@ pub(crate) async fn handle_update_footprints_from_library(
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum LayerState {
     Footprint(i32),
-    Pad {
-        number: String,
-        position: Option<(i64, i64)>,
-        pad_type: i32,
-        rotation: i64,
-        layers: Vec<i32>,
-        copper_layers: Vec<(i32, i32, Option<(i64, i64)>)>,
-        drill_layers: Option<(i32, i32)>,
-    },
-    Graphic {
-        geometry: Vec<u8>,
-        layer: i32,
-    },
-    Text {
-        value: String,
-        position: Option<(i64, i64)>,
-        layer: i32,
-        mirrored: bool,
-    },
-    Field {
-        name: String,
-        layer: i32,
-        mirrored: bool,
-    },
+    Pad(Vec<u8>),
+    Graphic(Vec<u8>),
+    Text(Vec<u8>),
+    Field { name: String, geometry: Vec<u8> },
+}
+
+fn normalized_layer_text(text: &kiapi::board::types::BoardText) -> Result<Vec<u8>> {
+    let mut text = text.clone();
+    text.id = None;
+    text.parent = None;
+    text.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
+    let content = text
+        .text
+        .as_mut()
+        .context("footprint readback text has no content")?;
+    if let Some(attributes) = content.attributes.as_mut() {
+        if let Some(angle) = attributes.angle.as_mut() {
+            anyhow::ensure!(
+                angle.value_degrees.is_finite(),
+                "footprint readback text has invalid rotation"
+            );
+            angle.value_degrees =
+                konnect_sexp::geometry::round6(angle.value_degrees.rem_euclid(360.0));
+            if angle.value_degrees == 0.0 {
+                attributes.angle = None;
+            }
+        }
+        // KiCad ignores the deprecated visible bit for BoardText; Fields own visibility.
+        attributes.visible = false;
+        if !content.text.contains('\n') {
+            attributes.multiline = false;
+        }
+    }
+    Ok(text.encode_to_vec())
 }
 
 fn text_layer_state(text: &kiapi::board::types::BoardText) -> Result<LayerState> {
-    let content = text
-        .text
-        .as_ref()
-        .context("footprint readback text has no content")?;
-    Ok(LayerState::Text {
-        value: content.text.clone(),
-        position: content.position.as_ref().map(|p| (p.x_nm, p.y_nm)),
-        layer: text.layer,
-        mirrored: content.attributes.as_ref().is_some_and(|a| a.mirrored),
-    })
+    Ok(LayerState::Text(normalized_layer_text(text)?))
 }
 
 fn append_field_layer_state(
@@ -397,16 +398,60 @@ fn append_field_layer_state(
         .text
         .as_ref()
         .context("footprint readback field has no text")?;
-    let content = text
-        .text
-        .as_ref()
-        .context("footprint readback field text has no content")?;
     states.push(LayerState::Field {
         name: name.to_string(),
-        layer: text.layer,
-        mirrored: content.attributes.as_ref().is_some_and(|a| a.mirrored),
+        geometry: normalized_layer_text(text)?,
     });
     Ok(())
+}
+
+fn pad_layer_state(mut pad: kiapi::board::types::Pad) -> Result<LayerState> {
+    let stack = pad
+        .pad_stack
+        .as_mut()
+        .context("footprint readback pad has no padstack")?;
+    if let Some(angle) = stack.angle.as_mut() {
+        anyhow::ensure!(
+            angle.value_degrees.is_finite(),
+            "footprint readback pad has invalid rotation"
+        );
+        angle.value_degrees = konnect_sexp::geometry::round6(angle.value_degrees.rem_euclid(360.0));
+        if angle.value_degrees == 0.0 {
+            stack.angle = None;
+        }
+    }
+    for layer in &mut stack.copper_layers {
+        anyhow::ensure!(
+            layer.corner_rounding_ratio.is_finite() && layer.chamfer_ratio.is_finite(),
+            "footprint readback pad has an invalid corner ratio"
+        );
+        layer.corner_rounding_ratio += 0.0;
+        layer.chamfer_ratio += 0.0;
+        if layer
+            .offset
+            .as_ref()
+            .is_some_and(|offset| offset.x_nm == 0 && offset.y_nm == 0)
+        {
+            layer.offset = None;
+        }
+    }
+    stack
+        .copper_layers
+        .sort_by_key(prost::Message::encode_to_vec);
+    pad.parent = None;
+    pad.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
+    let definition = kiapi::board::types::Footprint {
+        items: vec![konnect_ipc::builders::pack_any(
+            &pad,
+            "kiapi.board.types.Pad",
+        )],
+        ..Default::default()
+    };
+    Ok(LayerState::Pad(
+        normalized_items(&definition, "Pad")?
+            .pop()
+            .context("footprint readback pad has no geometry")?,
+    ))
 }
 
 fn footprint_layer_state(
@@ -433,61 +478,20 @@ fn footprint_layer_state(
     }
     for item in &definition.items {
         if konnect_ipc::builders::any_is(item, "kiapi.board.types.Pad") {
-            let pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
-            let stack = pad
-                .pad_stack
-                .as_ref()
-                .context("footprint readback pad has no padstack")?;
-            let mut layers = stack.layers.clone();
-            layers.sort_unstable();
-            let mut copper_layers = stack
-                .copper_layers
-                .iter()
-                .map(|entry| {
-                    (
-                        entry.layer,
-                        entry.shape,
-                        entry.size.as_ref().map(|size| (size.x_nm, size.y_nm)),
-                    )
-                })
-                .collect::<Vec<_>>();
-            copper_layers.sort_unstable();
-            let angle = stack
-                .angle
-                .as_ref()
-                .map_or(0.0, |angle| angle.value_degrees);
-            anyhow::ensure!(
-                angle.is_finite(),
-                "footprint readback pad has invalid rotation"
-            );
-            states.push(LayerState::Pad {
-                number: pad.number,
-                pad_type: pad.r#type,
-                rotation: (angle.rem_euclid(360.0) * 1_000_000.0).round() as i64,
-                position: pad.position.as_ref().map(|p| (p.x_nm, p.y_nm)),
-                layers,
-                copper_layers,
-                drill_layers: stack
-                    .drill
-                    .as_ref()
-                    .filter(|drill| {
-                        !(drill.start_layer == kiapi::board::types::BoardLayer::BlUndefined as i32
-                            && drill.end_layer
-                                == kiapi::board::types::BoardLayer::BlUndefined as i32
-                            && drill
-                                .diameter
-                                .as_ref()
-                                .is_none_or(|size| size.x_nm == 0 && size.y_nm == 0))
-                    })
-                    .map(|drill| (drill.start_layer, drill.end_layer)),
-            });
+            states.push(pad_layer_state(kiapi::board::types::Pad::decode(
+                item.value.as_slice(),
+            )?)?);
         } else if konnect_ipc::builders::any_is(item, "kiapi.board.types.BoardGraphicShape") {
             let mut graphic =
                 kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())?;
-            let layer = graphic.layer;
-            graphic.layer = kiapi::board::types::BoardLayer::BlUndefined as i32;
-            if let Some(shape) = graphic.shape.as_mut() {
-                shape.attributes = None;
+            graphic.parent = None;
+            if let Some(fill) = graphic
+                .shape
+                .as_mut()
+                .and_then(|shape| shape.attributes.as_mut())
+                .and_then(|attributes| attributes.fill.as_mut())
+            {
+                fill.color = None;
             }
             let definition = kiapi::board::types::Footprint {
                 items: vec![konnect_ipc::builders::pack_any(
@@ -496,10 +500,11 @@ fn footprint_layer_state(
                 )],
                 ..Default::default()
             };
-            let geometry = normalized_graphics(&definition)?
-                .pop()
-                .context("footprint readback graphic has no geometry")?;
-            states.push(LayerState::Graphic { geometry, layer });
+            states.push(LayerState::Graphic(
+                normalized_graphics(&definition)?
+                    .pop()
+                    .context("footprint readback graphic has no geometry")?,
+            ));
         } else if konnect_ipc::builders::any_is(item, "kiapi.board.types.BoardText") {
             states.push(text_layer_state(&kiapi::board::types::BoardText::decode(
                 item.value.as_slice(),
@@ -3076,6 +3081,191 @@ mod tests {
                 )]
             )
             .is_err());
+        }
+    }
+
+    fn layer_readback_instance(
+        items: Vec<prost_types::Any>,
+    ) -> kiapi::board::types::FootprintInstance {
+        kiapi::board::types::FootprintInstance {
+            id: Some(kiapi::common::types::Kiid {
+                value: "geometry-footprint".into(),
+            }),
+            layer: kiapi::board::types::BoardLayer::BlFCu as i32,
+            definition: Some(kiapi::board::types::Footprint {
+                items,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn layer_readback_binds_layers_to_coincident_pad_rounding() {
+        let make = |swapped: bool| {
+            let items = [0.1, 0.25]
+                .into_iter()
+                .enumerate()
+                .map(|(index, ratio)| {
+                    let layer = if (index == 0) != swapped {
+                        kiapi::board::types::BoardLayer::BlIn2Cu
+                    } else {
+                        kiapi::board::types::BoardLayer::BlIn5Cu
+                    } as i32;
+                    builders::pack_any(
+                        &kiapi::board::types::Pad {
+                            number: "1".into(),
+                            position: Some(Default::default()),
+                            r#type: kiapi::board::types::PadType::PtSmd as i32,
+                            pad_stack: Some(kiapi::board::types::PadStack {
+                                layers: vec![layer],
+                                copper_layers: vec![kiapi::board::types::PadStackLayer {
+                                    layer,
+                                    shape: kiapi::board::types::PadStackShape::PssRoundrect as i32,
+                                    size: Some(kiapi::common::types::Vector2 {
+                                        x_nm: 1_000_000,
+                                        y_nm: 1_000_000,
+                                    }),
+                                    corner_rounding_ratio: ratio,
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                        "kiapi.board.types.Pad",
+                    )
+                })
+                .collect();
+            builders::pack_any(
+                &layer_readback_instance(items),
+                "kiapi.board.types.FootprintInstance",
+            )
+        };
+        let expected = footprint_layer_states(&[make(false)]).unwrap();
+        assert!(verify_footprint_layer_readback(&expected, &[make(false)]).is_ok());
+        assert!(verify_footprint_layer_readback(&expected, &[make(true)]).is_err());
+    }
+
+    #[test]
+    fn layer_readback_binds_layers_to_complete_text_geometry() {
+        for difference in 0..9 {
+            let make = |swapped: bool| {
+                let items = (0..2)
+                    .map(|index| {
+                        let layer = if (index == 0) != swapped {
+                            kiapi::board::types::BoardLayer::BlIn2Cu
+                        } else {
+                            kiapi::board::types::BoardLayer::BlIn5Cu
+                        } as i32;
+                        let mut attributes = kiapi::common::types::TextAttributes {
+                            size: Some(kiapi::common::types::Vector2 {
+                                x_nm: 1_000_000,
+                                y_nm: 1_000_000,
+                            }),
+                            line_spacing: 1.0,
+                            mirrored: true,
+                            ..Default::default()
+                        };
+                        if index == 1 {
+                            match difference {
+                                0 => {
+                                    attributes.angle = Some(kiapi::common::types::Angle {
+                                        value_degrees: 90.0,
+                                    })
+                                }
+                                1 => attributes.size.as_mut().unwrap().x_nm = 2_000_000,
+                                2 => attributes.font_name = "KiCad Font".into(),
+                                3 => {
+                                    attributes.stroke_width =
+                                        Some(kiapi::common::types::Distance { value_nm: 100_000 })
+                                }
+                                4 => attributes.bold = true,
+                                5 => attributes.italic = true,
+                                6 => attributes.underlined = true,
+                                7 => attributes.keep_upright = true,
+                                _ => {
+                                    attributes.horizontal_alignment =
+                                        kiapi::common::types::HorizontalAlignment::HaLeft as i32
+                                }
+                            }
+                        }
+                        builders::pack_any(
+                            &kiapi::board::types::BoardText {
+                                layer,
+                                text: Some(kiapi::common::types::Text {
+                                    text: "same anchor".into(),
+                                    position: Some(Default::default()),
+                                    attributes: Some(attributes),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            },
+                            "kiapi.board.types.BoardText",
+                        )
+                    })
+                    .collect();
+                builders::pack_any(
+                    &layer_readback_instance(items),
+                    "kiapi.board.types.FootprintInstance",
+                )
+            };
+            let expected = footprint_layer_states(&[make(false)]).unwrap();
+            assert!(verify_footprint_layer_readback(&expected, &[make(false)]).is_ok());
+            assert!(
+                verify_footprint_layer_readback(&expected, &[make(true)]).is_err(),
+                "difference {difference}"
+            );
+        }
+    }
+
+    #[test]
+    fn layer_readback_binds_layers_to_graphic_stroke_geometry() {
+        for change_style in [false, true] {
+            let make = |swapped: bool| {
+                let items = (0..2)
+                    .map(|index| {
+                        let layer = if (index == 0) != swapped {
+                            "In2.Cu"
+                        } else {
+                            "In5.Cu"
+                        };
+                        let mut graphic = builders::board_segment(
+                            layer,
+                            if index == 1 && !change_style {
+                                0.2
+                            } else {
+                                0.1
+                            },
+                            0.0,
+                            0.0,
+                            1.0,
+                            0.0,
+                        );
+                        if index == 1 && change_style {
+                            graphic
+                                .shape
+                                .as_mut()
+                                .unwrap()
+                                .attributes
+                                .as_mut()
+                                .unwrap()
+                                .stroke
+                                .as_mut()
+                                .unwrap()
+                                .style = kiapi::common::types::StrokeLineStyle::SlsDash as i32;
+                        }
+                        builders::pack_any(&graphic, "kiapi.board.types.BoardGraphicShape")
+                    })
+                    .collect();
+                builders::pack_any(
+                    &layer_readback_instance(items),
+                    "kiapi.board.types.FootprintInstance",
+                )
+            };
+            let expected = footprint_layer_states(&[make(false)]).unwrap();
+            assert!(verify_footprint_layer_readback(&expected, &[make(false)]).is_ok());
+            assert!(verify_footprint_layer_readback(&expected, &[make(true)]).is_err());
         }
     }
 

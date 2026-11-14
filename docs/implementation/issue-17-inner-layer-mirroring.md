@@ -58,11 +58,13 @@ and [text flip implementation](https://docs.kicad.org/doxygen/pcb__text_8cpp_sou
 
 Before publishing the update commit, refresh reads the exact live document's
 footprints again. It compares the planned layer and mirrored-text state against
-that readback. Pad signatures retain position, type, rotation and geometry
-sizes, so same-number pads cannot exchange layer assignments unnoticed. Child
+that readback. Pad signatures retain normalized supported wire geometry, including corner
+rounding and drill dimensions, so coincident same-number pads cannot exchange
+layer assignments unnoticed. Child
 order and generated IDs do not affect comparison. Repeated children retain their
-multiplicity. Graphics retain their geometry association, while text retains its
-position and content association.
+multiplicity. Graphics retain stroke geometry and text retains its authored font, angle,
+size, alignment and effects. Assigned child IDs, read-only parents and full-turn
+angle representations do not change those associations.
 
 Known readback mismatch or unavailable evidence fails inside the transaction and
 requests its normal rollback. A failed rollback remains `ipc_outcome_unknown`;
@@ -94,3 +96,22 @@ pads. The inner-layer loss test explicitly starts on `In2.Cu` before injecting
 `In5.Cu`. A separate test requires missing padstack evidence to remain a refusal.
 Production validation is unchanged. The targeted `layer_readback_` rerun is
 queued; its result and the final-head full gates remain pending.
+
+## Coincident geometry review correction
+
+Readback records use normalized supported pad, text and graphic geometry rather
+than partial coordinate keys. They preserve the association of each layer with
+roundrect rounding, text angle and font effects, or graphic stroke width and
+style. Exact Any type checks precede typed decoding and canonical repacking.
+This prevents foreign message names with matching suffixes from satisfying the
+comparison. Repeated records remain a multiset.
+
+Before the correction, the exact current helpers failed three regression cases
+for coincident roundrect pads, text and strokes. The corrected helpers pass
+those cases. Neutralizing their geometry association in a temporary extracted
+harness causes all three cases to fail again. The isolated-target Cargo command
+`cargo test -p konnect-core --locked --lib layer_readback_binds_layers_to_` now
+passes all three committed regressions. This targeted result does not establish
+the full quality gates or native KiCad acceptance. Earlier shared-target Cargo
+results are superseded for final validation. Final-head gates and coverage
+remain pending.
