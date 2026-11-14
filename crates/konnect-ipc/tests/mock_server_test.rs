@@ -770,6 +770,8 @@ fn place_footprint_sends_graphics_children() {
         drill_oval: false,
         layers: vec!["F.Cu".to_string()],
         roundrect_ratio: 0.25,
+        chamfer_ratio: 0.0,
+        chamfered_corners: None,
     }];
     let graphics = vec![
         IpcGraphicDefinition::Rect {
@@ -1620,6 +1622,8 @@ fn footprint_with_a_pad_and_a_line(pad_uuid: &str, line_uuid: &str) -> prost_typ
             drill_oval: false,
             layers: vec!["F.Cu".to_string()],
             roundrect_ratio: 0.0,
+            chamfer_ratio: 0.0,
+            chamfered_corners: None,
         }],
         &[konnect_ipc::IpcGraphicDefinition::Poly {
             points: vec![(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0)],
@@ -3178,5 +3182,113 @@ mod board_stackup {
             format!("{error:#}").contains("carries no stackup"),
             "{error:#}"
         );
+    }
+}
+
+#[test]
+fn place_footprint_reports_uncertain_when_readback_loses_chamfer_corners() {
+    for lose_corner in [false, true] {
+        let observed = Arc::new(Mutex::new(Vec::<prost_types::Any>::new()));
+        let state = observed.clone();
+        let mock = spawn_mock(move |request| {
+            let message = request.message.unwrap();
+            if message.type_url.ends_with("GetOpenDocuments") {
+                return Some(open_board_response());
+            }
+            if message.type_url.ends_with("GetItems") {
+                return Some(reply_with(builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: state.lock().unwrap().clone(),
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                )));
+            }
+            assert!(message.type_url.ends_with("CreateItems"));
+            let create =
+                kiapi::common::commands::CreateItems::decode(message.value.as_slice()).unwrap();
+            let mut readback = create.items.clone();
+            if lose_corner {
+                let mut footprint =
+                    kiapi::board::types::FootprintInstance::decode(readback[0].value.as_slice())
+                        .unwrap();
+                let item = &mut footprint.definition.as_mut().unwrap().items[0];
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                pad.pad_stack.as_mut().unwrap().copper_layers[0]
+                    .chamfered_corners
+                    .as_mut()
+                    .unwrap()
+                    .top_left = false;
+                *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+                readback[0] = builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+            }
+            *state.lock().unwrap() = readback;
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::CreateItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    created_items: create
+                        .items
+                        .into_iter()
+                        .map(|item| kiapi::common::commands::ItemCreationResult {
+                            status: Some(kiapi::common::commands::ItemStatus {
+                                code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                error_message: String::new(),
+                            }),
+                            item: Some(item),
+                        })
+                        .collect(),
+                },
+                "kiapi.common.commands.CreateItemsResponse",
+            )))
+        });
+        let pad = konnect_ipc::IpcPadDefinition {
+            number: "1".into(),
+            pad_type: "smd".into(),
+            shape: "chamfered_rect".into(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            size_x: 1.0,
+            size_y: 1.0,
+            drill_x: None,
+            drill_y: None,
+            drill_oval: false,
+            layers: vec!["F.Cu".into()],
+            roundrect_ratio: 0.0,
+            chamfer_ratio: 0.2,
+            chamfered_corners: Some(konnect_ipc::IpcChamferCorners {
+                top_left: true,
+                ..Default::default()
+            }),
+        };
+        let result = KiCadIpcClient::new(&mock.url).place_footprint(
+            &mock_board("test.kicad_pcb"),
+            "L:F",
+            "U1",
+            "F",
+            &[pad],
+            &[],
+            &Default::default(),
+            10.0,
+            20.0,
+            0.0,
+            "F.Cu",
+        );
+        if lose_corner {
+            let error = result.expect_err("accepted writes do not prove chamfer preservation");
+            assert!(matches!(
+                konnect_ipc::IpcFailure::from_error(error),
+                konnect_ipc::IpcFailure::Uncertain(_)
+            ));
+            assert_eq!(
+                observed.lock().unwrap().len(),
+                1,
+                "the applied footprint must not be blindly repeated"
+            );
+        } else {
+            assert_eq!(result.unwrap().reference, "U1");
+        }
     }
 }

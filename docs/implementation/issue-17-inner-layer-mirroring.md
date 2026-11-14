@@ -157,3 +157,22 @@ The pinned-toolchain Clippy gate also identified an equivalent even-copper-count
 predicate in the live snapshot path. It now uses `is_multiple_of(2)` without
 changing accepted layer counts. Final-head normal gates and coverage remain
 required and are recorded separately.
+
+
+## Placement-fidelity prerequisite
+
+This branch includes the Issue #14 placement-fidelity implementation at
+`60d81d0`. Issue #17 extends its shared library parser and chamfer-aware IPC
+model, and its pull request uses the Issue #14 branch as its base.
+
+The merged refresh transaction reads the exact live board once after mutation.
+Both the active-chamfer verifier and the layer-to-geometry verifier inspect
+that same response before publication. Ordinary chamfer failures retain the
+existing rolled-back diagnostic; layer and mirrored-text failures retain
+their conflict behavior. Native unknown and recovered markers stay intact.
+Both sets of fault-injection tests remain in the merged implementation,
+including unavailable evidence and failed rollback.
+
+The earlier separate-branch results are historical evidence. This merged
+source requires its own four normal quality gates and independent resolution
+review before being reported as verified.

@@ -2,6 +2,8 @@
 pub mod gen;
 
 pub mod builders;
+mod chamfer;
+pub use chamfer::FootprintChamfers;
 pub mod client;
 mod endpoint;
 pub mod project_links;
