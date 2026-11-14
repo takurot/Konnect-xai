@@ -123,3 +123,23 @@ real KiCad session. The four normal gates for this correction are pending.
 
 Serializer evidence is
 [KiCad 10.0.5 `EDA_SHAPE::Serialize`](https://github.com/KiCad/kicad/blob/10.0.5/common/eda_shape.cpp#L234-L240).
+
+
+A follow-up serializer audit reproduced valid point polygons failing presentation
+readback when native KiCad removes repeated closing or adjacent vertices. The
+existing refresh polygon normalizer now lives beside shared presentation
+verification, so both consumers use the same geometry comparison. The added
+normalization removes only identical adjacent point nodes and repeated closing
+point nodes in closed loops. Arc nodes and open loops retain their prior
+behavior. Existing polygon ordering and winding normalization is preserved.
+
+A new presentation regression failed before the correction and passed after it;
+actual coordinate changes still fail verification. All seven tests in the exact presentation module pass, and the two independent
+audit reproducers also pass against the corrected module. These are exact-source
+harness results. Four normal gates for the combined rectangle and polygon
+corrections are pending.
+
+Native behavior follows KiCad10.0.5
+[`UnpackPolyLine`](https://github.com/KiCad/kicad/blob/10.0.5/common/api/api_utils.cpp#L119-L170)
+and
+[`SHAPE_LINE_CHAIN::Append`](https://github.com/KiCad/kicad/blob/10.0.5/libs/kimath/src/geometry/shape_line_chain.cpp#L218-L234).

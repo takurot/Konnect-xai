@@ -47,6 +47,73 @@ pub fn normalize_footprint_field(field: &board::Field) -> Result<board::Field> {
     Ok(field)
 }
 
+pub fn normalize_footprint_polyset(polyset: &mut common::PolySet) {
+    for polygon in &mut polyset.polygons {
+        if let Some(outline) = polygon.outline.as_mut() {
+            normalize_polyline(outline);
+        }
+        for hole in &mut polygon.holes {
+            normalize_polyline(hole);
+        }
+        polygon.holes.sort_by_key(prost::Message::encode_to_vec);
+    }
+    polyset.polygons.sort_by_key(prost::Message::encode_to_vec);
+}
+
+fn normalize_polyline(polyline: &mut common::PolyLine) {
+    if !polyline.closed || polyline.nodes.len() < 2 {
+        return;
+    }
+    polyline.nodes.dedup_by(|a, b| {
+        matches!(
+            (a.geometry.as_ref(), b.geometry.as_ref()),
+            (
+                Some(common::poly_line_node::Geometry::Point(a)),
+                Some(common::poly_line_node::Geometry::Point(b))
+            ) if a == b
+        )
+    });
+    if polyline.nodes.len() > 1
+        && polyline.nodes.first() == polyline.nodes.last()
+        && matches!(
+            polyline
+                .nodes
+                .first()
+                .and_then(|node| node.geometry.as_ref()),
+            Some(common::poly_line_node::Geometry::Point(_))
+        )
+    {
+        polyline.nodes.pop();
+    }
+    let candidates = [
+        polyline.nodes.clone(),
+        polyline.nodes.iter().cloned().rev().collect(),
+    ];
+    let mut best: Option<(Vec<u8>, Vec<common::PolyLineNode>)> = None;
+    for nodes in candidates {
+        for offset in 0..nodes.len() {
+            let rotated = nodes[offset..]
+                .iter()
+                .chain(nodes[..offset].iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            let encoded = rotated
+                .iter()
+                .flat_map(prost::Message::encode_to_vec)
+                .collect::<Vec<_>>();
+            if best
+                .as_ref()
+                .is_none_or(|(best_encoded, _)| encoded < *best_encoded)
+            {
+                best = Some((encoded, rotated));
+            }
+        }
+    }
+    if let Some((_, nodes)) = best {
+        polyline.nodes = nodes;
+    }
+}
+
 impl Presentation {
     fn of(footprint: &board::FootprintInstance) -> Result<Self> {
         let definition = footprint
@@ -137,6 +204,11 @@ impl Presentation {
                     {
                         rectangle.corner_radius = None;
                     }
+                }
+                if let Some(common::graphic_shape::Geometry::Polygon(polyset)) =
+                    shape.geometry.as_mut()
+                {
+                    normalize_footprint_polyset(polyset);
                 }
                 strokes.push((
                     item.layer,
@@ -467,6 +539,62 @@ mod tests {
                 crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
             assert_eq!(expected.verify(&[actual]).is_ok(), radius == 0);
         }
+    }
+
+    #[test]
+    fn presentation_accepts_native_polygon_point_dedup_but_checks_vertices() {
+        let points = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)];
+        let polygon_item = |points: &[(f64, f64)]| {
+            let mut footprint = board::FootprintInstance::decode(item().value.as_slice()).unwrap();
+            let graphic = crate::builders::board_polygon("F.CrtYd", 0.1, false, &[points.to_vec()]);
+            footprint.definition.as_mut().unwrap().items = vec![crate::builders::pack_any(
+                &graphic,
+                "kiapi.board.types.BoardGraphicShape",
+            )];
+            crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+        };
+        for repeated in [
+            vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 0.0)],
+            vec![(0.0, 0.0), (1.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+        ] {
+            let wanted = polygon_item(&repeated);
+            let expected = FootprintPresentation::from_items([&wanted]).unwrap();
+            assert!(expected.verify(&[polygon_item(&points)]).is_ok());
+            let mut changed = points.clone();
+            changed[1].0 += 0.1;
+            assert!(expected.verify(&[polygon_item(&changed)]).is_err());
+        }
+    }
+
+    #[test]
+    fn polygon_point_dedup_preserves_arc_nodes_and_open_loops() {
+        let arc = common::PolyLineNode {
+            geometry: Some(common::poly_line_node::Geometry::Arc(
+                common::ArcStartMidEnd {
+                    start: Some(crate::builders::vec2(0.0, 0.0)),
+                    mid: Some(crate::builders::vec2(1.0, 1.0)),
+                    end: Some(crate::builders::vec2(2.0, 0.0)),
+                },
+            )),
+        };
+        let mut arcs = common::PolyLine {
+            nodes: vec![arc.clone(), arc],
+            closed: true,
+        };
+        normalize_polyline(&mut arcs);
+        assert_eq!(arcs.nodes.len(), 2);
+        let point = common::PolyLineNode {
+            geometry: Some(common::poly_line_node::Geometry::Point(
+                crate::builders::vec2(0.0, 0.0),
+            )),
+        };
+        let mut open = common::PolyLine {
+            nodes: vec![point.clone(), point],
+            closed: false,
+        };
+        let wanted = open.clone();
+        normalize_polyline(&mut open);
+        assert_eq!(open, wanted);
     }
 
     #[test]

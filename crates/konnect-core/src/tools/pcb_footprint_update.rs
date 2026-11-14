@@ -1529,7 +1529,7 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                                     kiapi::common::types::graphic_shape::Geometry::Polygon(polyset),
                                 ) = graphic.geometry.as_mut()
                                 {
-                                    normalize_polyset(polyset);
+                                    konnect_ipc::normalize_footprint_polyset(polyset);
                                 }
                                 if let Some(
                                     kiapi::common::types::graphic_shape::Geometry::Rectangle(
@@ -1566,52 +1566,6 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
         .collect::<std::result::Result<Vec<_>, _>>()?;
     graphics.sort();
     Ok(graphics)
-}
-
-fn normalize_polyset(polyset: &mut kiapi::common::types::PolySet) {
-    for polygon in &mut polyset.polygons {
-        if let Some(outline) = polygon.outline.as_mut() {
-            normalize_polyline(outline);
-        }
-        for hole in &mut polygon.holes {
-            normalize_polyline(hole);
-        }
-        polygon.holes.sort_by_key(prost::Message::encode_to_vec);
-    }
-    polyset.polygons.sort_by_key(prost::Message::encode_to_vec);
-}
-
-fn normalize_polyline(polyline: &mut kiapi::common::types::PolyLine) {
-    if !polyline.closed || polyline.nodes.len() < 2 {
-        return;
-    }
-    let candidates = [
-        polyline.nodes.clone(),
-        polyline.nodes.iter().cloned().rev().collect(),
-    ];
-    let mut best: Option<(Vec<u8>, Vec<kiapi::common::types::PolyLineNode>)> = None;
-    for nodes in candidates {
-        for offset in 0..nodes.len() {
-            let rotated = nodes[offset..]
-                .iter()
-                .chain(nodes[..offset].iter())
-                .cloned()
-                .collect::<Vec<_>>();
-            let encoded = rotated
-                .iter()
-                .flat_map(prost::Message::encode_to_vec)
-                .collect::<Vec<_>>();
-            if best
-                .as_ref()
-                .is_none_or(|(best_encoded, _)| encoded < *best_encoded)
-            {
-                best = Some((encoded, rotated));
-            }
-        }
-    }
-    if let Some((_, nodes)) = best {
-        polyline.nodes = nodes;
-    }
 }
 
 fn library_owned_attributes(

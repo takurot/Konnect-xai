@@ -7,7 +7,9 @@ pub use chamfer::FootprintChamfers;
 pub mod client;
 mod endpoint;
 mod presentation;
-pub use presentation::{normalize_footprint_field, FootprintPresentation};
+pub use presentation::{
+    normalize_footprint_field, normalize_footprint_polyset, FootprintPresentation,
+};
 pub mod project_links;
 pub mod socket;
 pub mod transform;
