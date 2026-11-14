@@ -41,7 +41,7 @@ harness, and saved-hierarchy loading is not exercised there.
 The committed Rust tests also cover complete stored `SheetPath` preservation,
 root-bound plan revisions, skipped and unassigned matching, and a registered
 tool update with independent mock IPC readback followed by a no-op dry run.
-Their execution is pending the shared Rust verification lane.
+Their execution is pending the isolated worktree verification lane.
 
 Pinned `rustfmt` and `git diff --check` pass. The complete workspace test,
 doctest, Clippy, and line and branch coverage gates are pending. Real KiCad is
@@ -76,4 +76,28 @@ paths, a stale reference, a missing path, a missing footprint and malformed
 protobuf after updating. It requires a non-success response, a dropped undo
 commit and restored mock board state. The normal case still verifies preserved
 board-only objects and a following no-op plan. Its Cargo execution and the
-workspace gates remain pending in the shared verification lane.
+workspace gates remain pending in the isolated worktree verification lane.
+
+## Preserve native transport outcomes during readback
+
+The readback failure marker is an `anyhow` context without its own source.
+Native `IpcOutcomeUnknown` and `IpcBatchRecovered` markers remain downcastable,
+so the existing transaction logic retains its late-response recovery and
+no-blind-rollback decisions. An ordinary path mismatch still carries the domain
+marker and permits the transaction's normal drop attempt.
+
+A registered-tool regression returns a malformed response envelope after an
+update. It requires an uncertain outcome without a drop or a claim of applied
+success. The existing six data-mismatch cases still require a drop. A separate
+unit check covers the public unknown and recovered marker types.
+
+The exact old marker and wrapping expression fail an isolated native-marker
+assertion. The corrected expression passes two isolated checks, and removing
+its typed context makes the native-marker check fail again. This exercises
+`anyhow` context behavior with a stand-in native error. It does not establish
+registered-tool, transaction or real KiCad acceptance.
+
+Earlier Cargo runs used a shared target directory and may contain another
+worktree's workspace artifacts. They are not final validation evidence. All
+Cargo tests, four quality gates, coverage and real KiCad checks require fresh
+results from this worktree's isolated target.
