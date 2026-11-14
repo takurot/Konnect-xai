@@ -226,10 +226,27 @@ pub(crate) fn extract_pad_definitions(
                     .ok_or_else(|| anyhow::anyhow!("footprint pad is missing {label}"))
             };
             let shape = required(3, "shape")?.to_string();
-            if shape == "custom" {
-                anyhow::bail!(
-                    "custom-shape pads are not supported by KiCad 10's typed placement path"
-                );
+            if !matches!(
+                shape.as_str(),
+                "circle" | "rect" | "oval" | "roundrect" | "chamfered_rect"
+            ) {
+                anyhow::bail!("pad shape '{shape}' is not supported by typed IPC placement");
+            }
+            let chamfered_corners = pad_chamfer_corners(pad)?;
+            let chamfer_ratio = match pad.find("chamfer_ratio") {
+                Some(clause) => {
+                    let ratio = clause.get_f64(1).context("pad chamfer_ratio is invalid")?;
+                    if !ratio.is_finite() || !(0.0..=0.5).contains(&ratio) {
+                        anyhow::bail!("pad chamfer_ratio must be finite and between 0 and 0.5");
+                    }
+                    ratio
+                }
+                None => 0.0,
+            };
+            if (chamfered_corners.is_some() || chamfer_ratio != 0.0)
+                && !matches!(shape.as_str(), "roundrect" | "chamfered_rect")
+            {
+                anyhow::bail!("pad shape '{shape}' cannot carry chamfer geometry");
             }
             let at = pad
                 .find("at")
@@ -286,9 +303,37 @@ pub(crate) fn extract_pad_definitions(
                 drill_oval,
                 layers,
                 roundrect_ratio: pad.find_f64("roundrect_rratio").unwrap_or(0.0),
+                chamfer_ratio,
+                chamfered_corners,
             })
         })
         .collect()
+}
+
+fn pad_chamfer_corners(
+    pad: &konnect_sexp::SexpNode,
+) -> anyhow::Result<Option<konnect_ipc::IpcChamferCorners>> {
+    let Some(clause) = pad.find("chamfer") else {
+        return Ok(None);
+    };
+    let mut corners = konnect_ipc::IpcChamferCorners::default();
+    for corner in clause.children().unwrap_or_default().iter().skip(1) {
+        match corner.as_str() {
+            Some("top_left") => corners.top_left = true,
+            Some("top_right") => corners.top_right = true,
+            Some("bottom_left") => corners.bottom_left = true,
+            Some("bottom_right") => corners.bottom_right = true,
+            _ => anyhow::bail!("pad chamfer contains an unsupported corner"),
+        }
+    }
+    Ok(Some(corners))
+}
+
+fn validate_live_library(source: &str, lib_id: &str, reference: &str) -> anyhow::Result<()> {
+    let root = konnect_sexp::parse_sexp(source)?;
+    super::library_footprint::validate_supported_children(&root).with_context(|| format!(
+        "Cannot place reference '{reference}' from footprint '{lib_id}' live. Close the PCB editor and use closed-board file placement to preserve unsupported clauses"
+    ))
 }
 
 // ─── Footprint graphics extraction ───────────────────────────────────────────
@@ -872,18 +917,17 @@ fn insert_into_board(board_path: &Path, blocks: &[String]) -> anyhow::Result<()>
     Ok(())
 }
 
-/// One prepared footprint placement shared by the IPC and guarded file paths.
-///
-/// Callers choose whether the definition came from a KiCad library or from
-/// deliberately supplied inline geometry, but they do not orchestrate the
-/// parser, IPC extraction, board serialization, and duplicate-safe insertion
-/// helpers independently.
 #[derive(Clone)]
-pub(crate) struct PreparedFootprintPlacement {
-    pub(crate) value: String,
+pub(crate) struct PreparedIpcFootprint {
     pub(crate) pads: Vec<konnect_ipc::IpcPadDefinition>,
     pub(crate) graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     pub(crate) fields: konnect_ipc::IpcFieldPlacement,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedFootprintPlacement {
+    pub(crate) value: String,
+    ipc: std::result::Result<PreparedIpcFootprint, String>,
     board_sexp: String,
 }
 
@@ -902,9 +946,15 @@ impl PreparedFootprintPlacement {
     ) -> anyhow::Result<Self> {
         let prepared =
             prepare_footprint_source(source, lib_id, reference, value, x, y, rotation, layer)?;
-        let pads = extract_pad_definitions(&prepared)?;
-        let graphics = extract_graphic_definitions(&prepared)?;
-        let fields = extract_field_placement(&prepared);
+        let ipc = (|| -> anyhow::Result<_> {
+            validate_live_library(source, lib_id, reference)?;
+            Ok(PreparedIpcFootprint {
+                pads: extract_pad_definitions(&prepared)?,
+                graphics: extract_graphic_definitions(&prepared)?,
+                fields: extract_field_placement(&prepared),
+            })
+        })()
+        .map_err(|error| format!("reference '{reference}', footprint '{lib_id}': {error:#}"));
         let board_sexp =
             board_footprint_sexp(lib_id, x, y, rotation, layer, Some(reference), project_dir)
                 .map_err(anyhow::Error::msg)?;
@@ -916,9 +966,7 @@ impl PreparedFootprintPlacement {
         });
         Ok(Self {
             value,
-            pads,
-            graphics,
-            fields,
+            ipc,
             board_sexp,
         })
     }
@@ -932,15 +980,21 @@ impl PreparedFootprintPlacement {
     ) -> Self {
         Self {
             value,
-            pads,
-            graphics,
-            fields,
+            ipc: Ok(PreparedIpcFootprint {
+                pads,
+                graphics,
+                fields,
+            }),
             board_sexp,
         }
     }
 
-    /// Insert exactly this footprint through the same atomic, duplicate-safe
-    /// path used by ordinary library placement.
+    pub(crate) fn ipc(&self) -> anyhow::Result<&PreparedIpcFootprint> {
+        self.ipc
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!(error.clone()))
+    }
+
     pub(crate) fn insert_into_board(&self, board_path: &Path) -> anyhow::Result<()> {
         insert_into_board(board_path, std::slice::from_ref(&self.board_sexp))
     }
@@ -2230,14 +2284,15 @@ async fn handle_place_component(
     let requested_board = board.clone();
     let prepared_ipc = prepared.clone();
     let attempt = attempt_ipc_write(ctx, &board, "placement", move |c| {
+        let geometry = prepared_ipc.ipc()?;
         c.place_footprint(
             &requested_board,
             &footprint_ipc,
             &reference_ipc,
             &prepared_ipc.value,
-            &prepared_ipc.pads,
-            &prepared_ipc.graphics,
-            &prepared_ipc.fields,
+            &geometry.pads,
+            &geometry.graphics,
+            &geometry.fields,
             x,
             y,
             rotation,
@@ -3307,7 +3362,7 @@ pub(crate) fn pad_info_from_sexp(
             }
             .map(str::to_string)
         });
-    let shape = pad
+    let mut shape = pad
         .get(3)
         .and_then(konnect_sexp::SexpNode::as_str)
         .and_then(|shape| {
@@ -3348,6 +3403,10 @@ pub(crate) fn pad_info_from_sexp(
         .find("roundrect_rratio")
         .and_then(|node| node.get_f64(1));
     let chamfer_ratio = pad.find("chamfer_ratio").and_then(|node| node.get_f64(1));
+    let chamfered_corners = pad_chamfer_corners(pad)?;
+    if shape.as_deref() == Some("roundrect") && chamfered_corners.is_some() {
+        shape = Some("chamfered_rect".to_string());
+    }
     let copper_layers = layers
         .iter()
         .filter(|layer| layer.as_str() == "*.Cu" || layer.ends_with(".Cu"))
@@ -3358,6 +3417,7 @@ pub(crate) fn pad_info_from_sexp(
             offset: offset.clone(),
             corner_rounding_ratio,
             chamfer_ratio,
+            chamfered_corners: chamfered_corners.clone(),
         })
         .collect();
     let uuid = pad
@@ -3671,6 +3731,10 @@ async fn handle_place_array(
         Ok(source) => source,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
+    if let Err(error) = validate_live_library(&source, &footprint, &format!("{prefix}{ref_start}"))
+    {
+        return Ok(CallToolResult::error(format!("{error:#}")));
+    }
     // Graphics are footprint-local and identical for every array instance, so
     // one extraction serves the whole batch.
     let graphics = match extract_graphic_definitions(&source) {
@@ -3866,6 +3930,9 @@ async fn handle_duplicate_component(
         Ok(source) => source,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
+    if let Err(error) = validate_live_library(&source, &src.footprint, &new_reference) {
+        return Ok(CallToolResult::error(format!("{error:#}")));
+    }
     let prepared = match prepare_footprint_source(
         &source,
         &src.footprint,
@@ -4316,6 +4383,151 @@ mod tests {
     #[test]
     fn a_bare_pads_only_footprint_extracts_no_graphics() {
         assert!(extract_graphic_definitions(FOOTPRINT).unwrap().is_empty());
+    }
+
+    #[test]
+    fn live_chamfer_geometry_reaches_the_ipc_payload() {
+        use konnect_ipc::gen::kiapi::board::types::{FootprintInstance, Pad};
+        let source = r#"(footprint "F" (layer "F.Cu")
+            (pad "1" smd chamfered_rect (at 0 0) (size 2 1)
+                (layers "F.Cu") (chamfer_ratio 0.2) (chamfer top_left bottom_right)))"#;
+        let pads = extract_pad_definitions(source).unwrap();
+        let item = KiCadIpcClient::build_footprint_item(
+            "L:F",
+            "U1",
+            "F",
+            &pads,
+            &[],
+            &Default::default(),
+            0.0,
+            0.0,
+            0.0,
+            "F.Cu",
+        )
+        .unwrap();
+        let footprint = FootprintInstance::decode(item.value.as_slice()).unwrap();
+        let item = &footprint.definition.unwrap().items[0];
+        let pad = Pad::decode(item.value.as_slice()).unwrap();
+        let copper = &pad.pad_stack.unwrap().copper_layers[0];
+        assert_eq!(copper.chamfer_ratio, 0.2);
+        let corners = copper.chamfered_corners.as_ref().unwrap();
+        assert!(corners.top_left && corners.bottom_right);
+        assert!(!corners.top_right && !corners.bottom_left);
+    }
+
+    #[tokio::test]
+    async fn closed_file_placement_preserves_unsupported_library_geometry() {
+        for clause in [
+            "(zone (net 0))",
+            "(solder_mask_margin 0.1)",
+            "(net_tie_pad_groups \"1,2\")",
+            "(group \"g\")",
+            "(point (at 0 0))",
+            "(fp_text_box \"box\")",
+            "(dimension 0)",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let board = fallback_fixture(tmp.path());
+            let library = tmp
+                .path()
+                .join("Resistor_SMD.pretty/R_0805_2012Metric.kicad_mod");
+            let source = library_footprint();
+            let end = source.rfind(')').unwrap();
+            let source = format!("{} {clause}{}", &source[..end], &source[end..]);
+            std::fs::write(library, source).unwrap();
+            let result = handle_place_component(
+                &json!({
+                    "board": board, "footprint": "Resistor_SMD:R_0805_2012Metric",
+                    "reference": "R1", "x": 10.0, "y": 20.0,
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{}", result_text(&result));
+            assert!(
+                std::fs::read_to_string(board).unwrap().contains(clause),
+                "{clause}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_live_placement_refuses_before_create_and_never_writes_the_file() {
+        use konnect_ipc::gen::kiapi;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let board = fallback_fixture(tmp.path());
+        let before = std::fs::read_to_string(&board).unwrap();
+        let library = tmp
+            .path()
+            .join("Resistor_SMD.pretty/R_0805_2012Metric.kicad_mod");
+        let source = library_footprint();
+        let end = source.rfind(')').unwrap();
+        std::fs::write(
+            library,
+            format!("{} (zone (net 0)){}", &source[..end], &source[end..]),
+        )
+        .unwrap();
+        let creates = Arc::new(AtomicUsize::new(0));
+        let count = creates.clone();
+        let filename = board.to_string_lossy().to_string();
+        let server = crate::test_support::MockIpcServer::spawn(
+            "unsupported-placement",
+            move |request| {
+                let command = request.message.unwrap();
+                let message = if command.type_url.ends_with("GetOpenDocuments") {
+                    Some(konnect_ipc::builders::pack_any(&kiapi::common::commands::GetOpenDocumentsResponse {
+                    documents: vec![kiapi::common::types::DocumentSpecifier {
+                        r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                        identifier: Some(kiapi::common::types::document_specifier::Identifier::BoardFilename(filename.clone())),
+                        project: None,
+                    }],
+                }, "kiapi.common.commands.GetOpenDocumentsResponse"))
+                } else if command.type_url.ends_with("GetItems") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ))
+                } else {
+                    if command.type_url.ends_with("CreateItems") {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    None
+                };
+                kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    message,
+                    header: None,
+                }
+            },
+        );
+        let ctx = ctx_talking_to(server.address().to_string());
+        let result = handle_place_component(
+            &json!({
+                "board": board, "footprint": "Resistor_SMD:R_0805_2012Metric",
+                "reference": "R1", "x": 10.0, "y": 20.0,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let text = result_text(&result);
+        for expected in ["R1", "Resistor_SMD:R_0805_2012Metric", "zone", "closed"] {
+            assert!(text.contains(expected), "{text}");
+        }
+        assert_eq!(creates.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read_to_string(board).unwrap(), before);
     }
 
     fn test_ctx() -> ToolContext {

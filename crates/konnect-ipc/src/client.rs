@@ -110,6 +110,15 @@ fn pad_geometry(pad: &kiapi::board::types::Pad) -> PadGeometry {
             corner_rounding_ratio: (layer.corner_rounding_ratio != 0.0)
                 .then_some(layer.corner_rounding_ratio),
             chamfer_ratio: (layer.chamfer_ratio != 0.0).then_some(layer.chamfer_ratio),
+            chamfered_corners: layer
+                .chamfered_corners
+                .as_ref()
+                .map(|corners| IpcChamferCorners {
+                    top_left: corners.top_left,
+                    top_right: corners.top_right,
+                    bottom_left: corners.bottom_left,
+                    bottom_right: corners.bottom_right,
+                }),
         })
         .collect();
     let shape = copper_layers.first().and_then(|layer| layer.shape.clone());
@@ -4098,9 +4107,15 @@ impl KiCadIpcClient {
                     "rect" => kiapi::board::types::PadStackShape::PssRectangle,
                     "oval" => kiapi::board::types::PadStackShape::PssOval,
                     "trapezoid" => kiapi::board::types::PadStackShape::PssTrapezoid,
+                    "roundrect" if pad.chamfered_corners.is_some() => {
+                        kiapi::board::types::PadStackShape::PssChamferedrect
+                    }
                     "roundrect" => kiapi::board::types::PadStackShape::PssRoundrect,
                     "chamfered_rect" => kiapi::board::types::PadStackShape::PssChamferedrect,
-                    _ => kiapi::board::types::PadStackShape::PssRectangle,
+                    unknown => anyhow::bail!(
+                        "footprint '{lib_id}' pad '{}' has unsupported shape '{unknown}'",
+                        pad.number
+                    ),
                 };
                 // Always F_Cu: it is KiCad's ALL_LAYERS sentinel for a
                 // PST_NORMAL stack, not a statement about which side the pad
@@ -4112,6 +4127,15 @@ impl KiCadIpcClient {
                     shape: shape as i32,
                     size: Some(crate::builders::vec2(pad.size_x, pad.size_y)),
                     corner_rounding_ratio: pad.roundrect_ratio,
+                    chamfer_ratio: pad.chamfer_ratio,
+                    chamfered_corners: pad.chamfered_corners.as_ref().map(|corners| {
+                        kiapi::board::types::ChamferedRectCorners {
+                            top_left: corners.top_left,
+                            top_right: corners.top_right,
+                            bottom_left: corners.bottom_left,
+                            bottom_right: corners.bottom_right,
+                        }
+                    }),
                     custom_anchor_shape: shape as i32,
                     offset: Some(crate::builders::vec2(0.0, 0.0)),
                     ..Default::default()
@@ -4158,9 +4182,9 @@ impl KiCadIpcClient {
                     locked: kiapi::common::types::LockedState::LsUnlocked as i32,
                     ..Default::default()
                 };
-                crate::builders::pack_any(&item, "kiapi.board.types.Pad")
+                Ok(crate::builders::pack_any(&item, "kiapi.board.types.Pad"))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         child_items.extend(
             graphics
                 .iter()
@@ -6357,6 +6381,8 @@ mod footprint_graphics_tests {
             drill_y: None,
             drill_oval: false,
             roundrect_ratio: 0.0,
+            chamfer_ratio: 0.0,
+            chamfered_corners: None,
             rotation: 0.0,
         };
 
@@ -6503,6 +6529,8 @@ mod footprint_graphics_tests {
             drill_y: None,
             drill_oval: false,
             roundrect_ratio: 0.0,
+            chamfer_ratio: 0.0,
+            chamfered_corners: None,
             rotation: 0.0,
         }];
         let error = format!("{:#}", build(&pad, &[], "F.Cu").expect_err("pad layer"));
@@ -7070,5 +7098,74 @@ mod stackup_tests {
         assert_eq!(stackup.edge_connector, "unknown");
         assert!(!stackup.has_edge_plating);
         assert!(stackup.layers.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod issue14_shape_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_pad_shapes_are_refused_instead_of_rectangles() {
+        let pad = IpcPadDefinition {
+            number: "1".into(),
+            pad_type: "smd".into(),
+            shape: "future_shape".into(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            size_x: 1.0,
+            size_y: 1.0,
+            drill_x: None,
+            drill_y: None,
+            drill_oval: false,
+            layers: vec!["F.Cu".into()],
+            roundrect_ratio: 0.0,
+            chamfer_ratio: 0.0,
+            chamfered_corners: None,
+        };
+        let error = KiCadIpcClient::build_footprint_item(
+            "L:F",
+            "U1",
+            "F",
+            &[pad],
+            &[],
+            &Default::default(),
+            0.0,
+            0.0,
+            0.0,
+            "F.Cu",
+        )
+        .expect_err("unknown shapes must not silently become rectangles");
+        assert!(error.to_string().contains("future_shape"));
+    }
+    #[test]
+    fn native_chamfer_geometry_reads_ratio_and_corner_selection() {
+        let pad = kiapi::board::types::Pad {
+            pad_stack: Some(kiapi::board::types::PadStack {
+                copper_layers: vec![kiapi::board::types::PadStackLayer {
+                    layer: kiapi::board::types::BoardLayer::BlFCu as i32,
+                    shape: kiapi::board::types::PadStackShape::PssChamferedrect as i32,
+                    chamfer_ratio: 0.2,
+                    chamfered_corners: Some(kiapi::board::types::ChamferedRectCorners {
+                        top_left: true,
+                        top_right: false,
+                        bottom_left: false,
+                        bottom_right: true,
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let geometry = pad_geometry(&pad);
+        assert_eq!(geometry.copper_layers[0].chamfer_ratio, Some(0.2));
+        let corners = geometry.copper_layers[0]
+            .chamfered_corners
+            .as_ref()
+            .unwrap();
+        assert!(corners.top_left && corners.bottom_right);
+        assert!(!corners.top_right && !corners.bottom_left);
     }
 }

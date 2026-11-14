@@ -137,6 +137,330 @@ pub(crate) fn models(root: &SexpNode) -> Result<Vec<kiapi::board::types::Footpri
         .collect()
 }
 
+pub(crate) fn validate_supported_children(root: &konnect_sexp::SexpNode) -> Result<()> {
+    for child in root.children().unwrap_or_default().iter().skip(2) {
+        let Some(tag) = child.head() else {
+            continue;
+        };
+        match tag {
+            "version" | "generator" | "generator_version" | "layer" | "descr" | "tags" | "attr"
+            | "property" | "fp_text" | "fp_line" | "fp_rect" | "fp_circle" | "fp_arc"
+            | "fp_poly" | "pad" | "model" => {}
+            // KiCad 10 writes these two flags into every footprint it saves
+            // (all 15,428 official library files carry them, every one at its
+            // default). At the default the typed rebuild loses nothing;
+            // a non-default value carries semantics it cannot represent.
+            "embedded_fonts" | "duplicate_pad_numbers_are_jumpers" => {
+                let value = child.get(1).and_then(konnect_sexp::SexpNode::as_str);
+                if value != Some("no") {
+                    bail!(
+                        "footprint '{tag} {}' is not supported by typed IPC footprint rebuild",
+                        value.unwrap_or("")
+                    );
+                }
+            }
+            unsupported => {
+                bail!("footprint child '{unsupported}' is not supported by typed IPC footprint rebuild")
+            }
+        }
+        match tag {
+            "pad" => validate_pad(child)?,
+            "fp_line" | "fp_rect" | "fp_circle" | "fp_arc" | "fp_poly" => {
+                validate_graphic(child, tag)?
+            }
+            "fp_text" => {
+                let kind = child
+                    .get(1)
+                    .and_then(konnect_sexp::SexpNode::as_str)
+                    .context("fp_text is missing its kind")?;
+                match kind {
+                    "reference" | "value" => {}
+                    "user" => validate_user_text(child)?,
+                    _ => {
+                        bail!(
+                            "fp_text kind '{kind}' is not supported losslessly by typed IPC footprint rebuild"
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Accept only the `fp_text user` subset the typed IPC rebuild can reproduce.
+/// Refusing an unknown clause is intentional: silently dropping even a visual
+/// modifier would make a refreshed board differ from its library definition.
+fn validate_user_text(text: &konnect_sexp::SexpNode) -> Result<()> {
+    text.get(2)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .context("fp_text user is missing its text")?;
+
+    let mut saw_at = false;
+    let mut saw_layer = false;
+    let mut saw_effects = false;
+    let mut identifier = None;
+    for clause in text.children().unwrap_or_default().iter().skip(3) {
+        let tag = clause
+            .head()
+            .context("fp_text user contains an unsupported atom")?;
+        match tag {
+            "at" => {
+                if saw_at {
+                    bail!("fp_text user contains duplicate 'at' clauses");
+                }
+                saw_at = true;
+                let count = clause.children().map_or(0, |children| children.len());
+                if !matches!(count, 3 | 4) {
+                    bail!("fp_text user 'at' must contain x, y, and optional rotation");
+                }
+                for index in 1..count {
+                    let value = clause
+                        .get_f64(index)
+                        .with_context(|| format!("fp_text user 'at' value {index} is invalid"))?;
+                    if !value.is_finite() {
+                        bail!("fp_text user 'at' values must be finite");
+                    }
+                }
+            }
+            "layer" => {
+                if saw_layer {
+                    bail!("fp_text user contains duplicate 'layer' clauses");
+                }
+                saw_layer = true;
+                if clause.children().map_or(0, |children| children.len()) != 2
+                    || clause
+                        .get(1)
+                        .and_then(konnect_sexp::SexpNode::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    bail!("fp_text user 'layer' must name exactly one layer");
+                }
+            }
+            "uuid" | "tstamp" => {
+                if let Some(previous) = identifier {
+                    bail!(
+                        "fp_text user contains multiple identifier clauses ('{previous}' and '{tag}')"
+                    );
+                }
+                identifier = Some(tag);
+                if clause.children().map_or(0, |children| children.len()) != 2
+                    || clause
+                        .get(1)
+                        .and_then(konnect_sexp::SexpNode::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    bail!("fp_text user '{tag}' must contain exactly one identifier");
+                }
+            }
+            "effects" => {
+                if saw_effects {
+                    bail!("fp_text user contains duplicate 'effects' clauses");
+                }
+                saw_effects = true;
+                validate_user_text_effects(clause)?;
+            }
+            unsupported => {
+                bail!("fp_text user clause '{unsupported}' is not supported losslessly");
+            }
+        }
+    }
+
+    if !saw_at {
+        bail!("fp_text user is missing its 'at' clause");
+    }
+    if !saw_layer {
+        bail!("fp_text user is missing its 'layer' clause");
+    }
+    if !saw_effects {
+        bail!("fp_text user is missing its 'effects' clause");
+    }
+    Ok(())
+}
+
+fn validate_user_text_effects(effects: &konnect_sexp::SexpNode) -> Result<()> {
+    let mut font = None;
+    for clause in effects.children().unwrap_or_default().iter().skip(1) {
+        let tag = clause
+            .head()
+            .context("fp_text user effects contain an unsupported atom")?;
+        if tag != "font" {
+            bail!("fp_text user effects clause '{tag}' is not supported losslessly");
+        }
+        if font.replace(clause).is_some() {
+            bail!("fp_text user contains duplicate font clauses");
+        }
+    }
+    let font = font.context("fp_text user effects are missing the font clause")?;
+
+    let mut size = None;
+    let mut thickness = None;
+    for clause in font.children().unwrap_or_default().iter().skip(1) {
+        let tag = clause
+            .head()
+            .context("fp_text user font contains an unsupported atom")?;
+        match tag {
+            "size" => {
+                if size.is_some() {
+                    bail!("fp_text user contains duplicate font size clauses");
+                }
+                if clause.children().map_or(0, |children| children.len()) != 3 {
+                    bail!("fp_text user font size must contain width and height");
+                }
+                let width = clause
+                    .get_f64(1)
+                    .context("fp_text user font width is invalid")?;
+                let height = clause
+                    .get_f64(2)
+                    .context("fp_text user font height is invalid")?;
+                if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+                    bail!("fp_text user font size must be finite and positive");
+                }
+                if width != height {
+                    bail!("fp_text user non-square font size is not supported losslessly");
+                }
+                size = Some(width);
+            }
+            "thickness" => {
+                if thickness.is_some() {
+                    bail!("fp_text user contains duplicate font thickness clauses");
+                }
+                if clause.children().map_or(0, |children| children.len()) != 2 {
+                    bail!("fp_text user font thickness must contain exactly one value");
+                }
+                let value = clause
+                    .get_f64(1)
+                    .context("fp_text user font thickness is invalid")?;
+                if !value.is_finite() || value <= 0.0 {
+                    bail!("fp_text user font thickness must be finite and positive");
+                }
+                thickness = Some(value);
+            }
+            unsupported => {
+                bail!("fp_text user font clause '{unsupported}' is not supported losslessly");
+            }
+        }
+    }
+    size.context("fp_text user font is missing its size")?;
+    thickness.context("fp_text user font is missing its thickness")?;
+    Ok(())
+}
+
+fn validate_graphic(graphic: &konnect_sexp::SexpNode, kind: &str) -> Result<()> {
+    let allowed: &[&str] = match kind {
+        "fp_line" => &["start", "end", "stroke", "layer", "uuid", "tstamp"],
+        "fp_rect" => &["start", "end", "stroke", "fill", "layer", "uuid", "tstamp"],
+        "fp_circle" => &["center", "end", "stroke", "fill", "layer", "uuid", "tstamp"],
+        "fp_arc" => &["start", "mid", "end", "stroke", "layer", "uuid", "tstamp"],
+        "fp_poly" => &["pts", "stroke", "fill", "layer", "uuid", "tstamp"],
+        _ => bail!("unsupported footprint graphic '{kind}'"),
+    };
+    for child in graphic.children().unwrap_or_default().iter().skip(1) {
+        let Some(tag) = child.head() else {
+            bail!("{kind} contains an unsupported atom");
+        };
+        if !allowed.contains(&tag) {
+            bail!("{kind} clause '{tag}' is not supported by typed IPC footprint rebuild");
+        }
+        match tag {
+            "stroke" => {
+                for stroke_child in child.children().unwrap_or_default().iter().skip(1) {
+                    let stroke_tag = stroke_child
+                        .head()
+                        .context("graphic stroke contains an unsupported atom")?;
+                    match stroke_tag {
+                        "width" => {}
+                        "type" => {
+                            let stroke_type = stroke_child
+                                .get(1)
+                                .and_then(konnect_sexp::SexpNode::as_str)
+                                .context("graphic stroke type is missing")?;
+                            if !matches!(stroke_type, "solid" | "default") {
+                                bail!(
+                                    "graphic stroke type '{stroke_type}' is not supported losslessly"
+                                );
+                            }
+                        }
+                        unsupported => bail!(
+                            "graphic stroke clause '{unsupported}' is not supported losslessly"
+                        ),
+                    }
+                }
+            }
+            "fill" => {
+                let fill = child
+                    .get(1)
+                    .and_then(konnect_sexp::SexpNode::as_str)
+                    .context("graphic fill is missing")?;
+                if !matches!(fill, "none" | "no" | "solid" | "yes") {
+                    bail!("graphic fill '{fill}' is not supported losslessly");
+                }
+            }
+            "pts"
+                if child
+                    .children()
+                    .unwrap_or_default()
+                    .iter()
+                    .skip(1)
+                    .any(|point| point.head() != Some("xy")) =>
+            {
+                bail!("fp_poly contains a non-xy point");
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_pad(pad: &konnect_sexp::SexpNode) -> Result<()> {
+    let shape = pad
+        .get(3)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .context("footprint pad is missing its shape")?;
+    if !matches!(
+        shape,
+        "circle" | "rect" | "oval" | "roundrect" | "chamfered_rect"
+    ) {
+        bail!("pad shape '{shape}' is not supported by typed IPC footprint rebuild");
+    }
+    for child in pad.children().unwrap_or_default().iter().skip(4) {
+        let Some(tag) = child.head() else {
+            continue;
+        };
+        if !matches!(
+            tag,
+            "at" | "size"
+                | "layers"
+                | "drill"
+                | "roundrect_rratio"
+                | "chamfer_ratio"
+                | "chamfer"
+                | "uuid"
+                | "tstamp"
+                | "remove_unused_layers"
+        ) {
+            bail!("pad clause '{tag}' is not supported by typed IPC footprint rebuild");
+        }
+        if tag == "remove_unused_layers" {
+            // The typed rebuild always keeps unused layers (`UlrKeep`), so a
+            // pad that actually removes them cannot be rebuilt losslessly.
+            let value = child.get(1).and_then(konnect_sexp::SexpNode::as_str);
+            if value != Some("no") {
+                bail!("pad 'remove_unused_layers yes' is not supported by typed IPC footprint rebuild");
+            }
+        }
+        if tag == "drill" {
+            for nested in child.children().unwrap_or_default().iter().skip(1) {
+                if nested.head().is_some() {
+                    bail!("nested drill clauses are not supported by typed IPC footprint rebuild");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

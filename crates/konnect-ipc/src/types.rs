@@ -264,6 +264,8 @@ pub struct IpcPadLayerGeometry {
     pub offset: Option<IpcVector2>,
     pub corner_rounding_ratio: Option<f64>,
     pub chamfer_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chamfered_corners: Option<IpcChamferCorners>,
 }
 
 /// Native drill information for a pad, when it has a drilled hole.
@@ -340,6 +342,14 @@ pub struct IpcFootprintPlacement {
     pub rotation: f64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IpcChamferCorners {
+    pub top_left: bool,
+    pub top_right: bool,
+    pub bottom_left: bool,
+    pub bottom_right: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct IpcPadDefinition {
     pub number: String,
@@ -355,6 +365,8 @@ pub struct IpcPadDefinition {
     pub drill_oval: bool,
     pub layers: Vec<String>,
     pub roundrect_ratio: f64,
+    pub chamfer_ratio: f64,
+    pub chamfered_corners: Option<IpcChamferCorners>,
 }
 
 /// A footprint graphic item in footprint-local coordinates (mm), parsed from

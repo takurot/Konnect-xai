@@ -1990,17 +1990,25 @@ fn prepare_footprint(
 fn prepare_footprint_source(
     source: &str,
 ) -> std::result::Result<PreparedFootprint, (&'static str, String)> {
-    let unsupported =
-        |error: anyhow::Error| ("unsupported_library_footprint", format!("{error:#}"));
+    let unsupported = |error: anyhow::Error| {
+        (
+            "unsupported_library_footprint",
+            format!(
+                "{error:#}. Close the PCB editor and use closed-board file placement \
+                 to preserve unsupported clauses"
+            ),
+        )
+    };
+    let root = konnect_sexp::parse_sexp(source)
+        .context("invalid footprint S-expression")
+        .map_err(unsupported)?;
+    super::library_footprint::validate_supported_children(&root).map_err(unsupported)?;
     let pads = super::pcb_components::extract_pad_definitions(source).map_err(unsupported)?;
     let graphics =
         super::pcb_components::extract_graphic_definitions(source).map_err(unsupported)?;
     let fields = super::pcb_components::extract_field_placement(source);
     // Read with the same readers `update_footprints_from_library` uses, so a
     // footprint the sync places carries what a refresh would give it (#789).
-    let root = konnect_sexp::parse_sexp(source)
-        .context("invalid footprint S-expression")
-        .map_err(unsupported)?;
     let attributes = super::library_footprint::attributes(&root).map_err(unsupported)?;
     let description_and_keywords = super::library_footprint::description_and_keywords(&root);
     let models = super::library_footprint::models(&root).map_err(unsupported)?;
@@ -3073,6 +3081,8 @@ mod tests {
                 drill_oval: false,
                 layers: vec!["F.Cu".to_string()],
                 roundrect_ratio: 0.0,
+                chamfer_ratio: 0.0,
+                chamfered_corners: None,
             }],
             &[
                 konnect_ipc::IpcGraphicDefinition::Line {
@@ -3351,6 +3361,8 @@ mod tests {
                 drill_oval: false,
                 layers: vec!["F.Cu".to_string()],
                 roundrect_ratio: 0.0,
+                chamfer_ratio: 0.0,
+                chamfered_corners: None,
             }],
             &[],
             &konnect_ipc::IpcFieldPlacement::default(),
@@ -5583,5 +5595,77 @@ mod tests {
             "{}",
             refusal.1
         );
+    }
+    #[test]
+    fn live_sync_refuses_unsupported_footprint_clauses() {
+        for clause in [
+            "(zone (net 0))",
+            "(solder_mask_margin 0.1)",
+            "(solder_paste_margin 0.1)",
+            "(solder_paste_ratio -0.1)",
+            "(net_tie_pad_groups \"1,2\")",
+            "(zone_connect 2)",
+            "(clearance 0.2)",
+            "(group \"g\")",
+            "(point (at 0 0))",
+            "(fp_text_box \"box\")",
+            "(dimension 0)",
+        ] {
+            let source = format!("(footprint \"F\" (layer \"F.Cu\") {clause})");
+            let refusal = prepare_footprint_source(&source)
+                .expect_err("live sync must not silently discard a footprint clause");
+            assert_eq!(refusal.0, "unsupported_library_footprint");
+            assert!(
+                refusal.1.contains(
+                    clause
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .trim_start_matches('(')
+                ),
+                "{}",
+                refusal.1
+            );
+        }
+    }
+
+    #[test]
+    fn live_sync_refuses_unsupported_pad_clauses() {
+        for clause in [
+            "(zone_connect 2)",
+            "(thermal_bridge_angle 45)",
+            "(thermal_bridge_width 0.2)",
+            "(clearance 0.2)",
+            "(solder_mask_margin 0.1)",
+            "(solder_paste_margin -0.1)",
+            "(solder_paste_margin_ratio -0.1)",
+            "(property pad_prop_heatsink)",
+        ] {
+            let source = format!(
+                r#"(footprint "F" (layer "F.Cu")
+                (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") {clause}))"#
+            );
+            let refusal = prepare_footprint_source(&source)
+                .expect_err("live sync must not silently discard a pad clause");
+            assert_eq!(refusal.0, "unsupported_library_footprint");
+            assert!(
+                refusal.1.contains(
+                    clause
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .trim_start_matches('(')
+                ),
+                "{}",
+                refusal.1
+            );
+        }
+        let source = r#"(footprint "F" (layer "F.Cu")
+            (pad "1" thru_hole circle (at 0 0) (size 2 2)
+                (drill 1 (offset 0.2 0)) (layers "*.Cu")))"#;
+        assert!(prepare_footprint_source(source)
+            .unwrap_err()
+            .1
+            .contains("drill"));
     }
 }
