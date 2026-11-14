@@ -3102,6 +3102,12 @@ async fn handle_edit_schematic_component(
         )));
     }
 
+    if !attribute_patch.is_empty() && !errors.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "No fields or native attributes were updated on '{reference}': {}",
+            errors.join("; ")
+        )));
+    }
     if !attribute_patch.is_empty() {
         content = match set_native_attributes(&content, edit_reference, attribute_patch) {
             Ok(content) => content,
@@ -9799,6 +9805,23 @@ mod issue25_native_attributes_tests {
         assert_eq!(sch.symbols[0].exclude_from_sim, Some(false));
         assert!(sch.symbols[0].attributes().in_pos_files);
     }
+    #[tokio::test]
+    async fn invalid_sibling_fields_refuse_native_edits_before_persistence() {
+        let (_dir, path) = fixture();
+        let source = std::fs::read_to_string(&path).unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        let response = handle_edit_schematic_component(
+            &json!({"schematic": path,
+            "reference": sch.symbols[0].reference().unwrap(), "dnp": true,
+            "fields": {"Reference": "MUST_NOT_WRITE"}}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(response.is_error, "{response:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
+
     #[test]
     fn duplicate_native_clauses_and_missing_targets_are_refused() {
         let source = r#"(kicad_sch (symbol (lib_id "Device:R") (property "Reference" "R1") (dnp no) (dnp yes)))"#;

@@ -1392,6 +1392,12 @@ async fn handle_batch_edit(
         }
     }
 
+    if !attribute_patches.is_empty() && !errors.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "No fields or native attributes were updated: {}",
+            errors.join("; ")
+        )));
+    }
     let attributes_observed = if attribute_patches.is_empty() {
         write_atomic_if_unchanged(&sch_path, &expected, &content)?;
         Vec::new()
@@ -4920,6 +4926,26 @@ mod issue25_batch_native_attributes_tests {
                 Some(false)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_missing_sibling_target_refuses_the_native_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ecc83.kicad_sch");
+        let source = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+        std::fs::write(&path, source).unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        let response = handle_batch_edit(
+            &json!({"schematic": path, "edits": [
+                {"reference": sch.symbols[0].reference().unwrap(), "dnp": true},
+                {"reference": "MISSING", "value": "MUST_NOT_WRITE"}
+            ]}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(response.is_error, "{response:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
     }
 
     #[tokio::test]
