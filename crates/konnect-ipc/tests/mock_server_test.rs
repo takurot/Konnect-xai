@@ -775,6 +775,7 @@ fn place_footprint_sends_graphics_children() {
     }];
     let graphics = vec![
         IpcGraphicDefinition::Rect {
+            style: konnect_ipc::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
             start: (-0.8, -0.7),
             end: (0.8, 0.7),
             layer: "F.CrtYd".to_string(),
@@ -782,6 +783,7 @@ fn place_footprint_sends_graphics_children() {
             filled: false,
         },
         IpcGraphicDefinition::Line {
+            style: konnect_ipc::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
             start: (-0.6, -0.5),
             end: (0.6, -0.5),
             layer: "F.SilkS".to_string(),
@@ -1626,6 +1628,7 @@ fn footprint_with_a_pad_and_a_line(pad_uuid: &str, line_uuid: &str) -> prost_typ
             chamfered_corners: None,
         }],
         &[konnect_ipc::IpcGraphicDefinition::Poly {
+            style: konnect_ipc::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
             points: vec![(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0)],
             layer: "F.SilkS".to_string(),
             width: 0.12,

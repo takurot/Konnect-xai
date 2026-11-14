@@ -365,6 +365,27 @@ fn graphic_layer(node: &konnect_sexp::SexpNode, kind: &str) -> anyhow::Result<St
 
 /// Stroke width in mm: modern `(stroke (width w) …)`, legacy bare `(width w)`.
 /// KiCad's default silkscreen line width stands in when neither is present.
+fn graphic_stroke_style(
+    node: &konnect_sexp::SexpNode,
+) -> anyhow::Result<konnect_ipc::gen::kiapi::common::types::StrokeLineStyle> {
+    use konnect_ipc::gen::kiapi::common::types::StrokeLineStyle as Style;
+    Ok(
+        match node
+            .find("stroke")
+            .and_then(|stroke| stroke.find_str("type"))
+            .unwrap_or("solid")
+        {
+            "default" => Style::SlsDefault,
+            "solid" => Style::SlsSolid,
+            "dash" => Style::SlsDash,
+            "dot" => Style::SlsDot,
+            "dash_dot" => Style::SlsDashdot,
+            "dash_dot_dot" => Style::SlsDashdotdot,
+            other => anyhow::bail!("unsupported graphic stroke style '{other}'"),
+        },
+    )
+}
+
 fn graphic_stroke_width(node: &konnect_sexp::SexpNode) -> f64 {
     node.find("stroke")
         .and_then(|stroke| stroke.find_f64("width"))
@@ -433,11 +454,12 @@ fn text_at(node: &konnect_sexp::SexpNode, kind: &str) -> anyhow::Result<((f64, f
 /// Footprint-local Reference/Value text anchors from the library source, so
 /// placed parts keep the library's text layout (a synthesized offset put the
 /// Reference on the part's own silkscreen — silk_overlap in live DRC).
-pub(crate) fn extract_field_placement(source: &str) -> konnect_ipc::IpcFieldPlacement {
+pub(crate) fn extract_field_placement(
+    source: &str,
+) -> anyhow::Result<konnect_ipc::IpcFieldPlacement> {
     let mut placement = konnect_ipc::IpcFieldPlacement::default();
-    let Ok(footprint) = konnect_sexp::parse_sexp(source) else {
-        return placement;
-    };
+    let footprint = konnect_sexp::parse_sexp(source)?;
+    placement.fields = super::library_footprint::fields(&footprint)?;
     for prop in footprint.find_all("property") {
         let Some(name) = prop.get(1).and_then(|n| n.as_str()) else {
             continue;
@@ -460,13 +482,13 @@ pub(crate) fn extract_field_placement(source: &str) -> konnect_ipc::IpcFieldPlac
             }
         }
     }
-    placement
+    Ok(placement)
 }
 
 pub(crate) fn extract_graphic_definitions(
     source: &str,
 ) -> anyhow::Result<Vec<konnect_ipc::IpcGraphicDefinition>> {
-    extract_graphic_definitions_with_properties(source, true)
+    extract_graphic_definitions_with_properties(source, false)
 }
 
 pub(crate) fn extract_graphic_definitions_without_properties(
@@ -485,6 +507,7 @@ fn extract_graphic_definitions_with_properties(
 
     for line in footprint.find_all("fp_line") {
         graphics.push(Graphic::Line {
+            style: graphic_stroke_style(line)?,
             start: graphic_point(line, "start", "fp_line")?,
             end: graphic_point(line, "end", "fp_line")?,
             layer: graphic_layer(line, "fp_line")?,
@@ -493,6 +516,7 @@ fn extract_graphic_definitions_with_properties(
     }
     for rect in footprint.find_all("fp_rect") {
         graphics.push(Graphic::Rect {
+            style: graphic_stroke_style(rect)?,
             start: graphic_point(rect, "start", "fp_rect")?,
             end: graphic_point(rect, "end", "fp_rect")?,
             layer: graphic_layer(rect, "fp_rect")?,
@@ -502,6 +526,7 @@ fn extract_graphic_definitions_with_properties(
     }
     for circle in footprint.find_all("fp_circle") {
         graphics.push(Graphic::Circle {
+            style: graphic_stroke_style(circle)?,
             center: graphic_point(circle, "center", "fp_circle")?,
             end: graphic_point(circle, "end", "fp_circle")?,
             layer: graphic_layer(circle, "fp_circle")?,
@@ -511,6 +536,7 @@ fn extract_graphic_definitions_with_properties(
     }
     for arc in footprint.find_all("fp_arc") {
         graphics.push(Graphic::Arc {
+            style: graphic_stroke_style(arc)?,
             start: graphic_point(arc, "start", "fp_arc")?,
             mid: graphic_point(arc, "mid", "fp_arc")?,
             end: graphic_point(arc, "end", "fp_arc")?,
@@ -537,6 +563,7 @@ fn extract_graphic_definitions_with_properties(
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         graphics.push(Graphic::Poly {
+            style: graphic_stroke_style(poly)?,
             points,
             layer: graphic_layer(poly, "fp_poly")?,
             width: graphic_stroke_width(poly),
@@ -951,7 +978,7 @@ impl PreparedFootprintPlacement {
             Ok(PreparedIpcFootprint {
                 pads: extract_pad_definitions(&prepared)?,
                 graphics: extract_graphic_definitions(&prepared)?,
-                fields: extract_field_placement(&prepared),
+                fields: extract_field_placement(&prepared)?,
             })
         })()
         .map_err(|error| format!("reference '{reference}', footprint '{lib_id}': {error:#}"));
@@ -3117,7 +3144,7 @@ async fn handle_repair_corrupted_footprints(
                     &summary.value,
                     &pads,
                     &graphics,
-                    &extract_field_placement(&source),
+                    &extract_field_placement(&source)?,
                     summary.position.x,
                     summary.position.y,
                     summary.rotation,
@@ -3741,7 +3768,7 @@ async fn handle_place_array(
         Ok(graphics) => graphics,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
-    let fields = extract_field_placement(&source);
+    let fields = extract_field_placement(&source)?;
 
     let value = footprint
         .split_once(':')
@@ -3959,7 +3986,7 @@ async fn handle_duplicate_component(
         Ok(graphics) => graphics,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
-    let fields = extract_field_placement(&prepared);
+    let fields = extract_field_placement(&prepared)?;
     let dup_board = board.clone();
     let fp = ipc!(ctx, args, |c| c.place_footprint(
         &dup_board,
@@ -4318,7 +4345,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             rect,
-            Graphic::Rect { layer, width, filled, start, end }
+            Graphic::Rect {style: _, layer, width, filled, start, end }
                 if layer == "F.CrtYd" && *width == 0.05 && !*filled
                     && *start == (-0.8, -0.7) && *end == (0.8, 0.7)
         ));
@@ -7244,14 +7271,14 @@ mod field_placement_tests {
 		(layer \"F.Fab\")
 	)
 )";
-        let placement = extract_field_placement(source);
+        let placement = extract_field_placement(source).unwrap();
         assert_eq!(placement.reference_at, Some((0.0, -1.43, 0.0)));
         assert_eq!(placement.value_at, Some((0.0, 1.43, 0.0)));
     }
 
     #[test]
     fn missing_fields_leave_defaults() {
-        let placement = extract_field_placement("(footprint \"bare\")");
+        let placement = extract_field_placement("(footprint \"bare\")").unwrap();
         assert_eq!(placement.reference_at, None);
         assert_eq!(placement.value_at, None);
     }

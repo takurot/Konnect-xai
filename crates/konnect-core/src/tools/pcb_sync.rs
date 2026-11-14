@@ -79,6 +79,7 @@ struct SkippedComponent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DesignComponent {
+    properties: BTreeMap<String, String>,
     reference: String,
     value: String,
     footprint_id: String,
@@ -103,6 +104,7 @@ struct Bounds {
 
 #[derive(Debug, Clone, PartialEq)]
 struct BoardFootprint {
+    properties: BTreeMap<String, String>,
     kiid: String,
     reference: String,
     value: String,
@@ -168,6 +170,7 @@ struct PreservedBoardState {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PlannedChange {
     Add {
+        properties: BTreeMap<String, String>,
         reference: String,
         value: String,
         footprint_id: String,
@@ -177,6 +180,7 @@ enum PlannedChange {
         position: Point,
     },
     Update {
+        properties: BTreeMap<String, String>,
         kiid: String,
         reference: String,
         value: String,
@@ -393,6 +397,19 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 return Ok(sync_response(&plan, "conflict", hierarchy.len(), false));
             }
             restage_additions(&mut plan, &prepared, snapshot.state.bounds);
+            if plan.changes.iter().any(|change| matches!(change, PlannedChange::Update { .. })) {
+                let live_source = client.save_document_to_string_in(snapshot.document.clone())?;
+                let blocked = super::library_footprint::live_loss_diagnostics(&live_source)?;
+                let mut hasher = Sha256::new();
+                hasher.update(plan.plan_revision.as_bytes());
+                hasher.update(serde_json::to_vec(&blocked).expect("loss findings serialize"));
+                plan.plan_revision = format!("{:x}", hasher.finalize());
+                let conflicts = plan.changes.iter().filter_map(|change| {
+                    let PlannedChange::Update { kiid, reference, .. } = change else { return None; };
+                    blocked.get(kiid).map(|reason| conflict("unsupported_live_footprint_state", format!("{reference}: {reason}"), Some(reference)))
+                }).collect::<Vec<_>>();
+                if !conflicts.is_empty() { refuse_plan(&mut plan, conflicts); }
+            }
             refresh_revision_with_staging(&mut plan);
 
             if dry_run || plan.status == PlanStatus::Conflict {
@@ -759,6 +776,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             };
             add_index += 1;
             changes.push(PlannedChange::Add {
+                properties: component.properties.clone(),
                 reference: component.reference.clone(),
                 value: component.value.clone(),
                 footprint_id: component.footprint_id.clone(),
@@ -850,13 +868,29 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             }
         }
 
-        let needs_update = footprint.reference != component.reference
+        let properties = match super::library_footprint::schematic_properties(
+            &footprint.properties,
+            &component.properties,
+        ) {
+            Ok(properties) => properties,
+            Err(error) => {
+                diagnostics.push(conflict(
+                    "schematic_field_conflict",
+                    format!("{}: {error:#}", component.reference),
+                    Some(&component.reference),
+                ));
+                continue;
+            }
+        };
+        let needs_update = properties != footprint.properties
+            || footprint.reference != component.reference
             || footprint.value != component.value
             || footprint.symbol_path.as_deref() != Some(component.symbol_path.as_str())
             || footprint.dnp != component.dnp
             || changed_pads > 0;
         if needs_update {
             changes.push(PlannedChange::Update {
+                properties,
                 kiid: footprint.kiid.clone(),
                 reference: component.reference.clone(),
                 value: component.value.clone(),
@@ -1046,6 +1080,7 @@ fn plan_revision(netlist_source: &str, board: &BoardState) -> String {
     for footprint in footprints {
         hasher.update(footprint.kiid.as_bytes());
         hasher.update(footprint.reference.as_bytes());
+        hasher.update(serde_json::to_vec(&footprint.properties).expect("field map serializes"));
         hasher.update(footprint.footprint_id.as_bytes());
         hasher.update(footprint.symbol_path.as_deref().unwrap_or("").as_bytes());
         for (pad, net) in &footprint.pad_nets {
@@ -1136,6 +1171,7 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
         let index = components.len();
         by_reference.insert(reference.clone(), index);
         components.push(DesignComponent {
+            properties: exported_properties(component_node)?,
             reference,
             value,
             footprint_id,
@@ -1182,6 +1218,35 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
     })
 }
 
+fn exported_properties(component: &SexpNode) -> Result<BTreeMap<String, String>> {
+    let mut properties = BTreeMap::new();
+    if let Some(fields) = component.find("fields") {
+        for field in fields.find_all("field") {
+            let name = field
+                .find_str("name")
+                .context("netlist field has no name")?;
+            if matches!(name, "Reference" | "Value" | "Footprint") {
+                continue;
+            }
+            if name == super::library_footprint::SCHEMATIC_FIELDS || name.is_empty() {
+                bail!("reserved or empty schematic field '{name}'");
+            }
+            let value = field
+                .children()
+                .unwrap_or_default()
+                .iter()
+                .skip(1)
+                .filter_map(SexpNode::as_str)
+                .next_back()
+                .unwrap_or("");
+            if properties.insert(name.into(), value.into()).is_some() {
+                bail!("duplicate schematic field '{name}'");
+            }
+        }
+    }
+    Ok(properties)
+}
+
 fn required_value(node: &SexpNode, tag: &str) -> Result<String> {
     node.find_str(tag)
         .map(str::to_owned)
@@ -1198,6 +1263,7 @@ fn update_footprint_item(
 
     let PlannedChange::Update {
         kiid,
+        properties,
         reference,
         value,
         symbol_path,
@@ -1224,6 +1290,7 @@ fn update_footprint_item(
         net_codes,
     )?;
 
+    super::library_footprint::apply_properties(&mut footprint, properties)?;
     Ok(konnect_ipc::builders::pack_any(
         &footprint,
         "kiapi.board.types.FootprintInstance",
@@ -1321,6 +1388,7 @@ fn apply_footprint_fields(
 /// to leave off.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct FootprintShape {
+    properties: BTreeMap<String, String>,
     pads: usize,
     drawings: usize,
     attributes: AttributeSet,
@@ -1406,6 +1474,7 @@ fn footprint_shapes<'a>(
             continue;
         }
         let mut shape = FootprintShape {
+            properties: super::library_footprint::field_values(&footprint).unwrap_or_default(),
             attributes: AttributeSet::of(footprint.attributes.as_ref()),
             ..Default::default()
         };
@@ -1485,6 +1554,12 @@ fn verify_board_matches_what_was_sent(
             corrupted.push(detail);
         } else if (got.pads, got.drawings) != (want.pads, want.drawings) {
             suspicious.push(detail);
+        }
+        if got.properties != want.properties {
+            return Err(anyhow::Error::new(konnect_ipc::client::IpcOutcomeUnknown {
+                command: "schematic field readback".into(),
+                reason: format!("{reference}: board fields differ from the synchronized fields; inspect the live board before retrying"),
+            }));
         }
         if got.attributes != want.attributes {
             suspicious.push(format!(
@@ -1840,6 +1915,7 @@ fn board_footprint_from_instance(
     }
     let position = footprint.position.as_ref();
     Ok(BoardFootprint {
+        properties: super::library_footprint::field_values(footprint)?,
         kiid,
         reference: field_text(&footprint.reference_field),
         value: field_text(&footprint.value_field),
@@ -2006,7 +2082,7 @@ fn prepare_footprint_source(
     let pads = super::pcb_components::extract_pad_definitions(source).map_err(unsupported)?;
     let graphics =
         super::pcb_components::extract_graphic_definitions(source).map_err(unsupported)?;
-    let fields = super::pcb_components::extract_field_placement(source);
+    let fields = super::pcb_components::extract_field_placement(source).map_err(unsupported)?;
     // Read with the same readers `update_footprints_from_library` uses, so a
     // footprint the sync places carries what a refresh would give it (#789).
     let attributes = super::library_footprint::attributes(&root).map_err(unsupported)?;
@@ -2235,6 +2311,7 @@ fn build_added_footprint(
     net_codes: &BTreeMap<String, i32>,
 ) -> Result<prost_types::Any> {
     let PlannedChange::Add {
+        properties,
         reference,
         value,
         footprint_id,
@@ -2270,6 +2347,9 @@ fn build_added_footprint(
         pad_nets,
         net_codes,
     )?;
+    let existing = super::library_footprint::field_values(&footprint)?;
+    let properties = super::library_footprint::schematic_properties(&existing, properties)?;
+    super::library_footprint::apply_properties(&mut footprint, &properties)?;
     Ok(konnect_ipc::builders::pack_any(
         &footprint,
         "kiapi.board.types.FootprintInstance",
@@ -2314,7 +2394,7 @@ mod chunk_tests {
         let source = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
         let pads = super::super::pcb_components::extract_pad_definitions(source).unwrap();
         let graphics = super::super::pcb_components::extract_graphic_definitions(source).unwrap();
-        let fields = super::super::pcb_components::extract_field_placement(source);
+        let fields = super::super::pcb_components::extract_field_placement(source).unwrap();
         (0..count)
             .map(|i| {
                 KiCadIpcClient::build_footprint_item(
@@ -2684,6 +2764,32 @@ mod chunk_tests {
 mod tests {
     use super::*;
 
+    #[test]
+    fn issue26_schematic_custom_fields_plan_an_update_and_bind_revision() {
+        let netlist = ONE_RESISTOR.replace(
+            "(value \"10k\")",
+            "(value \"10k\") (fields (field (name \"LCSC\") \"C25804\"))",
+        );
+        let design = parse_exported_netlist(&netlist).unwrap();
+        assert_eq!(design.components[0].properties["LCSC"], "C25804");
+        let mut footprint = board_resistor("R1", Some("/sheet-uuid/symbol-uuid"));
+        footprint.pad_nets = design.components[0].pad_nets.clone();
+        let first = plan_sync(&netlist, &design, &board_with(vec![footprint.clone()]));
+        assert_eq!(first.status, PlanStatus::Ready);
+        let PlannedChange::Update { properties, .. } = &first.changes[0] else {
+            panic!("field sync must update the existing footprint");
+        };
+        assert_eq!(properties["LCSC"], "C25804");
+        footprint.properties = properties.clone();
+        let next = plan_sync(&netlist, &design, &board_with(vec![footprint.clone()]));
+        assert_eq!(next.status, PlanStatus::Noop);
+        footprint
+            .properties
+            .insert("BoardOnly".into(), "keep".into());
+        let changed = plan_sync(&netlist, &design, &board_with(vec![footprint]));
+        assert_ne!(next.plan_revision, changed.plan_revision);
+    }
+
     const ONE_RESISTOR: &str = r#"
 (export
   (components
@@ -2929,6 +3035,7 @@ mod tests {
 
     fn resistor(reference: &str, symbol_path: &str) -> DesignComponent {
         DesignComponent {
+            properties: BTreeMap::new(),
             reference: reference.to_string(),
             value: "10k".to_string(),
             footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
@@ -2943,6 +3050,7 @@ mod tests {
 
     fn board_resistor(reference: &str, symbol_path: Option<&str>) -> BoardFootprint {
         BoardFootprint {
+            properties: BTreeMap::new(),
             kiid: format!("{reference}-kiid"),
             reference: reference.to_string(),
             value: "10k".to_string(),
@@ -2988,6 +3096,7 @@ mod tests {
         let board = BoardState {
             footprints: vec![
                 BoardFootprint {
+                    properties: BTreeMap::new(),
                     kiid: "existing-kiid".to_string(),
                     reference: "R1".to_string(),
                     value: "1k".to_string(),
@@ -3006,6 +3115,7 @@ mod tests {
                     not_in_schematic: false,
                 },
                 BoardFootprint {
+                    properties: BTreeMap::new(),
                     kiid: "board-only".to_string(),
                     reference: "MH1".to_string(),
                     value: "MountingHole".to_string(),
@@ -3086,12 +3196,14 @@ mod tests {
             }],
             &[
                 konnect_ipc::IpcGraphicDefinition::Line {
+                    style: konnect_ipc::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
                     start: (-2.0, -2.5),
                     end: (2.0, -2.5),
                     layer: silk(),
                     width: 0.12,
                 },
                 konnect_ipc::IpcGraphicDefinition::Rect {
+                    style: konnect_ipc::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
                     start: (-2.6, -3.0),
                     end: (2.6, 3.0),
                     layer: "F.CrtYd".to_string(),
@@ -3099,6 +3211,7 @@ mod tests {
                     filled: false,
                 },
                 konnect_ipc::IpcGraphicDefinition::Circle {
+                    style: konnect_ipc::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
                     center: (-1.8, -1.8),
                     end: (-1.6, -1.8),
                     layer: silk(),
@@ -3106,6 +3219,7 @@ mod tests {
                     filled: true,
                 },
                 konnect_ipc::IpcGraphicDefinition::Arc {
+                    style: konnect_ipc::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
                     start: (-1.0, -2.5),
                     mid: (0.0, -2.0),
                     end: (1.0, -2.5),
@@ -3113,6 +3227,7 @@ mod tests {
                     width: 0.1,
                 },
                 konnect_ipc::IpcGraphicDefinition::Poly {
+                    style: konnect_ipc::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
                     points: vec![(-1.0, 2.0), (1.0, 2.0), (0.0, 2.8)],
                     layer: "F.Fab".to_string(),
                     width: 0.1,
@@ -3181,6 +3296,7 @@ mod tests {
         assert_eq!(before.get("kiapi.board.types.BoardText"), Some(&1));
 
         let change = PlannedChange::Update {
+            properties: BTreeMap::new(),
             kiid: "u1-kiid".to_string(),
             reference: "U1".to_string(),
             value: "NE555".to_string(),
@@ -3381,6 +3497,7 @@ mod tests {
         let item =
             konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
         let change = PlannedChange::Update {
+            properties: BTreeMap::new(),
             kiid: "keep-kiid".to_string(),
             reference: "R2".to_string(),
             value: "10k".to_string(),
@@ -3423,6 +3540,7 @@ mod tests {
     fn removing_a_pad_from_a_routed_net_conflicts_the_whole_plan() {
         let design = ExportedDesign {
             components: vec![DesignComponent {
+                properties: BTreeMap::new(),
                 pad_nets: BTreeMap::new(),
                 ..resistor("R1", "/sheet/existing")
             }],
@@ -3431,6 +3549,7 @@ mod tests {
         };
         let board = BoardState {
             footprints: vec![BoardFootprint {
+                properties: BTreeMap::new(),
                 kiid: "existing-kiid".to_string(),
                 reference: "R1".to_string(),
                 value: "10k".to_string(),
@@ -4515,6 +4634,7 @@ mod tests {
 
     fn planned_add(reference: &str, footprint_id: &str, pads: &[&str]) -> PlannedChange {
         PlannedChange::Add {
+            properties: BTreeMap::new(),
             reference: reference.to_string(),
             value: "part".to_string(),
             footprint_id: footprint_id.to_string(),
@@ -5549,6 +5669,7 @@ mod tests {
         ))
         .unwrap();
         let addition = |dnp: bool| PlannedChange::Add {
+            properties: BTreeMap::new(),
             reference: "C1".into(),
             value: "100n".into(),
             footprint_id: STOCK_0603.into(),

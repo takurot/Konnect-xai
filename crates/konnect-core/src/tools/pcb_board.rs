@@ -2438,6 +2438,7 @@ async fn handle_add_mounting_hole(
             vec![mounting_hole_pad(spec.drill_diameter_mm)],
             Vec::new(),
             konnect_ipc::IpcFieldPlacement {
+                fields: Vec::new(),
                 reference_at: Some((0.0, text_offset, 0.0)),
                 value_at: Some((0.0, -text_offset, 0.0)),
             },
@@ -4711,6 +4712,7 @@ mod mounting_hole_name_tests {
             vec![mounting_hole_pad(spec.drill_diameter_mm)],
             Vec::new(),
             konnect_ipc::IpcFieldPlacement {
+                fields: Vec::new(),
                 reference_at: Some((0.0, text_offset, 0.0)),
                 value_at: Some((0.0, -text_offset, 0.0)),
             },

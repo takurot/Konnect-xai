@@ -4062,13 +4062,13 @@ impl KiCadIpcClient {
                 visible,
             }
         };
-        let reference_field = text_field(
+        let mut reference_field = text_field(
             "Reference",
             reference,
             fields.reference_at.unwrap_or((0.0, -1.0, 0.0)),
             true,
         );
-        let value_field = text_field(
+        let mut value_field = text_field(
             "Value",
             value,
             fields.value_at.unwrap_or((0.0, 1.0, 0.0)),
@@ -4190,6 +4190,59 @@ impl KiCadIpcClient {
                 .iter()
                 .map(|graphic| build_graphic_child(graphic, x, y, rotation)),
         );
+        let mut datasheet_field = None;
+        let mut description_field = None;
+        for local_field in &fields.fields {
+            let mut field = local_field.clone();
+            field.id = None;
+            let board_text = field
+                .text
+                .as_mut()
+                .context("library field has no board text")?;
+            board_text.id = None;
+            let text = board_text
+                .text
+                .as_mut()
+                .context("library field has no text")?;
+            let local = text
+                .position
+                .as_ref()
+                .context("library field has no position")?;
+            let (fx, fy) = konnect_sexp::geometry::transform_pad(
+                crate::builders::nm_to_mm(local.x_nm),
+                crate::builders::nm_to_mm(local.y_nm),
+                x,
+                y,
+                rotation,
+            );
+            text.position = Some(crate::builders::vec2(fx, fy));
+            if let Some(attributes) = text.attributes.as_mut() {
+                let angle = attributes
+                    .angle
+                    .as_ref()
+                    .map_or(0.0, |angle| angle.value_degrees);
+                attributes.angle = Some(kiapi::common::types::Angle {
+                    value_degrees: if attributes.keep_upright {
+                        readable_text_angle(rotation + angle)
+                    } else {
+                        rotation + angle
+                    },
+                });
+            }
+            match field.name.as_str() {
+                "Reference" => {
+                    text.text = reference.to_string();
+                    reference_field = field;
+                }
+                "Value" => {
+                    text.text = value.to_string();
+                    value_field = field;
+                }
+                "Datasheet" => datasheet_field = Some(field),
+                "Description" => description_field = Some(field),
+                _ => child_items.push(crate::builders::pack_any(&field, "kiapi.board.types.Field")),
+            }
+        }
         let definition = kiapi::board::types::Footprint {
             id: Some(kiapi::common::types::LibraryIdentifier {
                 library_nickname: library_nickname.to_string(),
@@ -4197,6 +4250,8 @@ impl KiCadIpcClient {
             }),
             reference_field: Some(reference_field.clone()),
             value_field: Some(value_field.clone()),
+            datasheet_field: datasheet_field.clone(),
+            description_field: description_field.clone(),
             items: child_items,
             ..Default::default()
         };
@@ -4210,6 +4265,8 @@ impl KiCadIpcClient {
             definition: Some(definition),
             reference_field: Some(reference_field),
             value_field: Some(value_field),
+            datasheet_field,
+            description_field,
             ..Default::default()
         };
         Ok(crate::builders::pack_any(
@@ -4715,8 +4772,9 @@ fn build_graphic_child(
     use crate::builders;
     const SHAPE: &str = "kiapi.board.types.BoardGraphicShape";
     let xf = |(px, py): (f64, f64)| konnect_sexp::geometry::transform_pad(px, py, x, y, rotation);
-    match graphic {
+    let mut item = match graphic {
         IpcGraphicDefinition::Line {
+            style: _,
             start,
             end,
             layer,
@@ -4730,6 +4788,7 @@ fn build_graphic_child(
             )
         }
         IpcGraphicDefinition::Rect {
+            style: _,
             start,
             end,
             layer,
@@ -4770,6 +4829,7 @@ fn build_graphic_child(
             }
         }
         IpcGraphicDefinition::Circle {
+            style: _,
             center,
             end,
             layer,
@@ -4786,6 +4846,7 @@ fn build_graphic_child(
             )
         }
         IpcGraphicDefinition::Arc {
+            style: _,
             start,
             mid,
             end,
@@ -4801,6 +4862,7 @@ fn build_graphic_child(
             )
         }
         IpcGraphicDefinition::Poly {
+            style: _,
             points,
             layer,
             width,
@@ -4835,7 +4897,21 @@ fn build_graphic_child(
                 "kiapi.board.types.BoardText",
             )
         }
+    };
+    if let Some(style) = graphic.stroke_style() {
+        let mut shape = kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+            .expect("graphic builder emits a BoardGraphicShape");
+        if let Some(stroke) = shape
+            .shape
+            .as_mut()
+            .and_then(|shape| shape.attributes.as_mut())
+            .and_then(|attributes| attributes.stroke.as_mut())
+        {
+            stroke.style = style as i32;
+        }
+        item.value = shape.encode_to_vec();
     }
+    item
 }
 
 /// The reference designator text of a placed footprint, or `""` when the
@@ -6200,6 +6276,7 @@ mod footprint_graphics_tests {
     fn rotation_90_pretransforms_graphics_to_absolute_board_space() {
         let graphics = vec![
             IpcGraphicDefinition::Rect {
+                style: crate::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
                 start: (-1.0, -2.0),
                 end: (1.0, 2.0),
                 layer: "F.CrtYd".to_string(),
@@ -6207,6 +6284,7 @@ mod footprint_graphics_tests {
                 filled: false,
             },
             IpcGraphicDefinition::Line {
+                style: crate::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
                 start: (-1.0, 0.0),
                 end: (1.0, 0.0),
                 layer: "F.SilkS".to_string(),
@@ -6308,6 +6386,7 @@ mod footprint_graphics_tests {
     #[test]
     fn non_cardinal_rotation_emits_rect_as_polygon() {
         let graphics = vec![IpcGraphicDefinition::Rect {
+            style: crate::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
             start: (-1.0, -1.0),
             end: (1.0, 1.0),
             layer: "F.CrtYd".to_string(),
@@ -6339,6 +6418,7 @@ mod footprint_graphics_tests {
     #[test]
     fn circle_center_rotates_and_radius_is_preserved() {
         let graphics = vec![IpcGraphicDefinition::Circle {
+            style: crate::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
             center: (1.0, 0.0),
             end: (1.5, 0.0),
             layer: "F.Fab".to_string(),
@@ -6426,6 +6506,7 @@ mod footprint_graphics_tests {
     fn user_layer_graphics_reach_kicad_on_their_real_layer() {
         let graphics = vec![
             IpcGraphicDefinition::Line {
+                style: crate::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
                 start: (0.0, 0.0),
                 end: (1.0, 0.0),
                 layer: "Dwgs.User".to_string(),
@@ -6504,6 +6585,7 @@ mod footprint_graphics_tests {
         };
 
         let graphic = vec![IpcGraphicDefinition::Line {
+            style: crate::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
             start: (0.0, 0.0),
             end: (1.0, 1.0),
             layer: "In99.Cu".to_string(),
@@ -7167,5 +7249,119 @@ mod issue14_shape_tests {
             .unwrap();
         assert!(corners.top_left && corners.bottom_right);
         assert!(!corners.top_right && !corners.bottom_left);
+    }
+}
+
+#[cfg(test)]
+mod issue26_tests {
+    use super::*;
+
+    #[test]
+    fn library_graphics_keep_every_native_stroke_style() {
+        use kiapi::common::types::StrokeLineStyle as Style;
+        for style in [
+            Style::SlsDefault,
+            Style::SlsSolid,
+            Style::SlsDash,
+            Style::SlsDot,
+            Style::SlsDashdot,
+            Style::SlsDashdotdot,
+        ] {
+            for rotation in [0.0, 37.0, 90.0] {
+                let graphic = IpcGraphicDefinition::Rect {
+                    start: (0.0, 0.0),
+                    end: (2.0, 1.0),
+                    layer: "F.CrtYd".into(),
+                    width: 0.1,
+                    filled: false,
+                    style,
+                };
+                let item = build_graphic_child(&graphic, 10.0, 20.0, rotation);
+                let shape =
+                    kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).unwrap();
+                assert_eq!(
+                    shape
+                        .shape
+                        .unwrap()
+                        .attributes
+                        .unwrap()
+                        .stroke
+                        .unwrap()
+                        .style,
+                    style as i32
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn placed_library_fields_keep_effects_layer_and_visibility() {
+        let field = |name: &str, value: &str| kiapi::board::types::Field {
+            name: name.into(),
+            visible: false,
+            text: Some(kiapi::board::types::BoardText {
+                layer: kiapi::board::types::BoardLayer::BlFFab as i32,
+                text: Some(kiapi::common::types::Text {
+                    text: value.into(),
+                    position: Some(crate::builders::vec2(1.0, 2.0)),
+                    attributes: Some(kiapi::common::types::TextAttributes {
+                        size: Some(crate::builders::vec2(0.8, 0.9)),
+                        stroke_width: Some(crate::builders::distance(0.12)),
+                        line_spacing: 1.2,
+                        keep_upright: true,
+                        angle: Some(kiapi::common::types::Angle {
+                            value_degrees: 15.0,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let fields = IpcFieldPlacement {
+            fields: vec![
+                field("Value", "library value"),
+                field("KiLib_Generator", "fixture"),
+            ],
+            ..Default::default()
+        };
+        let item = KiCadIpcClient::build_footprint_item(
+            "Test:Socket",
+            "R1",
+            "10k",
+            &[],
+            &[],
+            &fields,
+            100.0,
+            50.0,
+            90.0,
+            "F.Cu",
+        )
+        .unwrap();
+        let instance =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        let value = instance.value_field.unwrap();
+        assert!(!value.visible);
+        let text = value.text.unwrap();
+        assert_eq!(text.layer, kiapi::board::types::BoardLayer::BlFFab as i32);
+        let text = text.text.unwrap();
+        assert_eq!(text.text, "10k");
+        assert_eq!(text.position.unwrap(), crate::builders::vec2(102.0, 49.0));
+        let attributes = text.attributes.unwrap();
+        assert_eq!(attributes.stroke_width.unwrap().value_nm, 120_000);
+        assert_eq!(attributes.line_spacing, 1.2);
+        assert!(attributes.keep_upright);
+        assert_eq!(attributes.size.unwrap(), crate::builders::vec2(0.8, 0.9));
+        let definition = instance.definition.unwrap();
+        let custom = definition
+            .items
+            .iter()
+            .find(|item| crate::builders::any_is(item, "kiapi.board.types.Field"))
+            .unwrap();
+        let custom = kiapi::board::types::Field::decode(custom.value.as_slice()).unwrap();
+        assert_eq!(custom.name, "KiLib_Generator");
+        assert_eq!(custom.text.unwrap().text.unwrap().text, "fixture");
     }
 }

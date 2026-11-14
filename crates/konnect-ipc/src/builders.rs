@@ -457,9 +457,7 @@ pub fn any_type_name(item: &prost_types::Any) -> &str {
 fn stroke(width_mm: f64) -> kiapi::common::types::StrokeAttributes {
     kiapi::common::types::StrokeAttributes {
         width: Some(distance(width_mm)),
-        // ponytail: leave style/color at proto default (solid, board default color).
-        // Add args when a caller needs dashed/colored graphics.
-        style: 0,
+        style: kiapi::common::types::StrokeLineStyle::SlsSolid as i32,
         color: None,
     }
 }
@@ -699,6 +697,14 @@ pub fn board_text_with_stroke_width(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_graphics_use_explicit_solid_strokes() {
+        assert_eq!(
+            stroke(0.1).style,
+            kiapi::common::types::StrokeLineStyle::SlsSolid as i32
+        );
+    }
     use kiapi::common::types::graphic_shape::Geometry;
 
     /// `layer_name` is the exact inverse of `layer_from_name` over every
