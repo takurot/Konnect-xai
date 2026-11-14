@@ -271,7 +271,7 @@ pub(crate) async fn handle_update_footprints_from_library(
                 .get_enabled_layers_in(document.clone())?
                 .copper_layer_count as usize;
             anyhow::ensure!(
-                (2..=32).contains(&copper_layer_count) && copper_layer_count % 2 == 0,
+                (2..=32).contains(&copper_layer_count) && copper_layer_count.is_multiple_of(2),
                 "KiCad returned an unsupported copper layer count {copper_layer_count} for the requested board"
             );
             let mut plan = plan_updates(
@@ -2299,6 +2299,18 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                                 {
                                     normalize_polyset(polyset);
                                 }
+                                if let Some(kiapi::common::types::graphic_shape::Geometry::Arc(
+                                    arc,
+                                )) = graphic.geometry.as_mut()
+                                {
+                                    if arc.start.as_ref().zip(arc.end.as_ref()).is_some_and(
+                                        |(start, end)| {
+                                            (start.x_nm, start.y_nm) > (end.x_nm, end.y_nm)
+                                        },
+                                    ) {
+                                        std::mem::swap(&mut arc.start, &mut arc.end);
+                                    }
+                                }
                                 if let Some(
                                     kiapi::common::types::graphic_shape::Geometry::Rectangle(
                                         rectangle,
@@ -3377,6 +3389,33 @@ mod tests {
             let expected = footprint_layer_states(&[make(false)]).unwrap();
             assert!(verify_footprint_layer_readback(&expected, &[make(false)]).is_ok());
             assert!(verify_footprint_layer_readback(&expected, &[make(true)]).is_err());
+        }
+    }
+
+    #[test]
+    fn layer_readback_accepts_native_arc_winding_but_checks_geometry() {
+        let make = |start: (f64, f64), mid: (f64, f64), end: (f64, f64)| {
+            layer_readback_instance(vec![builders::pack_any(
+                &builders::board_arc(
+                    "F.SilkS", 0.12, start.0, start.1, mid.0, mid.1, end.0, end.1,
+                ),
+                "kiapi.board.types.BoardGraphicShape",
+            )])
+        };
+        let expected = footprint_layer_state(&make((1.0, 0.0), (0.0, -1.0), (-1.0, 0.0))).unwrap();
+        assert_eq!(
+            expected,
+            footprint_layer_state(&make((-1.0, 0.0), (0.0, -1.0), (1.0, 0.0))).unwrap()
+        );
+        for (start, mid, end) in [
+            ((-1.0, 0.0), (0.0, 1.0), (1.0, 0.0)),
+            ((-2.0, 0.0), (0.0, -1.0), (1.0, 0.0)),
+            ((-1.0, 0.0), (0.0, -1.0), (2.0, 0.0)),
+        ] {
+            assert_ne!(
+                expected,
+                footprint_layer_state(&make(start, mid, end)).unwrap()
+            );
         }
     }
 

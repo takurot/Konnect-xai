@@ -135,3 +135,25 @@ These helper checks link protobuf types from this worktree's isolated target.
 They do not establish the complete crate, workspace gates, coverage or live
 KiCad acceptance. Those checks remain required at the final head. Manual scoped
 diff cleanup and direct pinned rustfmt were used before this checkpoint.
+
+
+## Native arc winding in readback
+
+The native serializer can reverse an arc's endpoint order while retaining its
+midpoint and geometric curve. Readback comparison now orders the two endpoints
+lexicographically. It keeps the midpoint, endpoint coordinates, stroke and
+layer unchanged, so the opposite semicircle and changed endpoints still differ.
+Only comparison data is normalized; transmitted geometry is unchanged.
+
+The exact current layer-state helper failed a native-serializer-shaped cardinal
+arc regression before this correction. The corrected helper passes the
+committed regression, including opposite-semicircle and changed-endpoint
+refusals. Disabling only the endpoint swap in the extracted helper makes the
+regression fail again. These checks link this worktree's own compiled IPC types.
+They do not establish actual editor behavior or the full workspace gates.
+The native winding behavior follows [KiCad 10.0.5 EDA_SHAPE](https://github.com/KiCad/kicad/blob/10.0.5/common/eda_shape.cpp#L1180).
+
+The pinned-toolchain Clippy gate also identified an equivalent even-copper-count
+predicate in the live snapshot path. It now uses `is_multiple_of(2)` without
+changing accepted layer counts. Final-head normal gates and coverage remain
+required and are recorded separately.
