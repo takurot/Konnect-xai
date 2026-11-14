@@ -433,10 +433,11 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             let (creates, updates) = build_mutation_items(&plan, &prepared, &snapshot)?;
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
+            let native_expected = native_assembly_expectations(&plan);
             client.run_commit_recovering_in(snapshot.document.clone(), "Update PCB from saved schematic", |client| {
                 create_sync_items_in(client, &snapshot.document, &creates)?;
                 client.update_items_in(snapshot.document.clone(), updates)?;
-                verify_native_assembly_attributes(client, &snapshot.document, &expected)?;
+                verify_native_assembly_attributes(client, &snapshot.document, &native_expected)?;
                 Ok(())
             }).map_err(|error| {
                 if error.downcast_ref::<NativeAssemblyVerificationError>().is_some()
@@ -451,7 +452,11 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                     error
                 }
             })?;
-            for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected)?
+            for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected, &native_expected)
+                .map_err(|error| error.context(konnect_ipc::client::IpcOutcomeUnknown {
+                    command: "update_pcb_from_schematic final readback".to_owned(),
+                    reason: "the commit was published, but the final live-board readback could not be verified".to_owned(),
+                }))?
             {
                 plan.diagnostics.push(conflict(
                     "board_readback_differs",
@@ -1481,10 +1486,75 @@ fn footprint_shapes<'a>(
 #[error("{0}")]
 struct NativeAssemblyVerificationError(String);
 
+#[derive(Debug, Clone)]
+struct NativeAssemblyExpectation {
+    kiid: Option<String>,
+    dnp: bool,
+    assembly: AssemblyAttributes,
+}
+
+#[derive(Debug)]
+struct NativeAssemblyObservation {
+    kiid: String,
+    dnp: bool,
+    assembly: AssemblyAttributes,
+}
+
+fn native_assembly_expectations(plan: &SyncPlan) -> BTreeMap<String, NativeAssemblyExpectation> {
+    plan.changes
+        .iter()
+        .map(|change| match change {
+            PlannedChange::Add {
+                reference,
+                dnp,
+                assembly,
+                ..
+            } => (
+                reference.clone(),
+                NativeAssemblyExpectation {
+                    kiid: None,
+                    dnp: *dnp,
+                    assembly: *assembly,
+                },
+            ),
+            PlannedChange::Update {
+                reference,
+                kiid,
+                dnp,
+                assembly,
+                ..
+            } => (
+                reference.clone(),
+                NativeAssemblyExpectation {
+                    kiid: Some(kiid.clone()),
+                    dnp: *dnp,
+                    assembly: *assembly,
+                },
+            ),
+        })
+        .collect()
+}
+
+fn decode_native_assembly_footprint(
+    item: &prost_types::Any,
+) -> Result<konnect_ipc::gen::kiapi::board::types::FootprintInstance> {
+    use konnect_ipc::gen::kiapi::board::types::FootprintInstance;
+    if !konnect_ipc::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
+        return Err(NativeAssemblyVerificationError(format!(
+            "native assembly readback expected FootprintInstance, got {}",
+            item.type_url
+        ))
+        .into());
+    }
+    FootprintInstance::decode(item.value.as_slice()).context(NativeAssemblyVerificationError(
+        "native assembly readback cannot decode FootprintInstance".to_owned(),
+    ))
+}
+
 fn verify_native_assembly_attributes(
     client: &konnect_ipc::KiCadIpcClient,
     document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
-    expected: &BTreeMap<String, FootprintShape>,
+    expected: &BTreeMap<String, NativeAssemblyExpectation>,
 ) -> Result<()> {
     use konnect_ipc::gen::kiapi::common::types::KiCadObjectType;
     let items = client
@@ -1492,23 +1562,85 @@ fn verify_native_assembly_attributes(
         .context(NativeAssemblyVerificationError(
             "native assembly readback is unavailable".to_owned(),
         ))?;
-    let actual = footprint_shapes(items.iter());
-    verify_native_assembly_snapshot(expected, &actual)
+    verify_native_assembly_snapshot(expected, &items)
 }
 
 fn verify_native_assembly_snapshot(
-    expected: &BTreeMap<String, FootprintShape>,
-    actual: &BTreeMap<String, FootprintShape>,
+    expected: &BTreeMap<String, NativeAssemblyExpectation>,
+    items: &[prost_types::Any],
 ) -> Result<()> {
+    let mut observations = BTreeMap::new();
+    let mut kiids = HashSet::new();
+    for item in items {
+        let footprint = decode_native_assembly_footprint(item)?;
+        let kiid = footprint
+            .id
+            .as_ref()
+            .map(|id| id.value.as_str())
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                NativeAssemblyVerificationError(
+                    "native assembly readback footprint has no KIID".to_owned(),
+                )
+            })?;
+        if !kiids.insert(kiid.to_owned()) {
+            return Err(NativeAssemblyVerificationError(format!(
+                "native assembly readback has duplicate KIID {kiid}"
+            ))
+            .into());
+        }
+        let reference = field_text(&footprint.reference_field);
+        if !expected.contains_key(&reference) {
+            continue;
+        }
+        let attributes = footprint.attributes.as_ref();
+        let observation = NativeAssemblyObservation {
+            kiid: kiid.to_owned(),
+            dnp: attributes.is_some_and(|attributes| attributes.do_not_populate),
+            assembly: AssemblyAttributes {
+                exclude_from_bom: attributes
+                    .is_some_and(|attributes| attributes.exclude_from_bill_of_materials),
+                exclude_from_pos_files: attributes
+                    .is_some_and(|attributes| attributes.exclude_from_position_files),
+            },
+        };
+        if observations
+            .insert(reference.clone(), observation)
+            .is_some()
+        {
+            return Err(NativeAssemblyVerificationError(format!(
+                "native assembly readback has ambiguous reference {reference}"
+            ))
+            .into());
+        }
+    }
     for (reference, want) in expected {
-        let got = actual.get(reference).ok_or_else(|| {
+        let got = observations.get(reference).ok_or_else(|| {
             NativeAssemblyVerificationError(format!(
                 "cannot verify native assembly attributes for missing footprint {reference}"
             ))
         })?;
-        for attribute in ["dnp", "exclude_from_bom", "exclude_from_pos_files"] {
-            let sent = want.attributes.0.contains(attribute);
-            let observed = got.attributes.0.contains(attribute);
+        if want.kiid.as_ref().is_some_and(|kiid| kiid != &got.kiid) {
+            return Err(NativeAssemblyVerificationError(format!(
+                "{reference}: native assembly readback KIID {} differs from expected {}",
+                got.kiid,
+                want.kiid.as_deref().unwrap_or_default()
+            ))
+            .into());
+        }
+        for (attribute, sent, observed) in [
+            ("dnp", want.dnp, got.dnp),
+            (
+                "exclude_from_bom",
+                want.assembly.exclude_from_bom,
+                got.assembly.exclude_from_bom,
+            ),
+            (
+                "exclude_from_pos_files",
+                want.assembly.exclude_from_pos_files,
+                got.assembly.exclude_from_pos_files,
+            ),
+        ] {
             if sent != observed {
                 return Err(NativeAssemblyVerificationError(format!("{reference}: native assembly attribute {attribute} was sent as {sent}, but KiCad reads back {observed}")).into());
             }
@@ -1543,6 +1675,7 @@ fn verify_board_matches_what_was_sent(
     client: &konnect_ipc::KiCadIpcClient,
     document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
     expected: &BTreeMap<String, FootprintShape>,
+    native_expected: &BTreeMap<String, NativeAssemblyExpectation>,
 ) -> Result<Vec<String>> {
     use konnect_ipc::gen::kiapi;
 
@@ -1553,13 +1686,8 @@ fn verify_board_matches_what_was_sent(
         document.clone(),
         kiapi::common::types::KiCadObjectType::KotPcbFootprint,
     )?;
+    verify_native_assembly_snapshot(native_expected, &items)?;
     let actual = footprint_shapes(items.iter());
-    verify_native_assembly_snapshot(expected, &actual).map_err(|error| {
-        konnect_ipc::client::IpcOutcomeUnknown {
-            command: "update_pcb_from_schematic readback".to_owned(),
-            reason: format!("the commit was published, but its native assembly attributes could not be verified: {error:#}"),
-        }
-    })?;
 
     let mut corrupted = Vec::new();
     let mut suspicious = Vec::new();
@@ -1817,12 +1945,13 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
     let mut footprints = Vec::new();
     let mut items = BTreeMap::new();
     for item in footprint_items {
-        let instance = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
-            .context("KiCad returned an invalid footprint item")?;
+        let instance = decode_native_assembly_footprint(&item)?;
         let footprint = board_footprint_from_instance(&instance)?;
         let kiid = footprint.kiid.clone();
         footprints.push(footprint);
-        items.insert(kiid, item);
+        if items.insert(kiid.clone(), item).is_some() {
+            bail!("KiCad returned duplicate footprint KIID {kiid}");
+        }
     }
 
     let nets = client.get_nets_in(document.clone())?;
@@ -3107,6 +3236,87 @@ mod tests {
         }
         let observed = board_footprint_from_instance(&footprint).unwrap();
         assert_eq!(observed.assembly, flags);
+    }
+
+    #[test]
+    fn issue25_strict_snapshot_binds_updates_to_the_planned_kiid() {
+        use konnect_ipc::gen::kiapi;
+        let sent = footprint_with_artwork("U4");
+        let expected = BTreeMap::from([(
+            "U4".to_owned(),
+            NativeAssemblyExpectation {
+                kiid: Some("u4-kiid".to_owned()),
+                dnp: false,
+                assembly: AssemblyAttributes::default(),
+            },
+        )]);
+        verify_native_assembly_snapshot(&expected, std::slice::from_ref(&sent)).unwrap();
+        let mut replaced =
+            kiapi::board::types::FootprintInstance::decode(sent.value.as_slice()).unwrap();
+        replaced.id = Some(kiapi::common::types::Kiid {
+            value: "replacement-id".to_owned(),
+        });
+        let replaced =
+            konnect_ipc::builders::pack_any(&replaced, "kiapi.board.types.FootprintInstance");
+        let error = verify_native_assembly_snapshot(&expected, &[replaced]).unwrap_err();
+        assert!(
+            error.to_string().contains("differs from expected u4-kiid"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn issue25_strict_snapshot_requires_a_unique_server_assigned_creation() {
+        use konnect_ipc::gen::kiapi;
+        let item = footprint_with_artwork("U4");
+        let expected = BTreeMap::from([(
+            "U4".to_owned(),
+            NativeAssemblyExpectation {
+                kiid: None,
+                dnp: false,
+                assembly: AssemblyAttributes::default(),
+            },
+        )]);
+        verify_native_assembly_snapshot(&expected, std::slice::from_ref(&item)).unwrap();
+        let mut duplicate =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        duplicate.id = Some(kiapi::common::types::Kiid {
+            value: "second-created-id".to_owned(),
+        });
+        let duplicate =
+            konnect_ipc::builders::pack_any(&duplicate, "kiapi.board.types.FootprintInstance");
+        let error =
+            verify_native_assembly_snapshot(&expected, &[item.clone(), duplicate]).unwrap_err();
+        assert!(
+            error.to_string().contains("ambiguous reference U4"),
+            "{error}"
+        );
+        let error =
+            verify_native_assembly_snapshot(&expected, &[item.clone(), item.clone()]).unwrap_err();
+        assert!(error.to_string().contains("duplicate KIID"), "{error}");
+        let mut wrong_type = item.clone();
+        wrong_type.type_url = "type.googleapis.com/kiapi.board.types.Pad".to_owned();
+        let error = verify_native_assembly_snapshot(&expected, &[wrong_type]).unwrap_err();
+        assert!(
+            error.to_string().contains("expected FootprintInstance"),
+            "{error}"
+        );
+        let mut malformed = item.clone();
+        malformed.value = vec![0xff];
+        let error = verify_native_assembly_snapshot(&expected, &[malformed]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot decode FootprintInstance"),
+            "{error}"
+        );
+        let mut missing_id =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        missing_id.id = None;
+        let missing_id =
+            konnect_ipc::builders::pack_any(&missing_id, "kiapi.board.types.FootprintInstance");
+        let error = verify_native_assembly_snapshot(&expected, &[missing_id]).unwrap_err();
+        assert!(error.to_string().contains("has no KIID"), "{error}");
     }
 
     fn resistor(reference: &str, symbol_path: &str) -> DesignComponent {
@@ -5191,9 +5401,23 @@ mod tests {
                         ));
                     }
                     if command.type_url.ends_with("CreateItems") {
-                        let request =
+                        let mut request =
                             kiapi::common::commands::CreateItems::decode(command.value.as_slice())
                                 .expect("CreateItems request");
+                        for item in &mut request.items {
+                            let mut footprint = kiapi::board::types::FootprintInstance::decode(
+                                item.value.as_slice(),
+                            )
+                            .unwrap();
+                            let reference = field_text(&footprint.reference_field);
+                            footprint.id = Some(kiapi::common::types::Kiid {
+                                value: format!("created-{reference}"),
+                            });
+                            *item = konnect_ipc::builders::pack_any(
+                                &footprint,
+                                "kiapi.board.types.FootprintInstance",
+                            );
+                        }
                         board_items
                             .lock()
                             .unwrap()
