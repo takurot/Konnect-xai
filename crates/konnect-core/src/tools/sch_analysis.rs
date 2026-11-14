@@ -318,7 +318,7 @@ async fn handle_get_net_connectivity(
         "net": net,
         "wires": net_wires,
         "labels": net_labels,
-        "t_junctions": t_junctions.iter().map(|(x,y)| json!({"x": round6(x), "y": round6(y)})).collect::<Vec<_>>()
+        "t_junctions": t_junctions.iter().map(|&(x,y)| json!({"x": round6(x), "y": round6(y)})).collect::<Vec<_>>()
     })))
 }
 
@@ -656,11 +656,11 @@ impl Connection<'_> {
                 "reference": reference,
                 "pin": pin.number,
                 "pin_name": pin.name,
-                "x": round6(x),
-                "y": round6(y)
+                "x": round6(*x),
+                "y": round6(*y)
             }),
             Connection::SheetPin { x, y } => {
-                json!({ "type": "sheet_pin", "x": round6(x), "y": round6(y) })
+                json!({ "type": "sheet_pin", "x": round6(*x), "y": round6(*y) })
             }
         }
     }

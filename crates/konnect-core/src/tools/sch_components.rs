@@ -609,7 +609,7 @@ async fn handle_add_schematic_component(
     };
     result["junctions_added"] = json!(junctions
         .iter()
-        .map(|(x, y)| json!({ "x": round6(x), "y": round6(y) }))
+        .map(|&(x, y)| json!({ "x": round6(x), "y": round6(y) }))
         .collect::<Vec<_>>());
 
     Ok(crate::outcome::attach(

@@ -2297,7 +2297,7 @@ async fn handle_add_power_symbol(
     observed["added_power"] = observed["value"].clone();
     observed["junctions_added"] = json!(junctions_added
         .iter()
-        .map(|(x, y)| json!({"x": round6(x), "y": round6(y)}))
+        .map(|&(x, y)| json!({"x": round6(x), "y": round6(y)}))
         .collect::<Vec<_>>());
 
     Ok(CallToolResult::json(&observed))

@@ -124,3 +124,16 @@ outline expressions before correction. The writer checks and both response
 expressions pass afterward. Neutralizing angle validation fails the invalid
 angle regression. These checks do not replace the pending registered-tool and
 workspace runs at the final committed head.
+
+
+## Borrowed coordinate compilation correction
+
+The first isolated workspace build rejected borrowed schematic point values
+passed to `round6`. Tuple iteration now copies the point pair, and connection
+serialization dereferences its borrowed coordinates. This keeps the existing
+coordinate formatting and data ownership unchanged. The new persistence test
+asserts that only its original document remains, without calling a private
+helper in a sibling test module. The isolated
+`cargo check --workspace --locked --all-targets` succeeds after this correction.
+The four final quality gates, coverage, and real KiCad verification are recorded
+separately and are not implied by that compilation check.

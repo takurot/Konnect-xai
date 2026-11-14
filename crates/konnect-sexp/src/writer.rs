@@ -1108,7 +1108,7 @@ mod tests {
                 let error = write_atomic_if_unchanged(&path, &before, &after).unwrap_err();
                 assert!(matches!(error, SexpError::InvalidValue(_)), "{clause}");
                 assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
-                assert!(!leftover_scratch_files(directory.path()));
+                assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
             }
         }
     }
