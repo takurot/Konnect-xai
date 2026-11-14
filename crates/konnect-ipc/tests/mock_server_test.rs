@@ -737,12 +737,15 @@ fn transformed_coordinates_outside_the_nanometre_range_never_send_create_items()
         drill_oval: false,
         layers: vec!["F.Cu".to_string()],
         roundrect_ratio: 0.0,
+        chamfer_ratio: 0.0,
+        chamfered_corners: None,
     };
     let graphic = IpcGraphicDefinition::Line {
         start: (9e12, 0.0),
         end: (9e12, 1.0),
         layer: "F.SilkS".to_string(),
         width: 0.1,
+        style: kiapi::common::types::StrokeLineStyle::SlsSolid,
     };
     let fields = IpcFieldPlacement {
         reference_at: Some((9e12, 0.0, 0.0)),
