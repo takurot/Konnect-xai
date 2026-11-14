@@ -59,10 +59,7 @@ impl FootprintChamfers {
                             | (u8::from(corners.bottom_left) << 2)
                             | (u8::from(corners.bottom_right) << 3)
                     });
-                    if layer.shape == kiapi::board::types::PadStackShape::PssChamferedrect as i32
-                        || layer.chamfer_ratio != 0.0
-                        || corners != 0
-                    {
+                    if layer.shape == kiapi::board::types::PadStackShape::PssChamferedrect as i32 {
                         if !layer.chamfer_ratio.is_finite()
                             || !layer.corner_rounding_ratio.is_finite()
                         {
@@ -127,7 +124,11 @@ impl FootprintChamfers {
                 }
                 chamfers.sort_unstable();
                 let evidence = ChamferFootprint {
-                    id: footprint.id.as_ref().map(|id| id.value.clone()),
+                    id: footprint
+                        .id
+                        .as_ref()
+                        .filter(|id| !id.value.is_empty())
+                        .map(|id| id.value.clone()),
                     pads: chamfers,
                 };
                 if footprints.insert(reference.clone(), evidence).is_some() {
@@ -143,8 +144,37 @@ impl FootprintChamfers {
     }
 
     pub fn verify(&self, items: &[prost_types::Any]) -> Result<()> {
-        let observed = Self::from_items(items)?;
+        if self.is_empty() {
+            return Ok(());
+        }
+        let footprints = items
+            .iter()
+            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.FootprintInstance"))
+            .map(|item| {
+                let footprint =
+                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                        .context("unreadable footprint during chamfer verification")?;
+                Ok((item, footprint))
+            })
+            .collect::<Result<Vec<_>>>()?;
         for (reference, expected) in &self.0 {
+            let mut matching = footprints.iter().filter(|(_, footprint)| {
+                if let Some(expected_id) = &expected.id {
+                    footprint
+                        .id
+                        .as_ref()
+                        .is_some_and(|id| id.value == *expected_id)
+                } else {
+                    crate::client::footprint_reference(footprint) == reference
+                }
+            });
+            let Some((item, _)) = matching.next() else {
+                bail!("footprint '{reference}' chamfer readback is missing");
+            };
+            if matching.next().is_some() {
+                bail!("footprint '{reference}' is duplicated during chamfer verification");
+            }
+            let observed = Self::from_items([*item])?;
             let Some(observed) = observed.0.get(reference) else {
                 bail!("footprint '{reference}' chamfer readback is missing");
             };
@@ -245,6 +275,125 @@ mod tests {
                 "kiapi.board.types.FootprintInstance"
             )])
             .is_err());
+    }
+
+    #[test]
+    fn native_inactive_chamfer_defaults_are_not_chamfer_geometry() {
+        let item = prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.FootprintInstance".to_string(),
+            value: include_bytes!("../../konnect-core/tests/fixtures/issue_474_r1.ipc.bin")
+                .to_vec(),
+        };
+        let captured =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        let layers = captured
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| crate::builders::any_is(item, "kiapi.board.types.Pad"))
+            .flat_map(|item| {
+                kiapi::board::types::Pad::decode(item.value.as_slice())
+                    .unwrap()
+                    .pad_stack
+                    .unwrap()
+                    .copper_layers
+            })
+            .collect::<Vec<_>>();
+        assert!(!layers.is_empty());
+        assert!(layers.iter().all(|layer| {
+            layer.shape != kiapi::board::types::PadStackShape::PssChamferedrect as i32
+                && layer.chamfer_ratio == 0.2
+        }));
+        let expected = FootprintChamfers::from_items([&item]).unwrap();
+        assert!(expected.is_empty());
+        assert!(expected.verify(&[]).is_ok());
+    }
+
+    #[test]
+    fn chamfer_verification_ignores_unrelated_footprints() {
+        let selected = footprint(&[1]);
+        let expected = FootprintChamfers::from_items([&selected]).unwrap();
+        let mut other =
+            kiapi::board::types::FootprintInstance::decode(selected.value.as_slice()).unwrap();
+        other
+            .reference_field
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .text = "OTHER".to_string();
+        let unrelated = crate::builders::pack_any(&other, "kiapi.board.types.FootprintInstance");
+        other.definition.as_mut().unwrap().items[0].value = vec![0xff];
+        let malformed = crate::builders::pack_any(&other, "kiapi.board.types.FootprintInstance");
+        assert!(expected
+            .verify(&[selected, unrelated.clone(), unrelated, malformed])
+            .is_ok());
+    }
+
+    #[test]
+    fn chamfer_verification_selects_existing_kiid_before_reference() {
+        let mut selected =
+            kiapi::board::types::FootprintInstance::decode(footprint(&[1]).value.as_slice())
+                .unwrap();
+        selected.id = Some(kiapi::common::types::Kiid {
+            value: "selected".to_string(),
+        });
+        let item = crate::builders::pack_any(&selected, "kiapi.board.types.FootprintInstance");
+        let expected = FootprintChamfers::from_items([&item]).unwrap();
+        let mut unrelated = selected.clone();
+        unrelated.id.as_mut().unwrap().value = "unrelated".to_string();
+        unrelated.definition.as_mut().unwrap().items[0].value = vec![0xff];
+        let unrelated =
+            crate::builders::pack_any(&unrelated, "kiapi.board.types.FootprintInstance");
+        assert!(expected.verify(&[unrelated, item.clone()]).is_ok());
+        assert!(expected.verify(&[item.clone(), item.clone()]).is_err());
+        selected.definition.as_mut().unwrap().items[0].value = vec![0xff];
+        assert!(expected
+            .verify(&[crate::builders::pack_any(
+                &selected,
+                "kiapi.board.types.FootprintInstance"
+            )])
+            .is_err());
+    }
+
+    #[test]
+    fn chamfer_verification_rejects_lost_shape_ratio_or_corners() {
+        let item = footprint(&[1]);
+        let expected = FootprintChamfers::from_items([&item]).unwrap();
+        for change in 0..3 {
+            let mut value =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            let child = &mut value.definition.as_mut().unwrap().items[0];
+            let mut pad = kiapi::board::types::Pad::decode(child.value.as_slice()).unwrap();
+            let layer = &mut pad.pad_stack.as_mut().unwrap().copper_layers[0];
+            match change {
+                0 => layer.shape = kiapi::board::types::PadStackShape::PssRoundrect as i32,
+                1 => layer.chamfer_ratio = 0.0,
+                _ => layer.chamfered_corners = None,
+            }
+            *child = crate::builders::pack_any(&pad, "kiapi.board.types.Pad");
+            assert!(
+                expected
+                    .verify(&[crate::builders::pack_any(
+                        &value,
+                        "kiapi.board.types.FootprintInstance",
+                    )])
+                    .is_err(),
+                "change {change}"
+            );
+        }
+        let unreadable = prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.FootprintInstance".to_string(),
+            value: vec![0xff],
+        };
+        assert!(expected.verify(&[item.clone(), item]).is_err());
+        assert!(expected.verify(&[unreadable]).is_err());
     }
 
     #[test]
@@ -393,6 +542,15 @@ mod tests {
         let mut unreadable = item.clone();
         unreadable.value = vec![0xff];
         assert!(FootprintChamfers::from_items([&unreadable]).is_err());
+        let mut invalid_rounding =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        let child = &mut invalid_rounding.definition.as_mut().unwrap().items[0];
+        let mut pad = kiapi::board::types::Pad::decode(child.value.as_slice()).unwrap();
+        pad.pad_stack.as_mut().unwrap().copper_layers[0].corner_rounding_ratio = f64::NAN;
+        *child = crate::builders::pack_any(&pad, "kiapi.board.types.Pad");
+        let invalid_rounding =
+            crate::builders::pack_any(&invalid_rounding, "kiapi.board.types.FootprintInstance");
+        assert!(FootprintChamfers::from_items([&invalid_rounding]).is_err());
         let mut missing_reference =
             kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
         missing_reference.reference_field = None;

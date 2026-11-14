@@ -55,3 +55,32 @@ association in a temporary module makes the same regression fail again. The
 harness uses vendored protocol types and does not prove the complete branch.
 All previous shared-target Cargo results are superseded. Final isolated-target
 quality gates, coverage and real KiCad verification remain pending.
+
+The served two-unusable-footprints regression retains its exact diagnostic
+objects, both footprint IDs and all three affected references. Its golden text
+now matches the shared validator's named custom-pad refusal and closed-file
+recovery guidance. The previous string-only failure was observed in the
+isolated descendant suite. Parent-branch rerun remains part of the final gates.
+
+## Native inactive defaults and selected-target readback
+
+The real KiCad `issue_474_r1.ipc.bin` capture contains ordinary roundrect pads
+with an inactive `chamfer_ratio` of 0.2. The vendored protocol defines that ratio
+and corner selection only for `PSS_CHAMFEREDRECT`. Treating a nonzero inactive
+ratio as chamfer geometry incorrectly requires chamfer evidence for ordinary
+footprints. Chamfer extraction now follows the declared active shape.
+
+Readback compares only the affected footprints. Existing footprints match by
+their expected KIID, while new placements match by their unique reference.
+Unrelated decoded footprints cannot fail the check through duplicate references
+or unreadable pad children. Missing, duplicated or malformed selected targets
+still fail. An unreadable outer footprint cannot be proven unrelated and remains
+an error when chamfer verification is required.
+
+An exact-source module harness reproduced three failures before the correction,
+including the unchanged real capture. The corrected module passes all 11 tests.
+Reintroducing inactive-ratio classification in a temporary module makes the real
+capture regression fail again. The harness uses the valid isolated #25 protocol
+types and an equivalent private reference-accessor shim. It is not a complete
+branch build, served IPC run or live KiCad check. Final isolated Cargo gates and
+native acceptance remain pending.
