@@ -1525,26 +1525,7 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                                     }
                                     stroke.color = None;
                                 }
-                                if let Some(
-                                    kiapi::common::types::graphic_shape::Geometry::Polygon(polyset),
-                                ) = graphic.geometry.as_mut()
-                                {
-                                    konnect_ipc::normalize_footprint_polyset(polyset);
-                                }
-                                if let Some(
-                                    kiapi::common::types::graphic_shape::Geometry::Rectangle(
-                                        rectangle,
-                                    ),
-                                ) = graphic.geometry.as_mut()
-                                {
-                                    if rectangle
-                                        .corner_radius
-                                        .as_ref()
-                                        .is_some_and(|radius| radius.value_nm == 0)
-                                    {
-                                        rectangle.corner_radius = None;
-                                    }
-                                }
+                                konnect_ipc::normalize_footprint_graphic_geometry(graphic);
                             }
                             shape.encode_to_vec()
                         },

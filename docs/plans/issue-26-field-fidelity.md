@@ -143,3 +143,20 @@ Native behavior follows KiCad10.0.5
 [`UnpackPolyLine`](https://github.com/KiCad/kicad/blob/10.0.5/common/api/api_utils.cpp#L119-L170)
 and
 [`SHAPE_LINE_CHAIN::Append`](https://github.com/KiCad/kicad/blob/10.0.5/libs/kimath/src/geometry/shape_line_chain.cpp#L218-L234).
+
+
+The same native-geometry audit confirmed endpoint-order differences for a
+cardinal semicircle: KiCad's `SetArcGeometry` swaps the endpoints to enforce its
+internal winding. The shared geometry helper now handles rectangle defaults,
+polygon point normalization, and arc endpoint order for both presentation and
+refresh comparison. Arc midpoint values remain exact. Changed endpoints, changed
+midpoints, and the opposite semicircle still fail verification. No coordinate
+tolerance or midpoint-recomputation exception was added.
+
+The new actual-module arc regression failed before the correction and passed
+after it, along with the independent native-shaped arc reproducer. Source-level
+geometry evidence is
+[KiCad10.0.5 `SetArcGeometry`](https://github.com/KiCad/kicad/blob/10.0.5/common/eda_shape.cpp#L1180-L1209).
+The latest four normal gates for all three native-geometry corrections are
+pending. Earlier queued gate wrappers were stopped before acquiring the build
+lane and did not execute checks.

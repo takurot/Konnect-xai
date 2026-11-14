@@ -47,7 +47,30 @@ pub fn normalize_footprint_field(field: &board::Field) -> Result<board::Field> {
     Ok(field)
 }
 
-pub fn normalize_footprint_polyset(polyset: &mut common::PolySet) {
+pub fn normalize_footprint_graphic_geometry(shape: &mut common::GraphicShape) {
+    match shape.geometry.as_mut() {
+        Some(common::graphic_shape::Geometry::Rectangle(rectangle)) => {
+            if rectangle
+                .corner_radius
+                .as_ref()
+                .is_some_and(|radius| radius.value_nm == 0)
+            {
+                rectangle.corner_radius = None;
+            }
+        }
+        Some(common::graphic_shape::Geometry::Polygon(polyset)) => normalize_polyset(polyset),
+        Some(common::graphic_shape::Geometry::Arc(arc)) => {
+            if let (Some(start), Some(end)) = (arc.start.as_ref(), arc.end.as_ref()) {
+                if (start.x_nm, start.y_nm) > (end.x_nm, end.y_nm) {
+                    std::mem::swap(&mut arc.start, &mut arc.end);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_polyset(polyset: &mut common::PolySet) {
     for polygon in &mut polyset.polygons {
         if let Some(outline) = polygon.outline.as_mut() {
             normalize_polyline(outline);
@@ -194,22 +217,7 @@ impl Presentation {
                     | common::StrokeLineStyle::SlsSolid => common::StrokeLineStyle::SlsSolid as i32,
                     other => other as i32,
                 };
-                if let Some(common::graphic_shape::Geometry::Rectangle(rectangle)) =
-                    shape.geometry.as_mut()
-                {
-                    if rectangle
-                        .corner_radius
-                        .as_ref()
-                        .is_some_and(|radius| radius.value_nm == 0)
-                    {
-                        rectangle.corner_radius = None;
-                    }
-                }
-                if let Some(common::graphic_shape::Geometry::Polygon(polyset)) =
-                    shape.geometry.as_mut()
-                {
-                    normalize_footprint_polyset(polyset);
-                }
+                normalize_footprint_graphic_geometry(&mut shape);
                 strokes.push((
                     item.layer,
                     shape.encode_to_vec(),
@@ -595,6 +603,31 @@ mod tests {
         let wanted = open.clone();
         normalize_polyline(&mut open);
         assert_eq!(open, wanted);
+    }
+
+    #[test]
+    fn presentation_accepts_native_arc_endpoint_order_but_checks_the_curve() {
+        let arc_item = |start: (f64, f64), mid: (f64, f64), end: (f64, f64)| {
+            let mut footprint = board::FootprintInstance::decode(item().value.as_slice()).unwrap();
+            let graphic = crate::builders::board_arc(
+                "F.CrtYd", 0.1, start.0, start.1, mid.0, mid.1, end.0, end.1,
+            );
+            footprint.definition.as_mut().unwrap().items = vec![crate::builders::pack_any(
+                &graphic,
+                "kiapi.board.types.BoardGraphicShape",
+            )];
+            crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+        };
+        let wanted = arc_item((1.0, 0.0), (0.0, -1.0), (-1.0, 0.0));
+        let expected = FootprintPresentation::from_items([&wanted]).unwrap();
+        for (start, mid, end, equal) in [
+            ((-1.0, 0.0), (0.0, -1.0), (1.0, 0.0), true),
+            ((-1.0, 0.0), (0.0, 1.0), (1.0, 0.0), false),
+            ((-1.1, 0.0), (0.0, -1.0), (1.0, 0.0), false),
+            ((-1.0, 0.0), (0.0, -1.1), (1.0, 0.0), false),
+        ] {
+            assert_eq!(expected.verify(&[arc_item(start, mid, end)]).is_ok(), equal);
+        }
     }
 
     #[test]
