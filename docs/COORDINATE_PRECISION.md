@@ -166,3 +166,11 @@ artifacts, not native KiCad evidence. New committed regressions require named
 refusals before live mutation, unchanged saved bytes, and nanometre-precise valid
 fields. Final merged-head quality gates remain required and are recorded
 separately from prior individual-branch results.
+
+An integration review also reproduced a finite property angle plus finite
+footprint rotation overflowing during library refresh. The property transform
+now refuses a nonfinite final angle before normalization. Its regression covers
+front and back planning, unchanged input instances, and valid readable angles.
+The exact old helper failed the overflow check, the corrected helper passed,
+and removing only the new guard made the regression fail again. These extracted
+checks do not establish whole-handler or native KiCad acceptance.

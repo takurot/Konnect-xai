@@ -1444,8 +1444,14 @@ fn transform_library_property(
     } else {
         local_angle
     };
+    let field_rotation = local_angle + footprint_rotation;
+    anyhow::ensure!(
+        field_rotation.is_finite(),
+        "property '{}' rotation must remain finite",
+        property.name
+    );
     attributes.angle = Some(kiapi::common::types::Angle {
-        value_degrees: readable_property_angle(local_angle + footprint_rotation),
+        value_degrees: readable_property_angle(field_rotation),
     });
     if is_back {
         if is_side_specific_layer(board_text.layer) {
@@ -2047,6 +2053,87 @@ mod tests {
         assert!(attributes.stroke_width.as_ref().unwrap().value_nm > 0);
         assert_eq!(attributes.line_spacing, 1.0);
         assert!(attributes.keep_upright);
+    }
+
+    #[test]
+    fn refresh_fields_refuse_nonfinite_rotation_before_preparing_a_write() {
+        use kiapi::board::types::BoardLayer;
+
+        for (layer, local_angle, is_back, expected_angle) in [
+            (BoardLayer::BlFCu, f64::MAX, false, 54.0),
+            (BoardLayer::BlBCu, -f64::MAX, true, 20.0),
+        ] {
+            let mut property = field("LCSC", "C25804", 1.0, 2.0, true);
+            let board_text = property.text.as_mut().unwrap();
+            board_text.layer = BoardLayer::BlFFab as i32;
+            let attributes = board_text
+                .text
+                .as_mut()
+                .unwrap()
+                .attributes
+                .as_mut()
+                .unwrap();
+            attributes.stroke_width = Some(builders::distance(0.15).unwrap());
+            attributes.line_spacing = 1.0;
+            attributes.keep_upright = true;
+            attributes.angle.as_mut().unwrap().value_degrees = local_angle;
+            let before_property = property.clone();
+            let mut current = current_instance(layer);
+            current.orientation.as_mut().unwrap().value_degrees = f64::MAX / 4.0;
+            let before_current = current.clone();
+            let mut library =
+                parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+            library.properties = vec![property.clone()];
+            let result = build_updated_instance(
+                &current,
+                &library,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                false,
+                2,
+            );
+            let error = result
+                .err()
+                .expect("nonfinite field rotation prepared a write");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("LCSC")
+                    && message.contains("rotation")
+                    && message.contains("finite"),
+                "{message}"
+            );
+            assert_eq!(current, before_current);
+            assert_eq!(property, before_property);
+
+            property
+                .text
+                .as_mut()
+                .unwrap()
+                .text
+                .as_mut()
+                .unwrap()
+                .attributes
+                .as_mut()
+                .unwrap()
+                .angle
+                .as_mut()
+                .unwrap()
+                .value_degrees = 17.0;
+            let transformed = transform_library_property(
+                &property,
+                &builders::vec2(10.0, 20.0).unwrap(),
+                37.0,
+                is_back,
+                2,
+            )
+            .unwrap();
+            let text = transformed.text.unwrap().text.unwrap();
+            assert_eq!(text.text, "C25804");
+            assert_eq!(
+                text.attributes.unwrap().angle.unwrap().value_degrees,
+                expected_angle
+            );
+        }
     }
 
     #[test]
