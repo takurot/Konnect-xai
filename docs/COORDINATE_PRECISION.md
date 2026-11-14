@@ -137,3 +137,9 @@ helper in a sibling test module. The isolated
 `cargo check --workspace --locked --all-targets` succeeds after this correction.
 The four final quality gates, coverage, and real KiCad verification are recorded
 separately and are not implied by that compilation check.
+
+
+The existing file-fallback regression expected an explicit zero placement angle.
+The canonical writer omits that optional angle, as its zero-rotation regression
+requires. The fallback test now parses the placed footprint and checks its
+coordinates and effective zero angle, accepting either valid representation.

@@ -4550,10 +4550,11 @@ mod tests {
             written.contains("(footprint \"Resistor_SMD:R_0805_2012Metric\""),
             "board should carry the Library:Footprint id:\n{written}"
         );
-        assert!(
-            written.contains("(at 50 60 0)"),
-            "placement missing:\n{written}"
-        );
+        let tree = konnect_sexp::parse_sexp(&written).unwrap();
+        let placement = tree.find("footprint").unwrap().find("at").unwrap();
+        assert_eq!(placement.get_f64(1), Some(50.0));
+        assert_eq!(placement.get_f64(2), Some(60.0));
+        assert!(placement.get(3).is_none() || placement.get_f64(3) == Some(0.0));
         assert!(
             written.contains("(property \"Reference\" \"R7\""),
             "{written}"
