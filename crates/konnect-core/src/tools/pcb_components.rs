@@ -3769,7 +3769,7 @@ async fn handle_place_array(
     }
 
     let footprint_id = footprint.clone();
-    let placed = match with_board_ipc_classified(ctx, &board, move |c, _| {
+    let placed = match with_board_ipc_classified(ctx, &board, move |c, document| {
         let existing = c
             .list_footprints()?
             .into_iter()
@@ -3805,7 +3805,9 @@ async fn handle_place_array(
                 .with_context(|| format!("failed to prepare {reference}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let chamfers = konnect_ipc::FootprintChamfers::from_items(&items)?;
         c.run_commit("Place footprint array", |c| c.create_items(items))?;
+        c.verify_footprint_chamfers_in(document, &chamfers)?;
 
         let mut created = c
             .list_footprints()?
@@ -3829,6 +3831,9 @@ async fn handle_place_array(
     .await?
     {
         Ok(placed) => placed,
+        Err(konnect_ipc::IpcFailure::Uncertain(message)) => {
+            return Ok(crate::tools::ipc_uncertain_result(&message));
+        }
         Err(error) => return Ok(CallToolResult::error(format!("IPC array error: {error}"))),
     };
     Ok(CallToolResult::json(
