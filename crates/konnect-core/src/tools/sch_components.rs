@@ -534,10 +534,29 @@ pub(crate) fn set_native_attributes(
             if let Some((from, to)) = matching.first() {
                 edits.push(SexpEdit::replace(start + *from, start + *to, replacement));
             } else {
-                edits.push(SexpEdit::insert(
-                    end - 1,
-                    format!("\n\t\t{replacement}\n\t"),
-                ));
+                let newline = if content.contains("\r\n") {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
+                let indent = children
+                    .iter()
+                    .find_map(|(from, _)| {
+                        let line = block[..*from].rfind('\n')? + 1;
+                        let prefix = &block[line..*from];
+                        prefix.chars().all(char::is_whitespace).then_some(prefix)
+                    })
+                    .unwrap_or("\t\t");
+                let line = content[..end - 1]
+                    .rfind('\n')
+                    .map_or(end - 1, |index| index + 1);
+                let closing_indent = &content[line..end - 1];
+                let (at, text) = if closing_indent.chars().all(char::is_whitespace) {
+                    (line, format!("{indent}{replacement}{newline}"))
+                } else {
+                    (end - 1, format!("{newline}{indent}{replacement}{newline}"))
+                };
+                edits.push(SexpEdit::insert(at, text));
             }
         }
     }
@@ -9820,6 +9839,14 @@ mod issue25_native_attributes_tests {
         .unwrap();
         assert!(response.is_error, "{response:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
+
+    #[test]
+    fn new_native_clauses_preserve_existing_line_endings_and_indentation() {
+        let source = "(kicad_sch\r\n  (symbol\r\n    (lib_id \"Device:R\")\r\n    (property \"Reference\" \"R1\")\r\n  )\r\n)\r\n";
+        let patch = SymbolAttributePatch::parse(&json!({"in_pos_files": false})).unwrap();
+        let output = set_native_attributes(source, "R1", patch).unwrap();
+        assert_eq!(output.replace("    (in_pos_files no)\r\n", ""), source);
     }
 
     #[test]
