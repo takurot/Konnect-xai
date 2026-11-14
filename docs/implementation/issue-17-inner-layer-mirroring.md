@@ -176,3 +176,10 @@ including unavailable evidence and failed rollback.
 The earlier separate-branch results are historical evidence. This merged
 source requires its own four normal quality gates and independent resolution
 review before being reported as verified.
+
+
+The first merged-source test compilation identified one inherited Issue #14
+outer-copper chamfer fixture calling `mirror_pad` without the new stack count.
+It now supplies its two-layer board explicitly. This changes only the fixture
+call; the production mapping and validation remain unchanged. The compiler
+failure is recorded separately from the rerun.

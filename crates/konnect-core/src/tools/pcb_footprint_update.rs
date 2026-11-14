@@ -4846,7 +4846,7 @@ mod issue14_chamfer_tests {
         let pad = super::super::pcb_components::extract_pad_definitions(source)
             .unwrap()
             .remove(0);
-        let mirrored = mirror_pad(&pad).unwrap();
+        let mirrored = mirror_pad(&pad, 2).unwrap();
         let item = konnect_ipc::KiCadIpcClient::build_footprint_item(
             "L:F",
             "U1",
