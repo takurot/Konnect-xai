@@ -423,6 +423,7 @@ fn embedded_lib_symbol<'a>(schematic: &'a Schematic, lib_id: &str) -> Option<&'a
 /// the exact definition the schematic instance refers to.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SymbolMetadata {
+    pub attributes: crate::SymbolAttributes,
     /// The reference prefix, such as `R` or `#FLG`.
     pub reference: String,
     pub value: String,
@@ -449,6 +450,7 @@ pub fn symbol_metadata(schematic: &Schematic, lib_id: &str) -> SymbolMetadata {
             .to_string()
     };
     SymbolMetadata {
+        attributes: crate::SymbolAttributes::from_sexp(symbol),
         reference: value("Reference"),
         value: value("Value"),
         footprint: value("Footprint"),
@@ -974,6 +976,7 @@ mod field_anchor_tests {
         assert_eq!(
             symbol_metadata(&sch, "Device:R"),
             SymbolMetadata {
+                attributes: crate::SymbolAttributes::default(),
                 reference: "R".to_string(),
                 value: "R".to_string(),
                 footprint: "Resistor_THT:R_Axial".to_string(),
