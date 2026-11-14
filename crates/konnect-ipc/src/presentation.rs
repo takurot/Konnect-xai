@@ -586,7 +586,7 @@ mod tests {
             )),
         };
         let mut arcs = common::PolyLine {
-            nodes: vec![arc.clone(), arc],
+            nodes: vec![arc, arc],
             closed: true,
         };
         normalize_polyline(&mut arcs);
@@ -597,7 +597,7 @@ mod tests {
             )),
         };
         let mut open = common::PolyLine {
-            nodes: vec![point.clone(), point],
+            nodes: vec![point, point],
             closed: false,
         };
         let wanted = open.clone();
