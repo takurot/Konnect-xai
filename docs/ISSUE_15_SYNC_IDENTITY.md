@@ -47,3 +47,33 @@ Pinned `rustfmt` and `git diff --check` pass. The complete workspace test,
 doctest, Clippy, and line and branch coverage gates are pending. Real KiCad is
 unavailable on this host. Mock IPC readback does not establish live KiCad
 behavior. This implementation is not a completed validation result.
+
+## Verify the complete live identity before publishing
+
+The sync records the exact `SheetPath` sent for each change. Updates are matched
+by their existing KIID, so reannotation cannot redirect verification to another
+footprint with the requested reference. Additions are matched by their unique
+new reference because KiCad may assign their KIID. Both checks require the
+requested reference and the complete UUID and human-readable path.
+
+The requested document is read inside the recovering transaction, after the
+mutations and before publication. Missing, duplicate, malformed or altered
+identity evidence aborts that transaction. Ordinary readback failures permit the
+existing rollback. Unknown transport outcomes retain their original recovery
+handling. A readback mismatch is returned as an uncertain result after the
+rollback attempt, rather than an `applied` response or a claim that no write
+was attempted. Inspect the live board before retrying.
+
+An extracted execution of the original readback function reproduces acceptance
+of a missing updated footprint. This harness stubs the client and footprint
+shape tally, so it is narrower than the registered tool. The new exact identity
+checker passes three isolated tests using the real KiCad capture and protobuf
+types. Neutralizing only the complete-path comparison makes its altered-path
+regression fail. These checks do not prove live KiCad behavior.
+
+The committed registered-tool test injects changed UUIDs, changed human-readable
+paths, a stale reference, a missing path, a missing footprint and malformed
+protobuf after updating. It requires a non-success response, a dropped undo
+commit and restored mock board state. The normal case still verifies preserved
+board-only objects and a following no-op plan. Its Cargo execution and the
+workspace gates remain pending in the shared verification lane.
