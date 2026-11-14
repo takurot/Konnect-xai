@@ -304,6 +304,21 @@ pub fn round6(v: f64) -> f64 {
     (v * 1_000_000.0).round() / 1_000_000.0 + 0.0
 }
 
+/// Format a millimetre value at KiCad's nanometre precision.
+pub fn fmt_mm(v: f64) -> String {
+    let text = format!("{:.6}", round6(v));
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// Serialize a coordinate without rounding unrelated numeric fields.
+pub fn serialize_mm<S: serde::Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+    let rounded = round6(*value);
+    if !rounded.is_finite() {
+        return Err(serde::ser::Error::custom("coordinate must be finite"));
+    }
+    serializer.serialize_f64(rounded)
+}
+
 /// Snap a coordinate to KiCAD's schematic grid (default 1.27 mm = 50 mil).
 ///
 /// Rounded, because 132 × 1.27 is `167.64000000000001` in `f64` (#744).
@@ -341,6 +356,46 @@ pub fn point_on_segment(px: f64, py: f64, x1: f64, y1: f64, x2: f64, y2: f64, to
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn millimetre_text_trims_zeros_and_rounds_arithmetic_noise() {
+        for (value, expected) in [
+            (167.64 - 5.08, "162.56"),
+            (101.6 - 3.81, "97.79"),
+            (50.8 * 1.075, "54.61"),
+            (-0.0000001, "0"),
+            (0.0, "0"),
+            (-0.0, "0"),
+            (1.2345674, "1.234567"),
+            (1.2345676, "1.234568"),
+            (100.0, "100"),
+        ] {
+            assert_eq!(fmt_mm(value), expected);
+        }
+    }
+
+    #[test]
+    fn coordinate_serialization_does_not_round_prices() {
+        #[derive(serde::Serialize)]
+        struct Item {
+            #[serde(serialize_with = "super::serialize_mm")]
+            x: f64,
+            price: f64,
+        }
+        let price = 0.12345678901234567;
+        let value = serde_json::to_value(Item {
+            x: 50.8 * 1.075,
+            price,
+        })
+        .unwrap();
+        assert_eq!(value["x"], 54.61);
+        assert_eq!(value["price"], price);
+        assert!(serde_json::to_value(Item {
+            x: f64::INFINITY,
+            price
+        })
+        .is_err());
+    }
 
     fn t(comp_x: f64, comp_y: f64, rot: f64, mx: bool, my: bool) -> PinTransform {
         PinTransform {

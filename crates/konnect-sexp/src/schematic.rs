@@ -2,7 +2,7 @@
 //!
 //! Provides typed query functions used by the tool implementations.
 
-use crate::geometry::{transform_pin, PinTransform};
+use crate::geometry::{fmt_mm, transform_pin, PinTransform};
 use crate::parser::{parse_sexp, SexpNode};
 use crate::writer::read_consistent;
 use crate::SexpError;
@@ -1027,6 +1027,10 @@ pub fn format_bus(x1: f64, y1: f64, x2: f64, y2: f64) -> String {
 
 fn format_schematic_line(kind: &str, x1: f64, y1: f64, x2: f64, y2: f64) -> String {
     let uuid = crate::writer::new_uuid();
+    let x1 = fmt_mm(x1);
+    let y1 = fmt_mm(y1);
+    let x2 = fmt_mm(x2);
+    let y2 = fmt_mm(y2);
     format!(
         "({kind}\n\t\t(pts\n\t\t\t(xy {x1} {y1}) (xy {x2} {y2})\n\t\t)\n\t\t(stroke\n\t\t\t(width 0)\n\t\t\t(type default)\n\t\t)\n\t\t(uuid \"{uuid}\")\n\t)"
     )
@@ -1034,6 +1038,8 @@ fn format_schematic_line(kind: &str, x1: f64, y1: f64, x2: f64, y2: f64) -> Stri
 
 pub fn format_junction(x: f64, y: f64) -> String {
     let uuid = crate::writer::new_uuid();
+    let x = fmt_mm(x);
+    let y = fmt_mm(y);
     format!(
         "\n  (junction\n    (at {x} {y})\n    (diameter 0)\n    (color 0 0 0 0)\n    (uuid \"{uuid}\")\n  )"
     )
@@ -1041,6 +1047,8 @@ pub fn format_junction(x: f64, y: f64) -> String {
 
 pub fn format_no_connect(x: f64, y: f64) -> String {
     let uuid = crate::writer::new_uuid();
+    let x = fmt_mm(x);
+    let y = fmt_mm(y);
     format!("\n  (no_connect\n    (at {x} {y})\n    (uuid \"{uuid}\")\n  )")
 }
 
@@ -1078,6 +1086,8 @@ impl BusEntryDirection {
 pub fn format_bus_entry(x: f64, y: f64, direction: BusEntryDirection) -> String {
     let uuid = crate::writer::new_uuid();
     let (width, height) = direction.size();
+    let x = fmt_mm(x);
+    let y = fmt_mm(y);
     format!(
         "\n  (bus_entry\n    (at {x} {y})\n    (size {width} {height})\n    (stroke\n      (width 0)\n      (type default)\n    )\n    (uuid \"{uuid}\")\n  )"
     )
@@ -1104,8 +1114,8 @@ pub fn format_hierarchical_sheet(spec: HierarchicalSheetSpec<'_>) -> String {
     let project_name = crate::escaped_string(spec.project_name);
     let parent_instance_path = crate::escaped_string(spec.parent_instance_path);
     let page = crate::escaped_string(spec.page);
-    let name_y = spec.y - 0.635;
-    let file_y = spec.y + spec.height + 0.635;
+    let name_y = fmt_mm(spec.y - 0.635);
+    let file_y = fmt_mm(spec.y + spec.height + 0.635);
     format!(
         r#"
   (sheet
@@ -1137,10 +1147,10 @@ pub fn format_hierarchical_sheet(spec: HierarchicalSheetSpec<'_>) -> String {
       )
     )
   )"#,
-        x = spec.x,
-        y = spec.y,
-        width = spec.width,
-        height = spec.height,
+        x = fmt_mm(spec.x),
+        y = fmt_mm(spec.y),
+        width = fmt_mm(spec.width),
+        height = fmt_mm(spec.height),
     )
 }
 
@@ -1187,6 +1197,9 @@ pub fn format_sheet_pin(
 ) -> String {
     let name = crate::escaped_string(name);
     let uuid = crate::writer::new_uuid();
+    let x = fmt_mm(x);
+    let y = fmt_mm(y);
+    let rotation = fmt_mm(rotation);
     format!(
         "(pin \"{name}\" {}\n\t(at {x} {y} {rotation})\n\t(uuid \"{uuid}\")\n)",
         pin_type.keyword()
@@ -1204,6 +1217,9 @@ pub fn format_net_label(net: &str, x: f64, y: f64, rotation: f64) -> String {
     // whatever the label points at. Plain labels also carry `bottom`, which
     // lifts the text off the wire it annotates.
     let justify = label_justify(rotation);
+    let x = fmt_mm(x);
+    let y = fmt_mm(y);
+    let rotation = fmt_mm(rotation);
     format!(
         r#"
   (label "{net}"
@@ -1218,6 +1234,24 @@ pub fn format_net_label(net: &str, x: f64, y: f64, rotation: f64) -> String {
 #[cfg(test)]
 mod power_symbol_tests {
     use super::*;
+
+    #[test]
+    fn coordinate_formatters_emit_nanometre_precision_without_float_noise() {
+        let x = 167.64 - 5.08;
+        let y = 50.8 * 1.075;
+        for text in [
+            format_wire(x, y, x, y),
+            format_bus(x, y, x, y),
+            format_junction(x, y),
+            format_no_connect(x, y),
+            format_net_label("SIG", x, y, 0.0),
+            format_bus_entry(x, y, BusEntryDirection::DownRight),
+        ] {
+            assert!(text.contains("162.56"), "{text}");
+            assert!(text.contains("54.61"), "{text}");
+            assert!(!text.contains("9999999"), "{text}");
+        }
+    }
 
     /// A sheet holding a `power:GND`, a `PWR_FLAG` (power symbol too, but with
     /// a `power_out` pin) and a plain `Device:R` that must be ignored for not

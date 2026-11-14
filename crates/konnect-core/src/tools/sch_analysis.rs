@@ -12,7 +12,7 @@ use crate::tools::{
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
-    geometry::{point_on_segment, points_coincident},
+    geometry::{point_on_segment, points_coincident, round6},
     schematic::{
         extract_all_net_labels, extract_buses, extract_labels, extract_sheet_pins,
         extract_symbol_instances, extract_wires, find_lib_symbol, read_schematic,
@@ -214,7 +214,7 @@ async fn handle_list_wires(
     let sch_path = get_path(args, "schematic")?;
     let sch = cse::Schematic::load(&sch_path)?;
     let items: Vec<serde_json::Value> = sch.wires.iter()
-        .map(|w| json!({ "x1": w.start.0, "y1": w.start.1, "x2": w.end.0, "y2": w.end.1, "uuid": w.uuid }))
+        .map(|w| json!({ "x1": round6(w.start.0), "y1": round6(w.start.1), "x2": round6(w.end.0), "y2": round6(w.end.1), "uuid": w.uuid }))
         .collect();
     Ok(CallToolResult::json(
         &json!({ "count": items.len(), "wires": items }),
@@ -247,13 +247,13 @@ async fn handle_list_labels(
     let sch = cse::Schematic::load(&sch_path)?;
     let mut items: Vec<serde_json::Value> = Vec::new();
     for l in sch.labels.iter() {
-        items.push(json!({ "net": l.text, "type": "NetLabel", "x": l.at.x, "y": l.at.y, "rotation": l.at.rotation.unwrap_or(0.0) }));
+        items.push(json!({ "net": l.text, "type": "NetLabel", "x": round6(l.at.x), "y": round6(l.at.y), "rotation": l.at.rotation.unwrap_or(0.0) }));
     }
     for g in sch.global_labels.iter() {
-        items.push(json!({ "net": g.text, "type": "GlobalLabel", "x": g.at.x, "y": g.at.y, "rotation": g.at.rotation.unwrap_or(0.0) }));
+        items.push(json!({ "net": g.text, "type": "GlobalLabel", "x": round6(g.at.x), "y": round6(g.at.y), "rotation": g.at.rotation.unwrap_or(0.0) }));
     }
     for h in sch.hierarchical_labels.iter() {
-        items.push(json!({ "net": h.text, "type": "HierarchicalLabel", "x": h.at.x, "y": h.at.y, "rotation": h.at.rotation.unwrap_or(0.0) }));
+        items.push(json!({ "net": h.text, "type": "HierarchicalLabel", "x": round6(h.at.x), "y": round6(h.at.y), "rotation": h.at.rotation.unwrap_or(0.0) }));
     }
     Ok(CallToolResult::json(
         &json!({ "count": items.len(), "labels": items }),
@@ -275,7 +275,7 @@ async fn handle_get_net_connections(
     let matching: Vec<_> = labels
         .iter()
         .filter(|l| l.net == net)
-        .map(|l| json!({ "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
+        .map(|l| json!({ "type": format!("{:?}", l.kind), "x": round6(l.x), "y": round6(l.y) }))
         .collect();
     let mut g = net_graph_for(&tree, &wires, &labels);
     let pts = g.points_on_net(&net).len();
@@ -301,12 +301,12 @@ async fn handle_get_net_connectivity(
     let net_wires: Vec<_> = wires
         .iter()
         .filter(|w| net_pts.contains(&pt_key(w.x1, w.y1)) || net_pts.contains(&pt_key(w.x2, w.y2)))
-        .map(|w| json!({ "x1": w.x1, "y1": w.y1, "x2": w.x2, "y2": w.y2 }))
+        .map(|w| json!({ "x1": round6(w.x1), "y1": round6(w.y1), "x2": round6(w.x2), "y2": round6(w.y2) }))
         .collect();
     let net_labels: Vec<_> = labels
         .iter()
         .filter(|l| l.net == net)
-        .map(|l| json!({ "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
+        .map(|l| json!({ "type": format!("{:?}", l.kind), "x": round6(l.x), "y": round6(l.y) }))
         .collect();
     let net_wire_objs: Vec<Wire> = wires
         .iter()
@@ -318,7 +318,7 @@ async fn handle_get_net_connectivity(
         "net": net,
         "wires": net_wires,
         "labels": net_labels,
-        "t_junctions": t_junctions.iter().map(|(x,y)| json!({"x": x, "y": y})).collect::<Vec<_>>()
+        "t_junctions": t_junctions.iter().map(|(x,y)| json!({"x": round6(x), "y": round6(y)})).collect::<Vec<_>>()
     })))
 }
 
@@ -392,7 +392,7 @@ async fn handle_get_component_nets(
         .flat_map(|(_, pins)| pins)
         .map(|(pin, transform)| {
             let (px, py) = konnect_sexp::schematic::pin_endpoint(&pin, transform);
-            json!({ "pin": pin.number, "name": pin.name, "x": px, "y": py, "net": g.net_at(px, py) })
+            json!({ "pin": pin.number, "name": pin.name, "x": round6(px), "y": round6(py), "net": g.net_at(px, py) })
         })
         .collect();
     Ok(CallToolResult::json(
@@ -474,7 +474,7 @@ async fn handle_trace_from_point(
                 || points_coincident(x, y, w.x2, w.y2, tol)
                 || point_on_segment(x, y, w.x1, w.y1, w.x2, w.y2, tol)
         })
-        .map(|w| json!({ "x1": w.x1, "y1": w.y1, "x2": w.x2, "y2": w.y2 }))
+        .map(|w| json!({ "x1": round6(w.x1), "y1": round6(w.y1), "x2": round6(w.x2), "y2": round6(w.y2) }))
         .collect();
     let at_label: Vec<_> = labels
         .iter()
@@ -498,19 +498,19 @@ async fn handle_trace_from_point(
                 "pin": placed.pin.number,
                 "pin_name": placed.pin.name,
                 "electrical_type": placed.pin.electrical_type,
-                "x": placed.at.0,
-                "y": placed.at.1
+                "x": round6(placed.at.0),
+                "y": round6(placed.at.1)
             })
         })
         .collect();
     let at_junction: Vec<_> = detail
         .junctions
         .iter()
-        .map(|&(jx, jy)| json!({ "x": jx, "y": jy }))
+        .map(|&(jx, jy)| json!({ "x": round6(jx), "y": round6(jy) }))
         .collect();
     Ok(CallToolResult::json(&json!({
-        "x": x,
-        "y": y,
+        "x": round6(x),
+        "y": round6(y),
         "net": g.net_at(x, y),
         "wires_here": on_wire,
         "labels_here": at_label,
@@ -547,8 +547,8 @@ async fn handle_find_orphan_items(
     for (x, y, wire_uuid) in index.floating_wire_ends() {
         all.push(json!({
             "type": "dangling_wire_end",
-            "x": x,
-            "y": y,
+            "x": round6(x),
+            "y": round6(y),
             "wire_uuid": wire_uuid
         }));
     }
@@ -569,8 +569,8 @@ async fn handle_find_orphan_items(
             all.push(json!({
                 "type": "floating_label",
                 "net": label.net,
-                "x": label.x,
-                "y": label.y
+                "x": round6(label.x),
+                "y": round6(label.y)
             }));
         }
     }
@@ -588,8 +588,8 @@ async fn handle_find_orphan_items(
                 "reference": placed.reference,
                 "pin": placed.pin.number,
                 "pin_name": placed.pin.name,
-                "x": x,
-                "y": y
+                "x": round6(x),
+                "y": round6(y)
             }));
         }
     }
@@ -656,10 +656,12 @@ impl Connection<'_> {
                 "reference": reference,
                 "pin": pin.number,
                 "pin_name": pin.name,
-                "x": x,
-                "y": y
+                "x": round6(x),
+                "y": round6(y)
             }),
-            Connection::SheetPin { x, y } => json!({ "type": "sheet_pin", "x": x, "y": y }),
+            Connection::SheetPin { x, y } => {
+                json!({ "type": "sheet_pin", "x": round6(x), "y": round6(y) })
+            }
         }
     }
 }
@@ -815,8 +817,8 @@ async fn handle_find_single_pin_nets(
                 reached.map(Connection::to_json).into_iter().collect();
             Some(json!({
                 "net": net,
-                "x": named.first_label.x,
-                "y": named.first_label.y,
+                "x": round6(named.first_label.x),
+                "y": round6(named.first_label.y),
                 "type": format!("{:?}", named.first_label.kind),
                 "label_types": named.kinds,
                 "cross_sheet_unverified": named.cross_sheet_unverified,
@@ -887,13 +889,13 @@ async fn handle_get_connected_items(
         .filter(|w| {
             all_net_pts.contains(&pt_key(w.x1, w.y1)) || all_net_pts.contains(&pt_key(w.x2, w.y2))
         })
-        .map(|w| json!({ "x1": w.x1, "y1": w.y1, "x2": w.x2, "y2": w.y2, "uuid": w.uuid }))
+        .map(|w| json!({ "x1": round6(w.x1), "y1": round6(w.y1), "x2": round6(w.x2), "y2": round6(w.y2), "uuid": w.uuid }))
         .collect();
 
     let connected_labels: Vec<serde_json::Value> = label_roots(&mut g, &labels)
         .into_iter()
         .filter(|(root, _)| connected_roots.contains(root))
-        .map(|(_, l)| json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
+        .map(|(_, l)| json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": round6(l.x), "y": round6(l.y) }))
         .collect();
 
     // Find other components on the same nets (excluding the queried one)
@@ -966,10 +968,10 @@ async fn handle_check_overlaps(
     let mut comp_overlaps: Vec<serde_json::Value> = Vec::new();
     let bounds_json = |bounds: SymbolBounds| {
         json!({
-            "x_min": bounds.min_x,
-            "y_min": bounds.min_y,
-            "x_max": bounds.max_x,
-            "y_max": bounds.max_y
+            "x_min": round6(bounds.min_x),
+            "y_min": round6(bounds.min_y),
+            "x_max": round6(bounds.max_x),
+            "y_max": round6(bounds.max_y)
         })
     };
     for (index, (a, a_bounds)) in placements.iter().enumerate() {
@@ -1004,8 +1006,8 @@ async fn handle_check_overlaps(
                         "unit_a": a.unit,
                         "b": b.reference,
                         "unit_b": b.unit,
-                        "x": a.x,
-                        "y": a.y,
+                        "x": round6(a.x),
+                        "y": round6(a.y),
                         "detection": "origin_fallback"
                     }));
                 }
@@ -1021,7 +1023,7 @@ async fn handle_check_overlaps(
     for (i, a) in all_labels.iter().enumerate() {
         for b in &all_labels[i + 1..] {
             if points_coincident(a.x, a.y, b.x, b.y, tol) && a.net != b.net {
-                label_overlaps.push(json!({ "type": "label_overlap", "net_a": a.net, "net_b": b.net, "x": a.x, "y": a.y }));
+                label_overlaps.push(json!({ "type": "label_overlap", "net_a": a.net, "net_b": b.net, "x": round6(a.x), "y": round6(a.y) }));
             }
         }
     }

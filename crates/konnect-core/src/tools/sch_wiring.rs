@@ -586,7 +586,7 @@ async fn handle_add_wire(
     let new_content = insert_wire_with_junctions(content.clone(), x1, y1, x2, y2)?;
     write_atomic_if_unchanged(&sch_path, &content, &new_content)?;
     Ok(CallToolResult::json(
-        &json!({ "added_wire": { "x1": x1, "y1": y1, "x2": x2, "y2": y2 } }),
+        &json!({ "added_wire": { "x1": round6(x1), "y1": round6(y1), "x2": round6(x2), "y2": round6(y2) } }),
     ))
 }
 
@@ -1202,8 +1202,8 @@ pub(crate) fn observed_no_connect_moves(
         };
         moves.push(json!({
             "uuid": carry.uuid,
-            "from": { "x": carry.from.0, "y": carry.from.1 },
-            "to": { "x": x, "y": y }
+            "from": { "x": round6(carry.from.0), "y": round6(carry.from.1) },
+            "to": { "x": round6(x), "y": round6(y) }
         }));
     }
     Ok(Ok(moves))
@@ -1632,9 +1632,9 @@ async fn handle_split_wire_at_point(
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
-        "split_at": { "x": px, "y": py },
-        "wire_a": { "x1": w.x1, "y1": w.y1, "x2": px, "y2": py },
-        "wire_b": { "x1": px, "y1": py, "x2": w.x2, "y2": w.y2 }
+        "split_at": { "x": round6(px), "y": round6(py) },
+        "wire_a": { "x1": round6(w.x1), "y1": round6(w.y1), "x2": round6(px), "y2": round6(py) },
+        "wire_b": { "x1": round6(px), "y1": round6(py), "x2": round6(w.x2), "y2": round6(w.y2) }
     })))
 }
 
@@ -1688,7 +1688,7 @@ async fn handle_add_net_label(
     sch.overwrite()?;
 
     Ok(CallToolResult::json(
-        &json!({ "added_label": net, "type": label_type, "x": x, "y": y }),
+        &json!({ "added_label": net, "type": label_type, "x": round6(x), "y": round6(y) }),
     ))
 }
 
@@ -1770,7 +1770,7 @@ async fn handle_delete_net_label(
     Ok(CallToolResult::json(&json!({
         "deleted_label": net,
         "type": kind,
-        "at": { "x": target_x, "y": target_y }
+        "at": { "x": round6(target_x), "y": round6(target_y) }
     })))
 }
 
@@ -1909,7 +1909,12 @@ async fn handle_rotate_label(
     edits.push(SexpEdit::replace(
         at_val,
         at_close,
-        format!("{x} {y} {rotation}"),
+        format!(
+            "{} {} {}",
+            cse::types::fmt_f64(x),
+            cse::types::fmt_f64(y),
+            cse::types::fmt_f64(rotation)
+        ),
     ));
 
     // 2. The justify, which is what actually turns the text — rotating the
@@ -2020,10 +2025,23 @@ async fn handle_move_labels_by_offset(
             .nth(2)
             .unwrap_or("0")
             .to_string();
+        let moved_x = match super::checked_mm(label.x + dx, "x") {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
+        let moved_y = match super::checked_mm(label.y + dy, "y") {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
         edits.push(SexpEdit::replace(
             at_val,
             at_close,
-            format!("{} {} {}", label.x + dx, label.y + dy, rotation),
+            format!(
+                "{} {} {}",
+                cse::types::fmt_f64(moved_x),
+                cse::types::fmt_f64(moved_y),
+                rotation
+            ),
         ));
         for (start, end) in konnect_sexp::writer::find_direct_child_blocks(block, label.kind) {
             let property = &block[start..end];
@@ -2267,7 +2285,7 @@ async fn handle_add_power_symbol(
     observed["added_power"] = observed["value"].clone();
     observed["junctions_added"] = json!(junctions_added
         .iter()
-        .map(|(x, y)| json!({"x": x, "y": y}))
+        .map(|(x, y)| json!({"x": round6(x), "y": round6(y)}))
         .collect::<Vec<_>>());
 
     Ok(CallToolResult::json(&observed))
@@ -2291,7 +2309,7 @@ async fn handle_add_no_connect(
     sch.add_no_connect(x, y);
     sch.overwrite()?;
     Ok(CallToolResult::json(
-        &json!({ "added_no_connect": { "x": x, "y": y } }),
+        &json!({ "added_no_connect": { "x": round6(x), "y": round6(y) } }),
     ))
 }
 
@@ -2313,7 +2331,7 @@ async fn handle_batch_add_no_connect(
         match (p["x"].as_f64(), p["y"].as_f64()) {
             (Some(x), Some(y)) => {
                 sch.add_no_connect(x, y);
-                added.push(json!({ "x": x, "y": y }));
+                added.push(json!({ "x": round6(x), "y": round6(y) }));
             }
             _ => errors.push(format!("Position {i}: needs numeric x and y")),
         }
@@ -2454,7 +2472,7 @@ async fn handle_add_junction(
     sch.add_junction(x, y);
     sch.overwrite()?;
     Ok(CallToolResult::json(
-        &json!({ "added_junction": { "x": x, "y": y } }),
+        &json!({ "added_junction": { "x": round6(x), "y": round6(y) } }),
     ))
 }
 
@@ -2579,8 +2597,8 @@ async fn handle_connect_to_net(
     Ok(CallToolResult::json(&json!({
         "connected": net,
         "direction": dir.name,
-        "wire": { "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y },
-        "label": { "x": label_x, "y": label_y, "rotation": label_rot }
+        "wire": { "x1": round6(pin_x), "y1": round6(pin_y), "x2": round6(label_x), "y2": round6(label_y) },
+        "label": { "x": round6(label_x), "y": round6(label_y), "rotation": label_rot }
     })))
 }
 
@@ -2735,8 +2753,8 @@ async fn handle_connect_pins(
 
     Ok(CallToolResult::json(&json!({
         "connected": {
-            "from": { "ref": ref1, "pin": pin1, "x": x1, "y": y1 },
-            "to":   { "ref": ref2, "pin": pin2, "x": x2, "y": y2 }
+            "from": { "ref": ref1, "pin": pin1, "x": round6(x1), "y": round6(y1) },
+            "to":   { "ref": ref2, "pin": pin2, "x": round6(x2), "y": round6(y2) }
         }
     })))
 }

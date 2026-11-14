@@ -104,7 +104,7 @@ fn mk_field(name: &str, text: &str, x_mm: f64, y_mm: f64) -> kiapi::board::types
         text: Some(kiapi::board::types::BoardText {
             text: Some(kiapi::common::types::Text {
                 text: text.to_string(),
-                position: Some(builders::vec2(x_mm, y_mm)),
+                position: Some(builders::vec2(x_mm, y_mm).unwrap()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -150,7 +150,7 @@ fn mk_footprint(
         id: Some(kiapi::common::types::Kiid {
             value: kiid.to_string(),
         }),
-        position: Some(builders::vec2(100.0, 100.0)),
+        position: Some(builders::vec2(100.0, 100.0).unwrap()),
         orientation: Some(kiapi::common::types::Angle { value_degrees: 0.0 }),
         layer: layer as i32,
         reference_field: Some(mk_field("Reference", "U1", 100.0, 98.0)),
@@ -159,7 +159,7 @@ fn mk_footprint(
                 builders::pack_any(
                     &kiapi::board::types::Pad {
                         number: "1".to_string(),
-                        position: Some(builders::vec2(99.0, 100.0)),
+                        position: Some(builders::vec2(99.0, 100.0).unwrap()),
                         pad_stack: Some(kiapi::board::types::PadStack {
                             angle: Some(kiapi::common::types::Angle { value_degrees: 0.0 }),
                             ..Default::default()
@@ -771,7 +771,7 @@ fn round_trip_f_cu_b_cu_f_cu_restores_layer_model_and_unrelated_content() {
     assert_eq!(pads[0].number, "1");
     assert_eq!(
         pads[0].position.as_ref().unwrap(),
-        &builders::vec2(99.0, 100.0)
+        &builders::vec2(99.0, 100.0).unwrap()
     );
 }
 

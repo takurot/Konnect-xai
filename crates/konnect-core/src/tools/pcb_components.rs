@@ -14,6 +14,7 @@ use crate::tools::{
 };
 use anyhow::Context;
 use konnect_ipc::client::KiCadIpcClient;
+use konnect_sexp::geometry::round6;
 use konnect_sexp::writer::{
     apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks, new_uuid,
     read_consistent, write_atomic_if_unchanged,
@@ -207,7 +208,7 @@ fn prepare_footprint_source(
         .find(')')
         .map(|offset| layer_start + offset + 1)
         .context("footprint root layer is unterminated")?;
-    prepared.insert_str(layer_end, &format!("\n\t(at {x} {y} {rotation})"));
+    prepared.insert_str(layer_end, &format!("\n\t{}", format_at(x, y, rotation)));
     konnect_sexp::parse_sexp(&prepared).context("prepared footprint is not valid S-expression")?;
     Ok(prepared)
 }
@@ -594,7 +595,8 @@ fn board_footprint_sexp(
         lib_id, &path, declared,
     )));
     out.push_str(&format!(
-        "\n\t(at {x} {y} {rotation})\n\t(uuid \"{}\")",
+        "\n\t{}\n\t(uuid \"{}\")",
+        format_at(x, y, rotation),
         new_uuid()
     ));
     out.push_str(&content[name_span.end..]);
@@ -762,15 +764,8 @@ fn normalize_root_angle(degrees: f64) -> f64 {
 /// Render `(at x y angle)`, dropping a zero angle as KiCad's writer does and
 /// trimming trailing zeros from the decimals.
 fn format_at(x: f64, y: f64, angle: f64) -> String {
-    let n = |v: f64| {
-        let s = format!("{v:.6}");
-        let s = s.trim_end_matches('0').trim_end_matches('.').to_string();
-        if s == "-0" {
-            "0".to_string()
-        } else {
-            s
-        }
-    };
+    let n = konnect_sexp::geometry::fmt_mm;
+
     if angle == 0.0 {
         format!("(at {} {})", n(x), n(y))
     } else {
@@ -2250,7 +2245,7 @@ async fn handle_place_component(
         BoardWrite::Ipc(fp) => Ok(CallToolResult::json(&json!({
             "placed": fp.reference,
             "footprint": fp.footprint,
-            "x": fp.position.x, "y": fp.position.y,
+            "x": round6(fp.position.x), "y": round6(fp.position.y),
             "rotation": fp.rotation, "layer": fp.layer,
             "source": "ipc"
         }))),
@@ -2273,7 +2268,7 @@ async fn handle_place_component(
             Ok(CallToolResult::json(&json!({
                 "placed": reference,
                 "footprint": footprint,
-                "x": x, "y": y, "rotation": rotation, "layer": layer,
+                "x": round6(x), "y": round6(y), "rotation": rotation, "layer": layer,
                 "source": "file",
                 "fallback_reason": reason.evidence(),
                 "warning": reason.warning()
@@ -2307,7 +2302,7 @@ async fn handle_move_component(
     .await?
     {
         BoardWrite::Ipc(()) => Ok(CallToolResult::json(
-            &json!({ "moved": reference, "x": x, "y": y, "source": "ipc" }),
+            &json!({ "moved": reference, "x": round6(x), "y": round6(y), "source": "ipc" }),
         )),
         BoardWrite::Refused(result) => Ok(result),
         BoardWrite::File(reason) => {
@@ -2318,8 +2313,8 @@ async fn handle_move_component(
             ) {
                 Ok(()) => Ok(CallToolResult::json(&json!({
                     "moved": reference,
-                    "x": x,
-                    "y": y,
+                    "x": round6(x),
+                    "y": round6(y),
                     "source": "file",
                     "fallback_reason": reason.evidence(),
                     "warning": reason.warning()
@@ -3237,7 +3232,7 @@ async fn handle_find_component(
         "reference": fp.reference,
         "value": fp.value,
         "footprint": fp.footprint,
-        "x": fp.position.x, "y": fp.position.y,
+        "x": round6(fp.position.x), "y": round6(fp.position.y),
         "rotation": fp.rotation, "layer": fp.layer
     })))
 }
@@ -3610,7 +3605,7 @@ async fn handle_get_component_list(
                 "reference": fp.reference,
                 "value": fp.value,
                 "footprint": fp.footprint,
-                "x": fp.position.x, "y": fp.position.y,
+                "x": round6(fp.position.x), "y": round6(fp.position.y),
                 "rotation": fp.rotation, "layer": fp.layer
             })
         })
@@ -3756,8 +3751,8 @@ async fn handle_place_array(
                 })?;
                 Ok(json!({
                     "reference": reference,
-                    "x": footprint.position.x,
-                    "y": footprint.position.y
+                    "x": round6(footprint.position.x),
+                    "y": round6(footprint.position.y)
                 }))
             })
             .collect::<anyhow::Result<Vec<_>>>()
@@ -3816,7 +3811,7 @@ async fn handle_align_components(
                         (value, footprint.position.y)
                     };
                     c.move_footprint(reference, x, y)?;
-                    Ok(json!({ "reference": reference, "x": x, "y": y }))
+                    Ok(json!({ "reference": reference, "x": round6(x), "y": round6(y) }))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()
         })
@@ -3910,7 +3905,7 @@ async fn handle_duplicate_component(
     Ok(CallToolResult::json(&json!({
         "duplicated_from": reference,
         "new_reference": fp.reference,
-        "x": fp.position.x, "y": fp.position.y
+        "x": round6(fp.position.x), "y": round6(fp.position.y)
     })))
 }
 
@@ -3975,7 +3970,7 @@ mod tests {
         .unwrap();
         pad.r#type = kiapi::board::types::PadType::PtPth as i32;
         pad.pad_stack.as_mut().unwrap().drill = Some(kiapi::board::types::DrillProperties {
-            diameter: Some(konnect_ipc::builders::vec2(0.000_001, 0.000_001)),
+            diameter: Some(konnect_ipc::builders::vec2(0.000_001, 0.000_001).unwrap()),
             ..Default::default()
         });
         konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad")
@@ -5499,7 +5494,7 @@ mod tests {
             id: Some(kiapi::common::types::Kiid {
                 value: kiid.to_string(),
             }),
-            position: Some(konnect_ipc::builders::vec2(10.0, 20.0)),
+            position: Some(konnect_ipc::builders::vec2(10.0, 20.0).unwrap()),
             orientation: Some(kiapi::common::types::Angle { value_degrees: 0.0 }),
             layer: layer as i32,
             reference_field: Some(kiapi::board::types::Field {
@@ -6296,7 +6291,7 @@ mod tests {
                 }),
                 number: number.to_string(),
                 r#type: konnect_ipc::gen::kiapi::board::types::PadType::PtSmd as i32,
-                position: Some(konnect_ipc::builders::vec2(x, y)),
+                position: Some(konnect_ipc::builders::vec2(x, y).unwrap()),
                 net: Some(konnect_ipc::gen::kiapi::board::types::Net {
                     code: None,
                     name: net.to_string(),
@@ -6311,7 +6306,7 @@ mod tests {
                         layer: konnect_ipc::gen::kiapi::board::types::BoardLayer::BlFCu as i32,
                         shape: konnect_ipc::gen::kiapi::board::types::PadStackShape::PssRoundrect
                             as i32,
-                        size: Some(konnect_ipc::builders::vec2(2.432, 1.524)),
+                        size: Some(konnect_ipc::builders::vec2(2.432, 1.524).unwrap()),
                         corner_rounding_ratio: 0.25,
                         ..Default::default()
                     }],
@@ -6335,14 +6330,14 @@ mod tests {
         let layer = |layer, shape, width, height| PadStackLayer {
             layer,
             shape,
-            size: Some(konnect_ipc::builders::vec2(width, height)),
+            size: Some(konnect_ipc::builders::vec2(width, height).unwrap()),
             ..Default::default()
         };
         konnect_ipc::builders::pack_any(
             &Pad {
                 number: number.to_string(),
                 r#type: PadType::PtPth as i32,
-                position: Some(konnect_ipc::builders::vec2(x, y)),
+                position: Some(konnect_ipc::builders::vec2(x, y).unwrap()),
                 pad_stack: Some(PadStack {
                     layers: vec![
                         BoardLayer::BlFCu as i32,
@@ -6372,7 +6367,7 @@ mod tests {
                     drill: Some(DrillProperties {
                         start_layer: BoardLayer::BlFCu as i32,
                         end_layer: BoardLayer::BlBCu as i32,
-                        diameter: Some(konnect_ipc::builders::vec2(0.8, 1.2)),
+                        diameter: Some(konnect_ipc::builders::vec2(0.8, 1.2).unwrap()),
                         shape: DrillShape::DsOblong as i32,
                         ..Default::default()
                     }),
@@ -6391,7 +6386,7 @@ mod tests {
         use konnect_ipc::gen::kiapi;
         konnect_ipc::builders::pack_any(
             &kiapi::board::types::FootprintInstance {
-                position: Some(konnect_ipc::builders::vec2(100.0, 100.0)),
+                position: Some(konnect_ipc::builders::vec2(100.0, 100.0).unwrap()),
                 reference_field: Some(kiapi::board::types::Field {
                     name: "Reference".to_string(),
                     text: Some(kiapi::board::types::BoardText {

@@ -859,7 +859,7 @@ fn parse_library_property(
                 if !x.is_finite() || !y.is_finite() || !rotation.is_finite() {
                     bail!("property '{name}' position and rotation must be finite");
                 }
-                position = Some(konnect_ipc::builders::vec2(x, y));
+                position = Some(konnect_ipc::builders::vec2(x, y)?);
             }
             "layer" => {
                 if layer.is_some() {
@@ -1121,7 +1121,7 @@ fn parse_property_effects(
         line_spacing: line_spacing.unwrap_or(1.0),
         stroke_width: Some(konnect_ipc::builders::distance(
             thickness.unwrap_or(width * 0.15),
-        )),
+        )?),
         italic: italic.unwrap_or(false),
         bold: bold.unwrap_or(false),
         underlined: false,
@@ -1129,7 +1129,7 @@ fn parse_property_effects(
         mirrored,
         multiline: false,
         keep_upright: false,
-        size: Some(konnect_ipc::builders::vec2(width, height)),
+        size: Some(konnect_ipc::builders::vec2(width, height)?),
     })
 }
 
@@ -1720,7 +1720,7 @@ fn transform_library_property(
         konnect_ipc::builders::nm_to_mm(footprint_position.y_nm),
         footprint_rotation,
     );
-    text.position = Some(konnect_ipc::builders::vec2(board_x, board_y));
+    text.position = Some(konnect_ipc::builders::vec2(board_x, board_y)?);
 
     let attributes = text
         .attributes
@@ -2310,7 +2310,7 @@ mod tests {
             builders::pack_any(&item, "kiapi.board.types.Pad")
         };
         let current = kiapi::board::types::FootprintInstance {
-            position: Some(builders::vec2(10.0, 20.0)),
+            position: Some(builders::vec2(10.0, 20.0).unwrap()),
             orientation: Some(kiapi::common::types::Angle {
                 value_degrees: 90.0,
             }),
@@ -2343,7 +2343,7 @@ mod tests {
         );
 
         let mut moved = current.clone();
-        moved.position = Some(builders::vec2(99.0, 99.0));
+        moved.position = Some(builders::vec2(99.0, 99.0).unwrap());
         moved.definition.as_mut().unwrap().items = vec![pad("1", None)];
         let diverged = PreservedState::derive(&current, &moved, &old_nets);
         assert!(
@@ -2407,9 +2407,9 @@ mod tests {
             visible,
             text: Some(kiapi::board::types::BoardText {
                 text: Some(kiapi::common::types::Text {
-                    position: Some(builders::vec2(x, y)),
+                    position: Some(builders::vec2(x, y).unwrap()),
                     attributes: Some(kiapi::common::types::TextAttributes {
-                        size: Some(builders::vec2(1.25, 1.25)),
+                        size: Some(builders::vec2(1.25, 1.25).unwrap()),
                         angle: Some(kiapi::common::types::Angle {
                             value_degrees: 17.0,
                         }),
@@ -2437,7 +2437,7 @@ mod tests {
                     code: Some(kiapi::board::types::NetCode { value: net_code }),
                     name: net_name.to_string(),
                 }),
-                position: Some(builders::vec2(100.0, 50.0)),
+                position: Some(builders::vec2(100.0, 50.0).unwrap()),
                 ..Default::default()
             },
             "kiapi.board.types.Pad",
@@ -2453,7 +2453,7 @@ mod tests {
             id: Some(kiapi::common::types::Kiid {
                 value: "instance-kiid".to_string(),
             }),
-            position: Some(builders::vec2(100.0, 50.0)),
+            position: Some(builders::vec2(100.0, 50.0).unwrap()),
             orientation: Some(kiapi::common::types::Angle {
                 value_degrees: 37.0,
             }),
@@ -2480,7 +2480,7 @@ mod tests {
                 ..Default::default()
             }),
             overrides: Some(kiapi::board::types::FootprintDesignRuleOverrides {
-                copper_clearance: Some(builders::distance(0.3)),
+                copper_clearance: Some(builders::distance(0.3).unwrap()),
                 ..Default::default()
             }),
             symbol_path: Some(kiapi::common::types::SheetPath {
@@ -3067,7 +3067,7 @@ mod tests {
                     stack.drill = Some(kiapi::board::types::DrillProperties {
                         start_layer: kiapi::board::types::BoardLayer::BlUndefined as i32,
                         end_layer: kiapi::board::types::BoardLayer::BlUndefined as i32,
-                        diameter: Some(builders::vec2(0.0, 0.0)),
+                        diameter: Some(builders::vec2(0.0, 0.0).unwrap()),
                         shape: kiapi::board::types::DrillShape::DsUndefined as i32,
                         ..Default::default()
                     });

@@ -6,8 +6,17 @@
 use crate::gen::kiapi;
 
 /// Converts millimeters to KiCAD nanometers.
-pub fn mm_to_nm(mm: f64) -> i64 {
-    (mm * 1_000_000.0) as i64
+pub fn mm_to_nm(mm: f64) -> anyhow::Result<i64> {
+    round_nanometres(mm * 1_000_000.0)
+}
+
+pub(crate) fn round_nanometres(value: f64) -> anyhow::Result<i64> {
+    let nm = value.round();
+    if !nm.is_finite() || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&nm)
+    {
+        anyhow::bail!("coordinate {value} is outside the signed 64-bit nanometre range");
+    }
+    Ok(nm as i64)
 }
 
 /// Converts KiCAD nanometers to millimeters.
@@ -16,18 +25,18 @@ pub fn nm_to_mm(nm: i64) -> f64 {
 }
 
 /// Build a Vector2 in nanometers from mm coordinates.
-pub fn vec2(x_mm: f64, y_mm: f64) -> kiapi::common::types::Vector2 {
-    kiapi::common::types::Vector2 {
-        x_nm: mm_to_nm(x_mm),
-        y_nm: mm_to_nm(y_mm),
-    }
+pub fn vec2(x_mm: f64, y_mm: f64) -> anyhow::Result<kiapi::common::types::Vector2> {
+    Ok(kiapi::common::types::Vector2 {
+        x_nm: mm_to_nm(x_mm)?,
+        y_nm: mm_to_nm(y_mm)?,
+    })
 }
 
 /// Build a Distance in nanometers from mm.
-pub fn distance(mm: f64) -> kiapi::common::types::Distance {
-    kiapi::common::types::Distance {
-        value_nm: mm_to_nm(mm),
-    }
+pub fn distance(mm: f64) -> anyhow::Result<kiapi::common::types::Distance> {
+    Ok(kiapi::common::types::Distance {
+        value_nm: mm_to_nm(mm)?,
+    })
 }
 
 /// Build a Net message.
@@ -201,17 +210,17 @@ pub fn build_track(
     y1: f64,
     x2: f64,
     y2: f64,
-) -> kiapi::board::types::Track {
-    kiapi::board::types::Track {
+) -> anyhow::Result<kiapi::board::types::Track> {
+    Ok(kiapi::board::types::Track {
         id: None, // KiCAD assigns the ID
-        start: Some(vec2(x1, y1)),
-        end: Some(vec2(x2, y2)),
-        width: Some(distance(width_mm)),
+        start: Some(vec2(x1, y1)?),
+        end: Some(vec2(x2, y2)?),
+        width: Some(distance(width_mm)?),
         locked: kiapi::common::types::LockedState::LsUnlocked as i32,
         layer: layer_from_name(layer) as i32,
         net: Some(net(net_name, net_code)),
         parent: None,
-    }
+    })
 }
 
 /// Build an arc-shaped copper track from KiCad's native start/mid/end form.
@@ -227,18 +236,18 @@ pub fn build_track_arc(
     mid_y: f64,
     end_x: f64,
     end_y: f64,
-) -> kiapi::board::types::Arc {
-    kiapi::board::types::Arc {
+) -> anyhow::Result<kiapi::board::types::Arc> {
+    Ok(kiapi::board::types::Arc {
         id: None,
-        start: Some(vec2(start_x, start_y)),
-        mid: Some(vec2(mid_x, mid_y)),
-        end: Some(vec2(end_x, end_y)),
-        width: Some(distance(width_mm)),
+        start: Some(vec2(start_x, start_y)?),
+        mid: Some(vec2(mid_x, mid_y)?),
+        end: Some(vec2(end_x, end_y)?),
+        width: Some(distance(width_mm)?),
         locked: kiapi::common::types::LockedState::LsUnlocked as i32,
         layer: layer_from_name(layer) as i32,
         net: Some(net(net_name, net_code)),
         parent: None,
-    }
+    })
 }
 
 /// Build a through-via `Via` protobuf message (F.Cu → B.Cu).
@@ -258,7 +267,7 @@ pub fn build_via(
     y: f64,
     drill_mm: f64,
     size_mm: f64,
-) -> kiapi::board::types::Via {
+) -> anyhow::Result<kiapi::board::types::Via> {
     use kiapi::board::types::{
         BoardLayer, DrillProperties, DrillShape, PadStack, PadStackLayer, PadStackShape,
         PadStackType, ViaType,
@@ -274,7 +283,7 @@ pub fn build_via(
     let copper_pad = PadStackLayer {
         layer: BoardLayer::BlFCu as i32,
         shape: PadStackShape::PssCircle as i32,
-        size: Some(vec2(size_mm, size_mm)),
+        size: Some(vec2(size_mm, size_mm)?),
         ..PadStackLayer::default()
     };
 
@@ -284,7 +293,7 @@ pub fn build_via(
         drill: Some(DrillProperties {
             start_layer: BoardLayer::BlFCu as i32,
             end_layer: BoardLayer::BlBCu as i32,
-            diameter: Some(vec2(drill_mm, drill_mm)),
+            diameter: Some(vec2(drill_mm, drill_mm)?),
             shape: DrillShape::DsCircle as i32,
             ..DrillProperties::default()
         }),
@@ -292,15 +301,15 @@ pub fn build_via(
         ..PadStack::default()
     };
 
-    kiapi::board::types::Via {
+    Ok(kiapi::board::types::Via {
         id: None, // KiCAD assigns the ID
-        position: Some(vec2(x, y)),
+        position: Some(vec2(x, y)?),
         pad_stack: Some(pad_stack),
         locked: kiapi::common::types::LockedState::LsUnlocked as i32,
         net: Some(net(net_name, net_code)),
         r#type: ViaType::VtThrough as i32,
         parent: None,
-    }
+    })
 }
 
 /// KiCad's default thermal-relief geometry. Kept as a constant because the
@@ -341,7 +350,7 @@ pub struct ZoneSpec<'a> {
 /// outline and the design rules, so [`crate::client::KiCadIpcClient::add_zone`]
 /// follows the create with a `RefillZones`. Sending our own polygons would
 /// hand KiCad a fill that ignores every clearance it knows about.
-pub fn build_zone(spec: &ZoneSpec<'_>, net_code: i32) -> kiapi::board::types::Zone {
+pub fn build_zone(spec: &ZoneSpec<'_>, net_code: i32) -> anyhow::Result<kiapi::board::types::Zone> {
     use kiapi::board::types::{
         CopperZoneSettings, IslandRemovalMode, TeardropSettings, TeardropType,
         ThermalSpokeSettings, ZoneBorderSettings, ZoneBorderStyle, ZoneConnectionSettings,
@@ -354,12 +363,14 @@ pub fn build_zone(spec: &ZoneSpec<'_>, net_code: i32) -> kiapi::board::types::Zo
                 nodes: spec
                     .points
                     .iter()
-                    .map(|&(x, y)| kiapi::common::types::PolyLineNode {
-                        geometry: Some(kiapi::common::types::poly_line_node::Geometry::Point(
-                            vec2(x, y),
-                        )),
+                    .map(|&(x, y)| -> anyhow::Result<_> {
+                        Ok(kiapi::common::types::PolyLineNode {
+                            geometry: Some(kiapi::common::types::poly_line_node::Geometry::Point(
+                                vec2(x, y)?,
+                            )),
+                        })
                     })
-                    .collect(),
+                    .collect::<anyhow::Result<Vec<_>>>()?,
                 closed: true,
             }),
             holes: vec![],
@@ -370,15 +381,15 @@ pub fn build_zone(spec: &ZoneSpec<'_>, net_code: i32) -> kiapi::board::types::Zo
         connection: Some(ZoneConnectionSettings {
             zone_connection: spec.connection as i32,
             thermal_spokes: Some(ThermalSpokeSettings {
-                width: Some(distance(ZONE_THERMAL_RELIEF_MM)),
-                gap: Some(distance(ZONE_THERMAL_RELIEF_MM)),
+                width: Some(distance(ZONE_THERMAL_RELIEF_MM)?),
+                gap: Some(distance(ZONE_THERMAL_RELIEF_MM)?),
                 angle: Some(kiapi::common::types::Angle {
                     value_degrees: 45.0,
                 }),
             }),
         }),
-        clearance: Some(distance(spec.clearance_mm)),
-        min_thickness: Some(distance(spec.min_thickness_mm)),
+        clearance: Some(distance(spec.clearance_mm)?),
+        min_thickness: Some(distance(spec.min_thickness_mm)?),
         island_mode: IslandRemovalMode::IrmAlways as i32,
         min_island_area: 0,
         fill_mode: ZoneFillMode::ZfmSolid as i32,
@@ -390,7 +401,7 @@ pub fn build_zone(spec: &ZoneSpec<'_>, net_code: i32) -> kiapi::board::types::Zo
         }),
     };
 
-    kiapi::board::types::Zone {
+    Ok(kiapi::board::types::Zone {
         id: None, // KiCAD assigns the ID
         r#type: ZoneType::ZtCopper as i32,
         layers: vec![layer_from_name(spec.layer) as i32],
@@ -401,13 +412,13 @@ pub fn build_zone(spec: &ZoneSpec<'_>, net_code: i32) -> kiapi::board::types::Zo
         filled_polygons: vec![],
         border: Some(ZoneBorderSettings {
             style: ZoneBorderStyle::ZbsDiagonalEdge as i32,
-            pitch: Some(distance(ZONE_BORDER_PITCH_MM)),
+            pitch: Some(distance(ZONE_BORDER_PITCH_MM)?),
         }),
         locked: kiapi::common::types::LockedState::LsUnlocked as i32,
         layer_properties: vec![],
         settings: Some(kiapi::board::types::zone::Settings::CopperSettings(copper)),
         parent: None,
-    }
+    })
 }
 
 /// Pack a protobuf message into a prost_types::Any.
@@ -449,24 +460,24 @@ pub fn any_type_name(item: &prost_types::Any) -> &str {
 
 // --- Graphic primitive builders (BoardGraphicShape + BoardText) --------------
 //
-// All wrap a common `stroke(width_mm)` + `fill(filled)` into `GraphicAttributes`,
+// All wrap a common `stroke(width_mm)?` + `fill(filled)` into `GraphicAttributes`,
 // then pack the geometry into `GraphicShape::geometry` (a oneof). Callers `pack_any`
 // the result and hand it to `create_items` / `update_items`, same shape as
 // `add_track` already uses.
 
-fn stroke(width_mm: f64) -> kiapi::common::types::StrokeAttributes {
-    kiapi::common::types::StrokeAttributes {
-        width: Some(distance(width_mm)),
+fn stroke(width_mm: f64) -> anyhow::Result<kiapi::common::types::StrokeAttributes> {
+    Ok(kiapi::common::types::StrokeAttributes {
+        width: Some(distance(width_mm)?),
         // ponytail: leave style/color at proto default (solid, board default color).
         // Add args when a caller needs dashed/colored graphics.
         style: 0,
         color: None,
-    }
+    })
 }
 
-fn attrs(width_mm: f64, filled: bool) -> kiapi::common::types::GraphicAttributes {
-    kiapi::common::types::GraphicAttributes {
-        stroke: Some(stroke(width_mm)),
+fn attrs(width_mm: f64, filled: bool) -> anyhow::Result<kiapi::common::types::GraphicAttributes> {
+    Ok(kiapi::common::types::GraphicAttributes {
+        stroke: Some(stroke(width_mm)?),
         fill: Some(kiapi::common::types::GraphicFillAttributes {
             fill_type: if filled {
                 kiapi::common::types::GraphicFillType::GftFilled as i32
@@ -475,7 +486,7 @@ fn attrs(width_mm: f64, filled: bool) -> kiapi::common::types::GraphicAttributes
             },
             color: None,
         }),
-    }
+    })
 }
 
 fn board_shape(
@@ -505,17 +516,17 @@ pub fn board_segment(
     y1: f64,
     x2: f64,
     y2: f64,
-) -> kiapi::board::types::BoardGraphicShape {
-    board_shape(
+) -> anyhow::Result<kiapi::board::types::BoardGraphicShape> {
+    Ok(board_shape(
         layer,
-        attrs(width_mm, false),
+        attrs(width_mm, false)?,
         kiapi::common::types::graphic_shape::Geometry::Segment(
             kiapi::common::types::GraphicSegmentAttributes {
-                start: Some(vec2(x1, y1)),
-                end: Some(vec2(x2, y2)),
+                start: Some(vec2(x1, y1)?),
+                end: Some(vec2(x2, y2)?),
             },
         ),
-    )
+    ))
 }
 
 /// Build a BoardGraphicShape rectangle. Corners are (x1,y1) and (x2,y2) in mm.
@@ -528,18 +539,18 @@ pub fn board_rectangle(
     x2: f64,
     y2: f64,
     filled: bool,
-) -> kiapi::board::types::BoardGraphicShape {
-    board_shape(
+) -> anyhow::Result<kiapi::board::types::BoardGraphicShape> {
+    Ok(board_shape(
         layer,
-        attrs(width_mm, filled),
+        attrs(width_mm, filled)?,
         kiapi::common::types::graphic_shape::Geometry::Rectangle(
             kiapi::common::types::GraphicRectangleAttributes {
-                top_left: Some(vec2(x1, y1)),
-                bottom_right: Some(vec2(x2, y2)),
+                top_left: Some(vec2(x1, y1)?),
+                bottom_right: Some(vec2(x2, y2)?),
                 corner_radius: None,
             },
         ),
-    )
+    ))
 }
 
 /// Build a BoardGraphicShape circle at (cx,cy) with radius r_mm.
@@ -550,18 +561,18 @@ pub fn board_circle(
     cy: f64,
     r_mm: f64,
     filled: bool,
-) -> kiapi::board::types::BoardGraphicShape {
-    board_shape(
+) -> anyhow::Result<kiapi::board::types::BoardGraphicShape> {
+    Ok(board_shape(
         layer,
-        attrs(width_mm, filled),
+        attrs(width_mm, filled)?,
         kiapi::common::types::graphic_shape::Geometry::Circle(
             kiapi::common::types::GraphicCircleAttributes {
-                center: Some(vec2(cx, cy)),
+                center: Some(vec2(cx, cy)?),
                 // Point on the circumference -- KiCAD stores this rather than a radius scalar.
-                radius_point: Some(vec2(cx + r_mm, cy)),
+                radius_point: Some(vec2(cx + r_mm, cy)?),
             },
         ),
-    )
+    ))
 }
 
 /// Build a BoardGraphicShape arc from start / mid / end points.
@@ -575,18 +586,18 @@ pub fn board_arc(
     my: f64,
     ex: f64,
     ey: f64,
-) -> kiapi::board::types::BoardGraphicShape {
-    board_shape(
+) -> anyhow::Result<kiapi::board::types::BoardGraphicShape> {
+    Ok(board_shape(
         layer,
-        attrs(width_mm, false),
+        attrs(width_mm, false)?,
         kiapi::common::types::graphic_shape::Geometry::Arc(
             kiapi::common::types::GraphicArcAttributes {
-                start: Some(vec2(sx, sy)),
-                mid: Some(vec2(mx, my)),
-                end: Some(vec2(ex, ey)),
+                start: Some(vec2(sx, sy)?),
+                mid: Some(vec2(mx, my)?),
+                end: Some(vec2(ex, ey)?),
             },
         ),
-    )
+    ))
 }
 
 /// Build a BoardGraphicShape polygon (or set of polygons) from closed point
@@ -599,32 +610,38 @@ pub fn board_polygon(
     width_mm: f64,
     filled: bool,
     outlines: &[Vec<(f64, f64)>],
-) -> kiapi::board::types::BoardGraphicShape {
+) -> anyhow::Result<kiapi::board::types::BoardGraphicShape> {
     let polygons = outlines
         .iter()
-        .map(|pts| kiapi::common::types::PolygonWithHoles {
-            outline: Some(kiapi::common::types::PolyLine {
-                nodes: pts
-                    .iter()
-                    .map(|&(x, y)| kiapi::common::types::PolyLineNode {
-                        geometry: Some(kiapi::common::types::poly_line_node::Geometry::Point(
-                            vec2(x, y),
-                        )),
-                    })
-                    .collect(),
-                closed: true,
-            }),
-            holes: vec![],
+        .map(|pts| -> anyhow::Result<_> {
+            Ok(kiapi::common::types::PolygonWithHoles {
+                outline: Some(kiapi::common::types::PolyLine {
+                    nodes: pts
+                        .iter()
+                        .map(|&(x, y)| -> anyhow::Result<_> {
+                            Ok(kiapi::common::types::PolyLineNode {
+                                geometry: Some(
+                                    kiapi::common::types::poly_line_node::Geometry::Point(vec2(
+                                        x, y,
+                                    )?),
+                                ),
+                            })
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?,
+                    closed: true,
+                }),
+                holes: vec![],
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
-    board_shape(
+    Ok(board_shape(
         layer,
-        attrs(width_mm, filled),
+        attrs(width_mm, filled)?,
         kiapi::common::types::graphic_shape::Geometry::Polygon(kiapi::common::types::PolySet {
             polygons,
         }),
-    )
+    ))
 }
 
 /// Build a BoardText. `size_mm` sets both width and height of the glyphs.
@@ -637,7 +654,7 @@ pub fn board_text(
     size_mm: f64,
     rotation_deg: f64,
     mirror: bool,
-) -> kiapi::board::types::BoardText {
+) -> anyhow::Result<kiapi::board::types::BoardText> {
     board_text_with_stroke_width(
         layer,
         text,
@@ -661,11 +678,14 @@ pub fn board_text_with_stroke_width(
     stroke_width_mm: f64,
     rotation_deg: f64,
     mirror: bool,
-) -> kiapi::board::types::BoardText {
-    kiapi::board::types::BoardText {
+) -> anyhow::Result<kiapi::board::types::BoardText> {
+    if !rotation_deg.is_finite() {
+        anyhow::bail!("text rotation must be finite");
+    }
+    Ok(kiapi::board::types::BoardText {
         id: None,
         text: Some(kiapi::common::types::Text {
-            position: Some(vec2(x, y)),
+            position: Some(vec2(x, y)?),
             attributes: Some(kiapi::common::types::TextAttributes {
                 // ponytail: font/alignment/bold/italic left at proto default.
                 // Add args (or a builder struct) when a caller needs them.
@@ -676,7 +696,7 @@ pub fn board_text_with_stroke_width(
                     value_degrees: rotation_deg,
                 }),
                 line_spacing: 1.0,
-                stroke_width: Some(distance(stroke_width_mm)),
+                stroke_width: Some(distance(stroke_width_mm)?),
                 italic: false,
                 bold: false,
                 underlined: false,
@@ -684,7 +704,7 @@ pub fn board_text_with_stroke_width(
                 mirrored: mirror,
                 multiline: false,
                 keep_upright: false,
-                size: Some(vec2(size_mm, size_mm)),
+                size: Some(vec2(size_mm, size_mm)?),
             }),
             text: text.to_string(),
             hyperlink: String::new(),
@@ -693,13 +713,50 @@ pub fn board_text_with_stroke_width(
         knockout: false,
         locked: kiapi::common::types::LockedState::LsUnlocked as i32,
         parent: None,
-    }
+    })
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use kiapi::common::types::graphic_shape::Geometry;
+
+    #[test]
+    fn millimetre_decimal_grid_converts_to_exact_nanometres() {
+        for denominator in [100_i64, 1000] {
+            for numerator in -20 * denominator..=20 * denominator {
+                assert_eq!(
+                    mm_to_nm(numerator as f64 / denominator as f64).unwrap(),
+                    numerator * (1_000_000 / denominator),
+                    "{numerator}/{denominator} mm"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nanometre_conversion_checks_limits_and_rounds_ties() {
+        for value in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            9_223_372_036_854.775,
+        ] {
+            assert!(mm_to_nm(value).is_err(), "{value}");
+        }
+        assert_eq!(mm_to_nm(0.0000005).unwrap(), 1);
+        assert_eq!(mm_to_nm(-0.0000005).unwrap(), -1);
+        assert_eq!(mm_to_nm(-0.0).unwrap(), 0);
+        assert!(mm_to_nm(-9_223_372_036_854.775).is_ok());
+    }
+
+    #[test]
+    fn message_builders_refuse_out_of_range_coordinates() {
+        assert!(board_circle("F.SilkS", 0.1, 9e12, 0.0, 9e12, false).is_err());
+        assert!(board_segment("F.SilkS", 0.1, f64::NAN, 0.0, 1.0, 1.0).is_err());
+        assert!(board_text("F.SilkS", "text", 0.0, 0.0, f64::MAX, 0.0, false).is_err());
+    }
 
     /// `layer_name` is the exact inverse of `layer_from_name` over every
     /// representable layer — computed runs included. The forward map was
@@ -768,7 +825,8 @@ pub(crate) mod tests {
                 connection: ZoneConnectionStyle::ZcsFull,
             },
             7,
-        );
+        )
+        .unwrap();
 
         assert_eq!(zone.r#type, ZoneType::ZtCopper as i32);
         assert_eq!(
@@ -841,7 +899,8 @@ pub(crate) mod tests {
                 connection: kiapi::board::types::ZoneConnectionStyle::ZcsThermal,
             },
             1,
-        );
+        )
+        .unwrap();
         assert!(!zone.filled);
         assert!(zone.filled_polygons.is_empty());
     }
@@ -864,7 +923,8 @@ pub(crate) mod tests {
                     connection: kiapi::board::types::ZoneConnectionStyle::ZcsThermal,
                 },
                 1,
-            );
+            )
+            .unwrap();
             assert_eq!(
                 zone.layers,
                 vec![try_layer_from_name(layer).expect("known layer") as i32],
@@ -973,7 +1033,8 @@ pub(crate) mod tests {
 
     #[test]
     fn track_arc_carries_route_geometry_layer_width_and_net() {
-        let arc = build_track_arc("GND", 3, "B.Cu", 0.25, 10.0, 20.0, 11.0, 21.0, 12.0, 20.0);
+        let arc =
+            build_track_arc("GND", 3, "B.Cu", 0.25, 10.0, 20.0, 11.0, 21.0, 12.0, 20.0).unwrap();
         assert_eq!(arc.start.unwrap().x_nm, 10_000_000);
         assert_eq!(arc.mid.unwrap().y_nm, 21_000_000);
         assert_eq!(arc.end.unwrap().x_nm, 12_000_000);
@@ -984,7 +1045,7 @@ pub(crate) mod tests {
 
     #[test]
     fn segment_populates_start_end_and_layer() {
-        let s = board_segment("Edge.Cuts", 0.05, 1.0, 2.0, 3.0, 4.0);
+        let s = board_segment("Edge.Cuts", 0.05, 1.0, 2.0, 3.0, 4.0).unwrap();
         assert_eq!(s.layer, kiapi::board::types::BoardLayer::BlEdgeCuts as i32);
         let shape = s.shape.expect("shape");
         match shape.geometry.expect("geometry") {
@@ -1006,7 +1067,7 @@ pub(crate) mod tests {
 
     #[test]
     fn rectangle_variant_and_filled_flag() {
-        let s = board_rectangle("F.SilkS", 0.1, 0.0, 0.0, 10.0, 5.0, true);
+        let s = board_rectangle("F.SilkS", 0.1, 0.0, 0.0, 10.0, 5.0, true).unwrap();
         assert_eq!(s.layer, kiapi::board::types::BoardLayer::BlFSilkS as i32);
         let shape = s.shape.expect("shape");
         assert!(matches!(shape.geometry, Some(Geometry::Rectangle(_))));
@@ -1018,7 +1079,7 @@ pub(crate) mod tests {
 
     #[test]
     fn circle_radius_point_is_center_plus_radius() {
-        let s = board_circle("F.SilkS", 0.1, 5.0, 5.0, 2.5, false);
+        let s = board_circle("F.SilkS", 0.1, 5.0, 5.0, 2.5, false).unwrap();
         match s.shape.unwrap().geometry.unwrap() {
             Geometry::Circle(c) => {
                 assert_eq!(c.center.unwrap().x_nm, 5_000_000);
@@ -1031,7 +1092,7 @@ pub(crate) mod tests {
 
     #[test]
     fn arc_start_mid_end_populated() {
-        let s = board_arc("F.SilkS", 0.1, 0.0, 0.0, 1.0, 1.0, 2.0, 0.0);
+        let s = board_arc("F.SilkS", 0.1, 0.0, 0.0, 1.0, 1.0, 2.0, 0.0).unwrap();
         match s.shape.unwrap().geometry.unwrap() {
             Geometry::Arc(a) => {
                 assert_eq!(a.start.unwrap().x_nm, 0);
@@ -1044,7 +1105,7 @@ pub(crate) mod tests {
 
     #[test]
     fn text_carries_position_size_layer_and_rotation() {
-        let t = board_text("F.SilkS", "hi", 12.0, 34.0, 1.5, 90.0, false);
+        let t = board_text("F.SilkS", "hi", 12.0, 34.0, 1.5, 90.0, false).unwrap();
         assert_eq!(t.layer, kiapi::board::types::BoardLayer::BlFSilkS as i32);
         let text = t.text.expect("text");
         assert_eq!(text.text, "hi");
@@ -1056,7 +1117,8 @@ pub(crate) mod tests {
         assert!(!attrs.mirrored);
 
         let explicit =
-            board_text_with_stroke_width("F.Fab", "${REFERENCE}", 0.0, 0.0, 0.8, 0.11, 0.0, false);
+            board_text_with_stroke_width("F.Fab", "${REFERENCE}", 0.0, 0.0, 0.8, 0.11, 0.0, false)
+                .unwrap();
         assert_eq!(
             explicit
                 .text
@@ -1076,7 +1138,7 @@ pub(crate) mod tests {
             vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
             vec![(5.0, 5.0), (6.0, 5.0), (6.0, 6.0)],
         ];
-        let s = board_polygon("F.SilkS", 0.0, true, &outlines);
+        let s = board_polygon("F.SilkS", 0.0, true, &outlines).unwrap();
         assert_eq!(s.layer, kiapi::board::types::BoardLayer::BlFSilkS as i32);
         let shape = s.shape.expect("shape");
         assert_eq!(
@@ -1099,7 +1161,7 @@ pub(crate) mod tests {
     #[test]
     fn polygon_nodes_carry_point_coordinates_in_nanometers() {
         let outlines = vec![vec![(1.0, 2.0)]];
-        let s = board_polygon("F.Cu", 0.0, false, &outlines);
+        let s = board_polygon("F.Cu", 0.0, false, &outlines).unwrap();
         match s.shape.unwrap().geometry.unwrap() {
             Geometry::Polygon(poly_set) => {
                 let node = &poly_set.polygons[0].outline.as_ref().unwrap().nodes[0];
@@ -1117,7 +1179,7 @@ pub(crate) mod tests {
 
     #[test]
     fn polygon_empty_outlines_produces_empty_polyset() {
-        let s = board_polygon("F.SilkS", 0.0, true, &[]);
+        let s = board_polygon("F.SilkS", 0.0, true, &[]).unwrap();
         match s.shape.unwrap().geometry.unwrap() {
             Geometry::Polygon(poly_set) => assert!(poly_set.polygons.is_empty()),
             _ => panic!("expected Polygon geometry"),
@@ -1128,7 +1190,7 @@ pub(crate) mod tests {
     fn via_is_a_through_via_with_position_drill_size_and_net() {
         use kiapi::board::types::{BoardLayer, PadStackShape, PadStackType, ViaType};
 
-        let v = build_via("VCC_BATT", 7, 146.268, 89.194, 0.2, 0.45);
+        let v = build_via("VCC_BATT", 7, 146.268, 89.194, 0.2, 0.45).unwrap();
 
         // Position, in nanometers.
         let pos = v.position.expect("position");

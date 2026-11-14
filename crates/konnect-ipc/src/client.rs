@@ -246,17 +246,23 @@ fn replace_polygon_outline(
         .iter()
         .map(|&(x, y)| {
             let (rx, ry) =
-                to_board.point(crate::builders::mm_to_nm(x), crate::builders::mm_to_nm(y));
-            kiapi::common::types::PolyLineNode {
+                to_board.point(crate::builders::mm_to_nm(x)?, crate::builders::mm_to_nm(y)?)?;
+            Ok(kiapi::common::types::PolyLineNode {
                 geometry: Some(kiapi::common::types::poly_line_node::Geometry::Point(
                     kiapi::common::types::Vector2 {
-                        x_nm: anchor.0 + rx,
-                        y_nm: anchor.1 + ry,
+                        x_nm: anchor
+                            .0
+                            .checked_add(rx)
+                            .context("polygon x coordinate exceeds the nanometre range")?,
+                        y_nm: anchor
+                            .1
+                            .checked_add(ry)
+                            .context("polygon y coordinate exceeds the nanometre range")?,
                     },
                 )),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     if let Some(s) = shape.shape.as_mut() {
         s.geometry = Some(kiapi::common::types::graphic_shape::Geometry::Polygon(
@@ -2856,10 +2862,10 @@ impl KiCadIpcClient {
             .iter()
             .map(|&(x1, y1, x2, y2)| {
                 let track =
-                    crate::builders::build_track(net_name, net_code, layer, width, x1, y1, x2, y2);
-                crate::builders::pack_any(&track, "kiapi.board.types.Track")
+                    crate::builders::build_track(net_name, net_code, layer, width, x1, y1, x2, y2)?;
+                Ok(crate::builders::pack_any(&track, "kiapi.board.types.Track"))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         self.create_items_in(document, items)
     }
 
@@ -2871,7 +2877,7 @@ impl KiCadIpcClient {
     /// returned success but never created the via (see `builders::build_via`).
     pub fn add_via(&self, net_name: &str, x: f64, y: f64, drill: f64, pad_size: f64) -> Result<()> {
         let net_code = self.resolve_net_code(net_name)?;
-        let via = crate::builders::build_via(net_name, net_code, x, y, drill, pad_size);
+        let via = crate::builders::build_via(net_name, net_code, x, y, drill, pad_size)?;
         let any = crate::builders::pack_any(&via, "kiapi.board.types.Via");
         self.create_items(vec![any])?;
         Ok(())
@@ -2885,7 +2891,7 @@ impl KiCadIpcClient {
     /// outline and no copper and reasonably concludes the tool did nothing.
     pub fn add_zone(&self, spec: &crate::builders::ZoneSpec<'_>) -> Result<Option<String>> {
         let net_code = self.resolve_net_code(spec.net_name)?;
-        let zone = crate::builders::build_zone(spec, net_code);
+        let zone = crate::builders::build_zone(spec, net_code)?;
         let any = crate::builders::pack_any(&zone, "kiapi.board.types.Zone");
         let created = self.create_items_returning(vec![any])?;
         self.refill_zones()?;
@@ -2923,8 +2929,16 @@ impl KiCadIpcClient {
                 } else {
                     client.resolve_net_code(net)?
                 };
-                let track =
-                    crate::builders::build_track(net, code, layer, track_width, *x1, *y1, *x2, *y2);
+                let track = crate::builders::build_track(
+                    net,
+                    code,
+                    layer,
+                    track_width,
+                    *x1,
+                    *y1,
+                    *x2,
+                    *y2,
+                )?;
                 items.push(crate::builders::pack_any(&track, "kiapi.board.types.Track"));
             }
             for (net, x, y) in vias {
@@ -2933,7 +2947,7 @@ impl KiCadIpcClient {
                 } else {
                     client.resolve_net_code(net)?
                 };
-                let via = crate::builders::build_via(net, code, *x, *y, via_drill, via_pad);
+                let via = crate::builders::build_via(net, code, *x, *y, via_drill, via_pad)?;
                 items.push(crate::builders::pack_any(&via, "kiapi.board.types.Via"));
             }
             let count = items.len();
@@ -3087,7 +3101,7 @@ impl KiCadIpcClient {
                     .unwrap_or("");
                 if ref_text == reference {
                     let old = fp.position.unwrap_or_default();
-                    let new_pos = crate::builders::vec2(x, y);
+                    let new_pos = crate::builders::vec2(x, y)?;
                     fp.position = Some(new_pos);
                     // KiCAD carries the footprint's children (pads, silk,
                     // text) in absolute board coordinates and re-creates them
@@ -3096,8 +3110,14 @@ impl KiCadIpcClient {
                     crate::transform::transform_footprint_children(
                         &mut fp,
                         &crate::transform::Xform::Translate {
-                            dx_nm: new_pos.x_nm - old.x_nm,
-                            dy_nm: new_pos.y_nm - old.y_nm,
+                            dx_nm: new_pos
+                                .x_nm
+                                .checked_sub(old.x_nm)
+                                .context("footprint x displacement exceeds the nanometre range")?,
+                            dy_nm: new_pos
+                                .y_nm
+                                .checked_sub(old.y_nm)
+                                .context("footprint y displacement exceeds the nanometre range")?,
                         },
                     )?;
                     let any = crate::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
@@ -3157,13 +3177,19 @@ impl KiCadIpcClient {
                 points: geometry_points(geometry)
                     .into_iter()
                     .map(|(x, y)| {
-                        let (lx, ly) = to_local.point(x, y);
-                        IpcVector2 {
-                            x: nm_to_mm(lx - anchor.0),
-                            y: nm_to_mm(ly - anchor.1),
-                        }
+                        let (lx, ly) = to_local.point(x, y)?;
+                        Ok(IpcVector2 {
+                            x: nm_to_mm(
+                                lx.checked_sub(anchor.0)
+                                    .context("local x coordinate exceeds the nanometre range")?,
+                            ),
+                            y: nm_to_mm(
+                                ly.checked_sub(anchor.1)
+                                    .context("local y coordinate exceeds the nanometre range")?,
+                            ),
+                        })
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>>>()?,
             });
         }
         Ok(out)
@@ -3820,9 +3846,15 @@ impl KiCadIpcClient {
                     )?;
                 }
 
-                let new_position = crate::builders::vec2(target.x, target.y);
-                let dx_nm = new_position.x_nm - old_position.x_nm;
-                let dy_nm = new_position.y_nm - old_position.y_nm;
+                let new_position = crate::builders::vec2(target.x, target.y)?;
+                let dx_nm = new_position
+                    .x_nm
+                    .checked_sub(old_position.x_nm)
+                    .context("footprint x displacement exceeds the nanometre range")?;
+                let dy_nm = new_position
+                    .y_nm
+                    .checked_sub(old_position.y_nm)
+                    .context("footprint y displacement exceeds the nanometre range")?;
                 if dx_nm != 0 || dy_nm != 0 {
                     crate::transform::transform_footprint_children(
                         &mut footprint,
@@ -3982,6 +4014,9 @@ impl KiCadIpcClient {
         rotation: f64,
         layer: &str,
     ) -> Result<prost_types::Any> {
+        if !rotation.is_finite() {
+            anyhow::bail!("footprint rotation must be finite");
+        }
         let (library_nickname, entry_name) = lib_id
             .split_once(':')
             .context("footprint identifier must use Library:Footprint syntax")?;
@@ -4017,60 +4052,67 @@ impl KiCadIpcClient {
             })?;
         }
 
-        let text_field = |name: &str, text: &str, local: (f64, f64, f64), visible: bool| {
-            // Field text positions come footprint-local from the library and
-            // are transformed exactly like pads, so the placed part keeps the
-            // library's text layout instead of a synthesized offset that can
-            // sit on the part's own silkscreen.
-            let (fx, fy, frot) = local;
-            let (bx, by) = konnect_sexp::geometry::transform_pad(fx, fy, x, y, rotation);
-            kiapi::board::types::Field {
-                id: None,
-                name: name.to_string(),
-                text: Some(kiapi::board::types::BoardText {
+        let text_field =
+            |name: &str, text: &str, local: (f64, f64, f64), visible: bool| -> Result<_> {
+                // Field text positions come footprint-local from the library and
+                // are transformed exactly like pads, so the placed part keeps the
+                // library's text layout instead of a synthesized offset that can
+                // sit on the part's own silkscreen.
+                let (fx, fy, frot) = local;
+                if !(rotation + frot).is_finite() {
+                    anyhow::bail!("field '{name}' rotation must be finite");
+                }
+                let (bx, by) = konnect_sexp::geometry::transform_pad(fx, fy, x, y, rotation);
+                Ok(kiapi::board::types::Field {
                     id: None,
-                    text: Some(kiapi::common::types::Text {
-                        position: Some(crate::builders::vec2(bx, by)),
-                        attributes: Some(kiapi::common::types::TextAttributes {
-                            size: Some(crate::builders::vec2(1.0, 1.0)),
-                            angle: Some(kiapi::common::types::Angle {
-                                value_degrees: readable_text_angle(rotation + frot),
+                    name: name.to_string(),
+                    text: Some(kiapi::board::types::BoardText {
+                        id: None,
+                        text: Some(kiapi::common::types::Text {
+                            position: Some(crate::builders::vec2(bx, by)?),
+                            attributes: Some(kiapi::common::types::TextAttributes {
+                                size: Some(crate::builders::vec2(1.0, 1.0)?),
+                                angle: Some(kiapi::common::types::Angle {
+                                    value_degrees: readable_text_angle(rotation + frot),
+                                }),
+                                ..Default::default()
                             }),
-                            ..Default::default()
+                            text: text.to_string(),
+                            hyperlink: String::new(),
                         }),
-                        text: text.to_string(),
-                        hyperlink: String::new(),
+                        layer: crate::builders::layer_from_name(if layer == "B.Cu" {
+                            "B.SilkS"
+                        } else {
+                            "F.SilkS"
+                        }) as i32,
+                        knockout: false,
+                        locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+                        parent: None,
                     }),
-                    layer: crate::builders::layer_from_name(if layer == "B.Cu" {
-                        "B.SilkS"
-                    } else {
-                        "F.SilkS"
-                    }) as i32,
-                    knockout: false,
-                    locked: kiapi::common::types::LockedState::LsUnlocked as i32,
-                    parent: None,
-                }),
-                visible,
-            }
-        };
+                    visible,
+                })
+            };
         let reference_field = text_field(
             "Reference",
             reference,
             fields.reference_at.unwrap_or((0.0, -1.0, 0.0)),
             true,
-        );
+        )?;
         let value_field = text_field(
             "Value",
             value,
             fields.value_at.unwrap_or((0.0, 1.0, 0.0)),
             false,
-        );
+        )?;
         let mut child_items: Vec<prost_types::Any> = pads
             .iter()
             .map(|pad| {
                 // Canonical KiCAD footprint-local → board transform; see
                 // konnect_sexp::geometry::transform_pad for why the sin terms
                 // are not the textbook rotation matrix (Y axis points down).
+                if !(rotation + pad.rotation).is_finite() {
+                    anyhow::bail!("pad '{}' rotation must be finite", pad.number);
+                }
                 let (board_x, board_y) =
                     konnect_sexp::geometry::transform_pad(pad.x, pad.y, x, y, rotation);
                 let mut layers = Vec::new();
@@ -4110,28 +4152,31 @@ impl KiCadIpcClient {
                 let copper = kiapi::board::types::PadStackLayer {
                     layer: kiapi::board::types::BoardLayer::BlFCu as i32,
                     shape: shape as i32,
-                    size: Some(crate::builders::vec2(pad.size_x, pad.size_y)),
+                    size: Some(crate::builders::vec2(pad.size_x, pad.size_y)?),
                     corner_rounding_ratio: pad.roundrect_ratio,
                     custom_anchor_shape: shape as i32,
-                    offset: Some(crate::builders::vec2(0.0, 0.0)),
+                    offset: Some(crate::builders::vec2(0.0, 0.0)?),
                     ..Default::default()
                 };
                 let drill = pad
                     .drill_x
-                    .map(|drill_x| kiapi::board::types::DrillProperties {
-                        start_layer: kiapi::board::types::BoardLayer::BlFCu as i32,
-                        end_layer: kiapi::board::types::BoardLayer::BlBCu as i32,
-                        diameter: Some(crate::builders::vec2(
-                            drill_x,
-                            pad.drill_y.unwrap_or(drill_x),
-                        )),
-                        shape: if pad.drill_oval {
-                            kiapi::board::types::DrillShape::DsOblong as i32
-                        } else {
-                            kiapi::board::types::DrillShape::DsCircle as i32
-                        },
-                        ..Default::default()
-                    });
+                    .map(|drill_x| -> Result<_> {
+                        Ok(kiapi::board::types::DrillProperties {
+                            start_layer: kiapi::board::types::BoardLayer::BlFCu as i32,
+                            end_layer: kiapi::board::types::BoardLayer::BlBCu as i32,
+                            diameter: Some(crate::builders::vec2(
+                                drill_x,
+                                pad.drill_y.unwrap_or(drill_x),
+                            )?),
+                            shape: if pad.drill_oval {
+                                kiapi::board::types::DrillShape::DsOblong as i32
+                            } else {
+                                kiapi::board::types::DrillShape::DsCircle as i32
+                            },
+                            ..Default::default()
+                        })
+                    })
+                    .transpose()?;
                 let stack = kiapi::board::types::PadStack {
                     r#type: kiapi::board::types::PadStackType::PstNormal as i32,
                     layers,
@@ -4154,17 +4199,18 @@ impl KiCadIpcClient {
                     number: pad.number.clone(),
                     r#type: pad_type as i32,
                     pad_stack: Some(stack),
-                    position: Some(crate::builders::vec2(board_x, board_y)),
+                    position: Some(crate::builders::vec2(board_x, board_y)?),
                     locked: kiapi::common::types::LockedState::LsUnlocked as i32,
                     ..Default::default()
                 };
-                crate::builders::pack_any(&item, "kiapi.board.types.Pad")
+                Ok(crate::builders::pack_any(&item, "kiapi.board.types.Pad"))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         child_items.extend(
             graphics
                 .iter()
-                .map(|graphic| build_graphic_child(graphic, x, y, rotation)),
+                .map(|graphic| build_graphic_child(graphic, x, y, rotation))
+                .collect::<Result<Vec<_>>>()?,
         );
         let definition = kiapi::board::types::Footprint {
             id: Some(kiapi::common::types::LibraryIdentifier {
@@ -4177,7 +4223,7 @@ impl KiCadIpcClient {
             ..Default::default()
         };
         let footprint = kiapi::board::types::FootprintInstance {
-            position: Some(crate::builders::vec2(x, y)),
+            position: Some(crate::builders::vec2(x, y)?),
             orientation: Some(kiapi::common::types::Angle {
                 value_degrees: rotation,
             }),
@@ -4687,11 +4733,11 @@ fn build_graphic_child(
     x: f64,
     y: f64,
     rotation: f64,
-) -> prost_types::Any {
+) -> Result<prost_types::Any> {
     use crate::builders;
     const SHAPE: &str = "kiapi.board.types.BoardGraphicShape";
     let xf = |(px, py): (f64, f64)| konnect_sexp::geometry::transform_pad(px, py, x, y, rotation);
-    match graphic {
+    Ok(match graphic {
         IpcGraphicDefinition::Line {
             start,
             end,
@@ -4701,7 +4747,7 @@ fn build_graphic_child(
             let (x1, y1) = xf(*start);
             let (x2, y2) = xf(*end);
             builders::pack_any(
-                &builders::board_segment(layer, *width, x1, y1, x2, y2),
+                &builders::board_segment(layer, *width, x1, y1, x2, y2)?,
                 SHAPE,
             )
         }
@@ -4726,7 +4772,7 @@ fn build_graphic_child(
                         x1.max(x2),
                         y1.max(y2),
                         *filled,
-                    ),
+                    )?,
                     SHAPE,
                 )
             } else {
@@ -4740,7 +4786,7 @@ fn build_graphic_child(
                     xf((start.0, end.1)),
                 ];
                 builders::pack_any(
-                    &builders::board_polygon(layer, *width, *filled, &[corners]),
+                    &builders::board_polygon(layer, *width, *filled, &[corners])?,
                     SHAPE,
                 )
             }
@@ -4757,7 +4803,7 @@ fn build_graphic_child(
             // circumference-point encoding by re-deriving it from the length.
             let radius = ((end.0 - center.0).powi(2) + (end.1 - center.1).powi(2)).sqrt();
             builders::pack_any(
-                &builders::board_circle(layer, *width, cx, cy, radius, *filled),
+                &builders::board_circle(layer, *width, cx, cy, radius, *filled)?,
                 SHAPE,
             )
         }
@@ -4772,7 +4818,7 @@ fn build_graphic_child(
             let (mx, my) = xf(*mid);
             let (ex, ey) = xf(*end);
             builders::pack_any(
-                &builders::board_arc(layer, *width, sx, sy, mx, my, ex, ey),
+                &builders::board_arc(layer, *width, sx, sy, mx, my, ex, ey)?,
                 SHAPE,
             )
         }
@@ -4784,7 +4830,7 @@ fn build_graphic_child(
         } => {
             let transformed: Vec<(f64, f64)> = points.iter().map(|p| xf(*p)).collect();
             builders::pack_any(
-                &builders::board_polygon(layer, *width, *filled, &[transformed]),
+                &builders::board_polygon(layer, *width, *filled, &[transformed])?,
                 SHAPE,
             )
         }
@@ -4807,11 +4853,11 @@ fn build_graphic_child(
                     *stroke_width_mm,
                     readable_text_angle(text_rotation + rotation),
                     false,
-                ),
+                )?,
                 "kiapi.board.types.BoardText",
             )
         }
-    }
+    })
 }
 
 /// The reference designator text of a placed footprint, or `""` when the
@@ -5746,7 +5792,8 @@ mod recovery_tests {
         let outcome = (|| -> Result<()> {
             let document = client.find_open_board(&board)?;
             let before = client.recovery_snapshot_in(document.clone())?;
-            let track = crate::builders::build_track("", 0, "F.Cu", 0.25, 5.0, 5.0, 6.0, 5.0);
+            let track =
+                crate::builders::build_track("", 0, "F.Cu", 0.25, 5.0, 5.0, 6.0, 5.0).unwrap();
             let result = client.run_commit_recovering_with_limits(
                 document.clone(),
                 "recovery regression",
@@ -6536,7 +6583,7 @@ mod footprint_graphic_tests {
         items: Vec<prost_types::Any>,
     ) -> kiapi::board::types::FootprintInstance {
         kiapi::board::types::FootprintInstance {
-            position: Some(builders::vec2(100.0, 100.0)),
+            position: Some(builders::vec2(100.0, 100.0).unwrap()),
             orientation: Some(kiapi::common::types::Angle {
                 value_degrees: angle,
             }),
@@ -6553,7 +6600,10 @@ mod footprint_graphic_tests {
         let ((x, y), angle) = footprint_frame(&instance(90.0, vec![]));
         assert_eq!(
             (x, y),
-            (builders::mm_to_nm(100.0), builders::mm_to_nm(100.0))
+            (
+                builders::mm_to_nm(100.0).unwrap(),
+                builders::mm_to_nm(100.0).unwrap()
+            )
         );
         assert_eq!(angle, 90.0);
     }
@@ -6567,8 +6617,8 @@ mod footprint_graphic_tests {
     #[test]
     fn geometry_kind_names_each_shape() {
         use kiapi::common::types::graphic_shape::Geometry;
-        let poly = builders::board_polygon("F.SilkS", 0.1, true, &[vec![(0.0, 0.0)]]);
-        let seg = builders::board_segment("F.SilkS", 0.1, 0.0, 0.0, 1.0, 0.0);
+        let poly = builders::board_polygon("F.SilkS", 0.1, true, &[vec![(0.0, 0.0)]]).unwrap();
+        let seg = builders::board_segment("F.SilkS", 0.1, 0.0, 0.0, 1.0, 0.0).unwrap();
         let of = |s: &kiapi::board::types::BoardGraphicShape| -> &'static str {
             geometry_kind(s.shape.as_ref().unwrap().geometry.as_ref().unwrap())
         };
@@ -6579,21 +6629,15 @@ mod footprint_graphic_tests {
         // aim a vertex list at the wrong graphic. A wrong name there sends
         // someone looking for a shape that isn't the one they picked.
         assert_eq!(
-            of(&builders::board_rectangle(
-                "F.SilkS", 0.1, 0.0, 0.0, 1.0, 1.0, false
-            )),
+            of(&builders::board_rectangle("F.SilkS", 0.1, 0.0, 0.0, 1.0, 1.0, false).unwrap()),
             "rectangle"
         );
         assert_eq!(
-            of(&builders::board_circle(
-                "F.SilkS", 0.1, 0.0, 0.0, 1.0, false
-            )),
+            of(&builders::board_circle("F.SilkS", 0.1, 0.0, 0.0, 1.0, false).unwrap()),
             "circle"
         );
         assert_eq!(
-            of(&builders::board_arc(
-                "F.SilkS", 0.1, 0.0, 0.0, 1.0, 1.0, 2.0, 0.0
-            )),
+            of(&builders::board_arc("F.SilkS", 0.1, 0.0, 0.0, 1.0, 1.0, 2.0, 0.0).unwrap()),
             "arc"
         );
         // Exhaustiveness is enforced by the match, not by listing every arm here.
@@ -6607,27 +6651,43 @@ mod footprint_graphic_tests {
             0.1,
             true,
             &[vec![(13.9, -0.5), (13.9, 0.5), (13.0, 0.0)]],
-        );
+        )
+        .unwrap();
         let pts = geometry_points(poly.shape.as_ref().unwrap().geometry.as_ref().unwrap());
         assert_eq!(
             pts,
             vec![
-                (builders::mm_to_nm(13.9), builders::mm_to_nm(-0.5)),
-                (builders::mm_to_nm(13.9), builders::mm_to_nm(0.5)),
-                (builders::mm_to_nm(13.0), builders::mm_to_nm(0.0)),
+                (
+                    builders::mm_to_nm(13.9).unwrap(),
+                    builders::mm_to_nm(-0.5).unwrap()
+                ),
+                (
+                    builders::mm_to_nm(13.9).unwrap(),
+                    builders::mm_to_nm(0.5).unwrap()
+                ),
+                (
+                    builders::mm_to_nm(13.0).unwrap(),
+                    builders::mm_to_nm(0.0).unwrap()
+                ),
             ]
         );
     }
 
     #[test]
     fn geometry_points_reads_a_segment_as_start_then_end() {
-        let seg = builders::board_segment("F.SilkS", 0.1, -19.0, 0.0, -17.0, 0.0);
+        let seg = builders::board_segment("F.SilkS", 0.1, -19.0, 0.0, -17.0, 0.0).unwrap();
         let pts = geometry_points(seg.shape.as_ref().unwrap().geometry.as_ref().unwrap());
         assert_eq!(
             pts,
             vec![
-                (builders::mm_to_nm(-19.0), builders::mm_to_nm(0.0)),
-                (builders::mm_to_nm(-17.0), builders::mm_to_nm(0.0)),
+                (
+                    builders::mm_to_nm(-19.0).unwrap(),
+                    builders::mm_to_nm(0.0).unwrap()
+                ),
+                (
+                    builders::mm_to_nm(-17.0).unwrap(),
+                    builders::mm_to_nm(0.0).unwrap()
+                ),
             ]
         );
     }
@@ -6637,7 +6697,7 @@ mod footprint_graphic_tests {
     /// malformed shape into a well-formed one in the wrong place.
     #[test]
     fn geometry_points_omits_a_missing_vertex() {
-        let mut seg = builders::board_segment("F.SilkS", 0.1, -19.0, 0.0, -17.0, 0.0);
+        let mut seg = builders::board_segment("F.SilkS", 0.1, -19.0, 0.0, -17.0, 0.0).unwrap();
         match seg
             .shape
             .as_mut()
@@ -6651,7 +6711,10 @@ mod footprint_graphic_tests {
         let pts = geometry_points(seg.shape.as_ref().unwrap().geometry.as_ref().unwrap());
         assert_eq!(
             pts,
-            vec![(builders::mm_to_nm(-19.0), builders::mm_to_nm(0.0))],
+            vec![(
+                builders::mm_to_nm(-19.0).unwrap(),
+                builders::mm_to_nm(0.0).unwrap()
+            )],
             "the absent end is missing from the list, not reported as (0, 0)"
         );
     }
@@ -6665,7 +6728,8 @@ mod footprint_graphic_tests {
             0.1,
             true,
             &[vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]],
-        );
+        )
+        .unwrap();
         let geom = |s: &kiapi::board::types::BoardGraphicShape| {
             s.shape.as_ref().unwrap().geometry.as_ref().unwrap().clone()
         };
@@ -6679,7 +6743,8 @@ mod footprint_graphic_tests {
                 vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
                 vec![(5.0, 5.0), (6.0, 5.0), (6.0, 6.0)],
             ],
-        );
+        )
+        .unwrap();
         assert_eq!(polygon_extent(&geom(&two)), (2, 0));
 
         // A hole on the first outline — what board_polygon never builds.
@@ -6698,7 +6763,7 @@ mod footprint_graphic_tests {
         assert_eq!(polygon_extent(&geom(&holed)), (1, 1));
 
         // Every other kind reports nothing rather than a misleading 1.
-        let seg = builders::board_segment("F.SilkS", 0.1, 0.0, 0.0, 1.0, 0.0);
+        let seg = builders::board_segment("F.SilkS", 0.1, 0.0, 0.0, 1.0, 0.0).unwrap();
         assert_eq!(polygon_extent(&geom(&seg)), (0, 0));
     }
 
@@ -6722,9 +6787,14 @@ mod footprint_graphic_tests {
         };
 
         for &(x_mm, y_mm) in &[(13.5, -0.5), (13.5, 0.5), (12.7, 0.0), (-19.0, 3.25)] {
-            let (rx, ry) = to_board.point(builders::mm_to_nm(x_mm), builders::mm_to_nm(y_mm));
+            let (rx, ry) = to_board
+                .point(
+                    builders::mm_to_nm(x_mm).unwrap(),
+                    builders::mm_to_nm(y_mm).unwrap(),
+                )
+                .unwrap();
             let (bx, by) = (anchor.0 + rx, anchor.1 + ry);
-            let (lx, ly) = to_local.point(bx, by);
+            let (lx, ly) = to_local.point(bx, by).unwrap();
             assert_eq!(
                 (
                     builders::nm_to_mm(lx - anchor.0),
@@ -6762,7 +6832,7 @@ mod footprint_graphic_tests {
 
     #[test]
     fn a_non_polygon_is_refused_by_name_and_left_alone() {
-        let mut seg = builders::board_segment("F.SilkS", 0.1, 0.0, 0.0, 1.0, 0.0);
+        let mut seg = builders::board_segment("F.SilkS", 0.1, 0.0, 0.0, 1.0, 0.0).unwrap();
         let before = seg.clone();
 
         let err = replace_polygon_outline(&mut seg, "J2", "u-1", &square(), (0, 0), &no_rotation())
@@ -6781,7 +6851,7 @@ mod footprint_graphic_tests {
 
     #[test]
     fn fewer_than_three_points_is_refused_and_leaves_the_outline_intact() {
-        let mut poly = builders::board_polygon("F.SilkS", 0.1, true, &[square()]);
+        let mut poly = builders::board_polygon("F.SilkS", 0.1, true, &[square()]).unwrap();
         let before = outline_of(&poly);
 
         let err = replace_polygon_outline(
@@ -6809,7 +6879,8 @@ mod footprint_graphic_tests {
             0.1,
             true,
             &[square(), vec![(5.0, 5.0), (6.0, 5.0), (6.0, 6.0)]],
-        );
+        )
+        .unwrap();
         let before = poly.clone();
 
         let err =
@@ -6827,7 +6898,7 @@ mod footprint_graphic_tests {
     #[test]
     fn a_hole_is_refused_rather_than_discarded() {
         use kiapi::common::types::graphic_shape::Geometry;
-        let mut poly = builders::board_polygon("F.SilkS", 0.1, true, &[square()]);
+        let mut poly = builders::board_polygon("F.SilkS", 0.1, true, &[square()]).unwrap();
         // `board_polygon` cannot build a hole, so inject one.
         if let Some(Geometry::Polygon(ps)) = poly.shape.as_mut().and_then(|s| s.geometry.as_mut()) {
             ps.polygons[0].holes.push(kiapi::common::types::PolyLine {
@@ -6847,8 +6918,11 @@ mod footprint_graphic_tests {
 
     #[test]
     fn the_rebuilt_outline_is_closed_and_anchored() {
-        let mut poly = builders::board_polygon("F.SilkS", 0.1, true, &[vec![(9.0, 9.0)]]);
-        let anchor = (builders::mm_to_nm(100.0), builders::mm_to_nm(50.0));
+        let mut poly = builders::board_polygon("F.SilkS", 0.1, true, &[vec![(9.0, 9.0)]]).unwrap();
+        let anchor = (
+            builders::mm_to_nm(100.0).unwrap(),
+            builders::mm_to_nm(50.0).unwrap(),
+        );
 
         let kind =
             replace_polygon_outline(&mut poly, "J2", "u-1", &square(), anchor, &no_rotation())
@@ -6860,8 +6934,8 @@ mod footprint_graphic_tests {
             .iter()
             .map(|&(x, y)| {
                 (
-                    anchor.0 + builders::mm_to_nm(x),
-                    anchor.1 + builders::mm_to_nm(y),
+                    anchor.0 + builders::mm_to_nm(x).unwrap(),
+                    anchor.1 + builders::mm_to_nm(y).unwrap(),
                 )
             })
             .collect();
@@ -6882,8 +6956,11 @@ mod footprint_graphic_tests {
 
     #[test]
     fn the_rebuilt_outline_follows_the_footprints_rotation() {
-        let mut poly = builders::board_polygon("F.SilkS", 0.1, true, &[vec![(0.0, 0.0)]]);
-        let anchor = (builders::mm_to_nm(10.0), builders::mm_to_nm(20.0));
+        let mut poly = builders::board_polygon("F.SilkS", 0.1, true, &[vec![(0.0, 0.0)]]).unwrap();
+        let anchor = (
+            builders::mm_to_nm(10.0).unwrap(),
+            builders::mm_to_nm(20.0).unwrap(),
+        );
         let rotate = Xform::Rotate {
             cx_nm: 0,
             cy_nm: 0,
@@ -6900,7 +6977,7 @@ mod footprint_graphic_tests {
         assert_eq!(got[0], anchor, "the first vertex is the anchor itself");
         assert_eq!(
             got[1],
-            (anchor.0, anchor.1 - builders::mm_to_nm(2.0)),
+            (anchor.0, anchor.1 - builders::mm_to_nm(2.0).unwrap()),
             "local +X must rotate to board -Y"
         );
     }

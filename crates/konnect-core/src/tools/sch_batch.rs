@@ -13,7 +13,7 @@ use crate::tools::{
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
-    geometry::{points_coincident, snap_point},
+    geometry::{points_coincident, round6, snap_point},
     schematic::{
         extract_all_net_labels, extract_buses, extract_labels, extract_symbol_instances,
         extract_wires, find_lib_symbol, format_net_label, format_wire, pin_endpoint,
@@ -564,15 +564,15 @@ async fn handle_batch_connect_to_net(
         let mut entry = json!({
             "reference": reference,
             "pin": pin_number,
-            "x": px,
-            "y": py,
+            "x": round6(px),
+            "y": round6(py),
             "rotation": rotation
         });
         if !is_legacy_placement {
             entry["direction"] = json!(dir.name);
-            entry["label"] = json!({ "x": lx, "y": ly, "rotation": rotation });
+            entry["label"] = json!({ "x": round6(lx), "y": round6(ly), "rotation": rotation });
             if needs_wire {
-                entry["wire"] = json!({ "x1": px, "y1": py, "x2": lx, "y2": ly });
+                entry["wire"] = json!({ "x1": round6(px), "y1": round6(py), "x2": round6(lx), "y2": round6(ly) });
             }
         }
         if duplicate {
@@ -1103,7 +1103,12 @@ async fn handle_bulk_move(
             edits.push(SexpEdit::replace(
                 at_abs,
                 at_end,
-                format!("{new_x} {new_y} {rot}"),
+                format!(
+                    "{} {} {}",
+                    cse::types::fmt_f64(new_x),
+                    cse::types::fmt_f64(new_y),
+                    cse::types::fmt_f64(rot)
+                ),
             ));
             // Property coordinates are ABSOLUTE in .kicad_sch, so the field
             // text does not follow the symbol on its own — moving only the
@@ -1188,7 +1193,7 @@ async fn handle_bulk_move(
     Ok(CallToolResult::json(&json!({
         "moved_count": moved.len(),
         "moved": moved,
-        "dx": dx, "dy": dy,
+        "dx": round6(dx), "dy": round6(dy),
         "junctions_added_count": junctions_added,
         "junctions_pruned_count": junctions_pruned,
         "no_connects_moved_count": moved_markers.len(),
@@ -1576,8 +1581,8 @@ async fn handle_connect_passthrough(
 
     Ok(CallToolResult::json(&json!({
         "net": net_name,
-        "stub_root": { "x": x, "y": y },
-        "label_position": { "x": wire_end_x, "y": wire_end_y },
+        "stub_root": { "x": round6(x), "y": round6(y) },
+        "label_position": { "x": round6(wire_end_x), "y": round6(wire_end_y) },
         "direction": dir.name,
         "label_rotation": dir.label_rotation
     })))
@@ -1590,7 +1595,7 @@ async fn handle_connect_passthrough(
 /// carry `(bold yes)`, 145 a `(thickness …)`, 77 a `(color …)` and 10
 /// `(italic yes)`. All of them sit inside `(font …)`, not beside it.
 fn schematic_text_font(args: &serde_json::Value, size: f64) -> Result<String, String> {
-    let mut font = format!("(size {size} {size})");
+    let mut font = format!("(size {0} {0})", cse::types::fmt_f64(size));
 
     if let Some(thickness) = args.get("thickness") {
         let thickness = thickness
@@ -1601,7 +1606,7 @@ fn schematic_text_font(args: &serde_json::Value, size: f64) -> Result<String, St
                 "thickness must be a positive number, got {thickness}"
             ));
         }
-        font.push_str(&format!(" (thickness {thickness})"));
+        font.push_str(&format!(" (thickness {})", cse::types::fmt_f64(thickness)));
     }
     // KiCad writes the token only when it is on, and omits it otherwise.
     if args["bold"].as_bool().unwrap_or(false) {
@@ -1738,7 +1743,15 @@ async fn handle_add_schematic_text(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    let (x, y) = match (super::checked_mm(x, "x"), super::checked_mm(y, "y")) {
+        (Ok(x), Ok(y)) => (x, y),
+        (Err(error), _) | (_, Err(error)) => return Ok(error),
+    };
     let size = args["size"].as_f64().unwrap_or(1.27);
+    let size = match super::checked_mm(size, "size") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
     let justify = args["justify"].as_str().unwrap_or(DEFAULT_TEXT_JUSTIFY);
     // Without a justify token KiCad centres the text on `x`, so a long line
@@ -1767,7 +1780,10 @@ async fn handle_add_schematic_text(
 
     let text_sexp = format!(
         "\n  (text \"{escaped}\"\n    (at {x} {y} {rotation})\n    \
-         (effects {font_sexp}{justify_sexp})\n    (uuid \"{uuid}\")\n  )"
+         (effects {font_sexp}{justify_sexp})\n    (uuid \"{uuid}\")\n  )",
+        x = cse::types::fmt_f64(x),
+        y = cse::types::fmt_f64(y),
+        rotation = cse::types::fmt_f64(rotation)
     );
 
     let content = read_consistent(&sch_path)?;
@@ -1780,7 +1796,7 @@ async fn handle_add_schematic_text(
 
     Ok(CallToolResult::json(&json!({
         "added": text,
-        "x": x, "y": y,
+        "x": round6(x), "y": round6(y),
         "size": size,
         "rotation": rotation,
         "justify": justify,
@@ -1814,12 +1830,12 @@ async fn handle_get_layout(
         .collect::<Vec<_>>();
     let bounds_json = |bounds: SymbolBounds| {
         json!({
-            "x_min": bounds.min_x,
-            "y_min": bounds.min_y,
-            "x_max": bounds.max_x,
-            "y_max": bounds.max_y,
-            "width": bounds.width(),
-            "height": bounds.height()
+            "x_min": round6(bounds.min_x),
+            "y_min": round6(bounds.min_y),
+            "x_max": round6(bounds.max_x),
+            "y_max": round6(bounds.max_y),
+            "width": round6(bounds.width()),
+            "height": round6(bounds.height())
         })
     };
     let components: Vec<serde_json::Value> = placements
@@ -1830,7 +1846,7 @@ async fn handle_get_layout(
                 "value": instance.value,
                 "lib_id": instance.lib_id,
                 "unit": instance.unit,
-                "x": instance.x, "y": instance.y,
+                "x": round6(instance.x), "y": round6(instance.y),
                 "rotation": instance.rotation,
                 "mirror_x": instance.mirror_x,
                 "mirror_y": instance.mirror_y,
@@ -1881,7 +1897,7 @@ async fn handle_get_layout(
         let wires = extract_wires(&tree);
         let wire_data: Vec<serde_json::Value> = wires
             .iter()
-            .map(|w| json!({ "x1": w.x1, "y1": w.y1, "x2": w.x2, "y2": w.y2, "uuid": w.uuid }))
+            .map(|w| json!({ "x1": round6(w.x1), "y1": round6(w.y1), "x2": round6(w.x2), "y2": round6(w.y2), "uuid": w.uuid }))
             .collect();
         result["wire_count"] = json!(wire_data.len());
         result["wires"] = json!(wire_data);
@@ -1891,7 +1907,7 @@ async fn handle_get_layout(
         let labels = extract_labels(&tree);
         let label_data: Vec<serde_json::Value> = labels
             .iter()
-            .map(|l| json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
+            .map(|l| json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": round6(l.x), "y": round6(l.y) }))
             .collect();
         result["label_count"] = json!(label_data.len());
         result["labels"] = json!(label_data);
@@ -1916,7 +1932,7 @@ async fn handle_validate_wire_connections(
     let floating: Vec<serde_json::Value> = index
         .floating_wire_ends()
         .into_iter()
-        .map(|(x, y, wire_uuid)| json!({ "x": x, "y": y, "wire_uuid": wire_uuid }))
+        .map(|(x, y, wire_uuid)| json!({ "x": round6(x), "y": round6(y), "wire_uuid": wire_uuid }))
         .collect();
 
     Ok(CallToolResult::json(&json!({
@@ -1980,8 +1996,8 @@ async fn handle_validate_component_connections(
                 "pin": placed.pin.number,
                 "pin_name": placed.pin.name,
                 "pin_type": placed.pin.electrical_type,
-                "x": px,
-                "y": py
+                "x": round6(px),
+                "y": round6(py)
             }));
         }
     }

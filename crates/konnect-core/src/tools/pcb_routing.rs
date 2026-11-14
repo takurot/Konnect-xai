@@ -12,6 +12,7 @@ use crate::tools::{
     with_bound_board_ipc_classified, BoardBinding, ToolContext, ToolDef,
 };
 use anyhow::Context;
+use konnect_sexp::geometry::round6;
 use konnect_sexp::writer::{apply_edits, write_atomic_if_unchanged, SexpEdit};
 use prost::Message;
 use serde_json::json;
@@ -461,7 +462,7 @@ async fn handle_route_trace(
         .add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2));
     Ok(CallToolResult::json(&json!({
         "net": net_name, "layer": layer, "width": width,
-        "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 }
+        "from": { "x": round6(x1), "y": round6(y1) }, "to": { "x": round6(x2), "y": round6(y2) }
     })))
 }
 
@@ -525,8 +526,8 @@ async fn handle_route_pad_to_pad(
     Ok(CallToolResult::json(&json!({
         "routed": true,
         "net": net_name, "layer": layer, "width": width,
-        "from": { "ref": ref1, "pad": pad1, "x": x1, "y": y1 },
-        "to":   { "ref": ref2, "pad": pad2, "x": x2, "y": y2 },
+        "from": { "ref": ref1, "pad": pad1, "x": round6(x1), "y": round6(y1) },
+        "to":   { "ref": ref2, "pad": pad2, "x": round6(x2), "y": round6(y2) },
         "source": "ipc"
     })))
 }
@@ -573,7 +574,7 @@ async fn handle_add_via(
     let net_ipc = net_name.clone();
     ipc!(ctx, args, |c| c.add_via(&net_ipc, x, y, drill, pad_size));
     Ok(CallToolResult::json(
-        &json!({ "net": net_name, "x": x, "y": y, "drill": drill, "pad_size": pad_size }),
+        &json!({ "net": net_name, "x": round6(x), "y": round6(y), "drill": drill, "pad_size": pad_size }),
     ))
 }
 
@@ -837,7 +838,7 @@ async fn handle_apply_specctra_ses(
                 track.y1_mm,
                 track.x2_mm,
                 track.y2_mm,
-            );
+            )?;
             items.push(konnect_ipc::builders::pack_any(
                 &item,
                 "kiapi.board.types.Track",
@@ -852,7 +853,7 @@ async fn handle_apply_specctra_ses(
                 &arc.net_name, net_code, &arc.layer, arc.width_mm,
                 arc.start_x_mm, arc.start_y_mm, arc.mid_x_mm, arc.mid_y_mm,
                 arc.end_x_mm, arc.end_y_mm,
-            );
+            )?;
             items.push(konnect_ipc::builders::pack_any(&item, "kiapi.board.types.Arc"));
         }
         for via in &plan.vias {
@@ -866,7 +867,7 @@ async fn handle_apply_specctra_ses(
                 via.y_mm,
                 via.drill_mm,
                 via.size_mm,
-            );
+            )?;
             items.push(konnect_ipc::builders::pack_any(
                 &item,
                 "kiapi.board.types.Via",
@@ -1065,8 +1066,8 @@ async fn handle_delete_trace(
             "net": trace.net_name,
             "layer": trace.layer,
             "width": trace.width,
-            "from": { "x": trace.start.x, "y": trace.start.y },
-            "to": { "x": trace.end.x, "y": trace.end.y }
+            "from": { "x": round6(trace.start.x), "y": round6(trace.start.y) },
+            "to": { "x": round6(trace.end.x), "y": round6(trace.end.y) }
         },
         "postcondition": "absent_from_trace_readback"
     })))
@@ -1140,7 +1141,7 @@ mod delete_trace_tests {
         let deleted = Arc::new(Mutex::new(false));
         let deleted_in_mock = deleted.clone();
         let mut track =
-            konnect_ipc::builders::build_track("GND", 7, "F.Cu", 0.4, 1.0, 2.0, 3.0, 4.0);
+            konnect_ipc::builders::build_track("GND", 7, "F.Cu", 0.4, 1.0, 2.0, 3.0, 4.0).unwrap();
         track.id = Some(kiapi::common::types::Kiid {
             value: "segment-1".to_string(),
         });
@@ -1216,8 +1217,8 @@ async fn handle_query_traces(
             json!({
                 "uuid": t.uuid,
                 "net": t.net_name, "layer": t.layer, "width": t.width,
-                "x1": t.start.x, "y1": t.start.y,
-                "x2": t.end.x,   "y2": t.end.y
+                "x1": round6(t.start.x), "y1": round6(t.start.y),
+                "x2": round6(t.end.x),   "y2": round6(t.end.y)
             })
         })
         .collect();
@@ -1285,7 +1286,7 @@ async fn handle_modify_trace(
     Ok(CallToolResult::json(&json!({
         "modified_uuid": uuid,
         "net": net_name, "layer": layer, "width": width,
-        "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 }
+        "from": { "x": round6(x1), "y": round6(y1) }, "to": { "x": round6(x2), "y": round6(y2) }
     })))
 }
 
@@ -3240,7 +3241,7 @@ mod route_pad_to_pad_tests {
                 konnect_ipc::builders::pack_any(
                     &kiapi::board::types::Pad {
                         number: number.to_string(),
-                        position: Some(konnect_ipc::builders::vec2(*x, *y)),
+                        position: Some(konnect_ipc::builders::vec2(*x, *y).unwrap()),
                         ..Default::default()
                     },
                     "kiapi.board.types.Pad",
@@ -3249,7 +3250,7 @@ mod route_pad_to_pad_tests {
             .collect();
         konnect_ipc::builders::pack_any(
             &kiapi::board::types::FootprintInstance {
-                position: Some(konnect_ipc::builders::vec2(at.0, at.1)),
+                position: Some(konnect_ipc::builders::vec2(at.0, at.1).unwrap()),
                 reference_field: Some(kiapi::board::types::Field {
                     name: "Reference".to_string(),
                     text: Some(kiapi::board::types::BoardText {
