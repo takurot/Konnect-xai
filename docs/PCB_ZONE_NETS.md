@@ -3,8 +3,10 @@
 `update_pcb_from_schematic` and `update_footprints_from_library` read zones
 from the requested live board before preparing a mutation. A copper zone
 protects only its own net from pad-net reassignment. A GND pour therefore
-does not block a change between unrelated signal nets. Rule areas do not
-protect any net.
+does not block a change between unrelated signal nets. Rule areas and graphical zones do not protect any net.
+KiCad 10.0.5 serializes graphical zones with `CopperZoneSettings` too.
+Their optional or stale net metadata is ignored because they are non-copper.
+Graphical zones without settings remain accepted.
 
 The vendored protocol stores a copper zone's net in
 `Zone.settings.copper_settings.net`. `Zone` has no direct `net` field.
@@ -49,3 +51,18 @@ quality gates remained pending in the serialized verification queue. Direct
 `rustfmt --check` on the changed Rust files and `git diff --check` passed.
 Line and branch coverage were not measured. Real KiCad IPC was unavailable.
 Mock payloads cannot prove behavior in an unobserved editor.
+
+## Graphical-zone serializer compatibility
+
+The [KiCad 10.0.5 serializer](https://github.com/KiCad/kicad/blob/10.0.5/pcbnew/zone.cpp#L239-L294)
+selects `ZT_GRAPHICAL` for non-copper zones and still fills
+`copper_settings` for every non-rule-area zone. The shared decoder therefore
+accepts that pair without interpreting its net. Unknown types and
+inconsistent copper or rule-area settings remain errors.
+
+Regression fixtures derive from the checked-in copper-zone capture by
+selecting a graphical type and silkscreen layer. They retain copper settings
+with a GND name, missing net, or unused stale net with an invalid copper code.
+These are serializer-shaped fixtures, not native graphical-zone captures.
+The classifier and both actual IPC snapshots must return no routed net for
+each fixture. Existing graphical-without-settings coverage remains.

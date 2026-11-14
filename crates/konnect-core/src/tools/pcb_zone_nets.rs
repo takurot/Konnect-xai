@@ -18,7 +18,7 @@ pub(super) fn routed_net(item: &prost_types::Any) -> Result<Option<Net>> {
         .unwrap_or("<unidentified>");
     let net = match (ZoneType::try_from(zone.r#type), zone.settings) {
         (Ok(ZoneType::ZtRuleArea), Some(Settings::RuleAreaSettings(_)))
-        | (Ok(ZoneType::ZtGraphical), None) => return Ok(None),
+        | (Ok(ZoneType::ZtGraphical), None | Some(Settings::CopperSettings(_))) => return Ok(None),
         (
             Ok(ZoneType::ZtCopper | ZoneType::ZtTeardrop),
             Some(Settings::CopperSettings(settings)),
