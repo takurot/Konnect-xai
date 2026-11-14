@@ -143,3 +143,26 @@ The existing file-fallback regression expected an explicit zero placement angle.
 The canonical writer omits that optional angle, as its zero-rotation regression
 requires. The fallback test now parses the placed footprint and checks its
 coordinates and effective zero angle, accepting either valid representation.
+
+## Checked builders after footprint fidelity integration
+
+This branch includes the #14, #17 and #26 footprint changes before completing
+the checked-builder migration. Library property positions, font sizes and
+stroke widths now propagate conversion errors through their existing `Result`
+parsers. Diagnostics identify the property and invalid dimension. New valid
+fixture calls unwrap only known finite test values. Graphic style selection,
+chamfer data, field presentation and geometry readback remain intact.
+
+The field builder retains the finite-angle check for fallback fields and checks
+the final rotation of library fields. Adding two finite rotations cannot publish
+a nonfinite angle. The comparison still distinguishes actual shape changes from
+native rectangle, polygon and arc normalization.
+
+Before integration, exact old property parser functions accepted finite values
+outside signed 64-bit nanometres. An isolated harness reproduced three failures
+for position, font size and thickness while preserving the valid precise field
+control. These are source-extracted checks against this task's isolated IPC
+artifacts, not native KiCad evidence. New committed regressions require named
+refusals before live mutation, unchanged saved bytes, and nanometre-precise valid
+fields. Final merged-head quality gates remain required and are recorded
+separately from prior individual-branch results.

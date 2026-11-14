@@ -110,6 +110,15 @@ fn pad_geometry(pad: &kiapi::board::types::Pad) -> PadGeometry {
             corner_rounding_ratio: (layer.corner_rounding_ratio != 0.0)
                 .then_some(layer.corner_rounding_ratio),
             chamfer_ratio: (layer.chamfer_ratio != 0.0).then_some(layer.chamfer_ratio),
+            chamfered_corners: layer
+                .chamfered_corners
+                .as_ref()
+                .map(|corners| IpcChamferCorners {
+                    top_left: corners.top_left,
+                    top_right: corners.top_right,
+                    bottom_left: corners.bottom_left,
+                    bottom_right: corners.bottom_right,
+                }),
         })
         .collect();
     let shape = copper_layers.first().and_then(|layer| layer.shape.clone());
@@ -4059,7 +4068,8 @@ impl KiCadIpcClient {
                 // library's text layout instead of a synthesized offset that can
                 // sit on the part's own silkscreen.
                 let (fx, fy, frot) = local;
-                if !(rotation + frot).is_finite() {
+                let field_rotation = rotation + frot;
+                if !field_rotation.is_finite() {
                     anyhow::bail!("field '{name}' rotation must be finite");
                 }
                 let (bx, by) = konnect_sexp::geometry::transform_pad(fx, fy, x, y, rotation);
@@ -4073,8 +4083,17 @@ impl KiCadIpcClient {
                             attributes: Some(kiapi::common::types::TextAttributes {
                                 size: Some(crate::builders::vec2(1.0, 1.0)?),
                                 angle: Some(kiapi::common::types::Angle {
-                                    value_degrees: readable_text_angle(rotation + frot),
+                                    value_degrees: readable_text_angle(field_rotation),
                                 }),
+                                stroke_width: Some(crate::builders::distance(0.15)?),
+                                line_spacing: 1.0,
+                                horizontal_alignment:
+                                    kiapi::common::types::HorizontalAlignment::HaCenter as i32,
+                                vertical_alignment:
+                                    kiapi::common::types::VerticalAlignment::VaCenter as i32,
+                                visible: true,
+                                multiline: true,
+                                keep_upright: true,
                                 ..Default::default()
                             }),
                             text: text.to_string(),
@@ -4092,13 +4111,13 @@ impl KiCadIpcClient {
                     visible,
                 })
             };
-        let reference_field = text_field(
+        let mut reference_field = text_field(
             "Reference",
             reference,
             fields.reference_at.unwrap_or((0.0, -1.0, 0.0)),
             true,
         )?;
-        let value_field = text_field(
+        let mut value_field = text_field(
             "Value",
             value,
             fields.value_at.unwrap_or((0.0, 1.0, 0.0)),
@@ -4140,9 +4159,15 @@ impl KiCadIpcClient {
                     "rect" => kiapi::board::types::PadStackShape::PssRectangle,
                     "oval" => kiapi::board::types::PadStackShape::PssOval,
                     "trapezoid" => kiapi::board::types::PadStackShape::PssTrapezoid,
+                    "roundrect" if pad.chamfered_corners.is_some() => {
+                        kiapi::board::types::PadStackShape::PssChamferedrect
+                    }
                     "roundrect" => kiapi::board::types::PadStackShape::PssRoundrect,
                     "chamfered_rect" => kiapi::board::types::PadStackShape::PssChamferedrect,
-                    _ => kiapi::board::types::PadStackShape::PssRectangle,
+                    unknown => anyhow::bail!(
+                        "footprint '{lib_id}' pad '{}' has unsupported shape '{unknown}'",
+                        pad.number
+                    ),
                 };
                 // Always F_Cu: it is KiCad's ALL_LAYERS sentinel for a
                 // PST_NORMAL stack, not a statement about which side the pad
@@ -4154,6 +4179,15 @@ impl KiCadIpcClient {
                     shape: shape as i32,
                     size: Some(crate::builders::vec2(pad.size_x, pad.size_y)?),
                     corner_rounding_ratio: pad.roundrect_ratio,
+                    chamfer_ratio: pad.chamfer_ratio,
+                    chamfered_corners: pad.chamfered_corners.as_ref().map(|corners| {
+                        kiapi::board::types::ChamferedRectCorners {
+                            top_left: corners.top_left,
+                            top_right: corners.top_right,
+                            bottom_left: corners.bottom_left,
+                            bottom_right: corners.bottom_right,
+                        }
+                    }),
                     custom_anchor_shape: shape as i32,
                     offset: Some(crate::builders::vec2(0.0, 0.0)?),
                     ..Default::default()
@@ -4212,6 +4246,63 @@ impl KiCadIpcClient {
                 .map(|graphic| build_graphic_child(graphic, x, y, rotation))
                 .collect::<Result<Vec<_>>>()?,
         );
+        let mut datasheet_field = None;
+        let mut description_field = None;
+        for local_field in &fields.fields {
+            let mut field = local_field.clone();
+            field.id = None;
+            let board_text = field
+                .text
+                .as_mut()
+                .context("library field has no board text")?;
+            board_text.id = None;
+            let text = board_text
+                .text
+                .as_mut()
+                .context("library field has no text")?;
+            let local = text
+                .position
+                .as_ref()
+                .context("library field has no position")?;
+            let (fx, fy) = konnect_sexp::geometry::transform_pad(
+                crate::builders::nm_to_mm(local.x_nm),
+                crate::builders::nm_to_mm(local.y_nm),
+                x,
+                y,
+                rotation,
+            );
+            text.position = Some(crate::builders::vec2(fx, fy)?);
+            if let Some(attributes) = text.attributes.as_mut() {
+                let angle = attributes
+                    .angle
+                    .as_ref()
+                    .map_or(0.0, |angle| angle.value_degrees);
+                let field_rotation = rotation + angle;
+                if !field_rotation.is_finite() {
+                    anyhow::bail!("field '{}' rotation must be finite", field.name);
+                }
+                attributes.angle = Some(kiapi::common::types::Angle {
+                    value_degrees: if attributes.keep_upright {
+                        readable_text_angle(field_rotation)
+                    } else {
+                        field_rotation
+                    },
+                });
+            }
+            match field.name.as_str() {
+                "Reference" => {
+                    text.text = reference.to_string();
+                    reference_field = field;
+                }
+                "Value" => {
+                    text.text = value.to_string();
+                    value_field = field;
+                }
+                "Datasheet" => datasheet_field = Some(field),
+                "Description" => description_field = Some(field),
+                _ => child_items.push(crate::builders::pack_any(&field, "kiapi.board.types.Field")),
+            }
+        }
         let definition = kiapi::board::types::Footprint {
             id: Some(kiapi::common::types::LibraryIdentifier {
                 library_nickname: library_nickname.to_string(),
@@ -4219,6 +4310,8 @@ impl KiCadIpcClient {
             }),
             reference_field: Some(reference_field.clone()),
             value_field: Some(value_field.clone()),
+            datasheet_field: datasheet_field.clone(),
+            description_field: description_field.clone(),
             items: child_items,
             ..Default::default()
         };
@@ -4232,6 +4325,8 @@ impl KiCadIpcClient {
             definition: Some(definition),
             reference_field: Some(reference_field),
             value_field: Some(value_field),
+            datasheet_field,
+            description_field,
             ..Default::default()
         };
         Ok(crate::builders::pack_any(
@@ -4270,7 +4365,11 @@ impl KiCadIpcClient {
         let item = Self::build_footprint_item(
             lib_id, reference, value, pads, graphics, fields, x, y, rotation, layer,
         )?;
+        let presentation = crate::FootprintPresentation::from_items([&item])?;
+        let chamfers = crate::FootprintChamfers::from_items([&item])?;
         self.create_items_in(document.clone(), vec![item])?;
+        self.verify_footprint_chamfers_in(document.clone(), &chamfers)?;
+        self.verify_footprint_presentation_in(document.clone(), &presentation)?;
         let footprints = self.list_footprints_in(document)?;
         footprints
             .iter()
@@ -4286,6 +4385,53 @@ impl KiCadIpcClient {
                     "KiCad created the footprint but reference '{reference}' was not found (board references: {references})"
                 )
             })
+    }
+
+    pub fn verify_footprint_presentation_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        expected: &crate::FootprintPresentation,
+    ) -> Result<()> {
+        if expected.is_empty() {
+            return Ok(());
+        }
+        self.get_items_in(
+            document,
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+        )
+        .and_then(|items| expected.verify(&items))
+        .map_err(|error| {
+            anyhow::Error::new(IpcOutcomeUnknown {
+                command: "footprint presentation readback".into(),
+                reason: format!(
+                    "{error:#}. A write already occurred; inspect the live board before retrying"
+                ),
+            })
+        })
+    }
+
+    pub fn verify_footprint_chamfers_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        expected: &crate::FootprintChamfers,
+    ) -> Result<()> {
+        if expected.is_empty() {
+            return Ok(());
+        }
+        let result = self
+            .get_items_in(
+                document,
+                kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+            )
+            .and_then(|items| expected.verify(&items));
+        result.map_err(|error| {
+            anyhow::Error::new(IpcOutcomeUnknown {
+                command: "footprint chamfer readback".to_string(),
+                reason: format!(
+                    "{error:#}. A write already occurred; inspect the live board before retrying"
+                ),
+            })
+        })
     }
 
     /// Measure every item of an exact open board (#688).
@@ -4737,8 +4883,9 @@ fn build_graphic_child(
     use crate::builders;
     const SHAPE: &str = "kiapi.board.types.BoardGraphicShape";
     let xf = |(px, py): (f64, f64)| konnect_sexp::geometry::transform_pad(px, py, x, y, rotation);
-    Ok(match graphic {
+    let mut item = match graphic {
         IpcGraphicDefinition::Line {
+            style: _,
             start,
             end,
             layer,
@@ -4752,6 +4899,7 @@ fn build_graphic_child(
             )
         }
         IpcGraphicDefinition::Rect {
+            style: _,
             start,
             end,
             layer,
@@ -4792,6 +4940,7 @@ fn build_graphic_child(
             }
         }
         IpcGraphicDefinition::Circle {
+            style: _,
             center,
             end,
             layer,
@@ -4808,6 +4957,7 @@ fn build_graphic_child(
             )
         }
         IpcGraphicDefinition::Arc {
+            style: _,
             start,
             mid,
             end,
@@ -4823,6 +4973,7 @@ fn build_graphic_child(
             )
         }
         IpcGraphicDefinition::Poly {
+            style: _,
             points,
             layer,
             width,
@@ -4857,12 +5008,26 @@ fn build_graphic_child(
                 "kiapi.board.types.BoardText",
             )
         }
-    })
+    };
+    if let Some(style) = graphic.stroke_style() {
+        let mut shape = kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+            .expect("graphic builder emits a BoardGraphicShape");
+        if let Some(stroke) = shape
+            .shape
+            .as_mut()
+            .and_then(|shape| shape.attributes.as_mut())
+            .and_then(|attributes| attributes.stroke.as_mut())
+        {
+            stroke.style = style as i32;
+        }
+        item.value = shape.encode_to_vec();
+    }
+    Ok(item)
 }
 
 /// The reference designator text of a placed footprint, or `""` when the
 /// instance carries no reference field.
-fn footprint_reference(footprint: &kiapi::board::types::FootprintInstance) -> &str {
+pub(crate) fn footprint_reference(footprint: &kiapi::board::types::FootprintInstance) -> &str {
     footprint
         .reference_field
         .as_ref()
@@ -6223,6 +6388,7 @@ mod footprint_graphics_tests {
     fn rotation_90_pretransforms_graphics_to_absolute_board_space() {
         let graphics = vec![
             IpcGraphicDefinition::Rect {
+                style: crate::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
                 start: (-1.0, -2.0),
                 end: (1.0, 2.0),
                 layer: "F.CrtYd".to_string(),
@@ -6230,6 +6396,7 @@ mod footprint_graphics_tests {
                 filled: false,
             },
             IpcGraphicDefinition::Line {
+                style: crate::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
                 start: (-1.0, 0.0),
                 end: (1.0, 0.0),
                 layer: "F.SilkS".to_string(),
@@ -6331,6 +6498,7 @@ mod footprint_graphics_tests {
     #[test]
     fn non_cardinal_rotation_emits_rect_as_polygon() {
         let graphics = vec![IpcGraphicDefinition::Rect {
+            style: crate::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
             start: (-1.0, -1.0),
             end: (1.0, 1.0),
             layer: "F.CrtYd".to_string(),
@@ -6362,6 +6530,7 @@ mod footprint_graphics_tests {
     #[test]
     fn circle_center_rotates_and_radius_is_preserved() {
         let graphics = vec![IpcGraphicDefinition::Circle {
+            style: crate::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
             center: (1.0, 0.0),
             end: (1.5, 0.0),
             layer: "F.Fab".to_string(),
@@ -6404,6 +6573,8 @@ mod footprint_graphics_tests {
             drill_y: None,
             drill_oval: false,
             roundrect_ratio: 0.0,
+            chamfer_ratio: 0.0,
+            chamfered_corners: None,
             rotation: 0.0,
         };
 
@@ -6447,6 +6618,7 @@ mod footprint_graphics_tests {
     fn user_layer_graphics_reach_kicad_on_their_real_layer() {
         let graphics = vec![
             IpcGraphicDefinition::Line {
+                style: crate::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
                 start: (0.0, 0.0),
                 end: (1.0, 0.0),
                 layer: "Dwgs.User".to_string(),
@@ -6525,6 +6697,7 @@ mod footprint_graphics_tests {
         };
 
         let graphic = vec![IpcGraphicDefinition::Line {
+            style: crate::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
             start: (0.0, 0.0),
             end: (1.0, 1.0),
             layer: "In99.Cu".to_string(),
@@ -6550,6 +6723,8 @@ mod footprint_graphics_tests {
             drill_y: None,
             drill_oval: false,
             roundrect_ratio: 0.0,
+            chamfer_ratio: 0.0,
+            chamfered_corners: None,
             rotation: 0.0,
         }];
         let error = format!("{:#}", build(&pad, &[], "F.Cu").expect_err("pad layer"));
@@ -7147,5 +7322,245 @@ mod stackup_tests {
         assert_eq!(stackup.edge_connector, "unknown");
         assert!(!stackup.has_edge_plating);
         assert!(stackup.layers.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod issue14_shape_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_pad_shapes_are_refused_instead_of_rectangles() {
+        let pad = IpcPadDefinition {
+            number: "1".into(),
+            pad_type: "smd".into(),
+            shape: "future_shape".into(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            size_x: 1.0,
+            size_y: 1.0,
+            drill_x: None,
+            drill_y: None,
+            drill_oval: false,
+            layers: vec!["F.Cu".into()],
+            roundrect_ratio: 0.0,
+            chamfer_ratio: 0.0,
+            chamfered_corners: None,
+        };
+        let error = KiCadIpcClient::build_footprint_item(
+            "L:F",
+            "U1",
+            "F",
+            &[pad],
+            &[],
+            &Default::default(),
+            0.0,
+            0.0,
+            0.0,
+            "F.Cu",
+        )
+        .expect_err("unknown shapes must not silently become rectangles");
+        assert!(error.to_string().contains("future_shape"));
+    }
+    #[test]
+    fn native_chamfer_geometry_reads_ratio_and_corner_selection() {
+        let pad = kiapi::board::types::Pad {
+            pad_stack: Some(kiapi::board::types::PadStack {
+                copper_layers: vec![kiapi::board::types::PadStackLayer {
+                    layer: kiapi::board::types::BoardLayer::BlFCu as i32,
+                    shape: kiapi::board::types::PadStackShape::PssChamferedrect as i32,
+                    chamfer_ratio: 0.2,
+                    chamfered_corners: Some(kiapi::board::types::ChamferedRectCorners {
+                        top_left: true,
+                        top_right: false,
+                        bottom_left: false,
+                        bottom_right: true,
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let geometry = pad_geometry(&pad);
+        assert_eq!(geometry.copper_layers[0].chamfer_ratio, Some(0.2));
+        let corners = geometry.copper_layers[0]
+            .chamfered_corners
+            .as_ref()
+            .unwrap();
+        assert!(corners.top_left && corners.bottom_right);
+        assert!(!corners.top_right && !corners.bottom_left);
+    }
+}
+
+#[cfg(test)]
+mod issue26_tests {
+    use super::*;
+
+    #[test]
+    fn library_graphics_keep_every_native_stroke_style() {
+        use kiapi::common::types::StrokeLineStyle as Style;
+        for style in [
+            Style::SlsDefault,
+            Style::SlsSolid,
+            Style::SlsDash,
+            Style::SlsDot,
+            Style::SlsDashdot,
+            Style::SlsDashdotdot,
+        ] {
+            for rotation in [0.0, 37.0, 90.0] {
+                let graphic = IpcGraphicDefinition::Rect {
+                    start: (0.0, 0.0),
+                    end: (2.0, 1.0),
+                    layer: "F.CrtYd".into(),
+                    width: 0.1,
+                    filled: false,
+                    style,
+                };
+                let item = build_graphic_child(&graphic, 10.0, 20.0, rotation).unwrap();
+                let shape =
+                    kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).unwrap();
+                assert_eq!(
+                    shape
+                        .shape
+                        .unwrap()
+                        .attributes
+                        .unwrap()
+                        .stroke
+                        .unwrap()
+                        .style,
+                    style as i32
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn footprint_fields_reject_nonfinite_derived_rotations() {
+        for (angle, rotation) in [(f64::NAN, 0.0), (f64::INFINITY, 0.0), (f64::MAX, f64::MAX)] {
+            for custom in [false, true] {
+                let fields = if custom {
+                    IpcFieldPlacement {
+                        fields: vec![kiapi::board::types::Field {
+                            name: "LCSC".into(),
+                            text: Some(kiapi::board::types::BoardText {
+                                text: Some(kiapi::common::types::Text {
+                                    position: Some(crate::builders::vec2(0.0, 0.0).unwrap()),
+                                    attributes: Some(kiapi::common::types::TextAttributes {
+                                        angle: Some(kiapi::common::types::Angle {
+                                            value_degrees: angle,
+                                        }),
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }
+                } else {
+                    IpcFieldPlacement {
+                        reference_at: Some((0.0, 0.0, angle)),
+                        ..Default::default()
+                    }
+                };
+                assert!(
+                    KiCadIpcClient::build_footprint_item(
+                        "Test:Field",
+                        "R1",
+                        "10k",
+                        &[],
+                        &[],
+                        &fields,
+                        0.0,
+                        0.0,
+                        rotation,
+                        "F.Cu",
+                    )
+                    .is_err(),
+                    "angle {angle}, rotation {rotation}, custom {custom}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn placed_library_fields_keep_effects_layer_and_visibility() {
+        let field = |name: &str, value: &str| kiapi::board::types::Field {
+            name: name.into(),
+            visible: false,
+            text: Some(kiapi::board::types::BoardText {
+                layer: kiapi::board::types::BoardLayer::BlFFab as i32,
+                text: Some(kiapi::common::types::Text {
+                    text: value.into(),
+                    position: Some(crate::builders::vec2(1.0, 2.0).unwrap()),
+                    attributes: Some(kiapi::common::types::TextAttributes {
+                        size: Some(crate::builders::vec2(0.8, 0.9).unwrap()),
+                        stroke_width: Some(crate::builders::distance(0.12).unwrap()),
+                        line_spacing: 1.2,
+                        keep_upright: true,
+                        angle: Some(kiapi::common::types::Angle {
+                            value_degrees: 15.0,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let fields = IpcFieldPlacement {
+            fields: vec![
+                field("Value", "library value"),
+                field("KiLib_Generator", "fixture"),
+            ],
+            ..Default::default()
+        };
+        let item = KiCadIpcClient::build_footprint_item(
+            "Test:Socket",
+            "R1",
+            "10k",
+            &[],
+            &[],
+            &fields,
+            100.0,
+            50.0,
+            90.0,
+            "F.Cu",
+        )
+        .unwrap();
+        let instance =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        let value = instance.value_field.unwrap();
+        assert!(!value.visible);
+        let text = value.text.unwrap();
+        assert_eq!(text.layer, kiapi::board::types::BoardLayer::BlFFab as i32);
+        let text = text.text.unwrap();
+        assert_eq!(text.text, "10k");
+        assert_eq!(
+            text.position.unwrap(),
+            crate::builders::vec2(102.0, 49.0).unwrap()
+        );
+        let attributes = text.attributes.unwrap();
+        assert_eq!(attributes.stroke_width.unwrap().value_nm, 120_000);
+        assert_eq!(attributes.line_spacing, 1.2);
+        assert!(attributes.keep_upright);
+        assert_eq!(
+            attributes.size.unwrap(),
+            crate::builders::vec2(0.8, 0.9).unwrap()
+        );
+        let definition = instance.definition.unwrap();
+        let custom = definition
+            .items
+            .iter()
+            .find(|item| crate::builders::any_is(item, "kiapi.board.types.Field"))
+            .unwrap();
+        let custom = kiapi::board::types::Field::decode(custom.value.as_slice()).unwrap();
+        assert_eq!(custom.name, "KiLib_Generator");
+        assert_eq!(custom.text.unwrap().text.unwrap().text, "fixture");
     }
 }

@@ -2,8 +2,14 @@
 pub mod gen;
 
 pub mod builders;
+mod chamfer;
+pub use chamfer::FootprintChamfers;
 pub mod client;
 mod endpoint;
+mod presentation;
+pub use presentation::{
+    normalize_footprint_field, normalize_footprint_graphic_geometry, FootprintPresentation,
+};
 pub mod project_links;
 pub mod socket;
 pub mod transform;

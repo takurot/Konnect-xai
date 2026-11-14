@@ -266,6 +266,8 @@ pub struct IpcPadLayerGeometry {
     pub offset: Option<IpcVector2>,
     pub corner_rounding_ratio: Option<f64>,
     pub chamfer_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chamfered_corners: Option<IpcChamferCorners>,
 }
 
 /// Native drill information for a pad, when it has a drilled hole.
@@ -346,6 +348,14 @@ pub struct IpcFootprintPlacement {
     pub rotation: f64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IpcChamferCorners {
+    pub top_left: bool,
+    pub top_right: bool,
+    pub bottom_left: bool,
+    pub bottom_right: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct IpcPadDefinition {
     pub number: String,
@@ -361,6 +371,8 @@ pub struct IpcPadDefinition {
     pub drill_oval: bool,
     pub layers: Vec<String>,
     pub roundrect_ratio: f64,
+    pub chamfer_ratio: f64,
+    pub chamfered_corners: Option<IpcChamferCorners>,
 }
 
 /// A footprint graphic item in footprint-local coordinates (mm), parsed from
@@ -378,6 +390,7 @@ pub enum IpcGraphicDefinition {
         end: (f64, f64),
         layer: String,
         width: f64,
+        style: crate::gen::kiapi::common::types::StrokeLineStyle,
     },
     /// `fp_rect` — axis-aligned rectangle between two opposite corners.
     Rect {
@@ -385,6 +398,7 @@ pub enum IpcGraphicDefinition {
         end: (f64, f64),
         layer: String,
         width: f64,
+        style: crate::gen::kiapi::common::types::StrokeLineStyle,
         filled: bool,
     },
     /// `fp_circle` — center plus a point on the circumference.
@@ -393,6 +407,7 @@ pub enum IpcGraphicDefinition {
         end: (f64, f64),
         layer: String,
         width: f64,
+        style: crate::gen::kiapi::common::types::StrokeLineStyle,
         filled: bool,
     },
     /// `fp_arc` — start / mid / end points.
@@ -402,12 +417,14 @@ pub enum IpcGraphicDefinition {
         end: (f64, f64),
         layer: String,
         width: f64,
+        style: crate::gen::kiapi::common::types::StrokeLineStyle,
     },
     /// `fp_poly` — closed outline.
     Poly {
         points: Vec<(f64, f64)>,
         layer: String,
         width: f64,
+        style: crate::gen::kiapi::common::types::StrokeLineStyle,
         filled: bool,
     },
     /// Visible `fp_text` / `property` text.
@@ -425,6 +442,17 @@ pub enum IpcGraphicDefinition {
 }
 
 impl IpcGraphicDefinition {
+    pub fn stroke_style(&self) -> Option<crate::gen::kiapi::common::types::StrokeLineStyle> {
+        match self {
+            Self::Line { style, .. }
+            | Self::Rect { style, .. }
+            | Self::Circle { style, .. }
+            | Self::Arc { style, .. }
+            | Self::Poly { style, .. } => Some(*style),
+            Self::Text { .. } => None,
+        }
+    }
+
     /// The KiCAD layer name this item draws on.
     pub fn layer(&self) -> &str {
         match self {
@@ -657,8 +685,9 @@ pub enum UnavailableReason {
 /// from the library footprint so placed parts keep the library's text
 /// positions. A hardcoded offset put the Reference on top of the part's own
 /// silkscreen (silk_overlap DRC warnings in live verification).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct IpcFieldPlacement {
+    pub fields: Vec<crate::gen::kiapi::board::types::Field>,
     /// (x, y, rotation) of the Reference text, footprint-local mm/degrees.
     pub reference_at: Option<(f64, f64, f64)>,
     /// (x, y, rotation) of the Value text, footprint-local mm/degrees.

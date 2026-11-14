@@ -636,7 +636,7 @@ mod tests {
         let source = std::fs::read_to_string(library).unwrap();
         let pads = super::super::pcb_components::extract_pad_definitions(&source).unwrap();
         let graphics = super::super::pcb_components::extract_graphic_definitions(&source).unwrap();
-        let fields = super::super::pcb_components::extract_field_placement(&source);
+        let fields = super::super::pcb_components::extract_field_placement(&source).unwrap();
         let mut creates = Vec::new();
         for (i, angle) in [0.0, 90.0, 180.0, 270.0, 45.0].iter().enumerate() {
             for (side, layer) in [("F", "F.Cu"), ("B", "B.Cu")] {
@@ -667,7 +667,7 @@ mod tests {
                 "10k",
                 &super::super::pcb_components::extract_pad_definitions(&centered).unwrap(),
                 &super::super::pcb_components::extract_graphic_definitions(&centered).unwrap(),
-                &super::super::pcb_components::extract_field_placement(&centered),
+                &super::super::pcb_components::extract_field_placement(&centered).unwrap(),
                 80.0,
                 20.0,
                 0.0,
