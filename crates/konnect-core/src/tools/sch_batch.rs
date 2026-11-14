@@ -117,6 +117,11 @@ pub fn tools() -> Vec<ToolDef> {
                                 "rotation": { "type": "number", "default": 0 },
                                 "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric." },
                                 "reference": { "type": "string" },
+                                "dnp": { "type": "boolean" },
+                                "in_bom": { "type": "boolean" },
+                                "on_board": { "type": "boolean" },
+                                "exclude_from_sim": { "type": "boolean" },
+                                "in_pos_files": { "type": "boolean" },
                                 "value": { "type": "string" },
                                 "footprint": { "type": "string" },
                                 "unit": { "type": "integer", "minimum": 1, "default": 1 }
@@ -205,7 +210,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_edit_schematic_components",
-            "Apply field updates (Value, Footprint, custom properties) to multiple components \
+            "Apply field updates and native symbol attributes to multiple components \
              in a single atomic file write. Missing custom properties are created on every \
              placed unit only when create_missing is true.",
             json!({
@@ -224,6 +229,9 @@ pub fn tools() -> Vec<ToolDef> {
                             "type": "object",
                             "properties": {
                                 "reference": { "type": "string" },
+                                "dnp": { "type": "boolean" }, "in_bom": { "type": "boolean" },
+                                "on_board": { "type": "boolean" }, "exclude_from_sim": { "type": "boolean" },
+                                "in_pos_files": { "type": "boolean" },
                                 "value": { "type": "string" },
                                 "footprint": { "type": "string" },
                                 "fields": {
@@ -698,6 +706,16 @@ async fn handle_batch_place_components(
             }
         };
 
+        let patch = match super::sch_components::SymbolAttributePatch::parse(comp) {
+            Ok(patch) => patch,
+            Err(error) => {
+                let message = error_text(&error);
+                errors.push(message.clone());
+                failures.push(json!({"index": index, "kind": "invalid_item", "message": message}));
+                continue;
+            }
+        };
+
         match place_one_component(
             &mut sch,
             &context.instance_paths,
@@ -713,7 +731,12 @@ async fn handle_batch_place_components(
             unit,
             &src,
         ) {
-            Ok(placed) => {
+            Ok(mut placed) => {
+                super::sch_components::apply_placement_attribute_patch(
+                    &mut sch,
+                    &mut placed,
+                    patch,
+                );
                 let (expected_x, expected_y) = snap_point(x, y, 1.27);
                 placements.push(super::sch_components::ComponentTargetUnit::placement(
                     &placed.uuid,
@@ -1213,6 +1236,33 @@ async fn handle_batch_edit(
         Some(_) => return Ok(invalid_arg("create_missing", "must be a boolean")),
     };
 
+    let mut attribute_patches = Vec::new();
+    let mut prepared_edits = Vec::new();
+    for edit in &edits_arr {
+        let patch = match super::sch_components::SymbolAttributePatch::parse(edit) {
+            Ok(patch) => patch,
+            Err(error) => return Ok(error),
+        };
+        if !patch.is_empty() {
+            let Some(reference) = edit["reference"].as_str() else {
+                return Ok(invalid_arg(
+                    "reference",
+                    "required for native attribute edits",
+                ));
+            };
+            if attribute_patches
+                .iter()
+                .any(|(existing, _)| existing == reference)
+            {
+                return Ok(invalid_arg(
+                    "edits",
+                    &format!("duplicate native attribute edit for '{reference}'"),
+                ));
+            }
+            attribute_patches.push((reference.to_owned(), patch));
+        }
+        prepared_edits.push((edit, patch));
+    }
     let expected = read_consistent(&sch_path)?;
     let mut content = expected.clone();
     let mut changed: Vec<serde_json::Value> = Vec::new();
@@ -1221,7 +1271,7 @@ async fn handle_batch_edit(
     let mut updated_unit_copies = 0;
     let mut created_unit_copies = 0;
 
-    for edit_spec in &edits_arr {
+    for (edit_spec, attribute_patch) in prepared_edits {
         let reference = match edit_spec["reference"].as_str() {
             Some(r) => r,
             None => {
@@ -1320,6 +1370,17 @@ async fn handle_batch_edit(
             }));
         }
 
+        if !attribute_patch.is_empty() {
+            content = match super::sch_components::set_native_attributes(
+                &content,
+                reference,
+                attribute_patch,
+            ) {
+                Ok(content) => content,
+                Err(error) => return Ok(error),
+            };
+            component_changes.push("native symbol attributes".to_owned());
+        }
         if !component_changes.is_empty() {
             changed.push(json!({
                 "reference": reference,
@@ -1331,9 +1392,29 @@ async fn handle_batch_edit(
         }
     }
 
-    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+    if !attribute_patches.is_empty() && !errors.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "No fields or native attributes were updated: {}",
+            errors.join("; ")
+        )));
+    }
+    let attributes_observed = if attribute_patches.is_empty() {
+        write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+        Vec::new()
+    } else {
+        match super::sch_components::commit_attribute_batch(
+            &sch_path,
+            &expected,
+            &content,
+            &attribute_patches,
+        )? {
+            Ok(observed) => observed,
+            Err(error) => return Ok(error),
+        }
+    };
 
     Ok(CallToolResult::json(&json!({
+        "attributes_observed": attributes_observed,
         "updated_count": changed.len(),
         "updated_unit_copies": updated_unit_copies,
         "created_unit_copies": created_unit_copies,
@@ -4792,3 +4873,99 @@ mod private_anchor_regression {
 #[cfg(test)]
 #[path = "sch_batch_route_safety_tests.rs"]
 mod route_safety_tests;
+
+#[cfg(test)]
+mod issue25_batch_native_attributes_tests {
+    use super::*;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn batch_native_attributes_are_written_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ecc83.kicad_sch");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch"),
+        )
+        .unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        let reference = sch.symbols[0].reference().unwrap();
+        let response = handle_batch_edit(&json!({"schematic": path,
+            "edits": [{"reference": reference, "dnp": true, "in_bom": false, "in_pos_files": false}]
+        }), &context()).await.unwrap();
+        assert!(!response.is_error, "{response:?}");
+        let saved = cse::Schematic::load(&path).unwrap();
+        for symbol in saved
+            .symbols
+            .iter()
+            .filter(|s| s.reference() == Some(reference))
+        {
+            assert!(symbol.dnp);
+            assert!(!symbol.in_bom);
+            assert_eq!(
+                symbol
+                    .in_pos_files
+                    .as_ref()
+                    .and_then(|node| node.bool_value()),
+                Some(false)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_sibling_target_refuses_the_native_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ecc83.kicad_sch");
+        let source = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+        std::fs::write(&path, source).unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        let response = handle_batch_edit(
+            &json!({"schematic": path, "edits": [
+                {"reference": sch.symbols[0].reference().unwrap(), "dnp": true},
+                {"reference": "MISSING", "value": "MUST_NOT_WRITE"}
+            ]}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(response.is_error, "{response:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn malformed_native_attribute_refuses_the_entire_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ecc83.kicad_sch");
+        let source = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+        std::fs::write(&path, source).unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        let reference = sch.symbols[0].reference().unwrap();
+        let response = handle_batch_edit(
+            &json!({"schematic": path, "edits": [
+                {"reference": reference, "value": "MUST_NOT_WRITE"},
+                {"reference": reference, "dnp": "yes"}
+            ]}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(response.is_error, "{response:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
+}

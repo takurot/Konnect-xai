@@ -3003,6 +3003,8 @@ mod component_properties_dispatch_tests {
             "rotation": 0.0,
             "mirror_x": false,
             "mirror_y": false,
+            "attributes": {"dnp": false, "in_bom": true, "on_board": true,
+                "exclude_from_sim": false, "in_pos_files": true},
             "properties": {
                 "Reference": "R1",
                 "Value": "10k",
@@ -3040,7 +3042,9 @@ mod component_properties_dispatch_tests {
             "rotation": 0.0,
             "mirror_x": false,
             "mirror_y": false,
-            "uuid": R1_UUID
+            "uuid": R1_UUID,
+            "attributes": {"dnp": false, "in_bom": true, "on_board": true,
+                "exclude_from_sim": false, "in_pos_files": true}
         }]);
         assert_eq!(r1, expected);
 

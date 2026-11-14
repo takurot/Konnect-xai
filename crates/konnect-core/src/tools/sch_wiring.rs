@@ -2157,8 +2157,7 @@ async fn handle_add_power_symbol(
     let mut sym = cse::Symbol::new(format!("power:{}", power_net), x, y);
     sym.at.rotation = Some(rotation);
     sym.unit = 1;
-    sym.in_bom = true;
-    sym.on_board = true;
+    sym.set_attributes(placement_fields.attributes);
     sym.uuid = uuid::Uuid::new_v4().to_string();
 
     // Property (at …) is absolute sheet coords — same as add_schematic_component.
@@ -4244,12 +4243,12 @@ mod power_symbol_tests {
     }
 
     #[tokio::test]
-    async fn add_power_symbol_copies_library_metadata() {
+    async fn issue25_add_power_symbol_copies_library_metadata_and_attributes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("power-metadata.kicad_sch");
         std::fs::write(
             &path,
-            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n      (property \"Footprint\" \"Test:Power_Point\" (at 0 0 0))\n      (property \"Datasheet\" \"https://example.com/gnd.pdf\" (at 0 0 0))\n      (property \"Description\" \"Ground power symbol\" (at 0 0 0))\n    )\n  )\n)\n",
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (in_bom no) (on_board no) (dnp yes) (exclude_from_sim yes) (in_pos_files no)\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n      (property \"Footprint\" \"Test:Power_Point\" (at 0 0 0))\n      (property \"Datasheet\" \"https://example.com/gnd.pdf\" (at 0 0 0))\n      (property \"Description\" \"Ground power symbol\" (at 0 0 0))\n    )\n  )\n)\n",
         )
         .unwrap();
 
@@ -4272,6 +4271,11 @@ mod power_symbol_tests {
             .iter()
             .find(|s| s.reference() == Some("#PWR01"))
             .expect("power symbol instance");
+        assert!(!sym.in_bom);
+        assert!(!sym.on_board);
+        assert!(sym.dnp);
+        assert_eq!(sym.exclude_from_sim, Some(true));
+        assert!(!sym.attributes().in_pos_files);
         assert_eq!(
             sym.footprint(),
             Some("Test:Power_Point"),

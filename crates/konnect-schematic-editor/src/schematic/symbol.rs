@@ -10,6 +10,39 @@ fn bool_kw(v: bool) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymbolAttributes {
+    pub dnp: bool,
+    pub in_bom: bool,
+    pub on_board: bool,
+    pub exclude_from_sim: bool,
+    pub in_pos_files: bool,
+}
+
+impl Default for SymbolAttributes {
+    fn default() -> Self {
+        Self {
+            dnp: false,
+            in_bom: true,
+            on_board: true,
+            exclude_from_sim: false,
+            in_pos_files: true,
+        }
+    }
+}
+
+impl SymbolAttributes {
+    pub fn from_sexp(node: &SexpNode) -> Self {
+        Self {
+            dnp: node.get_bool("dnp").unwrap_or(false),
+            in_bom: node.get_bool("in_bom").unwrap_or(true),
+            on_board: node.get_bool("on_board").unwrap_or(true),
+            exclude_from_sim: node.get_bool("exclude_from_sim").unwrap_or(false),
+            in_pos_files: node.get_bool("in_pos_files").unwrap_or(true),
+        }
+    }
+}
+
 // ---- Symbol -----------------------------------------------------------------
 
 /// One saved hierarchy identity from a placed symbol's `(instances ...)` block.
@@ -54,6 +87,31 @@ pub struct Symbol {
 }
 
 impl Symbol {
+    pub fn attributes(&self) -> SymbolAttributes {
+        SymbolAttributes {
+            dnp: self.dnp,
+            in_bom: self.in_bom,
+            on_board: self.on_board,
+            exclude_from_sim: self.exclude_from_sim.unwrap_or(false),
+            in_pos_files: self
+                .in_pos_files
+                .as_ref()
+                .and_then(SexpNode::bool_value)
+                .unwrap_or(true),
+        }
+    }
+
+    pub fn set_attributes(&mut self, attributes: SymbolAttributes) {
+        self.dnp = attributes.dnp;
+        self.in_bom = attributes.in_bom;
+        self.on_board = attributes.on_board;
+        self.exclude_from_sim = Some(attributes.exclude_from_sim);
+        self.in_pos_files = Some(tagged(
+            "in_pos_files",
+            vec![atom(bool_kw(attributes.in_pos_files))],
+        ));
+    }
+
     /// Create a new symbol with minimal required fields.
     pub fn new(lib_id: impl Into<String>, x: f64, y: f64) -> Self {
         Symbol {

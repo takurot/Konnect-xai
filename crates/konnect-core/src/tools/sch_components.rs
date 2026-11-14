@@ -42,7 +42,7 @@ pub fn tools() -> Vec<ToolDef> {
             "add_schematic_component",
             "Add a symbol from a KiCAD library to the schematic. The symbol is snapped \
              to the 1.27mm schematic grid. Preserves every saved hierarchy instance, reports \
-             committed-file readback, copies the library Value and Footprint unless explicitly \
+             committed-file readback, copies library fields and native attributes unless explicitly \
              overridden, and refuses stale instance metadata before writing. \
              Specify position in schematic mm coordinates.",
             json!({
@@ -57,6 +57,11 @@ pub fn tools() -> Vec<ToolDef> {
                     "reference": { "type": "string", "description": "Optional reference designator. Default: the library prefix plus '?' (e.g. 'R?', '#FLG?'), which annotate_schematic numbers" },
                     "value": { "type": "string", "description": "Optional override for the library symbol's Value" },
                     "footprint": { "type": "string", "description": "Optional override for the library symbol's Footprint" },
+                    "dnp": { "type": "boolean" },
+                    "in_bom": { "type": "boolean" },
+                    "on_board": { "type": "boolean" },
+                    "exclude_from_sim": { "type": "boolean" },
+                    "in_pos_files": { "type": "boolean" },
                     "unit": { "type": "integer", "minimum": 1, "description": "Unit number for multi-unit symbols (gate/part selection). Default 1.", "default": 1 }
                 },
                 "required": ["schematic", "lib_id", "x", "y"]
@@ -78,7 +83,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_schematic_component",
-            "Update fields (Reference, Value, Footprint, custom properties) consistently across every placed unit of a component, and move or hide the text of any of them.",
+            "Update fields and native dnp, in_bom, on_board, exclude_from_sim and in_pos_files attributes consistently across every placed unit. Omitted attributes remain unchanged. Move or hide field text.",
             json!({
                 "type": "object",
                 "properties": {
@@ -87,6 +92,11 @@ pub fn tools() -> Vec<ToolDef> {
                     "new_reference": { "type": "string", "description": "New reference designator (optional)" },
                     "value": { "type": "string", "description": "New value (optional)" },
                     "footprint": { "type": "string", "description": "New footprint (optional)" },
+                    "dnp": { "type": "boolean" },
+                    "in_bom": { "type": "boolean" },
+                    "on_board": { "type": "boolean" },
+                    "exclude_from_sim": { "type": "boolean" },
+                    "in_pos_files": { "type": "boolean" },
                     "datasheet": { "type": "string", "description": "New datasheet URL (optional)" },
                     "fields": {
                         "type": "object",
@@ -117,7 +127,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_schematic_component",
-            "Get a component's shared properties and every placed unit's position. Use get_schematic_pin_locations for pins.",
+            "Get a component's shared properties, native attributes and every placed unit's position. Use get_schematic_pin_locations for pins.",
             json!({
                 "type": "object",
                 "properties": {
@@ -417,6 +427,142 @@ pub fn tools() -> Vec<ToolDef> {
     ]
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SymbolAttributePatch {
+    dnp: Option<bool>,
+    in_bom: Option<bool>,
+    on_board: Option<bool>,
+    exclude_from_sim: Option<bool>,
+    in_pos_files: Option<bool>,
+}
+
+impl SymbolAttributePatch {
+    pub(crate) fn parse(args: &serde_json::Value) -> Result<Self, CallToolResult> {
+        let mut patch = Self::default();
+        for (name, slot) in [
+            ("dnp", &mut patch.dnp),
+            ("in_bom", &mut patch.in_bom),
+            ("on_board", &mut patch.on_board),
+            ("exclude_from_sim", &mut patch.exclude_from_sim),
+            ("in_pos_files", &mut patch.in_pos_files),
+        ] {
+            if let Some(value) = args.get(name) {
+                let Some(value) = value.as_bool() else {
+                    return Err(crate::tools::invalid_arg(name, "must be a boolean"));
+                };
+                *slot = Some(value);
+            }
+        }
+        if args
+            .get("fields")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|fields| fields.keys().any(|name| name.eq_ignore_ascii_case("DNP")))
+        {
+            return Err(crate::tools::invalid_arg(
+                "fields.DNP",
+                "use the native 'dnp' boolean instead of a custom DNP property",
+            ));
+        }
+        Ok(patch)
+    }
+
+    fn entries(self) -> [(&'static str, Option<bool>); 5] {
+        [
+            ("dnp", self.dnp),
+            ("in_bom", self.in_bom),
+            ("on_board", self.on_board),
+            ("exclude_from_sim", self.exclude_from_sim),
+            ("in_pos_files", self.in_pos_files),
+        ]
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.entries().iter().all(|(_, value)| value.is_none())
+    }
+
+    fn apply(self, attributes: &mut cse::SymbolAttributes) {
+        for (value, slot) in [
+            (self.dnp, &mut attributes.dnp),
+            (self.in_bom, &mut attributes.in_bom),
+            (self.on_board, &mut attributes.on_board),
+            (self.exclude_from_sim, &mut attributes.exclude_from_sim),
+            (self.in_pos_files, &mut attributes.in_pos_files),
+        ] {
+            if let Some(value) = value {
+                *slot = value;
+            }
+        }
+    }
+}
+
+fn attributes_json(attributes: cse::SymbolAttributes) -> serde_json::Value {
+    json!({"dnp": attributes.dnp, "in_bom": attributes.in_bom, "on_board": attributes.on_board,
+        "exclude_from_sim": attributes.exclude_from_sim, "in_pos_files": attributes.in_pos_files})
+}
+
+pub(crate) fn set_native_attributes(
+    content: &str,
+    reference: &str,
+    patch: SymbolAttributePatch,
+) -> Result<String, CallToolResult> {
+    let blocks = find_all_symbol_instance_blocks(content, reference);
+    if blocks.is_empty() {
+        return Err(crate::tools::invalid_arg(
+            "reference",
+            &format!("component '{reference}' was not found"),
+        ));
+    }
+    let mut edits = Vec::new();
+    for (start, end) in blocks {
+        let block = &content[start..end];
+        let children = find_direct_child_blocks(block, "symbol");
+        for (name, value) in patch.entries() {
+            let Some(value) = value else { continue };
+            let matching = children
+                .iter()
+                .filter(|(from, to)| {
+                    parse_sexp(&block[*from..*to]).is_ok_and(|node| node.head() == Some(name))
+                })
+                .collect::<Vec<_>>();
+            if matching.len() > 1 {
+                return Err(crate::tools::invalid_arg(
+                    name,
+                    &format!("duplicate native attribute on '{reference}'"),
+                ));
+            }
+            let replacement = format!("({name} {})", if value { "yes" } else { "no" });
+            if let Some((from, to)) = matching.first() {
+                edits.push(SexpEdit::replace(start + *from, start + *to, replacement));
+            } else {
+                let newline = if content.contains("\r\n") {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
+                let indent = children
+                    .iter()
+                    .find_map(|(from, _)| {
+                        let line = block[..*from].rfind('\n')? + 1;
+                        let prefix = &block[line..*from];
+                        prefix.chars().all(char::is_whitespace).then_some(prefix)
+                    })
+                    .unwrap_or("\t\t");
+                let line = content[..end - 1]
+                    .rfind('\n')
+                    .map_or(end - 1, |index| index + 1);
+                let closing_indent = &content[line..end - 1];
+                let (at, text) = if closing_indent.chars().all(char::is_whitespace) {
+                    (line, format!("{indent}{replacement}{newline}"))
+                } else {
+                    (end - 1, format!("{newline}{indent}{replacement}{newline}"))
+                };
+                edits.push(SexpEdit::insert(at, text));
+            }
+        }
+    }
+    Ok(apply_edits(content.to_owned(), edits))
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 async fn handle_add_schematic_component(
@@ -446,6 +592,10 @@ async fn handle_add_schematic_component(
     let footprint = opt_str(args, "footprint");
     let unit = match opt_u32(args, "unit") {
         Ok(unit) => unit.unwrap_or(1),
+        Err(error) => return Ok(failed_component_placement(error, &sch_path)),
+    };
+    let attribute_patch = match SymbolAttributePatch::parse(args) {
+        Ok(patch) => patch,
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
     // Load via konnect-schematic-editor
@@ -481,7 +631,7 @@ async fn handle_add_schematic_component(
         }
     };
 
-    let placed = match place_one_component(
+    let mut placed = match place_one_component(
         &mut sch,
         &context.instance_paths,
         &context.project_name,
@@ -500,6 +650,7 @@ async fn handle_add_schematic_component(
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
 
+    apply_placement_attribute_patch(&mut sch, &mut placed, attribute_patch);
     let (expected_x, expected_y) = snap_point(x, y, 1.27);
     let placement = ComponentTargetUnit::placement(
         &placed.uuid,
@@ -728,6 +879,7 @@ pub(crate) fn place_one_component(
     sym.at.rotation = Some(rotation);
     sym.set_mirror(mirror);
     sym.unit = unit;
+    sym.set_attributes(fields.attributes);
 
     // Reference and Value go where the library anchors them, carried through
     // the placement transform so they follow a rotated body (#101);
@@ -820,6 +972,7 @@ pub(crate) fn place_one_component(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlacementFields {
+    pub(crate) attributes: cse::SymbolAttributes,
     pub(crate) value: String,
     pub(crate) footprint: String,
 }
@@ -843,6 +996,7 @@ impl PlacementFields {
         Self {
             value: value.unwrap_or(library_value).to_owned(),
             footprint: footprint.unwrap_or(&metadata.footprint).to_owned(),
+            attributes: metadata.attributes,
         }
     }
 }
@@ -867,6 +1021,7 @@ pub(crate) struct ComponentTargetUnit {
     /// reflection that fails to reach the file cannot pass the readback.
     mirror: Option<String>,
     instances: Vec<(String, String)>,
+    attributes: cse::SymbolAttributes,
 }
 
 impl ComponentTargetUnit {
@@ -904,6 +1059,7 @@ impl ComponentTargetUnit {
                 ("Footprint".to_owned(), fields.footprint.clone()),
             ]),
             instances,
+            attributes: fields.attributes,
         }
     }
 }
@@ -1021,6 +1177,16 @@ fn verify_component_expectations(
                 .into_result());
             }
         }
+        if unit["attributes"] != attributes_json(target.attributes) {
+            return Err(ComponentDeleteTargetError::stale(
+                path,
+                format!(
+                    "observed native attributes differ from bound intent for UUID {}",
+                    target.uuid
+                ),
+            )
+            .into_result());
+        }
         for (field, value) in &target.fields {
             if unit["fields"][field].as_str() != Some(value) {
                 return Err(ComponentDeleteTargetError::stale(
@@ -1051,6 +1217,14 @@ impl ComponentTarget {
         }
         for unit in &mut expected.units {
             unit.fields.extend(fields.clone());
+        }
+        expected
+    }
+
+    fn with_attributes(&self, patch: SymbolAttributePatch) -> Self {
+        let mut expected = self.clone();
+        for unit in &mut expected.units {
+            patch.apply(&mut unit.attributes);
         }
         expected
     }
@@ -1173,6 +1347,7 @@ fn component_target_from_source(
             // readback assert they left it alone.
             mirror: symbol.mirror.clone(),
             instances: instance_paths,
+            attributes: symbol.attributes(),
         });
     }
     if let Some((unit, uuids)) = by_unit.iter().find(|(_, uuids)| uuids.len() > 1) {
@@ -1425,6 +1600,7 @@ fn component_mutation_readback_from_schematic(
             "fields": fields,
             "private_fields": symbol.properties.iter().filter(|p| p.private).map(|p| (&p.name, true)).collect::<std::collections::BTreeMap<_, _>>(),
             "field_placements": field_placements,
+            "attributes": attributes_json(symbol.attributes()),
             "instance_paths": instance_paths,
             "instance_references": instance_references
         }));
@@ -1447,7 +1623,8 @@ fn component_mutation_readback_from_schematic(
         "mirror_y": anchor_mirror.contains('y'),
         "unit_count": units.len(),
         "units": units,
-        "fields": fields
+        "fields": fields,
+        "attributes": attributes_json(anchor.attributes())
     }))
 }
 
@@ -1665,6 +1842,7 @@ fn copy_component_observation(result: &mut serde_json::Value, observed: &serde_j
         "unit_count",
         "units",
         "fields",
+        "attributes",
     ] {
         result[key] = observed[key].clone();
     }
@@ -2354,6 +2532,12 @@ pub(crate) fn set_property_value(
     new_value: &str,
     add_missing: bool,
 ) -> Result<(String, PropertyWriteCounts), String> {
+    if field.eq_ignore_ascii_case("DNP") {
+        return Err(
+            "use edit_schematic_component's native 'dnp' boolean instead of a custom DNP property"
+                .to_owned(),
+        );
+    }
     let blocks = find_all_symbol_instance_blocks(content, reference);
     if blocks.is_empty() {
         return Err(format!("symbol '{reference}' not found in this schematic"));
@@ -2720,6 +2904,10 @@ async fn handle_edit_schematic_component(
         Err(e) => return Ok(e),
     };
 
+    let attribute_patch = match SymbolAttributePatch::parse(args) {
+        Ok(patch) => patch,
+        Err(error) => return Ok(error),
+    };
     let mut content = read_consistent(&sch_path)?;
     let expected = content.clone();
     let target = match component_target_from_source(&sch_path, &expected, &reference) {
@@ -2933,8 +3121,25 @@ async fn handle_edit_schematic_component(
         )));
     }
 
-    let intent = ComponentMutationIntent::new(target.with_fields(&expected_fields))
-        .with_field_placements(applied_placements, placement_unit);
+    if !attribute_patch.is_empty() && !errors.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "No fields or native attributes were updated on '{reference}': {}",
+            errors.join("; ")
+        )));
+    }
+    if !attribute_patch.is_empty() {
+        content = match set_native_attributes(&content, edit_reference, attribute_patch) {
+            Ok(content) => content,
+            Err(error) => return Ok(error),
+        };
+        changed.push("native symbol attributes".to_owned());
+    }
+    let intent = ComponentMutationIntent::new(
+        target
+            .with_fields(&expected_fields)
+            .with_attributes(attribute_patch),
+    )
+    .with_field_placements(applied_placements, placement_unit);
     let observed = if !changed.is_empty() {
         let item_ids = match target.item_ids() {
             Ok(item_ids) => item_ids,
@@ -2989,6 +3194,74 @@ fn symbol_properties(symbol: &cse::Symbol) -> BTreeMap<&str, &str> {
     properties
 }
 
+pub(crate) fn apply_placement_attribute_patch(
+    schematic: &mut cse::Schematic,
+    placed: &mut PlacedComponent,
+    patch: SymbolAttributePatch,
+) {
+    patch.apply(&mut placed.fields.attributes);
+    if let Some(symbol) = schematic
+        .symbols
+        .iter_mut()
+        .find(|symbol| symbol.uuid == placed.uuid)
+    {
+        symbol.set_attributes(placed.fields.attributes);
+    }
+}
+
+pub(crate) fn commit_attribute_batch(
+    path: &std::path::Path,
+    expected: &str,
+    content: &str,
+    patches: &[(String, SymbolAttributePatch)],
+) -> anyhow::Result<Result<Vec<serde_json::Value>, CallToolResult>> {
+    let mut intents = Vec::new();
+    for (reference, patch) in patches {
+        let mut target = match component_target_from_source(path, expected, reference) {
+            Ok(target) => target,
+            Err(error) => return Ok(Err(error.into_result())),
+        };
+        let edited = match component_target_from_source(path, content, reference) {
+            Ok(target) => target,
+            Err(error) => return Ok(Err(error.into_result())),
+        };
+        for unit in &mut target.units {
+            let Some(edited_unit) = edited
+                .units
+                .iter()
+                .find(|candidate| candidate.uuid == unit.uuid)
+            else {
+                return Ok(Err(ComponentDeleteTargetError::stale(
+                    path,
+                    "batch edit lost a bound unit",
+                )
+                .into_result()));
+            };
+            unit.fields = edited_unit.fields.clone();
+        }
+        intents.push(ComponentMutationIntent::new(target.with_attributes(*patch)));
+    }
+    let tree = parse_sexp(expected)?;
+    let item_ids = extract_symbol_instances(&tree)
+        .into_iter()
+        .filter_map(|symbol| symbol.uuid)
+        .map(ItemId::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    let command = SchematicCommand::replace_items_from_document(
+        expected,
+        content,
+        item_ids,
+        "Edit native symbol attributes".to_owned(),
+    )?;
+    commit_verified_component_mutation(
+        path,
+        expected,
+        &command,
+        &intents,
+        "batch_edit_schematic_components",
+    )
+}
+
 async fn handle_get_schematic_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -3027,7 +3300,8 @@ async fn handle_get_schematic_component(
                 "rotation": symbol.at.rotation.unwrap_or(0.0),
                 "mirror_x": unit_mirror.contains('x'),
                 "mirror_y": unit_mirror.contains('y'),
-                "uuid": symbol.uuid
+                "uuid": symbol.uuid,
+                "attributes": attributes_json(symbol.attributes())
             })
         })
         .collect();
@@ -3044,6 +3318,7 @@ async fn handle_get_schematic_component(
         "uuid": anchor.uuid,
         "unit_count": units.len(),
         "units": units,
+        "attributes": attributes_json(anchor.attributes()),
         "properties": symbol_properties(anchor)
     })))
 }
@@ -3072,6 +3347,7 @@ async fn handle_list_schematic_components(
                 "rotation": rotation,
                 "mirror_x": mirror.contains('x'),
                 "mirror_y": mirror.contains('y'),
+                "attributes": attributes_json(sym.attributes()),
                 "properties": symbol_properties(sym)
             })
         })
@@ -9358,5 +9634,343 @@ mod rotate_junction_reconciliation_tests {
 
         assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), SHEET);
+    }
+}
+
+#[cfg(test)]
+mod issue25_native_attributes_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ecc83.kicad_sch");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch"),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_attributes_reach_every_unit_and_query_readback() {
+        let (_dir, path) = fixture();
+        let original = cse::Schematic::load(&path).unwrap();
+        let reference = original
+            .symbols
+            .iter()
+            .filter_map(|s| s.reference())
+            .max_by_key(|reference| {
+                original
+                    .symbols
+                    .iter()
+                    .filter(|s| s.reference() == Some(*reference))
+                    .count()
+            })
+            .unwrap()
+            .to_owned();
+        let count = original
+            .symbols
+            .iter()
+            .filter(|s| s.reference() == Some(&reference))
+            .count();
+        assert!(count > 1, "fixture must exercise all placed units");
+        let response = handle_edit_schematic_component(
+            &json!({
+                "schematic": path, "reference": reference,
+                "dnp": true, "in_bom": false, "on_board": false,
+                "exclude_from_sim": true, "in_pos_files": false
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!response.is_error, "{response:?}");
+        let saved = cse::Schematic::load(&path).unwrap();
+        for unit in saved
+            .symbols
+            .iter()
+            .filter(|s| s.reference() == Some(&reference))
+        {
+            assert!(unit.dnp, "DNP is a native symbol flag");
+            assert!(!unit.in_bom);
+            assert!(!unit.on_board);
+            assert_eq!(unit.exclude_from_sim, Some(true));
+            assert_eq!(
+                unit.in_pos_files.as_ref().and_then(|n| n.bool_value()),
+                Some(false)
+            );
+        }
+        let queried = handle_get_schematic_component(
+            &json!({"schematic": path, "reference": reference}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body(&queried)["attributes"]["dnp"], true);
+        assert_eq!(body(&queried)["attributes"]["in_pos_files"], false);
+        let response = handle_edit_schematic_component(
+            &json!({"schematic": path, "reference": reference,
+            "dnp": false}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!response.is_error, "{response:?}");
+        let saved = cse::Schematic::load(&path).unwrap();
+        for symbol in saved
+            .symbols
+            .iter()
+            .filter(|s| s.reference() == Some(&reference))
+        {
+            assert!(!symbol.dnp, "explicit false clears the native flag");
+            assert!(!symbol.in_bom, "omitted flags remain unchanged");
+            assert_eq!(symbol.exclude_from_sim, Some(true));
+            assert_eq!(
+                symbol
+                    .in_pos_files
+                    .as_ref()
+                    .and_then(|node| node.bool_value()),
+                Some(false)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_misleading_dnp_property_is_refused_before_other_updates() {
+        let (_dir, path) = fixture();
+        let source = std::fs::read_to_string(&path).unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        let reference = sch.symbols[0].reference().unwrap();
+        let response = handle_edit_schematic_component(
+            &json!({"schematic": path, "reference": reference,
+            "value": "MUST_NOT_WRITE", "fields": {"DNP": "yes"}}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(response.is_error, "{response:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
+    #[test]
+    fn mounting_hole_placement_inherits_native_library_flags() {
+        let source = r#"(kicad_sch (version 20250114) (generator "eeschema") (uuid "root")
+            (lib_symbols (symbol "MountingHole:MountingHole_3.2mm_M3"
+                (in_bom no) (on_board yes) (exclude_from_sim yes) (in_pos_files no)
+                (property "Reference" "H" (at 0 0 0))
+                (property "Value" "MountingHole_3.2mm_M3" (at 0 0 0))
+                (property "Footprint" "MountingHole:MountingHole_3.2mm_M3" (at 0 0 0)))))"#;
+        let mut sch = cse::Schematic::from_source("mount.kicad_sch", source.to_owned()).unwrap();
+        let mut placed = place_one_component(
+            &mut sch,
+            &["/root".to_owned()],
+            "mount",
+            "MountingHole:MountingHole_3.2mm_M3",
+            100.0,
+            100.0,
+            0.0,
+            None,
+            Some("H1"),
+            None,
+            None,
+            1,
+            &|_: &str| Vec::new(),
+        )
+        .unwrap();
+        let symbol = &sch.symbols[0];
+        assert!(
+            !symbol.in_bom,
+            "mounting holes belong on board without a BOM line"
+        );
+        assert!(symbol.on_board);
+        assert_eq!(symbol.exclude_from_sim, Some(true));
+        assert_eq!(
+            symbol
+                .in_pos_files
+                .as_ref()
+                .and_then(|node| node.bool_value()),
+            Some(false)
+        );
+        let patch = SymbolAttributePatch::parse(
+            &json!({"in_bom": true, "exclude_from_sim": false, "in_pos_files": true}),
+        )
+        .unwrap();
+        apply_placement_attribute_patch(&mut sch, &mut placed, patch);
+        assert!(sch.symbols[0].in_bom);
+        assert_eq!(sch.symbols[0].exclude_from_sim, Some(false));
+        assert!(sch.symbols[0].attributes().in_pos_files);
+    }
+    #[tokio::test]
+    async fn invalid_sibling_fields_refuse_native_edits_before_persistence() {
+        let (_dir, path) = fixture();
+        let source = std::fs::read_to_string(&path).unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        let response = handle_edit_schematic_component(
+            &json!({"schematic": path,
+            "reference": sch.symbols[0].reference().unwrap(), "dnp": true,
+            "fields": {"Reference": "MUST_NOT_WRITE"}}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(response.is_error, "{response:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
+
+    #[test]
+    fn new_native_clauses_preserve_existing_line_endings_and_indentation() {
+        let source = "(kicad_sch\r\n  (symbol\r\n    (lib_id \"Device:R\")\r\n    (property \"Reference\" \"R1\")\r\n  )\r\n)\r\n";
+        let patch = SymbolAttributePatch::parse(&json!({"in_pos_files": false})).unwrap();
+        let output = set_native_attributes(source, "R1", patch).unwrap();
+        assert_eq!(output.replace("    (in_pos_files no)\r\n", ""), source);
+    }
+
+    #[test]
+    fn duplicate_native_clauses_and_missing_targets_are_refused() {
+        let source = r#"(kicad_sch (symbol (lib_id "Device:R") (property "Reference" "R1") (dnp no) (dnp yes)))"#;
+        let patch = SymbolAttributePatch::parse(&json!({"dnp": true})).unwrap();
+        assert!(set_native_attributes(source, "R1", patch).is_err());
+        assert!(set_native_attributes(source, "R404", patch).is_err());
+        for invalid in [json!(null), json!(1), json!("yes")] {
+            assert!(SymbolAttributePatch::parse(&json!({"in_bom": invalid})).is_err());
+        }
+    }
+
+    #[test]
+    fn annotation_and_shared_property_writes_reject_custom_dnp() {
+        let (_dir, path) = fixture();
+        let source = std::fs::read_to_string(&path).unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        for name in ["DNP", "dnp", "Dnp"] {
+            let error = set_property_value(
+                &source,
+                sch.symbols[0].reference().unwrap(),
+                name,
+                "yes",
+                true,
+            )
+            .unwrap_err();
+            assert!(error.contains("native 'dnp' boolean"));
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
+
+    #[test]
+    fn native_attribute_intent_rejects_a_lost_flag() {
+        let (_dir, path) = fixture();
+        let source = std::fs::read_to_string(&path).unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        let reference = sch.symbols[0].reference().unwrap();
+        let target = component_target_from_source(&path, &source, reference).unwrap();
+        let patch = SymbolAttributePatch::parse(&json!({"dnp": true})).unwrap();
+        assert!(verified_component_readback(&path, &sch, &target.with_attributes(patch)).is_err());
+    }
+
+    #[tokio::test]
+    async fn served_native_attribute_edit_enforces_schema_and_reaches_saved_units() {
+        let (_dir, path) = fixture();
+        let original = cse::Schematic::load(&path).unwrap();
+        let reference = original.symbols[0].reference().unwrap();
+        let mut config = context().config.clone();
+        config.auto_load_toolsets = true;
+        let handler = crate::mcp::handler::McpHandler::new(config).await.unwrap();
+        let request = |id, value| {
+            json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "edit_schematic_component", "arguments": {
+                "schematic": path, "reference": reference, "dnp": value
+            }}})
+        };
+        let response = handler
+            .handle_message(request(1, json!(true)))
+            .await
+            .unwrap();
+        let result: CallToolResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let saved = cse::Schematic::load(&path).unwrap();
+        assert!(saved
+            .symbols
+            .iter()
+            .filter(|s| s.reference() == Some(reference))
+            .all(|s| s.dnp));
+        let expected = std::fs::read_to_string(&path).unwrap();
+        let response = handler
+            .handle_message(request(2, json!("yes")))
+            .await
+            .unwrap();
+        let result: CallToolResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn native_attribute_schemas_accept_booleans_and_reject_strings() {
+        for tool in tools()
+            .into_iter()
+            .chain(super::super::sch_batch::tools())
+            .filter(|tool| {
+                matches!(
+                    tool.name,
+                    "add_schematic_component"
+                        | "edit_schematic_component"
+                        | "batch_place_components"
+                        | "batch_edit_schematic_components"
+                )
+            })
+        {
+            let item = json!({"lib_id": "Device:R", "x": 100, "y": 100, "reference": "R1", "dnp": true,
+                "in_bom": false, "on_board": true, "exclude_from_sim": false, "in_pos_files": false});
+            let mut request = match tool.name {
+                "add_schematic_component" => item.clone(),
+                "edit_schematic_component" => {
+                    json!({"reference": "R1", "dnp": true, "in_bom": false,
+                    "on_board": true, "exclude_from_sim": false, "in_pos_files": false})
+                }
+                "batch_place_components" => json!({"components": [item]}),
+                _ => json!({"edits": [{"reference": "R1", "dnp": true, "in_bom": false,
+                    "on_board": true, "exclude_from_sim": false, "in_pos_files": false}]}),
+            };
+            request["schematic"] = json!("test.kicad_sch");
+            assert!(
+                tool.input_validator.is_valid(&request),
+                "{} {:?}",
+                tool.name,
+                request
+            );
+            if tool.name.starts_with("batch_") {
+                let key = if tool.name == "batch_place_components" {
+                    "components"
+                } else {
+                    "edits"
+                };
+                request[key][0]["dnp"] = json!("yes");
+            } else {
+                request["dnp"] = json!("yes");
+            }
+            assert!(!tool.input_validator.is_valid(&request), "{}", tool.name);
+        }
     }
 }
