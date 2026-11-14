@@ -357,19 +357,53 @@ fn snapshot_routed_nets(
             }
         }
     }
-    if !client
-        .get_items_in(document.clone(), ObjectType::KotPcbZone)?
-        .is_empty()
-    {
-        routed.extend(
-            client
-                .get_nets_in(document)?
-                .into_iter()
-                .filter(|net| !net.name.is_empty())
-                .map(|net| net.name),
-        );
+    for item in client.get_items_in(document, ObjectType::KotPcbZone)? {
+        if let Some(net) = super::pcb_zone_nets::routed_net(&item)? {
+            routed.insert(net.name);
+        }
     }
     Ok(routed)
+}
+
+#[cfg(test)]
+mod zone_net_tests {
+    use super::*;
+    use crate::tools::pcb_zone_nets::test_support::{
+        captured_zones, copper, invalid_zones, mock_zones, rule_area,
+    };
+
+    #[test]
+    fn zone_snapshot_counts_only_its_copper_net() {
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("zones.kicad_pcb");
+        for (zones, expected) in [
+            (vec![copper("GND", 1)], BTreeSet::from(["GND".to_string()])),
+            (vec![rule_area()], BTreeSet::new()),
+            (vec![copper("", 0)], BTreeSet::new()),
+            (captured_zones(), BTreeSet::from(["GND".to_string()])),
+        ] {
+            let (server, _) = mock_zones(&board, zones);
+            let client = konnect_ipc::KiCadIpcClient::new(server.address().to_string());
+            let document = client.find_open_board(&board).unwrap();
+            assert_eq!(snapshot_routed_nets(&client, document).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn zone_snapshot_refuses_unknown_copper_net_before_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("zones.kicad_pcb");
+        for zone in invalid_zones() {
+            let (server, requests) = mock_zones(&board, vec![zone]);
+            let client = konnect_ipc::KiCadIpcClient::new(server.address().to_string());
+            let document = client.find_open_board(&board).unwrap();
+            let error = snapshot_routed_nets(&client, document).unwrap_err();
+            assert!(error.to_string().contains("zone"), "{error:#}");
+            assert!(!requests.lock().unwrap().iter().any(|request| {
+                request.ends_with("BeginCommit") || request.ends_with("UpdateItems")
+            }));
+        }
+    }
 }
 
 fn plan_response(plan: &UpdatePlan, applied: bool) -> CallToolResult {
