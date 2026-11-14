@@ -267,12 +267,20 @@ pub(crate) async fn handle_update_footprints_from_library(
                 .map(|net| (net.name, net.netcode))
                 .collect::<BTreeMap<_, _>>();
             let routed_nets = snapshot_routed_nets(client, document.clone())?;
+            let copper_layer_count = client
+                .get_enabled_layers_in(document.clone())?
+                .copper_layer_count as usize;
+            anyhow::ensure!(
+                (2..=32).contains(&copper_layer_count) && copper_layer_count % 2 == 0,
+                "KiCad returned an unsupported copper layer count {copper_layer_count} for the requested board"
+            );
             let mut plan = plan_updates(
                 &planning_board_path,
                 &footprint_items,
                 &net_codes,
                 &routed_nets,
                 &filters,
+                copper_layer_count,
             );
 
             if dry_run || plan.status == PlanStatus::Conflict {
@@ -487,6 +495,7 @@ fn plan_updates(
     net_codes: &BTreeMap<String, i32>,
     routed_nets: &BTreeSet<String>,
     filters: &UpdateFilters,
+    copper_layer_count: usize,
 ) -> UpdatePlan {
     #[derive(Debug)]
     struct Candidate {
@@ -604,6 +613,7 @@ fn plan_updates(
 
     let mut hasher = Sha256::new();
     hasher.update(serde_json::to_vec(filters).expect("filters serialize"));
+    hasher.update(copper_layer_count.to_le_bytes());
     let mut changes = Vec::new();
     let mut prepared_items = Vec::new();
     for candidate in selected {
@@ -669,18 +679,23 @@ fn plan_updates(
                 continue;
             }
         };
-        let prepared =
-            match build_updated_instance(&candidate.instance, &library, net_codes, routed_nets) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    diagnostics.push(UpdateDiagnostic {
-                        code: "footprint_update_conflict".to_string(),
-                        message: format!("{error:#}"),
-                        reference: Some(candidate.reference),
-                    });
-                    continue;
-                }
-            };
+        let prepared = match build_updated_instance(
+            &candidate.instance,
+            &library,
+            net_codes,
+            routed_nets,
+            copper_layer_count,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                diagnostics.push(UpdateDiagnostic {
+                    code: "footprint_update_conflict".to_string(),
+                    message: format!("{error:#}"),
+                    reference: Some(candidate.reference),
+                });
+                continue;
+            }
+        };
 
         hasher.update(candidate.item.type_url.as_bytes());
         hasher.update(&candidate.item.value);
@@ -1457,6 +1472,7 @@ fn build_updated_instance(
     library: &LibraryFootprint,
     net_codes: &BTreeMap<String, i32>,
     routed_nets: &BTreeSet<String>,
+    copper_layer_count: usize,
 ) -> Result<PreparedUpdate> {
     let current_definition = current
         .definition
@@ -1524,12 +1540,12 @@ fn build_updated_instance(
             library
                 .pads
                 .iter()
-                .map(mirror_pad)
+                .map(|item| mirror_pad(item, copper_layer_count))
                 .collect::<Result<Vec<_>>>()?,
             library
                 .graphics
                 .iter()
-                .map(mirror_graphic)
+                .map(|item| mirror_graphic(item, copper_layer_count))
                 .collect::<Result<Vec<_>>>()?,
         )
     } else {
@@ -1605,6 +1621,7 @@ fn build_updated_instance(
         &position,
         rotation,
         is_back,
+        copper_layer_count,
     )?;
     updated.definition = Some(definition);
     apply_field_value(&mut updated.datasheet_field, library.datasheet.as_deref());
@@ -1648,6 +1665,7 @@ fn merge_custom_properties(
     footprint_position: &kiapi::common::types::Vector2,
     footprint_rotation: f64,
     is_back: bool,
+    copper_layer_count: usize,
 ) -> Result<()> {
     let library_names = library_properties
         .iter()
@@ -1677,8 +1695,13 @@ fn merge_custom_properties(
         }
     }
     for property in library_properties {
-        let property =
-            transform_library_property(property, footprint_position, footprint_rotation, is_back)?;
+        let property = transform_library_property(
+            property,
+            footprint_position,
+            footprint_rotation,
+            is_back,
+            copper_layer_count,
+        )?;
         updated.items.push(konnect_ipc::builders::pack_any(
             &property,
             "kiapi.board.types.Field",
@@ -1692,6 +1715,7 @@ fn transform_library_property(
     footprint_position: &kiapi::common::types::Vector2,
     footprint_rotation: f64,
     is_back: bool,
+    copper_layer_count: usize,
 ) -> Result<kiapi::board::types::Field> {
     let mut property = property.clone();
     property.id = None;
@@ -1745,8 +1769,9 @@ fn transform_library_property(
             .with_context(|| format!("property '{}' has an invalid layer", property.name))?;
         let layer_name = konnect_ipc::builders::layer_name(layer)
             .with_context(|| format!("property '{}' has an unnamed layer", property.name))?;
-        board_text.layer =
-            konnect_ipc::builders::try_layer_from_name(&flip_layer_name(layer_name)?)? as i32;
+        board_text.layer = konnect_ipc::builders::try_layer_from_name(
+            &konnect_ipc::builders::flip_layer(layer_name, copper_layer_count)?,
+        )? as i32;
     }
     Ok(property)
 }
@@ -1759,20 +1784,24 @@ fn readable_property_angle(degrees: f64) -> f64 {
     angle
 }
 
-fn mirror_pad(pad: &konnect_ipc::IpcPadDefinition) -> Result<konnect_ipc::IpcPadDefinition> {
+fn mirror_pad(
+    pad: &konnect_ipc::IpcPadDefinition,
+    copper_layer_count: usize,
+) -> Result<konnect_ipc::IpcPadDefinition> {
     let mut mirrored = pad.clone();
     mirrored.y = -mirrored.y;
     mirrored.rotation = -mirrored.rotation;
     mirrored.layers = mirrored
         .layers
         .iter()
-        .map(|layer| flip_layer_name(layer))
+        .map(|layer| konnect_ipc::builders::flip_layer(layer, copper_layer_count))
         .collect::<Result<_>>()?;
     Ok(mirrored)
 }
 
 fn mirror_graphic(
     graphic: &konnect_ipc::IpcGraphicDefinition,
+    copper_layer_count: usize,
 ) -> Result<konnect_ipc::IpcGraphicDefinition> {
     use konnect_ipc::IpcGraphicDefinition as Graphic;
 
@@ -1786,7 +1815,7 @@ fn mirror_graphic(
         } => Graphic::Line {
             start: point(*start),
             end: point(*end),
-            layer: flip_layer_name(layer)?,
+            layer: konnect_ipc::builders::flip_layer(layer, copper_layer_count)?,
             width: *width,
         },
         Graphic::Rect {
@@ -1798,7 +1827,7 @@ fn mirror_graphic(
         } => Graphic::Rect {
             start: point(*start),
             end: point(*end),
-            layer: flip_layer_name(layer)?,
+            layer: konnect_ipc::builders::flip_layer(layer, copper_layer_count)?,
             width: *width,
             filled: *filled,
         },
@@ -1811,7 +1840,7 @@ fn mirror_graphic(
         } => Graphic::Circle {
             center: point(*center),
             end: point(*end),
-            layer: flip_layer_name(layer)?,
+            layer: konnect_ipc::builders::flip_layer(layer, copper_layer_count)?,
             width: *width,
             filled: *filled,
         },
@@ -1825,7 +1854,7 @@ fn mirror_graphic(
             start: point(*end),
             mid: point(*mid),
             end: point(*start),
-            layer: flip_layer_name(layer)?,
+            layer: konnect_ipc::builders::flip_layer(layer, copper_layer_count)?,
             width: *width,
         },
         Graphic::Poly {
@@ -1835,7 +1864,7 @@ fn mirror_graphic(
             filled,
         } => Graphic::Poly {
             points: points.iter().copied().map(point).collect(),
-            layer: flip_layer_name(layer)?,
+            layer: konnect_ipc::builders::flip_layer(layer, copper_layer_count)?,
             width: *width,
             filled: *filled,
         },
@@ -1850,36 +1879,11 @@ fn mirror_graphic(
             text: text.clone(),
             position: point(*position),
             rotation: 180.0 - rotation,
-            layer: flip_layer_name(layer)?,
+            layer: konnect_ipc::builders::flip_layer(layer, copper_layer_count)?,
             size: *size,
             stroke_width_mm: *stroke_width_mm,
         },
     })
-}
-
-fn flip_layer_name(layer: &str) -> Result<String> {
-    let flipped = match layer {
-        "F.Cu" => "B.Cu",
-        "B.Cu" => "F.Cu",
-        "F.Adhes" => "B.Adhes",
-        "B.Adhes" => "F.Adhes",
-        "F.Paste" => "B.Paste",
-        "B.Paste" => "F.Paste",
-        "F.SilkS" | "F.Silkscreen" => "B.SilkS",
-        "B.SilkS" | "B.Silkscreen" => "F.SilkS",
-        "F.Mask" => "B.Mask",
-        "B.Mask" => "F.Mask",
-        "F.CrtYd" | "F.Courtyard" => "B.CrtYd",
-        "B.CrtYd" | "B.Courtyard" => "F.CrtYd",
-        "F.Fab" => "B.Fab",
-        "B.Fab" => "F.Fab",
-        "*.Cu" | "*.Mask" | "*.Paste" => layer,
-        other if other.starts_with("F.") || other.starts_with("B.") => {
-            bail!("unsupported side-specific footprint layer '{other}'")
-        }
-        other => other,
-    };
-    Ok(flipped.to_string())
 }
 
 fn is_side_specific_layer(layer: i32) -> bool {
@@ -2569,6 +2573,97 @@ mod tests {
     }
 
     #[test]
+    fn refresh_inner_copper_uses_the_eight_layer_stack() {
+        let library = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
+        let mut pad = library.pads[0].clone();
+        pad.layers = vec!["In2.Cu".to_string()];
+        let mirrored = mirror_pad(&pad, 8).unwrap();
+        assert_eq!(mirrored.layers, ["In5.Cu"]);
+    }
+
+    #[test]
+    fn refresh_rebuild_mirrors_inner_pad_graphic_and_numeric_field_layers() {
+        let current = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+        let mut library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+        library.pads[0].layers = vec!["In2.Cu".to_string()];
+        library
+            .graphics
+            .push(konnect_ipc::IpcGraphicDefinition::Line {
+                start: (1.0, 2.0),
+                end: (3.0, 4.0),
+                layer: "In2.Cu".to_string(),
+                width: 0.1,
+            });
+        let field = library
+            .properties
+            .first_mut()
+            .expect("fixture contains a custom property");
+        field.text.as_mut().unwrap().layer = kiapi::board::types::BoardLayer::BlIn2Cu as i32;
+        let field_name = field.name.clone();
+        let prepared =
+            build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new(), 8)
+                .unwrap();
+        let updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        let definition = updated.definition.as_ref().unwrap();
+        let pads = definition
+            .items
+            .iter()
+            .filter(|item| item.type_url.ends_with(".Pad"))
+            .map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(pads[0]
+            .pad_stack
+            .as_ref()
+            .unwrap()
+            .layers
+            .contains(&(kiapi::board::types::BoardLayer::BlIn5Cu as i32)));
+        let fields = decoded_custom_fields(&updated);
+        assert_eq!(
+            fields
+                .iter()
+                .find(|field| field.name == field_name)
+                .unwrap()
+                .text
+                .as_ref()
+                .unwrap()
+                .layer,
+            kiapi::board::types::BoardLayer::BlIn5Cu as i32
+        );
+        let graphic = mirror_graphic(library.graphics.last().unwrap(), 8).unwrap();
+        assert!(
+            matches!(graphic, konnect_ipc::IpcGraphicDefinition::Line { layer, .. } if layer == "In5.Cu")
+        );
+        assert!(
+            build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new(), 2)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn library_refresh_revision_includes_live_copper_count() {
+        let (_temp, board, items) = plan_fixture();
+        let filters = UpdateFilters::default();
+        let first = plan_updates(
+            &board,
+            &items,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &filters,
+            4,
+        );
+        let second = plan_updates(
+            &board,
+            &items,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &filters,
+            8,
+        );
+        assert_ne!(first.plan_revision, second.plan_revision);
+    }
+
+    #[test]
     fn merge_preserves_instance_state_and_nets_by_logical_pad_number() {
         let current = current_instance(kiapi::board::types::BoardLayer::BlBCu);
         let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
@@ -2577,6 +2672,7 @@ mod tests {
             &library,
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::from(["ROW1".to_string(), "COL1".to_string()]),
+            2,
         )
         .unwrap();
         let updated =
@@ -2729,6 +2825,7 @@ mod tests {
             &library,
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
+            2,
         )
         .unwrap();
         let updated =
@@ -2775,6 +2872,7 @@ mod tests {
             &library,
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::from(["COL1".to_string()]),
+            2,
         )
         .unwrap_err();
 
@@ -2925,6 +3023,7 @@ mod tests {
             &library,
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
+            2,
         )
         .unwrap_err();
 
@@ -3014,13 +3113,13 @@ mod tests {
                     value_degrees: rotation,
                 });
                 let first =
-                    build_updated_instance(&current, &library, &net_codes, &routed).unwrap();
+                    build_updated_instance(&current, &library, &net_codes, &routed, 2).unwrap();
                 let applied =
                     kiapi::board::types::FootprintInstance::decode(first.item.value.as_slice())
                         .unwrap();
 
                 let second =
-                    build_updated_instance(&applied, &library, &net_codes, &routed).unwrap();
+                    build_updated_instance(&applied, &library, &net_codes, &routed, 2).unwrap();
 
                 assert!(
                     second.changed_domains.is_empty(),
@@ -3040,6 +3139,7 @@ mod tests {
             &library,
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
+            2,
         )
         .unwrap();
         let mut prepared =
@@ -3208,6 +3308,7 @@ mod tests {
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
             &UpdateFilters::default(),
+            2,
         );
 
         assert_eq!(plan.status, PlanStatus::Conflict);
@@ -3243,6 +3344,7 @@ mod tests {
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
             &parse_filters(&serde_json::json!({ "references": [] })).unwrap(),
+            2,
         );
         assert_eq!(empty.status, PlanStatus::Noop);
         assert_eq!(empty.coverage.selected.planned, 0);
@@ -3264,6 +3366,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &UpdateFilters::default(),
+            2,
         );
         assert_eq!(all.status, PlanStatus::Ready);
         assert_eq!(all.coverage.selected.planned, 2);
@@ -3287,6 +3390,7 @@ mod tests {
                 "library_ids": ["Other:Socket"]
             }))
             .unwrap(),
+            2,
         );
         assert_eq!(intersection.status, PlanStatus::Noop);
         assert_eq!(intersection.coverage.selected.planned, 0);
@@ -3302,6 +3406,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &parse_filters(&serde_json::json!({ "references": ["SW404"] })).unwrap(),
+            2,
         );
         assert_eq!(missing.status, PlanStatus::Conflict);
         assert!(missing
@@ -3316,6 +3421,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &parse_filters(&serde_json::json!({ "references": ["SW1"] })).unwrap(),
+            2,
         );
         assert_eq!(duplicate.status, PlanStatus::Conflict);
         assert!(duplicate
@@ -3334,6 +3440,7 @@ mod tests {
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
             &parse_filters(&serde_json::json!({ "references": ["TP1"] })).unwrap(),
+            2,
         );
 
         assert_eq!(plan.status, PlanStatus::Conflict);
@@ -3354,6 +3461,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &UpdateFilters::default(),
+            2,
         );
         assert_eq!(first.status, PlanStatus::Ready);
 
@@ -3363,6 +3471,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &UpdateFilters::default(),
+            2,
         );
 
         assert_eq!(second.status, PlanStatus::Noop);
@@ -3378,14 +3487,14 @@ mod tests {
         let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
         let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
         let routed = BTreeSet::new();
-        let applied = build_updated_instance(&current, &base, &net_codes, &routed).unwrap();
+        let applied = build_updated_instance(&current, &base, &net_codes, &routed, 2).unwrap();
         let applied =
             kiapi::board::types::FootprintInstance::decode(applied.item.value.as_slice()).unwrap();
         let changed_source =
             LIBRARY_FOOTPRINT.replace("new-datasheet.pdf", "replacement-datasheet.pdf");
         let changed = parse_library_footprint("Test:Socket", &changed_source).unwrap();
 
-        let prepared = build_updated_instance(&applied, &changed, &net_codes, &routed).unwrap();
+        let prepared = build_updated_instance(&applied, &changed, &net_codes, &routed, 2).unwrap();
 
         assert_eq!(
             prepared.changed_domains,
@@ -3398,16 +3507,16 @@ mod tests {
         let (_temp, board, mut items) = plan_fixture();
         let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
         let filters = parse_filters(&serde_json::json!({ "references": ["SW1"] })).unwrap();
-        let first = plan_updates(&board, &items, &net_codes, &BTreeSet::new(), &filters);
-        let identical = plan_updates(&board, &items, &net_codes, &BTreeSet::new(), &filters);
+        let first = plan_updates(&board, &items, &net_codes, &BTreeSet::new(), &filters, 2);
+        let identical = plan_updates(&board, &items, &net_codes, &BTreeSet::new(), &filters, 2);
         assert_eq!(first.plan_revision, identical.plan_revision);
 
         items[0] = plan_item("SW2", Some("Test:Socket"), "unselected-changed");
-        let unrelated = plan_updates(&board, &items, &net_codes, &BTreeSet::new(), &filters);
+        let unrelated = plan_updates(&board, &items, &net_codes, &BTreeSet::new(), &filters, 2);
         assert_eq!(first.plan_revision, unrelated.plan_revision);
 
         items[2] = plan_item("SW1", Some("Test:Socket"), "selected-changed");
-        let board_changed = plan_updates(&board, &items, &net_codes, &BTreeSet::new(), &filters);
+        let board_changed = plan_updates(&board, &items, &net_codes, &BTreeSet::new(), &filters, 2);
         assert_ne!(first.plan_revision, board_changed.plan_revision);
 
         std::fs::write(
@@ -3415,7 +3524,8 @@ mod tests {
             LIBRARY_FOOTPRINT.replace("updated description", "library changed"),
         )
         .unwrap();
-        let library_changed = plan_updates(&board, &items, &net_codes, &BTreeSet::new(), &filters);
+        let library_changed =
+            plan_updates(&board, &items, &net_codes, &BTreeSet::new(), &filters, 2);
         assert_ne!(board_changed.plan_revision, library_changed.plan_revision);
 
         let different_filter = plan_updates(
@@ -3424,6 +3534,7 @@ mod tests {
             &net_codes,
             &BTreeSet::new(),
             &parse_filters(&serde_json::json!({ "references": ["SW2"] })).unwrap(),
+            2,
         );
         assert_ne!(
             library_changed.plan_revision,
@@ -3536,6 +3647,7 @@ mod tests {
 
     struct PlannerMock {
         url: String,
+        copper_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
         capture: std::sync::Arc<std::sync::Mutex<MutationCapture>>,
         _thread: std::thread::JoinHandle<()>,
     }
@@ -3579,6 +3691,8 @@ mod tests {
         let board_name = board.to_string_lossy().to_string();
         let capture = std::sync::Arc::new(std::sync::Mutex::new(MutationCapture::default()));
         let captured = capture.clone();
+        let copper_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2));
+        let live_copper_count = copper_count.clone();
         let thread = std::thread::spawn(move || {
             while let Ok(message) = socket.recv() {
                 let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
@@ -3597,6 +3711,19 @@ mod tests {
                             }],
                         },
                         "kiapi.common.commands.GetOpenDocumentsResponse",
+                    ))
+                } else if message.type_url.ends_with("GetBoardEnabledLayers") {
+                    api_reply(builders::pack_any(
+                        &kiapi::board::commands::BoardEnabledLayersResponse {
+                            layers: vec![
+                                kiapi::board::types::BoardLayer::BlFCu as i32,
+                                kiapi::board::types::BoardLayer::BlBCu as i32,
+                            ],
+                            copper_layer_count: live_copper_count
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            ..Default::default()
+                        },
+                        "kiapi.board.commands.BoardEnabledLayersResponse",
                     ))
                 } else if message.type_url.ends_with("GetItems") {
                     let command =
@@ -3689,9 +3816,57 @@ mod tests {
         });
         PlannerMock {
             url,
+            copper_count,
             capture,
             _thread: thread,
         }
+    }
+
+    #[tokio::test]
+    async fn live_stack_change_invalidates_a_reviewed_library_refresh_before_mutation() {
+        let (_temp, board, items) = plan_fixture();
+        let mock = spawn_planner_mock(&board, items[2].clone(), false);
+        mock.copper_count
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        let context = test_context(&mock.url);
+        let dry_run =
+            handle_update_footprints_from_library(&serde_json::json!({"board": board}), &context)
+                .await
+                .unwrap();
+        let dry_run = result_json(&dry_run);
+        assert_eq!(dry_run["status"], "ready");
+        mock.copper_count
+            .store(6, std::sync::atomic::Ordering::Relaxed);
+        let applied = handle_update_footprints_from_library(&serde_json::json!({
+            "board": board, "dry_run": false, "expected_plan_revision": dry_run["plan_revision"],
+        }), &context).await.unwrap();
+        let applied = result_json(&applied);
+        assert_eq!(applied["status"], "conflict");
+        assert_eq!(applied["diagnostics"][0]["code"], "stale_plan_revision");
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 0);
+        assert!(capture.update_batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_refresh_refuses_an_unavailable_copper_count_before_mutation() {
+        let (_temp, board, items) = plan_fixture();
+        let mock = spawn_planner_mock(&board, items[2].clone(), false);
+        mock.copper_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let result = handle_update_footprints_from_library(
+            &serde_json::json!({"board": board}),
+            &test_context(&mock.url),
+        )
+        .await
+        .unwrap();
+        let result = result_json(&result);
+        assert_eq!(result["status"], "conflict");
+        assert!(result["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("copper layer count 0"));
+        assert_eq!(mock.capture.lock().unwrap().begin_count, 0);
     }
 
     #[tokio::test]
