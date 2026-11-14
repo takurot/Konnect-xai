@@ -31,22 +31,30 @@ pub enum Xform {
 }
 
 impl Xform {
-    pub(crate) fn point(&self, x: i64, y: i64) -> (i64, i64) {
+    pub(crate) fn point(&self, x: i64, y: i64) -> Result<(i64, i64)> {
+        let add = |a: i64, b: i64| {
+            a.checked_add(b).ok_or_else(|| {
+                anyhow::anyhow!("transformed coordinate exceeds the nanometre range")
+            })
+        };
         match *self {
-            Xform::Translate { dx_nm, dy_nm } => (x + dx_nm, y + dy_nm),
+            Xform::Translate { dx_nm, dy_nm } => Ok((add(x, dx_nm)?, add(y, dy_nm)?)),
             Xform::Rotate {
                 cx_nm,
                 cy_nm,
                 delta_deg,
             } => {
-                // KiCAD's RotatePoint (libs/kimath/src/trigo.cpp):
-                //   x' = x·cosθ + y·sinθ ;  y' = y·cosθ − x·sinθ
-                let (rx, ry) = ((x - cx_nm) as f64, (y - cy_nm) as f64);
+                let difference = |a: i64, b: i64| {
+                    a.checked_sub(b).ok_or_else(|| {
+                        anyhow::anyhow!("rotation offset exceeds the nanometre range")
+                    })
+                };
+                let (rx, ry) = (difference(x, cx_nm)? as f64, difference(y, cy_nm)? as f64);
                 let (s, c) = delta_deg.to_radians().sin_cos();
-                (
-                    cx_nm + (rx * c + ry * s).round() as i64,
-                    cy_nm + (ry * c - rx * s).round() as i64,
-                )
+                Ok((
+                    add(cx_nm, crate::builders::round_nanometres(rx * c + ry * s)?)?,
+                    add(cy_nm, crate::builders::round_nanometres(ry * c - rx * s)?)?,
+                ))
             }
         }
     }
@@ -76,12 +84,13 @@ fn normalize_deg(deg: f64) -> f64 {
     d
 }
 
-fn xform_vec2(v: &mut Option<common::Vector2>, xf: &Xform) {
+fn xform_vec2(v: &mut Option<common::Vector2>, xf: &Xform) -> Result<()> {
     if let Some(p) = v.as_mut() {
-        let (x, y) = xf.point(p.x_nm, p.y_nm);
+        let (x, y) = xf.point(p.x_nm, p.y_nm)?;
         p.x_nm = x;
         p.y_nm = y;
     }
+    Ok(())
 }
 
 fn xform_angle(a: &mut Option<common::Angle>, xf: &Xform) {
@@ -94,54 +103,59 @@ fn xform_angle(a: &mut Option<common::Angle>, xf: &Xform) {
     }
 }
 
-fn xform_text(t: &mut Option<common::Text>, xf: &Xform) {
+fn xform_text(t: &mut Option<common::Text>, xf: &Xform) -> Result<()> {
     if let Some(text) = t.as_mut() {
-        xform_vec2(&mut text.position, xf);
+        xform_vec2(&mut text.position, xf)?;
         if let Some(attrs) = text.attributes.as_mut() {
             xform_angle(&mut attrs.angle, xf);
         }
     }
+    Ok(())
 }
 
-fn xform_board_text(bt: &mut board::BoardText, xf: &Xform) {
-    xform_text(&mut bt.text, xf);
+fn xform_board_text(bt: &mut board::BoardText, xf: &Xform) -> Result<()> {
+    xform_text(&mut bt.text, xf)?;
+    Ok(())
 }
 
-fn xform_field(f: &mut Option<board::Field>, xf: &Xform) {
+fn xform_field(f: &mut Option<board::Field>, xf: &Xform) -> Result<()> {
     if let Some(field) = f.as_mut() {
         if let Some(text) = field.text.as_mut() {
-            xform_board_text(text, xf);
+            xform_board_text(text, xf)?;
         }
     }
+    Ok(())
 }
 
-fn xform_polyline(pl: &mut common::PolyLine, xf: &Xform) {
+fn xform_polyline(pl: &mut common::PolyLine, xf: &Xform) -> Result<()> {
     for node in pl.nodes.iter_mut() {
         match node.geometry.as_mut() {
             Some(common::poly_line_node::Geometry::Point(p)) => {
-                let (x, y) = xf.point(p.x_nm, p.y_nm);
+                let (x, y) = xf.point(p.x_nm, p.y_nm)?;
                 p.x_nm = x;
                 p.y_nm = y;
             }
             Some(common::poly_line_node::Geometry::Arc(arc)) => {
-                xform_vec2(&mut arc.start, xf);
-                xform_vec2(&mut arc.mid, xf);
-                xform_vec2(&mut arc.end, xf);
+                xform_vec2(&mut arc.start, xf)?;
+                xform_vec2(&mut arc.mid, xf)?;
+                xform_vec2(&mut arc.end, xf)?;
             }
             None => {}
         }
     }
+    Ok(())
 }
 
-fn xform_polyset(ps: &mut common::PolySet, xf: &Xform) {
+fn xform_polyset(ps: &mut common::PolySet, xf: &Xform) -> Result<()> {
     for poly in ps.polygons.iter_mut() {
         if let Some(outline) = poly.outline.as_mut() {
-            xform_polyline(outline, xf);
+            xform_polyline(outline, xf)?;
         }
         for hole in poly.holes.iter_mut() {
-            xform_polyline(hole, xf);
+            xform_polyline(hole, xf)?;
         }
     }
+    Ok(())
 }
 
 fn xform_graphic_shape(gs: &mut board::BoardGraphicShape, xf: &Xform) -> Result<()> {
@@ -152,13 +166,13 @@ fn xform_graphic_shape(gs: &mut board::BoardGraphicShape, xf: &Xform) -> Result<
     };
     match shape.geometry.as_mut() {
         Some(Geometry::Segment(seg)) => {
-            xform_vec2(&mut seg.start, xf);
-            xform_vec2(&mut seg.end, xf);
+            xform_vec2(&mut seg.start, xf)?;
+            xform_vec2(&mut seg.end, xf)?;
         }
         Some(Geometry::Rectangle(rect)) => {
             if xf.is_cardinal() {
-                xform_vec2(&mut rect.top_left, xf);
-                xform_vec2(&mut rect.bottom_right, xf);
+                xform_vec2(&mut rect.top_left, xf)?;
+                xform_vec2(&mut rect.bottom_right, xf)?;
             } else if rect.corner_radius.is_some() {
                 // A rounded rectangle can't be represented off-axis; KiCAD
                 // itself converts plain rectangles to polygons here, but has
@@ -183,14 +197,14 @@ fn xform_graphic_shape(gs: &mut board::BoardGraphicShape, xf: &Xform) -> Result<
                 let nodes = corners
                     .iter()
                     .map(|&(x, y)| {
-                        let (nx, ny) = xf.point(x, y);
-                        common::PolyLineNode {
+                        let (nx, ny) = xf.point(x, y)?;
+                        Ok(common::PolyLineNode {
                             geometry: Some(common::poly_line_node::Geometry::Point(
                                 common::Vector2 { x_nm: nx, y_nm: ny },
                             )),
-                        }
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 shape.geometry = Some(Geometry::Polygon(common::PolySet {
                     polygons: vec![common::PolygonWithHoles {
                         outline: Some(common::PolyLine {
@@ -203,76 +217,81 @@ fn xform_graphic_shape(gs: &mut board::BoardGraphicShape, xf: &Xform) -> Result<
             }
         }
         Some(Geometry::Arc(arc)) => {
-            xform_vec2(&mut arc.start, xf);
-            xform_vec2(&mut arc.mid, xf);
-            xform_vec2(&mut arc.end, xf);
+            xform_vec2(&mut arc.start, xf)?;
+            xform_vec2(&mut arc.mid, xf)?;
+            xform_vec2(&mut arc.end, xf)?;
         }
         Some(Geometry::Circle(circle)) => {
-            xform_vec2(&mut circle.center, xf);
-            xform_vec2(&mut circle.radius_point, xf);
+            xform_vec2(&mut circle.center, xf)?;
+            xform_vec2(&mut circle.radius_point, xf)?;
         }
         Some(Geometry::Polygon(polyset)) => {
-            xform_polyset(polyset, xf);
+            xform_polyset(polyset, xf)?;
         }
         Some(Geometry::Bezier(bez)) => {
-            xform_vec2(&mut bez.start, xf);
-            xform_vec2(&mut bez.control1, xf);
-            xform_vec2(&mut bez.control2, xf);
-            xform_vec2(&mut bez.end, xf);
+            xform_vec2(&mut bez.start, xf)?;
+            xform_vec2(&mut bez.control1, xf)?;
+            xform_vec2(&mut bez.control2, xf)?;
+            xform_vec2(&mut bez.end, xf)?;
         }
         None => {}
     }
     Ok(())
 }
 
-fn xform_zone(zone: &mut board::Zone, xf: &Xform) {
+fn xform_zone(zone: &mut board::Zone, xf: &Xform) -> Result<()> {
     if let Some(outline) = zone.outline.as_mut() {
-        xform_polyset(outline, xf);
+        xform_polyset(outline, xf)?;
     }
     for filled in zone.filled_polygons.iter_mut() {
         if let Some(shapes) = filled.shapes.as_mut() {
-            xform_polyset(shapes, xf);
+            xform_polyset(shapes, xf)?;
         }
     }
+    Ok(())
 }
 
-fn xform_dimension(dim: &mut board::Dimension, xf: &Xform) {
+fn xform_dimension(dim: &mut board::Dimension, xf: &Xform) -> Result<()> {
     use board::dimension::DimensionStyle;
 
-    xform_text(&mut dim.text, xf);
+    xform_text(&mut dim.text, xf)?;
     match dim.dimension_style.as_mut() {
         Some(DimensionStyle::Aligned(a)) => {
-            xform_vec2(&mut a.start, xf);
-            xform_vec2(&mut a.end, xf);
+            xform_vec2(&mut a.start, xf)?;
+            xform_vec2(&mut a.end, xf)?;
         }
         Some(DimensionStyle::Orthogonal(o)) => {
-            xform_vec2(&mut o.start, xf);
-            xform_vec2(&mut o.end, xf);
+            xform_vec2(&mut o.start, xf)?;
+            xform_vec2(&mut o.end, xf)?;
         }
         Some(DimensionStyle::Radial(r)) => {
-            xform_vec2(&mut r.center, xf);
-            xform_vec2(&mut r.radius_point, xf);
+            xform_vec2(&mut r.center, xf)?;
+            xform_vec2(&mut r.radius_point, xf)?;
         }
         Some(DimensionStyle::Leader(l)) => {
-            xform_vec2(&mut l.start, xf);
-            xform_vec2(&mut l.end, xf);
+            xform_vec2(&mut l.start, xf)?;
+            xform_vec2(&mut l.end, xf)?;
         }
         Some(DimensionStyle::Center(c)) => {
-            xform_vec2(&mut c.center, xf);
-            xform_vec2(&mut c.end, xf);
+            xform_vec2(&mut c.center, xf)?;
+            xform_vec2(&mut c.end, xf)?;
         }
         None => {}
     }
+    Ok(())
 }
 
 /// Apply `xf` to every position-bearing child carried in `fp`: the four
 /// mandatory fields plus all `definition.items`. Does NOT touch
 /// `fp.position` / `fp.orientation` — the caller sets those.
 pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xform) -> Result<()> {
-    xform_field(&mut fp.reference_field, xf);
-    xform_field(&mut fp.value_field, xf);
-    xform_field(&mut fp.datasheet_field, xf);
-    xform_field(&mut fp.description_field, xf);
+    if !xf.angle_delta_deg().is_finite() {
+        anyhow::bail!("footprint rotation must be finite");
+    }
+    xform_field(&mut fp.reference_field, xf)?;
+    xform_field(&mut fp.value_field, xf)?;
+    xform_field(&mut fp.datasheet_field, xf)?;
+    xform_field(&mut fp.description_field, xf)?;
 
     let Some(def) = fp.definition.as_mut() else {
         return Ok(());
@@ -285,14 +304,14 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
         let url = crate::builders::any_type_name(item);
         if url == "kiapi.board.types.Pad" {
             let mut pad = board::Pad::decode(item.value.as_slice())?;
-            xform_vec2(&mut pad.position, xf);
+            xform_vec2(&mut pad.position, xf)?;
             if let Some(ps) = pad.pad_stack.as_mut() {
                 xform_angle(&mut ps.angle, xf);
             }
             item.value = pad.encode_to_vec();
         } else if url == "kiapi.board.types.BoardText" {
             let mut text = board::BoardText::decode(item.value.as_slice())?;
-            xform_board_text(&mut text, xf);
+            xform_board_text(&mut text, xf)?;
             item.value = text.encode_to_vec();
         } else if url == "kiapi.board.types.BoardTextBox" {
             if !xf.is_cardinal() {
@@ -303,8 +322,8 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
             }
             let mut tb = board::BoardTextBox::decode(item.value.as_slice())?;
             if let Some(textbox) = tb.textbox.as_mut() {
-                xform_vec2(&mut textbox.top_left, xf);
-                xform_vec2(&mut textbox.bottom_right, xf);
+                xform_vec2(&mut textbox.top_left, xf)?;
+                xform_vec2(&mut textbox.bottom_right, xf)?;
                 if let Some(attrs) = textbox.attributes.as_mut() {
                     xform_angle(&mut attrs.angle, xf);
                 }
@@ -313,7 +332,7 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
         } else if url == "kiapi.board.types.Field" {
             let mut field = board::Field::decode(item.value.as_slice())?;
             if let Some(text) = field.text.as_mut() {
-                xform_board_text(text, xf);
+                xform_board_text(text, xf)?;
             }
             item.value = field.encode_to_vec();
         } else if url == "kiapi.board.types.BoardGraphicShape" {
@@ -322,11 +341,11 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
             item.value = shape.encode_to_vec();
         } else if url == "kiapi.board.types.Zone" {
             let mut zone = board::Zone::decode(item.value.as_slice())?;
-            xform_zone(&mut zone, xf);
+            xform_zone(&mut zone, xf)?;
             item.value = zone.encode_to_vec();
         } else if url == "kiapi.board.types.Dimension" {
             let mut dim = board::Dimension::decode(item.value.as_slice())?;
-            xform_dimension(&mut dim, xf);
+            xform_dimension(&mut dim, xf)?;
             item.value = dim.encode_to_vec();
         } else if url == "kiapi.board.types.Footprint3DModel" || url == "kiapi.board.types.Group" {
             // No board-space geometry of their own — nothing to shift.
@@ -347,9 +366,30 @@ mod tests {
     use super::*;
     use crate::builders;
 
+    #[test]
+    fn coordinate_transforms_refuse_overflow() {
+        assert!(Xform::Translate { dx_nm: 1, dy_nm: 0 }
+            .point(i64::MAX, 0)
+            .is_err());
+        assert!(Xform::Rotate {
+            cx_nm: i64::MIN,
+            cy_nm: 0,
+            delta_deg: 90.0
+        }
+        .point(i64::MAX, 0)
+        .is_err());
+        assert!(Xform::Rotate {
+            cx_nm: 0,
+            cy_nm: 0,
+            delta_deg: f64::INFINITY
+        }
+        .point(1, 1)
+        .is_err());
+    }
+
     fn pad_at(x_mm: f64, y_mm: f64, angle_deg: f64) -> board::Pad {
         board::Pad {
-            position: Some(builders::vec2(x_mm, y_mm)),
+            position: Some(builders::vec2(x_mm, y_mm).unwrap()),
             pad_stack: Some(board::PadStack {
                 angle: Some(common::Angle {
                     value_degrees: angle_deg,
@@ -364,7 +404,7 @@ mod tests {
         board::Field {
             text: Some(board::BoardText {
                 text: Some(common::Text {
-                    position: Some(builders::vec2(x_mm, y_mm)),
+                    position: Some(builders::vec2(x_mm, y_mm).unwrap()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -375,7 +415,7 @@ mod tests {
 
     fn instance_with(items: Vec<prost_types::Any>) -> board::FootprintInstance {
         board::FootprintInstance {
-            position: Some(builders::vec2(100.0, 100.0)),
+            position: Some(builders::vec2(100.0, 100.0).unwrap()),
             reference_field: Some(field_at(100.0, 98.0)),
             definition: Some(board::Footprint {
                 items,
@@ -393,33 +433,36 @@ mod tests {
     fn translate_shifts_pads_fields_and_graphics() {
         let pad = builders::pack_any(&pad_at(100.0, 100.0, 0.0), "kiapi.board.types.Pad");
         let seg = builders::pack_any(
-            &builders::board_segment("F.SilkS", 0.1, 99.0, 99.0, 101.0, 99.0),
+            &builders::board_segment("F.SilkS", 0.1, 99.0, 99.0, 101.0, 99.0).unwrap(),
             "kiapi.board.types.BoardGraphicShape",
         );
         let mut fp = instance_with(vec![pad, seg]);
 
         // Move 100,100 -> 50,50: delta is -50mm on both axes.
         let xf = Xform::Translate {
-            dx_nm: builders::mm_to_nm(-50.0),
-            dy_nm: builders::mm_to_nm(-50.0),
+            dx_nm: builders::mm_to_nm(-50.0).unwrap(),
+            dy_nm: builders::mm_to_nm(-50.0).unwrap(),
         };
         transform_footprint_children(&mut fp, &xf).unwrap();
 
         let items = &fp.definition.as_ref().unwrap().items;
         let pad = decode_pad(&items[0]);
-        assert_eq!(pad.position.unwrap(), builders::vec2(50.0, 50.0));
+        assert_eq!(pad.position.unwrap(), builders::vec2(50.0, 50.0).unwrap());
 
         let shape = board::BoardGraphicShape::decode(items[1].value.as_slice()).unwrap();
         match shape.shape.unwrap().geometry.unwrap() {
             common::graphic_shape::Geometry::Segment(s) => {
-                assert_eq!(s.start.unwrap(), builders::vec2(49.0, 49.0));
-                assert_eq!(s.end.unwrap(), builders::vec2(51.0, 49.0));
+                assert_eq!(s.start.unwrap(), builders::vec2(49.0, 49.0).unwrap());
+                assert_eq!(s.end.unwrap(), builders::vec2(51.0, 49.0).unwrap());
             }
             other => panic!("expected segment, got {other:?}"),
         }
 
         let ref_text = fp.reference_field.unwrap().text.unwrap().text.unwrap();
-        assert_eq!(ref_text.position.unwrap(), builders::vec2(50.0, 48.0));
+        assert_eq!(
+            ref_text.position.unwrap(),
+            builders::vec2(50.0, 48.0).unwrap()
+        );
     }
 
     #[test]
@@ -429,8 +472,8 @@ mod tests {
         let mut fp = instance_with(vec![pad]);
 
         let xf = Xform::Rotate {
-            cx_nm: builders::mm_to_nm(100.0),
-            cy_nm: builders::mm_to_nm(100.0),
+            cx_nm: builders::mm_to_nm(100.0).unwrap(),
+            cy_nm: builders::mm_to_nm(100.0).unwrap(),
             delta_deg: 90.0,
         };
         transform_footprint_children(&mut fp, &xf).unwrap();
@@ -438,7 +481,7 @@ mod tests {
         // KiCAD positive rotation is counterclockwise on screen (Y down):
         // (+1, 0) relative -> (0, -1) relative.
         let pad = decode_pad(&fp.definition.as_ref().unwrap().items[0]);
-        assert_eq!(pad.position.unwrap(), builders::vec2(100.0, 99.0));
+        assert_eq!(pad.position.unwrap(), builders::vec2(100.0, 99.0).unwrap());
         assert_eq!(pad.pad_stack.unwrap().angle.unwrap().value_degrees, 90.0);
     }
 
@@ -448,8 +491,8 @@ mod tests {
         let mut fp = instance_with(vec![pad]);
 
         let xf = Xform::Rotate {
-            cx_nm: builders::mm_to_nm(100.0),
-            cy_nm: builders::mm_to_nm(100.0),
+            cx_nm: builders::mm_to_nm(100.0).unwrap(),
+            cy_nm: builders::mm_to_nm(100.0).unwrap(),
             delta_deg: 20.0,
         };
         transform_footprint_children(&mut fp, &xf).unwrap();
@@ -461,14 +504,14 @@ mod tests {
     #[test]
     fn non_cardinal_rotation_turns_rectangle_into_polygon() {
         let rect = builders::pack_any(
-            &builders::board_rectangle("F.Fab", 0.1, 99.0, 99.0, 101.0, 101.0, false),
+            &builders::board_rectangle("F.Fab", 0.1, 99.0, 99.0, 101.0, 101.0, false).unwrap(),
             "kiapi.board.types.BoardGraphicShape",
         );
         let mut fp = instance_with(vec![rect]);
 
         let xf = Xform::Rotate {
-            cx_nm: builders::mm_to_nm(100.0),
-            cy_nm: builders::mm_to_nm(100.0),
+            cx_nm: builders::mm_to_nm(100.0).unwrap(),
+            cy_nm: builders::mm_to_nm(100.0).unwrap(),
             delta_deg: 45.0,
         };
         transform_footprint_children(&mut fp, &xf).unwrap();
@@ -490,14 +533,14 @@ mod tests {
     #[test]
     fn cardinal_rotation_keeps_rectangle_a_rectangle() {
         let rect = builders::pack_any(
-            &builders::board_rectangle("F.Fab", 0.1, 99.0, 99.0, 101.0, 101.0, false),
+            &builders::board_rectangle("F.Fab", 0.1, 99.0, 99.0, 101.0, 101.0, false).unwrap(),
             "kiapi.board.types.BoardGraphicShape",
         );
         let mut fp = instance_with(vec![rect]);
 
         let xf = Xform::Rotate {
-            cx_nm: builders::mm_to_nm(100.0),
-            cy_nm: builders::mm_to_nm(100.0),
+            cx_nm: builders::mm_to_nm(100.0).unwrap(),
+            cy_nm: builders::mm_to_nm(100.0).unwrap(),
             delta_deg: 180.0,
         };
         transform_footprint_children(&mut fp, &xf).unwrap();
@@ -538,7 +581,7 @@ mod tests {
         let mut fp = instance_with(vec![model]);
 
         let xf = Xform::Translate {
-            dx_nm: builders::mm_to_nm(10.0),
+            dx_nm: builders::mm_to_nm(10.0).unwrap(),
             dy_nm: 0,
         };
         transform_footprint_children(&mut fp, &xf).unwrap();

@@ -8,7 +8,7 @@ use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::{get_path, placed_pins, placed_pins_by_reference, ToolContext, ToolDef};
 use konnect_sexp::{
-    geometry::{point_on_segment, points_coincident},
+    geometry::{point_on_segment, points_coincident, round6},
     parser::{parse_sexp, SexpNode},
     schematic::{
         extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
@@ -581,7 +581,7 @@ async fn handle_export_netlist_summary(
                                 "number": pin.number,
                                 "name": pin.name,
                                 "net": net,
-                                "x": px, "y": py
+                                "x": round6(px), "y": round6(py)
                             })
                         })
                         .collect()
@@ -917,7 +917,11 @@ async fn handle_fix_connectivity(
         file_edits.push(SexpEdit::replace(
             start,
             end,
-            format!("({tag} {} {})", fix.to.0, fix.to.1),
+            format!(
+                "({tag} {} {})",
+                konnect_sexp::geometry::fmt_mm(fix.to.0),
+                konnect_sexp::geometry::fmt_mm(fix.to.1)
+            ),
         ));
     }
 
@@ -959,8 +963,8 @@ async fn handle_fix_connectivity(
         observed.push(json!({
             "wire_uuid": fix.uuid,
             "endpoint": fix.endpoint.name(),
-            "from": { "x": fix.from.0, "y": fix.from.1 },
-            "to": { "x": actual.0, "y": actual.1 }
+            "from": { "x": round6(fix.from.0), "y": round6(fix.from.1) },
+            "to": { "x": round6(actual.0), "y": round6(actual.1) }
         }));
     }
 
@@ -1020,8 +1024,8 @@ impl PlannedWireFix {
         json!({
             "wire_uuid": self.uuid,
             "endpoint": self.endpoint.name(),
-            "from": { "x": self.from.0, "y": self.from.1 },
-            "to": { "x": self.to.0, "y": self.to.1 }
+            "from": { "x": round6(self.from.0), "y": round6(self.from.1) },
+            "to": { "x": round6(self.to.0), "y": round6(self.to.1) }
         })
     }
 }

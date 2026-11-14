@@ -994,6 +994,13 @@ pub fn require_f64(args: &Value, key: &str) -> Result<f64, CallToolResult> {
         .ok_or_else(|| invalid_arg(key, "missing or not a number"))
 }
 
+/// Validate a millimetre value before a coordinate is written or reported.
+pub(crate) fn checked_mm(value: f64, key: &str) -> Result<f64, CallToolResult> {
+    konnect_ipc::builders::mm_to_nm(value)
+        .map(|_| konnect_sexp::geometry::round6(value))
+        .map_err(|error| invalid_arg(key, &error.to_string()))
+}
+
 /// Extract an optional f64.
 pub fn opt_f64(args: &Value, key: &str) -> Option<f64> {
     args[key].as_f64()

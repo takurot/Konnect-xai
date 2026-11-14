@@ -13,7 +13,7 @@ use crate::tools::{
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
-    geometry::{points_coincident, snap_point},
+    geometry::{points_coincident, round6, snap_point},
     schematic::{
         extract_all_net_labels, extract_buses, extract_labels, extract_symbol_instances,
         extract_wires, find_lib_symbol, format_net_label, format_wire, pin_endpoint,
@@ -564,15 +564,15 @@ async fn handle_batch_connect_to_net(
         let mut entry = json!({
             "reference": reference,
             "pin": pin_number,
-            "x": px,
-            "y": py,
+            "x": round6(px),
+            "y": round6(py),
             "rotation": rotation
         });
         if !is_legacy_placement {
             entry["direction"] = json!(dir.name);
-            entry["label"] = json!({ "x": lx, "y": ly, "rotation": rotation });
+            entry["label"] = json!({ "x": round6(lx), "y": round6(ly), "rotation": rotation });
             if needs_wire {
-                entry["wire"] = json!({ "x1": px, "y1": py, "x2": lx, "y2": ly });
+                entry["wire"] = json!({ "x1": round6(px), "y1": round6(py), "x2": round6(lx), "y2": round6(ly) });
             }
         }
         if duplicate {
@@ -979,9 +979,9 @@ fn property_translation_edits(
     sym_end: usize,
     ddx: f64,
     ddy: f64,
-) -> Vec<SexpEdit> {
+) -> Result<Vec<SexpEdit>, CallToolResult> {
     if ddx == 0.0 && ddy == 0.0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut edits = Vec::new();
     for prop_start in konnect_sexp::writer::find_block_starts(content, "property") {
@@ -1022,12 +1022,12 @@ fn property_translation_edits(
             at_end,
             format!(
                 "{} {} {rot}",
-                cse::types::fmt_f64(px + ddx),
-                cse::types::fmt_f64(py + ddy)
+                cse::types::fmt_f64(super::checked_mm(px + ddx, "property.x")?),
+                cse::types::fmt_f64(super::checked_mm(py + ddy, "property.y")?)
             ),
         ));
     }
-    edits
+    Ok(edits)
 }
 
 async fn handle_bulk_move(
@@ -1047,6 +1047,12 @@ async fn handle_bulk_move(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+
+    for (field, value) in [("dx", dx), ("dy", dy)] {
+        if let Err(error) = super::checked_mm(value, field) {
+            return Ok(error);
+        }
+    }
 
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
@@ -1099,11 +1105,34 @@ async fn handle_bulk_move(
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(0.0);
 
-            let (new_x, new_y) = snap_point(x + dx, y + dy, 1.27);
+            let moved_x = x + dx;
+            let moved_y = y + dy;
+            for (field, value) in [("x", moved_x), ("y", moved_y)] {
+                if let Err(error) = super::checked_mm(value, field) {
+                    return Ok(error);
+                }
+            }
+            let (new_x, new_y) = snap_point(moved_x, moved_y, 1.27);
+            let new_x = match super::checked_mm(new_x, "x") {
+                Ok(value) => value,
+                Err(error) => return Ok(error),
+            };
+            let new_y = match super::checked_mm(new_y, "y") {
+                Ok(value) => value,
+                Err(error) => return Ok(error),
+            };
+            if !rot.is_finite() {
+                return Ok(super::invalid_arg("rotation", "must be finite"));
+            }
             edits.push(SexpEdit::replace(
                 at_abs,
                 at_end,
-                format!("{new_x} {new_y} {rot}"),
+                format!(
+                    "{} {} {}",
+                    cse::types::fmt_f64(new_x),
+                    cse::types::fmt_f64(new_y),
+                    cse::types::fmt_f64(rot)
+                ),
             ));
             // Property coordinates are ABSOLUTE in .kicad_sch, so the field
             // text does not follow the symbol on its own — moving only the
@@ -1111,13 +1140,10 @@ async fn handle_bulk_move(
             // location (#202). Shift them by the delta the symbol *actually*
             // moved, which is the snapped one, or they drift relative to the
             // part. `Symbol::translate` does the same on the typed path.
-            edits.extend(property_translation_edits(
-                &content,
-                sym_start,
-                sym_end,
-                new_x - x,
-                new_y - y,
-            ));
+            match property_translation_edits(&content, sym_start, sym_end, new_x - x, new_y - y) {
+                Ok(property_edits) => edits.extend(property_edits),
+                Err(error) => return Ok(error),
+            }
             placements.push(json!({
                 "old_x": x, "old_y": y,
                 "new_x": new_x, "new_y": new_y
@@ -1188,7 +1214,7 @@ async fn handle_bulk_move(
     Ok(CallToolResult::json(&json!({
         "moved_count": moved.len(),
         "moved": moved,
-        "dx": dx, "dy": dy,
+        "dx": round6(dx), "dy": round6(dy),
         "junctions_added_count": junctions_added,
         "junctions_pruned_count": junctions_pruned,
         "no_connects_moved_count": moved_markers.len(),
@@ -1576,8 +1602,8 @@ async fn handle_connect_passthrough(
 
     Ok(CallToolResult::json(&json!({
         "net": net_name,
-        "stub_root": { "x": x, "y": y },
-        "label_position": { "x": wire_end_x, "y": wire_end_y },
+        "stub_root": { "x": round6(x), "y": round6(y) },
+        "label_position": { "x": round6(wire_end_x), "y": round6(wire_end_y) },
         "direction": dir.name,
         "label_rotation": dir.label_rotation
     })))
@@ -1590,7 +1616,7 @@ async fn handle_connect_passthrough(
 /// carry `(bold yes)`, 145 a `(thickness …)`, 77 a `(color …)` and 10
 /// `(italic yes)`. All of them sit inside `(font …)`, not beside it.
 fn schematic_text_font(args: &serde_json::Value, size: f64) -> Result<String, String> {
-    let mut font = format!("(size {size} {size})");
+    let mut font = format!("(size {0} {0})", cse::types::fmt_f64(size));
 
     if let Some(thickness) = args.get("thickness") {
         let thickness = thickness
@@ -1601,7 +1627,8 @@ fn schematic_text_font(args: &serde_json::Value, size: f64) -> Result<String, St
                 "thickness must be a positive number, got {thickness}"
             ));
         }
-        font.push_str(&format!(" (thickness {thickness})"));
+        konnect_ipc::builders::mm_to_nm(thickness).map_err(|error| error.to_string())?;
+        font.push_str(&format!(" (thickness {})", cse::types::fmt_f64(thickness)));
     }
     // KiCad writes the token only when it is on, and omits it otherwise.
     if args["bold"].as_bool().unwrap_or(false) {
@@ -1738,8 +1765,22 @@ async fn handle_add_schematic_text(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    let (x, y) = match (super::checked_mm(x, "x"), super::checked_mm(y, "y")) {
+        (Ok(x), Ok(y)) => (x, y),
+        (Err(error), _) | (_, Err(error)) => return Ok(error),
+    };
     let size = args["size"].as_f64().unwrap_or(1.27);
+    let size = match super::checked_mm(size, "size") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
+    if !round6(rotation).is_finite() {
+        return Ok(super::invalid_arg(
+            "rotation",
+            "must remain finite when formatted",
+        ));
+    }
     let justify = args["justify"].as_str().unwrap_or(DEFAULT_TEXT_JUSTIFY);
     // Without a justify token KiCad centres the text on `x`, so a long line
     // crosses the page edge and is dropped from the PDF export while the
@@ -1767,7 +1808,10 @@ async fn handle_add_schematic_text(
 
     let text_sexp = format!(
         "\n  (text \"{escaped}\"\n    (at {x} {y} {rotation})\n    \
-         (effects {font_sexp}{justify_sexp})\n    (uuid \"{uuid}\")\n  )"
+         (effects {font_sexp}{justify_sexp})\n    (uuid \"{uuid}\")\n  )",
+        x = cse::types::fmt_f64(x),
+        y = cse::types::fmt_f64(y),
+        rotation = cse::types::fmt_f64(rotation)
     );
 
     let content = read_consistent(&sch_path)?;
@@ -1780,7 +1824,7 @@ async fn handle_add_schematic_text(
 
     Ok(CallToolResult::json(&json!({
         "added": text,
-        "x": x, "y": y,
+        "x": round6(x), "y": round6(y),
         "size": size,
         "rotation": rotation,
         "justify": justify,
@@ -1814,12 +1858,12 @@ async fn handle_get_layout(
         .collect::<Vec<_>>();
     let bounds_json = |bounds: SymbolBounds| {
         json!({
-            "x_min": bounds.min_x,
-            "y_min": bounds.min_y,
-            "x_max": bounds.max_x,
-            "y_max": bounds.max_y,
-            "width": bounds.width(),
-            "height": bounds.height()
+            "x_min": round6(bounds.min_x),
+            "y_min": round6(bounds.min_y),
+            "x_max": round6(bounds.max_x),
+            "y_max": round6(bounds.max_y),
+            "width": round6(bounds.width()),
+            "height": round6(bounds.height())
         })
     };
     let components: Vec<serde_json::Value> = placements
@@ -1830,7 +1874,7 @@ async fn handle_get_layout(
                 "value": instance.value,
                 "lib_id": instance.lib_id,
                 "unit": instance.unit,
-                "x": instance.x, "y": instance.y,
+                "x": round6(instance.x), "y": round6(instance.y),
                 "rotation": instance.rotation,
                 "mirror_x": instance.mirror_x,
                 "mirror_y": instance.mirror_y,
@@ -1881,7 +1925,7 @@ async fn handle_get_layout(
         let wires = extract_wires(&tree);
         let wire_data: Vec<serde_json::Value> = wires
             .iter()
-            .map(|w| json!({ "x1": w.x1, "y1": w.y1, "x2": w.x2, "y2": w.y2, "uuid": w.uuid }))
+            .map(|w| json!({ "x1": round6(w.x1), "y1": round6(w.y1), "x2": round6(w.x2), "y2": round6(w.y2), "uuid": w.uuid }))
             .collect();
         result["wire_count"] = json!(wire_data.len());
         result["wires"] = json!(wire_data);
@@ -1891,7 +1935,7 @@ async fn handle_get_layout(
         let labels = extract_labels(&tree);
         let label_data: Vec<serde_json::Value> = labels
             .iter()
-            .map(|l| json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
+            .map(|l| json!({ "net": l.net, "type": format!("{:?}", l.kind), "x": round6(l.x), "y": round6(l.y) }))
             .collect();
         result["label_count"] = json!(label_data.len());
         result["labels"] = json!(label_data);
@@ -1916,7 +1960,7 @@ async fn handle_validate_wire_connections(
     let floating: Vec<serde_json::Value> = index
         .floating_wire_ends()
         .into_iter()
-        .map(|(x, y, wire_uuid)| json!({ "x": x, "y": y, "wire_uuid": wire_uuid }))
+        .map(|(x, y, wire_uuid)| json!({ "x": round6(x), "y": round6(y), "wire_uuid": wire_uuid }))
         .collect();
 
     Ok(CallToolResult::json(&json!({
@@ -1980,8 +2024,8 @@ async fn handle_validate_component_connections(
                 "pin": placed.pin.number,
                 "pin_name": placed.pin.name,
                 "pin_type": placed.pin.electrical_type,
-                "x": px,
-                "y": py
+                "x": round6(px),
+                "y": round6(py)
             }));
         }
     }
@@ -4150,6 +4194,25 @@ mod bulk_move_coordinate_text_tests {
     /// `#PWR002` exposed the noise and `R8` is the control. Expected text is
     /// what `kicad-cli sch upgrade --force` writes for the moved sheet.
     #[tokio::test]
+    async fn coordinate_review_bulk_move_refuses_overflow_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("move.kicad_sch");
+        std::fs::write(&path, SCH).unwrap();
+        let context = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_bulk_move(
+            &json!({"schematic": path, "references": ["R8"], "dx": 1e308, "dy": 0.0}),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), SCH);
+    }
+
+    #[tokio::test]
     async fn bulk_move_writes_kicad_coordinate_text() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("move.kicad_sch");
@@ -4782,7 +4845,7 @@ mod private_anchor_regression {
     #[test]
     fn translation_preserves_property_text_with_at() {
         let source = r#"(symbol (property "Description" "see (at 5 5) note" (at 10 20 0)))"#;
-        let edits = property_translation_edits(source, 0, source.len(), 1.0, 2.0);
+        let edits = property_translation_edits(source, 0, source.len(), 1.0, 2.0).unwrap();
         let after = apply_edits(source.to_owned(), edits);
         assert!(after.contains("see (at 5 5) note"));
         assert!(after.contains("(at 11 22 0)"));

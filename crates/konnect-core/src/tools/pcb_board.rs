@@ -18,6 +18,7 @@ use crate::tools::{
 };
 use konnect_ipc::builders;
 use konnect_sexp::{
+    geometry::{fmt_mm, round6},
     parser::{parse_sexp, SexpNode},
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, new_uuid,
@@ -28,7 +29,13 @@ use serde_json::json;
 use std::path::Path;
 
 // Build the 4 Edge.Cuts segments forming a rectangle, packed as Any for create_items.
-fn rect_outline_items(x1: f64, y1: f64, x2: f64, y2: f64, w: f64) -> Vec<prost_types::Any> {
+fn rect_outline_items(
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    w: f64,
+) -> anyhow::Result<Vec<prost_types::Any>> {
     let sides = [
         (x1, y1, x2, y1),
         (x2, y1, x2, y2),
@@ -38,10 +45,10 @@ fn rect_outline_items(x1: f64, y1: f64, x2: f64, y2: f64, w: f64) -> Vec<prost_t
     sides
         .iter()
         .map(|&(a, b, c, d)| {
-            builders::pack_any(
-                &builders::board_segment("Edge.Cuts", w, a, b, c, d),
+            Ok(builders::pack_any(
+                &builders::board_segment("Edge.Cuts", w, a, b, c, d)?,
                 "kiapi.board.types.BoardGraphicShape",
-            )
+            ))
         })
         .collect()
 }
@@ -162,13 +169,16 @@ fn rounded_rectangle_outline(
     Ok(primitives)
 }
 
-fn outline_items(primitives: &[OutlinePrimitive], width: f64) -> Vec<prost_types::Any> {
+fn outline_items(
+    primitives: &[OutlinePrimitive],
+    width: f64,
+) -> anyhow::Result<Vec<prost_types::Any>> {
     primitives
         .iter()
         .map(|primitive| {
             let shape = match primitive {
                 OutlinePrimitive::Line { start, end } => {
-                    builders::board_segment("Edge.Cuts", width, start.0, start.1, end.0, end.1)
+                    builders::board_segment("Edge.Cuts", width, start.0, start.1, end.0, end.1)?
                 }
                 OutlinePrimitive::Arc { start, mid, end } => builders::board_arc(
                     "Edge.Cuts",
@@ -179,9 +189,12 @@ fn outline_items(primitives: &[OutlinePrimitive], width: f64) -> Vec<prost_types
                     mid.1,
                     end.0,
                     end.1,
-                ),
+                )?,
             };
-            builders::pack_any(&shape, "kiapi.board.types.BoardGraphicShape")
+            Ok(builders::pack_any(
+                &shape,
+                "kiapi.board.types.BoardGraphicShape",
+            ))
         })
         .collect()
 }
@@ -686,6 +699,11 @@ fn graphic_layer_argument(args: &serde_json::Value) -> Result<String, CallToolRe
 fn format_gr_line(x1: f64, y1: f64, x2: f64, y2: f64, layer: &str, width: f64) -> String {
     let uuid = new_uuid();
     let layer = konnect_sexp::quoted(layer);
+    let x1 = fmt_mm(x1);
+    let y1 = fmt_mm(y1);
+    let x2 = fmt_mm(x2);
+    let y2 = fmt_mm(y2);
+    let width = fmt_mm(width);
     format!(
         "\n  (gr_line\n    (start {x1} {y1})\n    (end {x2} {y2})\n    \
          (stroke (width {width}) (type solid))\n    (layer {layer})\n    (uuid \"{uuid}\")\n  )"
@@ -701,10 +719,16 @@ fn format_gr_arc(
 ) -> String {
     let uuid = new_uuid();
     let layer = konnect_sexp::quoted(layer);
+    let width = fmt_mm(width);
     format!(
         "\n  (gr_arc\n    (start {} {})\n    (mid {} {})\n    (end {} {})\n    \
          (stroke (width {width}) (type solid))\n    (layer {layer})\n    (uuid \"{uuid}\")\n  )",
-        start.0, start.1, mid.0, mid.1, end.0, end.1
+        fmt_mm(start.0),
+        fmt_mm(start.1),
+        fmt_mm(mid.0),
+        fmt_mm(mid.1),
+        fmt_mm(end.0),
+        fmt_mm(end.1)
     )
 }
 
@@ -727,6 +751,10 @@ fn format_gr_text(text: &str, x: f64, y: f64, rot: f64, layer: &str, size: f64) 
     let uuid = new_uuid();
     let layer = konnect_sexp::quoted(layer);
     let text = konnect_sexp::quoted(text);
+    let x = fmt_mm(x);
+    let y = fmt_mm(y);
+    let rot = fmt_mm(rot);
+    let size = fmt_mm(size);
     format!(
         "\n  (gr_text {text}\n    (at {x} {y} {rot})\n    (layer {layer})\n    \
          (effects (font (size {size} {size}) (thickness 0.15)))\n    (uuid \"{uuid}\")\n  )"
@@ -944,6 +972,10 @@ fn format_npth_footprint(x: f64, y: f64, spec: &MountingHoleSpec) -> String {
     let reference = &spec.reference;
     let lib_id = &spec.lib_id;
     let drill_diameter_mm = spec.drill_diameter_mm;
+    let drill_text = fmt_mm(drill_diameter_mm);
+    let x = fmt_mm(x);
+    let y = fmt_mm(y);
+    let pad_size = fmt_mm(pad_size);
     format!(
         "\n  (footprint \"{lib_id}\"\n    \
          (layer \"F.Cu\")\n    (at {x} {y})\n    \
@@ -951,9 +983,9 @@ fn format_npth_footprint(x: f64, y: f64, spec: &MountingHoleSpec) -> String {
          (property \"Reference\" \"{reference}\"\n      (at 0 {offset} 0)\n      (layer \"F.SilkS\")\n      (uuid \"{ref_uuid}\")\n    )\n    \
          (property \"Value\" \"MountingHole\"\n      (at 0 -{offset} 0)\n      (layer \"F.Fab\")\n      (uuid \"{val_uuid}\")\n    )\n    \
          (pad \"\" np_thru_hole circle (at 0 0) (size {pad_size} {pad_size})\n      \
-         (drill {drill_diameter_mm})\n      (layers \"*.Cu\" \"*.Mask\")\n      (uuid \"{pad_uuid}\")\n    )\n    \
+         (drill {drill_text})\n      (layers \"*.Cu\" \"*.Mask\")\n      (uuid \"{pad_uuid}\")\n    )\n    \
          (uuid \"{fp_uuid}\")\n  )",
-        offset = mounting_hole_text_offset(drill_diameter_mm)
+        offset = fmt_mm(mounting_hole_text_offset(drill_diameter_mm))
     )
 }
 
@@ -980,7 +1012,7 @@ fn format_zone_polygon(
     let uuid = new_uuid();
     let pts: String = points
         .iter()
-        .map(|(x, y)| format!("\n      (xy {x} {y})"))
+        .map(|(x, y)| format!("\n      (xy {} {})", fmt_mm(*x), fmt_mm(*y)))
         .collect();
     // KiCad omits both of these at their defaults, and so do we: an explicit
     // `(priority 0)` is legal but is not what pcbnew writes.
@@ -994,6 +1026,8 @@ fn format_zone_polygon(
     } else {
         format!("\n    (priority {priority})")
     };
+    let clearance = fmt_mm(clearance);
+    let min_width = fmt_mm(min_width);
     let connect = connection.sexp_token();
     let thermal = konnect_ipc::builders::ZONE_THERMAL_RELIEF_MM;
     let hatch_pitch = konnect_ipc::builders::ZONE_BORDER_PITCH_MM;
@@ -1015,7 +1049,7 @@ fn format_gr_poly(points: &[(f64, f64)], layer: &str) -> String {
     let layer = konnect_sexp::quoted(layer);
     let pts: String = points
         .iter()
-        .map(|(x, y)| format!("\n      (xy {x} {y})"))
+        .map(|(x, y)| format!("\n      (xy {} {})", fmt_mm(*x), fmt_mm(*y)))
         .collect();
     format!(
         "\n  (gr_poly\n    (pts{pts}\n    )\n    \
@@ -1403,7 +1437,7 @@ async fn handle_set_board_size(
     // this tool only ever appended, so every resize added a second rectangle
     // to Edge.Cuts and the board failed DRC with a self-intersecting outline
     // while the tool reported success (#314).
-    let items = rect_outline_items(ox, oy, x2, y2, w);
+    let items = rect_outline_items(ox, oy, x2, y2, w)?;
     let fallback_reason = match attempt_ipc_write(ctx, &board_path, "board size", move |c| {
         let existing =
             c.get_items(konnect_ipc::gen::kiapi::common::types::KiCadObjectType::KotPcbShape)?;
@@ -1423,7 +1457,7 @@ async fn handle_set_board_size(
         BoardWrite::Ipc(OutlineIpcOutcome::Replaced(removed)) => {
             return Ok(CallToolResult::json(&json!({
                 "width": width, "height": height,
-                "x1": ox, "y1": oy, "x2": x2, "y2": y2,
+                "x1": round6(ox), "y1": round6(oy), "x2": round6(x2), "y2": round6(y2),
                 "replaced_segments": removed,
                 "source": "ipc"
             })))
@@ -1482,7 +1516,7 @@ async fn handle_set_board_size(
 
     Ok(CallToolResult::json(&json!({
         "width": width, "height": height,
-        "x1": ox, "y1": oy, "x2": x2, "y2": y2,
+        "x1": round6(ox), "y1": round6(oy), "x2": round6(x2), "y2": round6(y2),
         "replaced_segments": removed,
         "source": "file",
         "fallback_reason": fallback_reason.evidence(),
@@ -1729,14 +1763,19 @@ fn board_extents_body(
     evidence: serde_json::Value,
 ) -> CallToolResult {
     let (x_min, y_min, x_max, y_max) = match bounds {
-        Some((x0, y0, x1, y1)) => (json!(x0), json!(y0), json!(x1), json!(y1)),
+        Some((x0, y0, x1, y1)) => (
+            json!(round6(x0)),
+            json!(round6(y0)),
+            json!(round6(x1)),
+            json!(round6(y1)),
+        ),
         None => (json!(null), json!(null), json!(null), json!(null)),
     };
     let mut body = json!({
         "x_min": x_min, "y_min": y_min,
         "x_max": x_max, "y_max": y_max,
-        "width": bounds.map(|(x0, _, x1, _)| x1 - x0),
-        "height": bounds.map(|(_, y0, _, y1)| y1 - y0),
+        "width": bounds.map(|(x0, _, x1, _)| round6(x1 - x0)),
+        "height": bounds.map(|(_, y0, _, y1)| round6(y1 - y0)),
         "item_count": counts.item_count,
         "measured_item_counts": counts.measured,
         "unmeasured_item_counts": counts.unmeasured,
@@ -2185,7 +2224,7 @@ async fn handle_add_board_outline(
         .count();
     let arc_count = primitives.len() - line_count;
 
-    let items = outline_items(&primitives, w);
+    let items = outline_items(&primitives, w)?;
     let fallback_reason = match attempt_ipc_write(ctx, &board_path, "board outline", move |c| {
         c.create_items(items).map(|_| ())
     })
@@ -2193,8 +2232,8 @@ async fn handle_add_board_outline(
     {
         BoardWrite::Ipc(()) => {
             return Ok(CallToolResult::json(&json!({
-                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                "width": (x2-x1).abs(), "height": (y2-y1).abs(),
+                "x1": round6(x1), "y1": round6(y1), "x2": round6(x2), "y2": round6(y2),
+                "width": round6((x2-x1).abs()), "height": round6((y2-y1).abs()),
                 "corner_radius": corner_radius,
                 "line_count": line_count, "arc_count": arc_count,
                 "source": "ipc"
@@ -2212,8 +2251,8 @@ async fn handle_add_board_outline(
     write_atomic_if_unchanged(&board_path, &content, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
-        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-        "width": (x2-x1).abs(), "height": (y2-y1).abs(),
+        "x1": round6(x1), "y1": round6(y1), "x2": round6(x2), "y2": round6(y2),
+        "width": round6((x2-x1).abs()), "height": round6((y2-y1).abs()),
         "corner_radius": corner_radius,
         "line_count": line_count, "arc_count": arc_count,
         "source": "file",
@@ -2478,7 +2517,7 @@ async fn handle_add_mounting_hole(
 
     match attempt {
         BoardWrite::Ipc(fp) => Ok(CallToolResult::json(&json!({
-            "reference": fp.reference, "x": fp.position.x, "y": fp.position.y,
+            "reference": fp.reference, "x": round6(fp.position.x), "y": round6(fp.position.y),
             "drill_diameter": spec.drill_diameter_mm, "footprint": fp.footprint,
             "geometry": geometry,
             "geometry_note": geometry_note,
@@ -2497,7 +2536,7 @@ async fn handle_add_mounting_hole(
             };
 
             Ok(CallToolResult::json(&json!({
-                "reference": spec.reference, "x": x, "y": y,
+                "reference": spec.reference, "x": round6(x), "y": round6(y),
                 "drill_diameter": spec.drill_diameter_mm,
                 "footprint": footprint,
                 "geometry": geometry,
@@ -2531,13 +2570,27 @@ async fn handle_add_board_text(
         Ok(layer) => layer,
         Err(error) => return Ok(error),
     };
+    let (x, y) = match (super::checked_mm(x, "x"), super::checked_mm(y, "y")) {
+        (Ok(x), Ok(y)) => (x, y),
+        (Err(error), _) | (_, Err(error)) => return Ok(error),
+    };
     let size = args["size"].as_f64().unwrap_or(1.0);
+    let size = match super::checked_mm(size, "size") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
+    if !round6(rotation).is_finite() {
+        return Ok(super::invalid_arg(
+            "rotation",
+            "must remain finite when formatted",
+        ));
+    }
 
     let text_ipc = text.clone();
     let layer_ipc = layer.clone();
     let fallback_reason = match attempt_ipc_write(ctx, &board_path, "board text", move |c| {
-        let bt = builders::board_text(&layer_ipc, &text_ipc, x, y, size, rotation, false);
+        let bt = builders::board_text(&layer_ipc, &text_ipc, x, y, size, rotation, false)?;
         let any = builders::pack_any(&bt, "kiapi.board.types.BoardText");
         c.create_items(vec![any]).map(|_| ())
     })
@@ -2545,7 +2598,7 @@ async fn handle_add_board_text(
     {
         BoardWrite::Ipc(()) => {
             return Ok(CallToolResult::json(&json!({
-                "text": text, "x": x, "y": y, "layer": layer, "size": size,
+                "text": text, "x": round6(x), "y": round6(y), "layer": layer, "size": size,
                 "source": "ipc"
             })))
         }
@@ -2560,7 +2613,7 @@ async fn handle_add_board_text(
     write_atomic_if_unchanged(&board_path, &content, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
-        "text": text, "x": x, "y": y, "layer": layer, "size": size,
+        "text": text, "x": round6(x), "y": round6(y), "layer": layer, "size": size,
         "source": "file",
         "fallback_reason": fallback_reason.evidence(),
         "warning": fallback_reason.warning()
@@ -2727,7 +2780,7 @@ async fn handle_import_svg_logo(
     let layer_ipc = layer.clone();
     let placed_ipc = placed.clone();
     let ipc_attempt = attempt_ipc_write(ctx, &board_path, "SVG logo", move |c| {
-        let shape = builders::board_polygon(&layer_ipc, 0.0, true, &placed_ipc);
+        let shape = builders::board_polygon(&layer_ipc, 0.0, true, &placed_ipc)?;
         let any = builders::pack_any(&shape, "kiapi.board.types.BoardGraphicShape");
         c.create_items(vec![any]).map(|_| ())
     })
@@ -2998,8 +3051,8 @@ pub(crate) mod board_mock {
             .map(|id| {
                 let (x, y, w, h) = box_of(&id.value);
                 kiapi::common::types::Box2 {
-                    position: Some(konnect_ipc::builders::vec2(x, y)),
-                    size: Some(konnect_ipc::builders::vec2(w, h)),
+                    position: Some(konnect_ipc::builders::vec2(x, y).unwrap()),
+                    size: Some(konnect_ipc::builders::vec2(w, h).unwrap()),
                 }
             })
             .collect();
@@ -4013,6 +4066,26 @@ mod svg_logo_tests {
     }
 
     #[test]
+    fn coordinate_review_zone_dimensions_use_mm_formatter_with_and_without_name() {
+        let board = parse_sexp("(kicad_pcb (version 20250610) (net 1 \"GND\"))").unwrap();
+        let net = konnect_sexp::net::net_ref_for_write(&board, "GND").unwrap();
+        for name in ["", "pour"] {
+            let source = format_zone_polygon(
+                &net,
+                "F.Cu",
+                0.1 + 0.2,
+                0.1 + 0.2,
+                &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+                name,
+                0,
+                PadConnection::Thermal,
+            );
+            assert!(source.contains("(clearance 0.3)"), "{source}");
+            assert!(source.contains("(min_thickness 0.3)"), "{source}");
+        }
+    }
+
+    #[test]
     fn format_gr_poly_contains_layer_fill_and_points() {
         let sexp = format_gr_poly(&[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)], "F.SilkS");
         assert!(sexp.contains("(gr_poly"));
@@ -4313,7 +4386,8 @@ mod delete_graphics_tests {
                     .iter()
                     .map(|(uuid, layer)| {
                         let mut shape =
-                            konnect_ipc::builders::board_segment(layer, 0.05, 0.0, 0.0, 10.0, 0.0);
+                            konnect_ipc::builders::board_segment(layer, 0.05, 0.0, 0.0, 10.0, 0.0)
+                                .unwrap();
                         shape.id = Some(kiapi::common::types::Kiid {
                             value: uuid.to_string(),
                         });
@@ -4923,6 +4997,66 @@ mod board_write_gate_tests {
     }
 
     #[tokio::test]
+    async fn outline_responses_round_derived_millimetre_dimensions() {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+
+        for live in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let board = blank_board(directory.path());
+            let server = live.then(|| {
+                super::board_mock::spawn_kicad_holding_board(&board, |command| {
+                    if !konnect_ipc::builders::any_is(command, "kiapi.common.commands.CreateItems")
+                    {
+                        return None;
+                    }
+                    let request =
+                        kiapi::common::commands::CreateItems::decode(command.value.as_slice())
+                            .unwrap();
+                    assert_eq!(request.items.len(), 4);
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::CreateItemsResponse {
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            created_items: request
+                                .items
+                                .into_iter()
+                                .map(|item| kiapi::common::commands::ItemCreationResult {
+                                    status: Some(kiapi::common::commands::ItemStatus {
+                                        code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                        ..Default::default()
+                                    }),
+                                    item: Some(item),
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.CreateItemsResponse",
+                    ))
+                })
+            });
+            let ctx = ctx_with_ipc(
+                server
+                    .as_ref()
+                    .map_or_else(String::new, |server| server.address().to_string()),
+            );
+            let result = handle_add_board_outline(
+                &json!({
+                    "board": board.to_string_lossy(),
+                    "x1": 0.1, "y1": 0.2, "x2": 0.3, "y2": 0.4,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{:?}", result.content);
+            let response: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+            assert_eq!(response["source"], if live { "ipc" } else { "file" });
+            assert_eq!(response["width"], json!(0.2));
+            assert_eq!(response["height"], json!(0.2));
+        }
+    }
+
+    #[tokio::test]
     async fn rounded_outline_file_fallback_writes_real_kicad_arcs() {
         let dir = tempfile::tempdir().unwrap();
         let board = blank_board(dir.path());
@@ -5343,14 +5477,14 @@ mod board_size_tests {
         use konnect_ipc::gen::kiapi;
 
         let edge_segment = builders::pack_any(
-            &builders::board_segment("Edge.Cuts", 0.05, 0.0, 0.0, 20.0, 0.0),
+            &builders::board_segment("Edge.Cuts", 0.05, 0.0, 0.0, 20.0, 0.0).unwrap(),
             "kiapi.board.types.BoardGraphicShape",
         );
         let silk_segment = builders::pack_any(
-            &builders::board_segment("F.SilkS", 0.12, 0.0, 0.0, 5.0, 0.0),
+            &builders::board_segment("F.SilkS", 0.12, 0.0, 0.0, 5.0, 0.0).unwrap(),
             "kiapi.board.types.BoardGraphicShape",
         );
-        let mut arc = builders::board_segment("Edge.Cuts", 0.05, 0.0, 0.0, 1.0, 1.0);
+        let mut arc = builders::board_segment("Edge.Cuts", 0.05, 0.0, 0.0, 1.0, 1.0).unwrap();
         arc.shape = Some(kiapi::common::types::GraphicShape {
             geometry: Some(kiapi::common::types::graphic_shape::Geometry::Arc(
                 kiapi::common::types::GraphicArcAttributes::default(),
@@ -5834,6 +5968,45 @@ mod layer_type_input_tests {
             let body = serde_json::to_value(&result).unwrap();
             assert!(body.to_string().contains("invalid_argument"));
             assert!(!path.exists());
+        }
+    }
+}
+
+#[cfg(test)]
+mod coordinate_review_extents_tests {
+    use super::*;
+
+    fn response(bounds: Option<konnect_sexp::bounds::Bbox>) -> serde_json::Value {
+        let result = board_extents_body(
+            bounds,
+            BoardExtentsCounts {
+                item_count: 0,
+                measured: json!({}),
+                unmeasured: json!({}),
+                unavailable: Vec::new(),
+                skipped: 0,
+                shared_kiids: 0,
+            },
+            "file",
+            "saved_board_file",
+            json!({}),
+        );
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected JSON text")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn coordinate_review_mm_extents_round_before_json_and_preserve_null() {
+        let body = response(Some((0.0, 0.0, 50.8 * 1.075, 167.64 - 5.08)));
+        assert_eq!(body["x_max"], 54.61);
+        assert_eq!(body["y_max"], 162.56);
+        assert_eq!(body["width"], 54.61);
+        assert_eq!(body["height"], 162.56);
+        let absent = response(None);
+        for field in ["x_min", "y_min", "x_max", "y_max", "width", "height"] {
+            assert!(absent[field].is_null(), "{absent}");
         }
     }
 }

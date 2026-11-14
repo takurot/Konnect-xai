@@ -245,7 +245,9 @@ impl std::error::Error for IpcSelectionObservationError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IpcVector2 {
+    #[serde(serialize_with = "konnect_sexp::geometry::serialize_mm")]
     pub x: f64,
+    #[serde(serialize_with = "konnect_sexp::geometry::serialize_mm")]
     pub y: f64,
 }
 
@@ -296,7 +298,9 @@ pub struct IpcPad {
     /// one.  Never synthesize an identifier for a pad that KiCad did not name.
     pub uuid: Option<String>,
     pub number: String,
+    #[serde(serialize_with = "konnect_sexp::geometry::serialize_mm")]
     pub x: f64,
+    #[serde(serialize_with = "konnect_sexp::geometry::serialize_mm")]
     pub y: f64,
     /// Net name, empty when the pad carries no net.
     pub net: String,
@@ -335,7 +339,9 @@ pub struct IpcTitleBlock {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IpcFootprintPlacement {
     pub reference: String,
+    #[serde(serialize_with = "konnect_sexp::geometry::serialize_mm")]
     pub x: f64,
+    #[serde(serialize_with = "konnect_sexp::geometry::serialize_mm")]
     pub y: f64,
     pub rotation: f64,
 }

@@ -20,6 +20,7 @@ use crate::tools::{
     ReembedOutcome, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
+use konnect_sexp::geometry::round6;
 use konnect_sexp::{
     commit_command,
     geometry::snap_point,
@@ -608,7 +609,7 @@ async fn handle_add_schematic_component(
     };
     result["junctions_added"] = json!(junctions
         .iter()
-        .map(|(x, y)| json!({ "x": x, "y": y }))
+        .map(|&(x, y)| json!({ "x": round6(x), "y": round6(y) }))
         .collect::<Vec<_>>());
 
     Ok(crate::outcome::attach(
@@ -1403,8 +1404,8 @@ fn component_mutation_readback_from_schematic(
                 field_placements.insert(
                     property.name.clone(),
                     json!({
-                        "x": at.x,
-                        "y": at.y,
+                        "x": round6(at.x),
+                        "y": round6(at.y),
                         "rotation": at.rotation.unwrap_or(0.0),
                         "hide": hidden,
                         "private": property.private
@@ -1416,8 +1417,8 @@ fn component_mutation_readback_from_schematic(
         units.push(json!({
             "uuid": symbol.uuid,
             "unit": symbol.unit,
-            "x": symbol.at.x,
-            "y": symbol.at.y,
+            "x": round6(symbol.at.x),
+            "y": round6(symbol.at.y),
             "rotation": symbol.at.rotation.unwrap_or(0.0),
             "mirror_x": unit_mirror.contains('x'),
             "mirror_y": unit_mirror.contains('y'),
@@ -1440,8 +1441,8 @@ fn component_mutation_readback_from_schematic(
         "datasheet": anchor.datasheet().unwrap_or(""),
         "lib_id": anchor.lib_id,
         "uuid": anchor.uuid,
-        "x": anchor.at.x,
-        "y": anchor.at.y,
+        "x": round6(anchor.at.x),
+        "y": round6(anchor.at.y),
         "rotation": anchor.at.rotation.unwrap_or(0.0),
         "mirror_x": anchor_mirror.contains('x'),
         "mirror_y": anchor_mirror.contains('y'),
@@ -3022,8 +3023,8 @@ async fn handle_get_schematic_component(
             let unit_mirror = symbol.mirror.as_deref().unwrap_or("");
             json!({
                 "unit": symbol.unit,
-                "x": unit_x,
-                "y": unit_y,
+                "x": round6(unit_x),
+                "y": round6(unit_y),
                 "rotation": symbol.at.rotation.unwrap_or(0.0),
                 "mirror_x": unit_mirror.contains('x'),
                 "mirror_y": unit_mirror.contains('y'),
@@ -3036,8 +3037,8 @@ async fn handle_get_schematic_component(
         "value": anchor.value_str().unwrap_or(""),
         "footprint": anchor.footprint().unwrap_or(""),
         "lib_id": anchor.lib_id,
-        "x": x,
-        "y": y,
+        "x": round6(x),
+        "y": round6(y),
         "rotation": rotation,
         "mirror_x": mirror.contains('x'),
         "mirror_y": mirror.contains('y'),
@@ -3067,8 +3068,8 @@ async fn handle_list_schematic_components(
                 "value": sym.value_str().unwrap_or(""),
                 "footprint": sym.footprint().unwrap_or(""),
                 "lib_id": sym.lib_id,
-                "x": x,
-                "y": y,
+                "x": round6(x),
+                "y": round6(y),
                 "rotation": rotation,
                 "mirror_x": mirror.contains('x'),
                 "mirror_y": mirror.contains('y'),
@@ -3376,8 +3377,8 @@ async fn handle_move_region(
         placements.push(json!({
             "reference": reference,
             "unit": symbol.unit,
-            "x": observed_x,
-            "y": observed_y
+            "x": round6(observed_x),
+            "y": round6(observed_y)
         }));
     }
 
@@ -3493,8 +3494,8 @@ fn pin_locations_for_reference(
                     "number": pin.number,
                     "name": pin.name,
                     "unit": instance.unit,
-                    "x": x,
-                    "y": y,
+                    "x": round6(x),
+                    "y": round6(y),
                     "orientation_degrees": pin_outward_direction(pin, transform),
                     "length_mm": pin.length
                 })
@@ -3503,8 +3504,8 @@ fn pin_locations_for_reference(
         all_pins.extend(pins.iter().cloned());
         units.push(json!({
             "unit": instance.unit,
-            "x": instance.x,
-            "y": instance.y,
+            "x": round6(instance.x),
+            "y": round6(instance.y),
             "rotation": instance.rotation,
             "pins": pins
         }));
@@ -3516,8 +3517,8 @@ fn pin_locations_for_reference(
         // component anchor while exposing every real placement below.
         "component_x": anchor.x,
         "component_y": anchor.y,
-        "x": anchor.x,
-        "y": anchor.y,
+        "x": round6(anchor.x),
+        "y": round6(anchor.y),
         "rotation": anchor.rotation,
         "unit_count": units.len(),
         "units": units,

@@ -7,6 +7,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
+use konnect_sexp::geometry::round6;
 use serde_json::json;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
@@ -488,7 +489,7 @@ async fn handle_apply_template(
                 "reference": reference,
                 "lib_id": lib_id,
                 "value": value,
-                "x": x, "y": y,
+                "x": round6(x), "y": round6(y),
                 "notes": notes
             }));
 
