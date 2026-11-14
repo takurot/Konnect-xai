@@ -1754,15 +1754,9 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
             record_routed_net(&mut routed_nets, via.net.as_ref());
         }
     }
-    if !client
-        .get_items_in(document.clone(), ObjectType::KotPcbZone)?
-        .is_empty()
-    {
-        // KiCad 10's Zone protobuf does not expose the zone net. A pad-net
-        // reassignment on a zoned board therefore fails closed.
-        for net in net_codes.keys() {
-            *routed_nets.entry(net.clone()).or_insert(0) += 1;
-        }
+    for item in client.get_items_in(document.clone(), ObjectType::KotPcbZone)? {
+        let net = super::pcb_zone_nets::routed_net(&item)?;
+        record_routed_net(&mut routed_nets, net.as_ref());
     }
     // Every item KiCad holds, measured as KiCad measures it (#688). A board
     // with nothing measured stages from the origin. The classes KiCad would
@@ -1941,6 +1935,120 @@ fn record_routed_net(
 ) {
     if let Some(net) = net.filter(|net| !net.name.is_empty()) {
         *routed.entry(net.name.clone()).or_insert(0) += 1;
+    }
+}
+
+#[cfg(test)]
+mod zone_net_tests {
+    use super::*;
+    use crate::tools::pcb_zone_nets::test_support::{
+        captured_zones, copper, invalid_zones, mock_zones, rule_area,
+        serializer_shaped_graphical_zones,
+    };
+
+    #[test]
+    fn graphical_zone_does_not_block_the_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("zones.kicad_pcb");
+        for zone in serializer_shaped_graphical_zones() {
+            let (server, _) = mock_zones(&board, vec![zone]);
+            let client = konnect_ipc::KiCadIpcClient::new(server.address().to_string());
+            assert!(snapshot_board(&client, &board)
+                .unwrap()
+                .state
+                .routed_nets
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn zone_snapshot_counts_only_its_copper_net() {
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("zones.kicad_pcb");
+        for (zones, expected) in [
+            (
+                vec![copper("GND", 1)],
+                BTreeMap::from([("GND".to_string(), 1)]),
+            ),
+            (vec![rule_area()], BTreeMap::new()),
+            (vec![copper("", 0)], BTreeMap::new()),
+            (captured_zones(), BTreeMap::from([("GND".to_string(), 1)])),
+        ] {
+            let (server, _) = mock_zones(&board, zones);
+            let client = konnect_ipc::KiCadIpcClient::new(server.address().to_string());
+            let snapshot = snapshot_board(&client, &board).unwrap();
+            assert_eq!(snapshot.state.routed_nets, expected);
+        }
+    }
+
+    #[test]
+    fn a_ground_pour_only_blocks_changes_on_ground() {
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("zones.kicad_pcb");
+        for (zones, old_net, expected) in [
+            (vec![copper("GND", 1)], "SIG_A", PlanStatus::Ready),
+            (vec![copper("GND", 1)], "GND", PlanStatus::Conflict),
+            (vec![rule_area()], "SIG_A", PlanStatus::Ready),
+            (vec![rule_area()], "GND", PlanStatus::Ready),
+        ] {
+            let (server, _) = mock_zones(&board, zones);
+            let client = konnect_ipc::KiCadIpcClient::new(server.address().to_string());
+            let mut snapshot = snapshot_board(&client, &board).unwrap();
+            snapshot.state.footprints.push(BoardFootprint {
+                kiid: "resistor-id".to_string(),
+                reference: "R1".to_string(),
+                value: "10k".to_string(),
+                footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
+                symbol_path: Some("/sheet/symbol".to_string()),
+                pad_nets: BTreeMap::from([("1".to_string(), old_net.to_string())]),
+                pad_numbers: BTreeSet::from(["1".to_string()]),
+                position: Point { x: 1.0, y: 2.0 },
+                rotation: 0.0,
+                layer: "F.Cu".to_string(),
+                locked: false,
+                dnp: false,
+                not_in_schematic: false,
+            });
+            let design = ExportedDesign {
+                components: vec![DesignComponent {
+                    reference: "R1".to_string(),
+                    value: "10k".to_string(),
+                    footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
+                    symbol_path: "/sheet/symbol".to_string(),
+                    dnp: false,
+                    pad_nets: BTreeMap::from([("1".to_string(), "SIG_B".to_string())]),
+                }],
+                skipped: Vec::new(),
+                unassigned: Vec::new(),
+            };
+            let plan = plan_sync("netlist", &design, &snapshot.state);
+            assert_eq!(plan.status, expected, "old net {old_net}");
+            if expected == PlanStatus::Conflict {
+                assert!(plan.changes.is_empty());
+                assert!(plan
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| { diagnostic.code == "routed_pad_net_change" }));
+            }
+        }
+    }
+
+    #[test]
+    fn zone_snapshot_refuses_unknown_copper_net_before_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("zones.kicad_pcb");
+        for zone in invalid_zones() {
+            let (server, requests) = mock_zones(&board, vec![zone]);
+            let client = konnect_ipc::KiCadIpcClient::new(server.address().to_string());
+            let error = match snapshot_board(&client, &board) {
+                Ok(_) => panic!("unknown zone net must refuse the snapshot"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("zone"), "{error:#}");
+            assert!(!requests.lock().unwrap().iter().any(|request| {
+                request.ends_with("BeginCommit") || request.ends_with("UpdateItems")
+            }));
+        }
     }
 }
 
