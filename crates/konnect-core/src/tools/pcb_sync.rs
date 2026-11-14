@@ -4969,6 +4969,15 @@ mod tests {
         created: std::sync::Arc<std::sync::Mutex<Vec<prost_types::Any>>>,
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum InvalidFootprintReadback {
+        Rejected,
+        WrongType,
+        Malformed,
+        DuplicateReference,
+        MissingKiid,
+    }
+
     /// What the mock's board holds after `CreateItems`.
     #[derive(Clone, Copy)]
     enum Readback {
@@ -4983,6 +4992,7 @@ mod tests {
         WrongBom,
         WrongPosition,
         WrongAssemblyAfterCommit,
+        InvalidAfterCommit(InvalidFootprintReadback),
     }
 
     impl ServedSync {
@@ -5054,7 +5064,7 @@ mod tests {
                         let shapes = kiapi::common::types::KiCadObjectType::KotPcbShape as i32;
                         let footprints =
                             kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32;
-                        let items = match outline {
+                        let mut items = match outline {
                             Some(_) if request.types.contains(&shapes) => {
                                 vec![crate::tools::pcb_board::board_mock::listed_item(
                                     kiapi::common::types::KiCadObjectType::KotPcbShape,
@@ -5082,10 +5092,56 @@ mod tests {
                                 .collect(),
                             _ => Vec::new(),
                         };
+                        let mut status = kiapi::common::types::ItemRequestStatus::IrsOk as i32;
+                        if request.types.contains(&footprints)
+                            && published.load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            if let Readback::InvalidAfterCommit(kind) = readback {
+                                match kind {
+                                    InvalidFootprintReadback::Rejected => {
+                                        status = kiapi::common::types::ItemRequestStatus::IrsUnknown
+                                            as i32
+                                    }
+                                    InvalidFootprintReadback::WrongType => {
+                                        items[0].type_url =
+                                            "type.googleapis.com/kiapi.board.types.Pad".to_owned()
+                                    }
+                                    InvalidFootprintReadback::Malformed => {
+                                        items[0].value = vec![0xff]
+                                    }
+                                    InvalidFootprintReadback::DuplicateReference => {
+                                        let mut duplicate =
+                                            kiapi::board::types::FootprintInstance::decode(
+                                                items[0].value.as_slice(),
+                                            )
+                                            .unwrap();
+                                        duplicate.id = Some(kiapi::common::types::Kiid {
+                                            value: "duplicate-reference-id".to_owned(),
+                                        });
+                                        items.push(konnect_ipc::builders::pack_any(
+                                            &duplicate,
+                                            "kiapi.board.types.FootprintInstance",
+                                        ));
+                                    }
+                                    InvalidFootprintReadback::MissingKiid => {
+                                        let mut footprint =
+                                            kiapi::board::types::FootprintInstance::decode(
+                                                items[0].value.as_slice(),
+                                            )
+                                            .unwrap();
+                                        footprint.id = None;
+                                        items[0] = konnect_ipc::builders::pack_any(
+                                            &footprint,
+                                            "kiapi.board.types.FootprintInstance",
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         return Some(konnect_ipc::builders::pack_any(
                             &kiapi::common::commands::GetItemsResponse {
                                 header: None,
-                                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                                status,
                                 items,
                             },
                             "kiapi.common.commands.GetItemsResponse",
@@ -5311,7 +5367,7 @@ mod tests {
     /// A created item as the mock's board lists it back.
     fn read_back(item: &prost_types::Any, readback: Readback) -> prost_types::Any {
         match readback {
-            Readback::AsSent => item.clone(),
+            Readback::AsSent | Readback::InvalidAfterCommit(_) => item.clone(),
             Readback::WithoutLibraryData => {
                 let mut footprint =
                     konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(
@@ -5803,6 +5859,56 @@ mod tests {
             !served.sent_footprints().is_empty(),
             "published work must not be hidden or blindly retried"
         );
+    }
+
+    async fn assert_invalid_postpublication_readback(kind: InvalidFootprintReadback) {
+        let served = ServedSync::reading_back(Readback::InvalidAfterCommit(kind)).await;
+        let plan = served
+            .dry_run(&exported_netlist(&[("R1", STOCK_0603, &["1", "2"])]))
+            .await;
+        assert_eq!(plan["status"], "ready", "{plan}");
+        let (is_error, result) = served
+            .call(serde_json::json!({
+                "schematic": served.schematic, "board": served.board, "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"]
+            }))
+            .await;
+        assert!(is_error, "{kind:?}: {result}");
+        assert_eq!(
+            result["error"]["kind"], "ipc_outcome_unknown",
+            "{kind:?}: {result}"
+        );
+        assert_eq!(result["error"]["retry_safe"], false, "{result}");
+        assert_ne!(result["status"], "applied", "{result}");
+        assert!(
+            !served.sent_footprints().is_empty(),
+            "published work must remain visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue25_postpublish_getitems_rejection_is_unknown() {
+        assert_invalid_postpublication_readback(InvalidFootprintReadback::Rejected).await;
+    }
+
+    #[tokio::test]
+    async fn issue25_postpublish_wrong_any_type_is_unknown() {
+        assert_invalid_postpublication_readback(InvalidFootprintReadback::WrongType).await;
+    }
+
+    #[tokio::test]
+    async fn issue25_postpublish_decode_failure_is_unknown() {
+        assert_invalid_postpublication_readback(InvalidFootprintReadback::Malformed).await;
+    }
+
+    #[tokio::test]
+    async fn issue25_postpublish_duplicate_reference_is_unknown() {
+        assert_invalid_postpublication_readback(InvalidFootprintReadback::DuplicateReference).await;
+    }
+
+    #[tokio::test]
+    async fn issue25_postpublish_missing_kiid_is_unknown() {
+        assert_invalid_postpublication_readback(InvalidFootprintReadback::MissingKiid).await;
     }
 
     /// The control for the test above: the same DNP part on a board that kept
