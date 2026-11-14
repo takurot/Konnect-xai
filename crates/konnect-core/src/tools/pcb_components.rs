@@ -4420,25 +4420,57 @@ mod tests {
         assert!(!corners.top_right && !corners.bottom_left);
     }
 
+    fn unsupported_placement_cases() -> Vec<(&'static str, String)> {
+        [
+            ("footprint", "(zone (net 0))"),
+            ("footprint", "(solder_mask_margin 0.1)"),
+            ("footprint", "(solder_paste_margin 0.1)"),
+            ("footprint", "(solder_paste_ratio 0.1)"),
+            ("footprint", "(net_tie_pad_groups \"1,2\")"),
+            ("footprint", "(zone_connect 1)"),
+            ("footprint", "(clearance 0.2)"),
+            ("footprint", "(group \"g\")"),
+            ("footprint", "(point (at 0 0))"),
+            ("footprint", "(fp_text_box \"box\")"),
+            ("footprint", "(dimension 0)"),
+            ("pad", "(zone_connect 1)"),
+            ("pad", "(thermal_bridge_angle 45)"),
+            ("pad", "(thermal_bridge_width 0.3)"),
+            ("pad", "(thermal_gap 0.2)"),
+            ("pad", "(clearance 0.2)"),
+            ("pad", "(solder_mask_margin 0.1)"),
+            ("pad", "(solder_paste_margin 0.1)"),
+            ("pad", "(solder_paste_margin_ratio 0.1)"),
+            ("pad", "(property pad_prop_bga)"),
+            ("pad", "(drill 0.5 (offset 0.1 0))"),
+        ]
+        .into_iter()
+        .map(|(target, clause)| {
+            let mut source = library_footprint();
+            let end = if target == "pad" {
+                find_direct_child_blocks(&source, "footprint")
+                    .into_iter()
+                    .find(|(start, end)| source[*start..*end].starts_with("(pad "))
+                    .unwrap()
+                    .1
+                    - 1
+            } else {
+                source.rfind(')').unwrap()
+            };
+            source.insert_str(end, &format!(" {clause}"));
+            (clause, source)
+        })
+        .collect()
+    }
+
     #[tokio::test]
     async fn closed_file_placement_preserves_unsupported_library_geometry() {
-        for clause in [
-            "(zone (net 0))",
-            "(solder_mask_margin 0.1)",
-            "(net_tie_pad_groups \"1,2\")",
-            "(group \"g\")",
-            "(point (at 0 0))",
-            "(fp_text_box \"box\")",
-            "(dimension 0)",
-        ] {
+        for (clause, source) in unsupported_placement_cases() {
             let tmp = tempfile::tempdir().unwrap();
             let board = fallback_fixture(tmp.path());
             let library = tmp
                 .path()
                 .join("Resistor_SMD.pretty/R_0805_2012Metric.kicad_mod");
-            let source = library_footprint();
-            let end = source.rfind(')').unwrap();
-            let source = format!("{} {clause}{}", &source[..end], &source[end..]);
             std::fs::write(library, source).unwrap();
             let result = handle_place_component(
                 &json!({
@@ -4464,75 +4496,81 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
             Arc,
         };
-        let tmp = tempfile::tempdir().unwrap();
-        let board = fallback_fixture(tmp.path());
-        let before = std::fs::read_to_string(&board).unwrap();
-        let library = tmp
-            .path()
-            .join("Resistor_SMD.pretty/R_0805_2012Metric.kicad_mod");
-        let source = library_footprint();
-        let end = source.rfind(')').unwrap();
-        std::fs::write(
-            library,
-            format!("{} (zone (net 0)){}", &source[..end], &source[end..]),
-        )
-        .unwrap();
-        let creates = Arc::new(AtomicUsize::new(0));
-        let count = creates.clone();
-        let filename = board.to_string_lossy().to_string();
-        let server = crate::test_support::MockIpcServer::spawn(
-            "unsupported-placement",
-            move |request| {
-                let command = request.message.unwrap();
-                let message = if command.type_url.ends_with("GetOpenDocuments") {
-                    Some(konnect_ipc::builders::pack_any(&kiapi::common::commands::GetOpenDocumentsResponse {
+        for (clause, source) in unsupported_placement_cases() {
+            let tmp = tempfile::tempdir().unwrap();
+            let board = fallback_fixture(tmp.path());
+            let before = std::fs::read_to_string(&board).unwrap();
+            let library = tmp
+                .path()
+                .join("Resistor_SMD.pretty/R_0805_2012Metric.kicad_mod");
+            std::fs::write(library, source).unwrap();
+            let creates = Arc::new(AtomicUsize::new(0));
+            let count = creates.clone();
+            let filename = board.to_string_lossy().to_string();
+            let server = crate::test_support::MockIpcServer::spawn(
+                "unsupported-placement",
+                move |request| {
+                    let command = request.message.unwrap();
+                    let message = if command.type_url.ends_with("GetOpenDocuments") {
+                        Some(konnect_ipc::builders::pack_any(&kiapi::common::commands::GetOpenDocumentsResponse {
                     documents: vec![kiapi::common::types::DocumentSpecifier {
                         r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
                         identifier: Some(kiapi::common::types::document_specifier::Identifier::BoardFilename(filename.clone())),
                         project: None,
                     }],
                 }, "kiapi.common.commands.GetOpenDocumentsResponse"))
-                } else if command.type_url.ends_with("GetItems") {
-                    Some(konnect_ipc::builders::pack_any(
-                        &kiapi::common::commands::GetItemsResponse {
-                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                            ..Default::default()
-                        },
-                        "kiapi.common.commands.GetItemsResponse",
-                    ))
-                } else {
-                    if command.type_url.ends_with("CreateItems") {
-                        count.fetch_add(1, Ordering::SeqCst);
+                    } else if command.type_url.ends_with("GetItems") {
+                        Some(konnect_ipc::builders::pack_any(
+                            &kiapi::common::commands::GetItemsResponse {
+                                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                                ..Default::default()
+                            },
+                            "kiapi.common.commands.GetItemsResponse",
+                        ))
+                    } else {
+                        if command.type_url.ends_with("CreateItems") {
+                            count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        None
+                    };
+                    kiapi::common::ApiResponse {
+                        status: Some(kiapi::common::ApiResponseStatus {
+                            status: kiapi::common::ApiStatusCode::AsOk as i32,
+                            error_message: String::new(),
+                        }),
+                        message,
+                        header: None,
                     }
-                    None
-                };
-                kiapi::common::ApiResponse {
-                    status: Some(kiapi::common::ApiResponseStatus {
-                        status: kiapi::common::ApiStatusCode::AsOk as i32,
-                        error_message: String::new(),
-                    }),
-                    message,
-                    header: None,
-                }
-            },
-        );
-        let ctx = ctx_talking_to(server.address().to_string());
-        let result = handle_place_component(
-            &json!({
-                "board": board, "footprint": "Resistor_SMD:R_0805_2012Metric",
-                "reference": "R1", "x": 10.0, "y": 20.0,
-            }),
-            &ctx,
-        )
-        .await
-        .unwrap();
-        assert!(result.is_error);
-        let text = result_text(&result);
-        for expected in ["R1", "Resistor_SMD:R_0805_2012Metric", "zone", "closed"] {
-            assert!(text.contains(expected), "{text}");
+                },
+            );
+            let ctx = ctx_talking_to(server.address().to_string());
+            let result = handle_place_component(
+                &json!({
+                    "board": board, "footprint": "Resistor_SMD:R_0805_2012Metric",
+                    "reference": "R1", "x": 10.0, "y": 20.0,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error);
+            let text = result_text(&result);
+            let tag = konnect_sexp::parse_sexp(clause)
+                .unwrap()
+                .head()
+                .unwrap()
+                .to_string();
+            for expected in [
+                "R1",
+                "Resistor_SMD:R_0805_2012Metric",
+                tag.as_str(),
+                "closed",
+            ] {
+                assert!(text.contains(expected), "{clause}: {text}");
+            }
+            assert_eq!(creates.load(Ordering::SeqCst), 0);
+            assert_eq!(std::fs::read_to_string(board).unwrap(), before);
         }
-        assert_eq!(creates.load(Ordering::SeqCst), 0);
-        assert_eq!(std::fs::read_to_string(board).unwrap(), before);
     }
 
     fn test_ctx() -> ToolContext {
