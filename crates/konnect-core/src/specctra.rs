@@ -2246,7 +2246,7 @@ mod tests {
         for (from, to, expected) in [
             ("(image Resistor_SMD:R_0402\n", "(image Resistor_SMD:R_0402)\n    (image Resistor_SMD:R_0402\n".to_string(), "repeats image"),
             ("(shape (rect F.Cu -300 -250 300 250))", "".into(), "empty or duplicate padstack"),
-            ("(library\n", "(library\n    (padstack Rect[T]Pad_600.000000x500.000000_um (shape (rect F.Cu -300 -250 300 250)))\n".into(), "empty or duplicate padstack"),
+            ("(padstack Rect[T]Pad_600.000000x500.000000_um\n", "(padstack Rect[T]Pad_600.000000x500.000000_um (shape (rect F.Cu -300 -250 300 250)) (attach off))\n    (padstack Rect[T]Pad_600.000000x500.000000_um\n".into(), "empty or duplicate padstack"),
             (place, format!("{place} {place}"), "repeats component"),
             ("(pins R1-2 R2-1)", "(pins)".into(), "empty or duplicate net"),
             (net, format!("{net} {net}"), "empty or duplicate net"),
