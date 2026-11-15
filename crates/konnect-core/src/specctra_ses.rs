@@ -1421,4 +1421,56 @@ mod tests {
         let without_optional = parse_import_plan(&board, &source, &manifest, &source_ses).unwrap();
         assert_eq!(without_optional, original);
     }
+
+    #[test]
+    fn empty_routes_incomplete_pairs_and_duplicate_via_library_are_refused() {
+        let (_dir, board, source, manifest) = fixture();
+        let wire = "(wire (path F.Cu 2500 995000 -500000 1050000 -500000 1050000 -510000))";
+        let via = "(via konnect_via_0001 1050000 -510000 (net GND) (type protect))";
+        let duplicate_library = "(padstack konnect_via_0001 (shape (circle F.Cu 6000 0 0)) (shape (circle B.Cu 6000 0 0)) (attach off))";
+        for (ses, expected) in [
+            (
+                sample_ses().replace(wire, "").replace(via, ""),
+                "no route primitives",
+            ),
+            (
+                sample_ses().replace(wire, "(wire (path F.Cu 2500 0 0 100 100 200))"),
+                "complete point pairs",
+            ),
+            (
+                sample_ses().replace("(library_out", &format!("(library_out {duplicate_library}")),
+                "repeats padstack",
+            ),
+        ] {
+            let error = parse_import_plan(&board, &source, &manifest, &ses).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+        let arc = "(wire (qarc F.Cu 2500 995000 -500000 1000000 -495000 1000000 -500000))";
+        let arc_only = sample_ses().replace(wire, arc).replace(via, "");
+        let plan = parse_import_plan(&board, &source, &manifest, &arc_only).unwrap();
+        assert!(plan.tracks.is_empty() && plan.vias.is_empty());
+        assert_eq!(plan.arcs.len(), 1);
+        let negative_via = sample_ses().replace(
+            "(via konnect_via_0001 1050000",
+            "(via konnect_via_0001 -1050000",
+        );
+        let plan = parse_import_plan(&board, &source, &manifest, &negative_via).unwrap();
+        assert_eq!(plan.vias[0].x_mm, -105.0);
+    }
+
+    #[test]
+    fn import_refuses_live_routing_that_the_manifest_cannot_preserve() {
+        let (_dir, board, source, manifest) = fixture();
+        for (routing, expected) in [
+            ("(arc)", "unsupported routed arc"),
+            ("(segment)", "track segment that is not locked"),
+            ("(via)", "via that is not locked"),
+        ] {
+            let mut snapshot = source.clone();
+            snapshot.insert_str(snapshot.rfind(')').unwrap(), routing);
+            let error = parse_import_plan(&board, &snapshot, &manifest, sample_ses()).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+        }
+    }
 }

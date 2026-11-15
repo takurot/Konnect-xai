@@ -2106,4 +2106,131 @@ mod tests {
         zero_clearance.get_mut("GND").unwrap().clearance_mm = Some(0.0);
         assert!(export_dsn(Path::new("board.kicad_pcb"), &source, &zero_clearance).is_ok());
     }
+
+    #[test]
+    fn native_dsn_adoption_refuses_changed_geometry_identity_and_routing_rules() {
+        let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        let native = include_str!("../tests/fixtures/specctra_two_resistors.native-kicad-10.dsn");
+        for (from, to, expected) in [
+            (
+                "(layer B.Cu",
+                "(layer In1.Cu",
+                "renamed a KiCad copper layer",
+            ),
+            ("(index 1)", "(index 2)", "omitted layer index"),
+            ("(index 1)", "(index 0)", "repeats a layer index"),
+            (
+                "(place R1 100000 -50000 front 0",
+                "(place R1 100001 -50000 front 0",
+                "changed placement or pins",
+            ),
+            (
+                "(place R1 100000 -50000 front 0",
+                "(place R1 100000 -50001 front 0",
+                "changed placement or pins",
+            ),
+            (
+                "(place R1 100000 -50000 front 0",
+                "(place R1 100000 -50000 back 0",
+                "changed placement or pins",
+            ),
+            (
+                "(place R1 100000 -50000 front 0",
+                "(place R1 100000 -50000 front 90",
+                "changed placement or pins",
+            ),
+            (
+                "(place R1 100000 -50000 front 0",
+                "(place R3 100000 -50000 front 0",
+                "omitted component",
+            ),
+            ("1 -500 0)", "1 -501 0)", "changed pin position"),
+            ("2 500 0)", "3 500 0)", "changed placement or pins"),
+            (
+                "1 -500 0)",
+                "1 -500 0)\n      (pin Rect[T]Pad_600.000000x500.000000_um 1 -500 0)",
+                "repeats a pin number",
+            ),
+            (
+                "(rect F.Cu -300 -250 300 250)",
+                "(rect F.Cu -301 -250 300 250)",
+                "changed pad geometry",
+            ),
+            (
+                "(circle F.Cu 600)",
+                "(circle F.Cu 601)",
+                "changed via geometry",
+            ),
+            (
+                "(pins R1-1 R2-2)",
+                "(pins R1-2 R2-2)",
+                "changed net or pin membership",
+            ),
+            (
+                "(class kicad_default GND VCC",
+                "(class kicad_default GND",
+                "no unique class",
+            ),
+            (
+                "(class kicad_default GND VCC",
+                "(class kicad_default GND UNKNOWN",
+                "invalid or duplicate class",
+            ),
+            ("(width 200)", "(width 201)", "changed width or clearance"),
+            (
+                "(clearance 200)",
+                "(clearance 201)",
+                "changed width or clearance",
+            ),
+        ] {
+            let changed = native.replace(from, to);
+            assert_ne!(changed, native, "ineffective fixture mutation {from}");
+            let baseline = export_dsn(
+                Path::new("board.kicad_pcb"),
+                source,
+                &native_fixture_rules(),
+            )
+            .unwrap();
+            let error = format!("{:#}", adopt_native_dsn(baseline, changed).unwrap_err());
+            assert!(error.contains(expected), "{from} -> {to}: {error}");
+        }
+    }
+
+    #[test]
+    fn export_rejects_duplicate_references_pads_empty_boards_and_disconnected_outlines() {
+        let pad = COVERAGE_ROUTING_PAD;
+        for (source, expected) in [
+            (coverage_routing_board("", "", ""), "has no pads"),
+            (coverage_routing_board(pad, pad, ""), "duplicate pad number"),
+            (
+                coverage_routing_board(
+                    pad,
+                    "",
+                    &format!(
+                        r#"(footprint "Second" (layer "F.Cu") (uuid "second") (at 1 1) (property "Reference" "U1") {pad})"#
+                    ),
+                ),
+                "duplicate footprint reference",
+            ),
+            (
+                coverage_routing_board(pad, "", "")
+                    .replace("(footprint \"Fixture\"", "(unused \"Fixture\""),
+                "at least one footprint",
+            ),
+            (
+                coverage_routing_board(
+                    pad,
+                    "",
+                    r#"(gr_line (start 40 0) (end 50 0) (layer "Edge.Cuts")) (gr_line (start 50 0) (end 50 10) (layer "Edge.Cuts")) (gr_line (start 50 10) (end 40 10) (layer "Edge.Cuts")) (gr_line (start 40 10) (end 40 0) (layer "Edge.Cuts"))"#,
+                ),
+                "not one closed loop",
+            ),
+        ] {
+            let error = format!(
+                "{:#}",
+                export_dsn(Path::new("board.kicad_pcb"), &source, &rules()).unwrap_err()
+            );
+            assert!(error.contains(expected), "{error}");
+        }
+    }
 }

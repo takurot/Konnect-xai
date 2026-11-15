@@ -394,4 +394,269 @@ mod tests {
             "Rust must consume the private bridge artifact"
         );
     }
+
+    fn coverage_registration() -> Registration {
+        Registration {
+            protocol_version: 1,
+            pid: 42,
+            address: "http://127.0.0.1:32123".into(),
+            token: "fixture".repeat(8),
+            started_at_unix: 1.0,
+        }
+    }
+
+    #[test]
+    fn registration_refuses_incompatible_identity_credentials_and_url_components() {
+        for field in ["protocol", "pid", "token", "nonfinite", "timestamp"] {
+            let mut registration = coverage_registration();
+            match field {
+                "protocol" => registration.protocol_version = 2,
+                "pid" => registration.pid = 0,
+                "token" => registration.token.clear(),
+                "nonfinite" => registration.started_at_unix = f64::NAN,
+                "timestamp" => registration.started_at_unix = 0.0,
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_registration(&registration)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid or incompatible"),
+                "{field}"
+            );
+        }
+        for address in [
+            "http://127.0.0.1",
+            "http://127.0.0.1:32123/?token=other",
+            "http://127.0.0.1:32123/#redirect",
+            "http://user@127.0.0.1:32123",
+            "http://:password@127.0.0.1:32123",
+            "not a URL",
+        ] {
+            let registration = Registration {
+                address: address.into(),
+                ..coverage_registration()
+            };
+            assert!(validate_registration(&registration).is_err(), "{address}");
+        }
+    }
+
+    #[test]
+    fn discovery_only_returns_sorted_registration_names() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "other.json",
+            "bridge-3.txt",
+            "bridge-2.json",
+            "bridge-1.json",
+        ] {
+            std::fs::write(dir.path().join(name), "{}").unwrap();
+        }
+        assert_eq!(
+            registrations(dir.path()).unwrap(),
+            vec![
+                dir.path().join("bridge-1.json"),
+                dir.path().join("bridge-2.json")
+            ]
+        );
+    }
+
+    #[test]
+    fn export_response_refuses_wrong_status_identity_extension_and_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let other = dir.path().join("other.kicad_pcb");
+        std::fs::write(&board, "board").unwrap();
+        std::fs::write(&other, "board").unwrap();
+        for field in ["success", "protocol", "pid", "extension", "board"] {
+            let mut response = ExportResponse {
+                success: true,
+                protocol_version: 1,
+                pid: 42,
+                board_path: board.display().to_string(),
+                dsn_path: "export.DSN".into(),
+                dsn_bytes: 1,
+            };
+            match field {
+                "success" => response.success = false,
+                "protocol" => response.protocol_version = 2,
+                "pid" => response.pid = 43,
+                "extension" => response.dsn_path = "export.txt".into(),
+                "board" => response.board_path = other.display().to_string(),
+                _ => unreachable!(),
+            }
+            let error = validate_response(&coverage_registration(), &response, &board).unwrap_err();
+            let expected = if field == "board" {
+                "does not match requested board"
+            } else {
+                "response is invalid"
+            };
+            assert!(error.to_string().contains(expected), "{field}: {error:#}");
+        }
+    }
+
+    async fn coverage_bridge_server(
+        root: &Path,
+        responses: Vec<serde_json::Value>,
+    ) -> (PathBuf, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for (index, response) in responses.into_iter().enumerate() {
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let request = tokio::time::timeout(Duration::from_secs(3), async {
+                    let mut request = Vec::new();
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let mut chunk = [0u8; 1024];
+                        let count = stream.read(&mut chunk).await.unwrap();
+                        assert!(count > 0, "client closed before sending headers");
+                        request.extend_from_slice(&chunk[..count]);
+                        assert!(request.len() <= 8192, "request exceeded fixture bound");
+                    }
+                    String::from_utf8(request).unwrap()
+                })
+                .await
+                .unwrap();
+                let method = if index == 0 {
+                    "GET /v1/status "
+                } else {
+                    "POST /v1/export-specctra-dsn "
+                };
+                assert!(request.starts_with(method), "{request}");
+                assert!(request
+                    .to_ascii_lowercase()
+                    .contains(&format!("authorization: bearer {}", "fixture".repeat(8))));
+                let body = response.to_string();
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                tokio::time::timeout(Duration::from_secs(3), stream.write_all(reply.as_bytes()))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        });
+        let registration = root.join("bridge-42.json");
+        std::fs::write(
+            &registration,
+            serde_json::json!({
+                "protocol_version": 1, "pid":42, "address": format!("http://{address}"),
+                "token": "fixture".repeat(8), "started_at_unix":1.0,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (registration, task)
+    }
+
+    #[tokio::test]
+    async fn mismatched_live_status_never_requests_an_export() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "board").unwrap();
+        for (key, value) in [
+            ("success", json!(false)),
+            ("native_specctra_export", json!(false)),
+            ("protocol_version", json!(2)),
+            ("pid", json!(43)),
+        ] {
+            let mut status =
+                json!({"success":true,"native_specctra_export":true,"protocol_version":1,"pid":42});
+            status[key] = value;
+            let (registration, server) = coverage_bridge_server(dir.path(), vec![status]).await;
+            let error = try_registration(dir.path(), &registration, &board)
+                .await
+                .unwrap_err();
+            server.await.unwrap();
+            assert!(
+                error.to_string().contains("status does not match"),
+                "{key}: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn private_artifact_validation_refuses_foreign_missing_and_inconsistent_output() {
+        use serde_json::json;
+        for case in [
+            "outside",
+            "missing",
+            "empty",
+            "wrong_size",
+            "oversized",
+            "wrong_root",
+            "invalid_utf8",
+            "uppercase",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("bridge");
+            std::fs::create_dir(&root).unwrap();
+            let board = dir.path().join("board.kicad_pcb");
+            std::fs::write(&board, "board").unwrap();
+            let dsn = if case == "outside" {
+                dir.path().join("foreign.dsn")
+            } else {
+                root.join("private.DSN")
+            };
+            let bytes: &[u8] = match case {
+                "empty" => b"",
+                "wrong_root" => b"(session board)",
+                "invalid_utf8" => &[0xff],
+                _ => b"(pcb board)",
+            };
+            if case != "missing" {
+                std::fs::write(&dsn, bytes).unwrap();
+            }
+            if case == "oversized" {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&dsn)
+                    .unwrap()
+                    .set_len(MAX_DSN_BYTES + 1)
+                    .unwrap();
+            }
+            let size = if case == "oversized" {
+                MAX_DSN_BYTES + 1
+            } else if case == "wrong_size" {
+                bytes.len() as u64 + 1
+            } else {
+                bytes.len() as u64
+            };
+            let (registration, server) = coverage_bridge_server(&root, vec![
+                json!({"success":true,"native_specctra_export":true,"protocol_version":1,"pid":42}),
+                json!({"success":true,"protocol_version":1,"pid":42,"board_path":board,"dsn_path":dsn,"dsn_bytes":size}),
+            ]).await;
+            let result = try_registration(&root, &registration, &board).await;
+            server.await.unwrap();
+            if case == "uppercase" {
+                assert_eq!(result.unwrap().dsn, "(pcb board)");
+                assert!(!dsn.exists());
+                continue;
+            }
+            let expected = match case {
+                "outside" => "outside its private directory",
+                "missing" => "resolve native DSN",
+                "wrong_root" => "not a Specctra PCB",
+                "invalid_utf8" => "read native DSN",
+                _ => "size does not match",
+            };
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains(expected), "{case}: {error}");
+            if matches!(case, "wrong_root" | "invalid_utf8") {
+                assert!(
+                    !dsn.exists(),
+                    "consumed private artifacts are removed even if content is invalid"
+                );
+            } else if case != "missing" {
+                assert!(
+                    dsn.exists(),
+                    "unaccepted artifact must not be deleted: {case}"
+                );
+            }
+            assert_eq!(std::fs::read_to_string(board).unwrap(), "board");
+        }
+    }
 }

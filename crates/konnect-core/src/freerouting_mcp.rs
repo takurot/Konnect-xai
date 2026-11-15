@@ -1399,4 +1399,150 @@ cat >/dev/null"#;
             );
         }
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn routing_protocol_refusals_stop_before_creating_or_downloading_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut missing_session_tool = coverage_tool_list(false);
+        missing_session_tool["tools"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|tool| tool["name"] != "create_session");
+        let mut bad_type = coverage_tool_list(false);
+        bad_type["tools"][1]["inputSchema"]["type"] = json!("string");
+        let mut missing_path = coverage_tool_list(false);
+        missing_path["tools"][1]["inputSchema"]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("body");
+        let mut missing_required = coverage_tool_list(false);
+        missing_required["tools"][1]["inputSchema"]["required"] = json!([]);
+        for (index, (results, configure, expected)) in [
+            (
+                vec![missing_session_tool],
+                false,
+                "missing required tool(s): create_session",
+            ),
+            (vec![bad_type], false, "incompatible input schema"),
+            (vec![missing_path], false, "has no argument"),
+            (vec![missing_required], false, "does not require argument"),
+            (
+                vec![coverage_tool_list(false), json!({})],
+                false,
+                "no session id",
+            ),
+            (
+                vec![
+                    coverage_tool_list(false),
+                    json!({"sessionId":"fixture-session"}),
+                    json!({}),
+                ],
+                false,
+                "no job id",
+            ),
+            (
+                vec![
+                    coverage_tool_list(false),
+                    json!({"sessionId":"fixture-session"}),
+                    json!({"jobId":"fixture-job"}),
+                    json!({}),
+                ],
+                true,
+                "does not expose update_job_settings",
+            ),
+            (
+                vec![
+                    coverage_tool_list(false),
+                    json!({"sessionId":"fixture-session"}),
+                    json!({"jobId":"fixture-job"}),
+                    json!({}),
+                    json!({}),
+                    json!({}),
+                ],
+                false,
+                "no job state",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let replies = results
+                .into_iter()
+                .enumerate()
+                .map(|(index, result)| json!({"id":index + 2,"result":result}).to_string())
+                .collect::<Vec<_>>();
+            let trace = dir.path().join(format!("refused-{index}.log"));
+            let mut client = scripted_client(&trace, &replies).await;
+            let mut settings = coverage_settings();
+            if configure {
+                settings.max_passes = Some(2);
+            }
+            let output = dir.path().join("output.ses");
+            let error = run_state_machine(
+                &mut client,
+                &dir.path().join("input.dsn"),
+                &output,
+                &settings,
+                Instant::now(),
+            )
+            .await
+            .unwrap_err();
+            client.close().await;
+            assert!(
+                format!("{error:#}").contains(expected),
+                "case {index}: {error:#}"
+            );
+            let requests = std::fs::read_to_string(trace).unwrap();
+            assert!(!requests.contains("download_job_output_to_local_file"));
+            assert!(!output.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn routing_polls_a_waiting_job_until_completion_and_preserves_the_job_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let trace = dir.path().join("poll.log");
+        let results = [
+            coverage_tool_list(false),
+            json!({"sessionId":"fixture-session"}),
+            json!({"jobId":"fixture-job"}),
+            json!({}),
+            json!({}),
+            json!({"state":"RUNNING"}),
+            json!({"status":"completed"}),
+            json!({}),
+        ];
+        let replies = results
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| json!({"id":index + 2,"result":result}).to_string())
+            .collect::<Vec<_>>();
+        let mut client = scripted_client(&trace, &replies).await;
+        let settings = RouteSettings {
+            poll_interval: Duration::from_millis(1),
+            ..coverage_settings()
+        };
+        let evidence = run_state_machine(
+            &mut client,
+            &dir.path().join("input.dsn"),
+            &dir.path().join("output.ses"),
+            &settings,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        client.close().await;
+        assert_eq!(evidence.poll_count, 2);
+        assert_eq!(evidence.job_id, "fixture-job");
+        let requests = std::fs::read_to_string(trace).unwrap();
+        assert_eq!(requests.matches("get_job_details").count(), 2);
+        assert_eq!(
+            requests
+                .matches("download_job_output_to_local_file")
+                .count(),
+            1
+        );
+    }
 }
