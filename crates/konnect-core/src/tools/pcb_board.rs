@@ -6015,3 +6015,109 @@ mod coordinate_review_extents_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod board_boundary_contract_tests {
+    use super::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+    use super::*;
+    use konnect_ipc::gen::kiapi;
+
+    fn text(result: &CallToolResult) -> &str {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("text response required");
+        };
+        text
+    }
+
+    #[test]
+    fn rounded_outline_rejects_nonfinite_and_degenerate_dimensions() {
+        for (coordinates, field) in [
+            ([f64::NAN, 0.0, 10.0, 10.0, 1.0], "corner_radius"),
+            ([0.0, 0.0, f64::INFINITY, 10.0, 1.0], "corner_radius"),
+            ([0.0, 0.0, 0.0, 10.0, 1.0], "x2"),
+            ([0.0, 0.0, 10.0, 0.0, 1.0], "y2"),
+            ([0.0, 0.0, 10.0, 10.0, -1.0], "corner_radius"),
+        ] {
+            let [x1, y1, x2, y2, radius] = coordinates;
+            assert_eq!(
+                rounded_rectangle_outline(x1, y1, x2, y2, radius)
+                    .unwrap_err()
+                    .0,
+                field
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_zone_with_too_few_vertices_refuses_without_changing_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let source = "(kicad_pcb (version 20240108))";
+        std::fs::write(&board, source).unwrap();
+        let result = handle_add_zone(
+            &json!({
+                "board": board, "net_name": "GND", "layer": "F.Cu",
+                "points": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 1.0}]
+            }),
+            &ctx_talking_to(String::new()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(text(&result).contains("3"), "{}", text(&result));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn a_live_layer_list_reports_unavailable_saved_ids_and_types_without_inventing_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let source = "(kicad_pcb (version 20240108))";
+        std::fs::write(&board, source).unwrap();
+        let server = spawn_kicad_holding_board(&board, |command| {
+            if command.type_url.ends_with("GetBoardEnabledLayers") {
+                return Some(builders::pack_any(
+                    &kiapi::board::commands::BoardEnabledLayersResponse {
+                        copper_layer_count: 2,
+                        layers: vec![
+                            kiapi::board::types::BoardLayer::BlFCu as i32,
+                            kiapi::board::types::BoardLayer::BlBCu as i32,
+                        ],
+                    },
+                    "kiapi.board.commands.BoardEnabledLayersResponse",
+                ));
+            }
+            None
+        });
+        let result = handle_get_layer_list(
+            &json!({"board": board, "board_source": "live"}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        let body: serde_json::Value = serde_json::from_str(text(&result)).unwrap();
+        assert_eq!(body["copper_layer_count"], 2);
+        assert!(body["file_backed_fields_note"]
+            .as_str()
+            .unwrap()
+            .contains("null"));
+        for layer in body["layers"].as_array().unwrap() {
+            assert!(layer["id"].is_null());
+            assert!(layer["type"].is_null());
+        }
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+
+    #[test]
+    fn graphic_origin_uses_the_first_valid_defining_point() {
+        for (source, expected) in [
+            ("(gr_line (start invalid 1) (center 2 3))", Some((2.0, 3.0))),
+            ("(gr_poly (pts (xy 4 5) (xy 8 9)))", Some((4.0, 5.0))),
+            ("(gr_poly (pts (xy invalid 5)))", None),
+            ("(gr_poly (pts))", None),
+        ] {
+            assert_eq!(block_origin(&parse_sexp(source).unwrap()), expected);
+        }
+    }
+}

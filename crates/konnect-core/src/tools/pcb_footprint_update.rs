@@ -5555,3 +5555,21 @@ mod planner_refusal_tests {
         assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
     }
 }
+
+#[cfg(test)]
+mod routing_snapshot_contract_tests {
+    use super::*;
+
+    #[test]
+    fn refresh_protects_named_track_arc_and_via_nets_and_ignores_unconnected_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("routing.kicad_pcb");
+        let server = super::super::pcb_sync::routing_snapshot_contract_tests::server(&board);
+        let client = konnect_ipc::KiCadIpcClient::new(server.address().to_string());
+        let document = client.find_open_board(&board).unwrap();
+        assert_eq!(
+            snapshot_routed_nets(&client, document).unwrap(),
+            BTreeSet::from(["GND".into()])
+        );
+    }
+}

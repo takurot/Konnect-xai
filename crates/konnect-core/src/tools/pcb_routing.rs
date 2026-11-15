@@ -3471,3 +3471,143 @@ mod route_pad_to_pad_tests {
         assert!(tracks.lock().unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+mod specctra_preflight_contract_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::ctx_talking_to;
+    use konnect_ipc::gen::kiapi;
+
+    fn text(result: &CallToolResult) -> &str {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("text response required");
+        };
+        text
+    }
+
+    #[test]
+    fn created_arc_ids_are_retained_and_missing_or_malformed_identity_is_refused() {
+        use kiapi::board::types::{Arc, Track, Via};
+        use kiapi::common::types::Kiid;
+        use konnect_ipc::builders::pack_any;
+        let valid = pack_any(
+            &Arc {
+                id: Some(Kiid {
+                    value: "arc-id".into(),
+                }),
+                ..Default::default()
+            },
+            "kiapi.board.types.Arc",
+        );
+        assert_eq!(created_route_item_ids(&[valid]).unwrap(), ["arc-id"]);
+        assert_eq!(created_route_item_ids(&[]).unwrap(), Vec::<String>::new());
+        for (item, expected) in [
+            (
+                pack_any(&Track::default(), "kiapi.board.types.Track"),
+                "without a KIID",
+            ),
+            (
+                pack_any(
+                    &Via {
+                        id: Some(Kiid {
+                            value: String::new(),
+                        }),
+                        ..Default::default()
+                    },
+                    "kiapi.board.types.Via",
+                ),
+                "empty KIID",
+            ),
+            (
+                pack_any(&Arc::default(), "kiapi.board.types.FootprintInstance"),
+                "unexpected created item type",
+            ),
+        ] {
+            assert!(created_route_item_ids(&[item])
+                .unwrap_err()
+                .to_string()
+                .contains(expected));
+        }
+        for kind in ["Track", "Arc", "Via"] {
+            let malformed = prost_types::Any {
+                type_url: format!("type.googleapis.com/kiapi.board.types.{kind}"),
+                value: vec![0xff],
+            };
+            assert!(created_route_item_ids(&[malformed]).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_and_apply_refuse_bad_extensions_without_touching_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let manifest = dir.path().join("manifest.json");
+        let ses = dir.path().join("routing.ses");
+        std::fs::write(&board, "source board").unwrap();
+        std::fs::write(&manifest, "manifest").unwrap();
+        std::fs::write(&ses, "session").unwrap();
+        let ctx = ctx_talking_to(String::new());
+        let args = json!({"board": board, "candidate_output_path": dir.path().join("candidate.kicad_pcb"), "manifest_path": manifest, "ses_path": ses});
+        for field in ["board", "candidate_output_path", "ses_path"] {
+            let mut invalid = args.clone();
+            invalid[field] = json!(dir.path().join("wrong.txt"));
+            let refused = handle_apply_specctra_ses(&invalid, &ctx).await.unwrap();
+            assert!(refused.is_error);
+            assert!(text(&refused).contains(field), "{}", text(&refused));
+            if field != "candidate_output_path" {
+                let refused = handle_plan_specctra_ses_import(&invalid, &ctx)
+                    .await
+                    .unwrap();
+                assert!(refused.is_error);
+                assert!(text(&refused).contains(field), "{}", text(&refused));
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), "source board");
+        assert_eq!(std::fs::read_to_string(&manifest).unwrap(), "manifest");
+        assert_eq!(std::fs::read_to_string(&ses).unwrap(), "session");
+    }
+
+    #[tokio::test]
+    async fn apply_preserves_existing_candidate_and_drc_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let candidate = dir.path().join("candidate.kicad_pcb");
+        let drc = candidate.with_extension("drc.json");
+        std::fs::write(&board, "source").unwrap();
+        for path in [&candidate, &drc] {
+            std::fs::write(path, "existing evidence").unwrap();
+            let result = handle_apply_specctra_ses(
+                &json!({"board": board, "candidate_output_path": candidate}),
+                &ctx_talking_to(String::new()),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error);
+            assert!(
+                text(&result).contains("already exists"),
+                "{}",
+                text(&result)
+            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "existing evidence");
+            std::fs::remove_file(path).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), "source");
+    }
+
+    #[tokio::test]
+    async fn session_inputs_require_an_existing_manifest_and_readable_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let ses = dir.path().join("routing.SES");
+        let manifest = dir.path().join("manifest.json");
+        let args = json!({"ses_path": ses, "manifest_path": manifest});
+        let refusal = read_specctra_inputs(&args).await.unwrap().unwrap_err();
+        assert!(text(&refusal).contains("manifest_path"));
+        std::fs::write(&manifest, "manifest").unwrap();
+        assert!(read_specctra_inputs(&args).await.is_err());
+        std::fs::write(&ses, "session").unwrap();
+        let (path, session, reverse_manifest) = read_specctra_inputs(&args).await.unwrap().unwrap();
+        assert_eq!(path, ses);
+        assert_eq!(session, "session");
+        assert_eq!(reverse_manifest, "manifest");
+    }
+}
