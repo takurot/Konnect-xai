@@ -3526,3 +3526,596 @@ fn issue26_placement_checks_field_presentation_and_stroke_readback() {
         }
     }
 }
+
+mod v015_client_contract_tests {
+    use super::*;
+    use kiapi::board::{commands as bc, types as bt};
+    use kiapi::common::{commands as cc, types as ct};
+
+    fn reply_to(command: &'static str, payload: prost_types::Any) -> MockKicad {
+        spawn_mock(move |request| {
+            let message = request.message.unwrap();
+            assert!(message.type_url.ends_with(command), "{}", message.type_url);
+            Some(reply_with(payload.clone()))
+        })
+    }
+
+    #[test]
+    fn empty_or_duplicate_local_requests_never_reach_kicad() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let mock = spawn_mock(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(ok_response())
+        });
+        let client = KiCadIpcClient::new(&mock.url);
+        let document = doc_for("test.kicad_pcb");
+        assert!(client
+            .create_items_in_returning(document.clone(), vec![])
+            .unwrap()
+            .is_empty());
+        client.update_items_in(document.clone(), vec![]).unwrap();
+        client.delete_items_in(document.clone(), vec![]).unwrap();
+        assert!(client
+            .get_item_boxes_in(document.clone(), &[])
+            .unwrap()
+            .is_empty());
+        assert!(client
+            .delete_items_in(document.clone(), vec!["same".into(), "same".into()])
+            .is_err());
+        assert!(client
+            .get_item_boxes_in(document, &["same".into(), "same".into()])
+            .is_err());
+        client
+            .verify_footprint_presentation_in(
+                doc_for("test.kicad_pcb"),
+                &konnect_ipc::FootprintPresentation::default(),
+            )
+            .unwrap();
+        for (operation, ids) in [
+            (IpcSelectionMutation::Add, vec![]),
+            (IpcSelectionMutation::Remove, vec![]),
+            (IpcSelectionMutation::Add, vec![String::new()]),
+        ] {
+            let error = client
+                .mutate_selection(&navigation_board_target(), operation, &ids)
+                .unwrap_err();
+            assert_eq!(
+                IpcSelectionMutationError::from_error(&error).unwrap().kind,
+                IpcSelectionMutationErrorKind::InvalidRequest
+            );
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn bounding_boxes_require_complete_unique_identity_and_valid_dimensions() {
+        let valid = ct::Box2 {
+            position: Some(ct::Vector2 { x_nm: 10, y_nm: 20 }),
+            size: Some(ct::Vector2 { x_nm: 30, y_nm: 40 }),
+        };
+        let cases = [
+            (vec!["one"], vec![], "incomplete"),
+            (vec!["other"], vec![valid], "unexpected"),
+            (
+                vec!["one"],
+                vec![ct::Box2 {
+                    size: None,
+                    ..valid
+                }],
+                "missing size",
+            ),
+            (
+                vec!["one"],
+                vec![ct::Box2 {
+                    position: None,
+                    ..valid
+                }],
+                "invalid native",
+            ),
+            (
+                vec!["one"],
+                vec![ct::Box2 {
+                    size: Some(ct::Vector2 { x_nm: -1, y_nm: 40 }),
+                    ..valid
+                }],
+                "invalid native",
+            ),
+            (
+                vec!["one"],
+                vec![ct::Box2 {
+                    size: Some(ct::Vector2 { x_nm: 30, y_nm: -1 }),
+                    ..valid
+                }],
+                "invalid native",
+            ),
+            (vec!["one", "one"], vec![valid, valid], "duplicate native"),
+        ];
+        for (ids, boxes, reason) in cases {
+            let requested = if ids.len() == 2 {
+                vec!["one".into(), "two".into()]
+            } else {
+                vec!["one".into()]
+            };
+            let response = cc::GetBoundingBoxResponse {
+                items: ids
+                    .into_iter()
+                    .map(|value| ct::Kiid {
+                        value: value.into(),
+                    })
+                    .collect(),
+                boxes,
+            };
+            let mock = reply_to(
+                "GetBoundingBox",
+                builders::pack_any(&response, "kiapi.common.commands.GetBoundingBoxResponse"),
+            );
+            let error = KiCadIpcClient::new(&mock.url)
+                .get_item_boxes_in(doc_for("test.kicad_pcb"), &requested)
+                .unwrap_err();
+            assert!(error.to_string().contains(reason), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn creation_default_status_and_result_counts_do_not_invent_success() {
+        let mock = spawn_mock_creating(vec![cc::ItemCreationResult {
+            status: None,
+            item: Some(any_item()),
+        }]);
+        let created = KiCadIpcClient::new(&mock.url)
+            .create_items_in_returning(doc_for("test.kicad_pcb"), vec![any_item()])
+            .unwrap();
+        assert_eq!(created, vec![any_item()]);
+        let mock = spawn_mock_creating(vec![cc::ItemCreationResult {
+            status: None,
+            item: None,
+        }]);
+        let error = KiCadIpcClient::new(&mock.url)
+            .create_items_in_returning(doc_for("test.kicad_pcb"), vec![any_item()])
+            .unwrap_err();
+        assert!(error.to_string().contains("no error message"));
+        let mock = spawn_mock_creating(vec![creation_result(cc::ItemStatusCode::IscOk, "")]);
+        let error = KiCadIpcClient::new(&mock.url)
+            .create_items_in_returning(doc_for("test.kicad_pcb"), vec![any_item(), any_item()])
+            .unwrap_err();
+        assert!(error.to_string().contains("created 1 of 2 requested"));
+    }
+
+    #[test]
+    fn update_results_without_success_status_are_refused() {
+        for (status, reason) in [
+            (None, "without item status"),
+            (
+                Some(cc::ItemStatus {
+                    code: cc::ItemStatusCode::IscInvalidData as i32,
+                    error_message: "not editable".into(),
+                }),
+                "not editable",
+            ),
+            (Some(cc::ItemStatus::default()), "ISC_UNKNOWN"),
+        ] {
+            let response = cc::UpdateItemsResponse {
+                status: ct::ItemRequestStatus::IrsOk as i32,
+                updated_items: vec![cc::ItemUpdateResult { status, item: None }],
+                ..Default::default()
+            };
+            let mock = reply_to(
+                "UpdateItems",
+                builders::pack_any(&response, "kiapi.common.commands.UpdateItemsResponse"),
+            );
+            let error = KiCadIpcClient::new(&mock.url)
+                .update_items_in(doc_for("test.kicad_pcb"), vec![any_item()])
+                .unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+    }
+
+    #[test]
+    fn deletion_results_must_account_for_each_requested_identifier() {
+        for (ids, reason) in [
+            (vec![Some("one"), Some("extra")], "unexpected item"),
+            (vec![Some("one"), Some("one")], "unexpected item"),
+            (vec![Some("one"), None], "without an item identifier"),
+            (vec![Some("one")], "1 deletion results for 2"),
+        ] {
+            let response = cc::DeleteItemsResponse {
+                status: ct::ItemRequestStatus::IrsOk as i32,
+                deleted_items: ids
+                    .into_iter()
+                    .map(|id| cc::ItemDeletionResult {
+                        id: id.map(|value| ct::Kiid {
+                            value: value.into(),
+                        }),
+                        status: cc::ItemDeletionStatus::IdsOk as i32,
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let mock = reply_to(
+                "DeleteItems",
+                builders::pack_any(&response, "kiapi.common.commands.DeleteItemsResponse"),
+            );
+            let error = KiCadIpcClient::new(&mock.url)
+                .delete_items_in(doc_for("test.kicad_pcb"), vec!["one".into(), "two".into()])
+                .unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+    }
+
+    #[test]
+    fn route_filters_keep_only_matching_straight_tracks_and_preserve_defaults() {
+        let track = |id: &str, net: &str, layer| {
+            builders::pack_any(
+                &bt::Track {
+                    id: Some(ct::Kiid { value: id.into() }),
+                    net: Some(bt::Net {
+                        name: net.into(),
+                        ..Default::default()
+                    }),
+                    layer,
+                    ..Default::default()
+                },
+                "kiapi.board.types.Track",
+            )
+        };
+        let mock = spawn_kicad_holding_items(vec![
+            track("front", "GND", bt::BoardLayer::BlFCu as i32),
+            track("back", "GND", bt::BoardLayer::BlBCu as i32),
+            track("signal", "SIG", bt::BoardLayer::BlFCu as i32),
+            builders::pack_any(&bt::Via::default(), "kiapi.board.types.Via"),
+            prost_types::Any {
+                type_url: "kiapi.board.types.Track".into(),
+                value: vec![0xff],
+            },
+        ]);
+        let client = KiCadIpcClient::new(&mock.url);
+        let filtered = client
+            .get_tracks_in(doc_for("test.kicad_pcb"), Some("GND"), Some("F.Cu"))
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].uuid, "front");
+        assert_eq!(filtered[0].width, 0.25);
+        assert_eq!(filtered[0].start.x, 0.0);
+        assert_eq!(filtered[0].end.y, 0.0);
+        assert_eq!(
+            client
+                .get_tracks_in(doc_for("test.kicad_pcb"), Some("missing"), None)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn duplicate_footprint_references_are_not_pad_identity() {
+        let item = footprint_with_pads("U1", vec![]);
+        let mock = spawn_kicad_holding_items(vec![any_item(), item.clone(), item]);
+        let error = KiCadIpcClient::new(&mock.url)
+            .get_footprint_pads_in(doc_for("test.kicad_pcb"), "U1")
+            .unwrap_err();
+        assert!(error.to_string().contains("appears more than once"));
+    }
+
+    #[test]
+    fn missing_nets_and_empty_snapshots_are_distinct_observations() {
+        let mock = spawn_mock(|request| {
+            let message = request.message.unwrap();
+            if message.type_url.ends_with("GetNets") {
+                return Some(ok_response());
+            }
+            panic!("empty net set must not trigger a netclass request");
+        });
+        let client = KiCadIpcClient::new(&mock.url);
+        assert!(client
+            .get_nets_in(doc_for("test.kicad_pcb"))
+            .unwrap()
+            .is_empty());
+        assert!(client
+            .get_effective_routing_rules_in(doc_for("test.kicad_pcb"))
+            .unwrap()
+            .is_empty());
+        let mock = reply_to(
+            "SaveDocumentToString",
+            builders::pack_any(
+                &cc::SaveDocumentToStringResponse::default(),
+                "kiapi.common.commands.SaveDocumentToStringResponse",
+            ),
+        );
+        assert!(KiCadIpcClient::new(&mock.url)
+            .save_document_to_string_in(doc_for("test.kicad_pcb"))
+            .unwrap_err()
+            .to_string()
+            .contains("empty PCB snapshot"));
+        let mock = reply_to(
+            "BeginCommit",
+            builders::pack_any(
+                &cc::BeginCommitResponse {
+                    id: Some(ct::Kiid {
+                        value: String::new(),
+                    }),
+                },
+                "kiapi.common.commands.BeginCommitResponse",
+            ),
+        );
+        assert!(KiCadIpcClient::new(&mock.url)
+            .begin_commit()
+            .unwrap_err()
+            .to_string()
+            .contains("empty commit identifier"));
+    }
+
+    #[test]
+    fn effective_rules_keep_missing_or_invalid_dimensions_unknown() {
+        for mode in 0..3 {
+            let mock = spawn_mock(move |request| {
+                let message = request.message.unwrap();
+                let response = if message.type_url.ends_with("GetNets") {
+                    builders::pack_any(
+                        &bc::NetsResponse {
+                            nets: vec![bt::Net {
+                                name: "SIG".into(),
+                                code: None,
+                            }],
+                        },
+                        "kiapi.board.commands.NetsResponse",
+                    )
+                } else {
+                    assert!(message.type_url.ends_with("GetNetClassForNets"));
+                    let class = kiapi::common::project::NetClass {
+                        constituents: vec!["Power".into(), "Fast".into()],
+                        board: if mode == 0 {
+                            None
+                        } else {
+                            Some(kiapi::common::project::NetClassBoardSettings {
+                                track_width: Some(ct::Distance { value_nm: 0 }),
+                                clearance: Some(ct::Distance {
+                                    value_nm: if mode == 1 { 0 } else { -1 },
+                                }),
+                                via_stack: Some(bt::PadStack {
+                                    copper_layers: vec![bt::PadStackLayer {
+                                        size: Some(ct::Vector2 { x_nm: 0, y_nm: 0 }),
+                                        ..Default::default()
+                                    }],
+                                    drill: Some(bt::DrillProperties {
+                                        diameter: Some(ct::Vector2 { x_nm: -1, y_nm: -1 }),
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            })
+                        },
+                        ..Default::default()
+                    };
+                    builders::pack_any(
+                        &bc::NetClassForNetsResponse {
+                            classes: [("SIG".into(), class)].into_iter().collect(),
+                        },
+                        "kiapi.board.commands.NetClassForNetsResponse",
+                    )
+                };
+                Some(reply_with(response))
+            });
+            let rules = KiCadIpcClient::new(&mock.url)
+                .get_effective_routing_rules_in(doc_for("test.kicad_pcb"))
+                .unwrap();
+            let rule = &rules["SIG"];
+            assert_eq!(rule.class_name, "Power+Fast");
+            assert_eq!(rule.track_width_mm, None);
+            assert_eq!(rule.via_diameter_mm, None);
+            assert_eq!(rule.via_drill_mm, None);
+            assert_eq!(rule.clearance_mm, if mode == 1 { Some(0.0) } else { None });
+        }
+    }
+    #[test]
+    fn identical_model_replacement_is_a_readback_derived_noop() {
+        use konnect_ipc::{IpcFootprint3DModelEdit, IpcFootprint3DModelEditOutcome};
+        let footprint = model_footprint();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let mock = spawn_mock(move |request| {
+            let message = request.message.unwrap();
+            observed.lock().unwrap().push(message.type_url.clone());
+            assert!(message.type_url.ends_with("GetItems"));
+            Some(reply_with(builders::pack_any(
+                &cc::GetItemsResponse {
+                    status: ct::ItemRequestStatus::IrsOk as i32,
+                    items: vec![builders::pack_any(
+                        &footprint,
+                        "kiapi.board.types.FootprintInstance",
+                    )],
+                    ..Default::default()
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            )))
+        });
+        let client = KiCadIpcClient::new(&mock.url);
+        let before = client
+            .footprint_3d_model_snapshot_in(doc_for("test.kicad_pcb"), "U1")
+            .unwrap();
+        let result = client
+            .edit_footprint_3d_models_in(
+                doc_for("test.kicad_pcb"),
+                "U1",
+                before.clone(),
+                IpcFootprint3DModelEdit::Replace {
+                    index: 0,
+                    model: before.models[0].clone(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            result,
+            IpcFootprint3DModelEditOutcome::Applied { changed: false, .. }
+        ));
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "no commit or mutation is needed"
+        );
+    }
+
+    fn model_footprint() -> bt::FootprintInstance {
+        let packed = footprint_with_pads("U1", vec![]);
+        let mut footprint = bt::FootprintInstance::decode(packed.value.as_slice()).unwrap();
+        footprint.id = Some(ct::Kiid {
+            value: "footprint-one".into(),
+        });
+        footprint
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .push(builders::pack_any(
+                &bt::Footprint3DModel {
+                    filename: "part.step".into(),
+                    scale: Some(ct::Vector3D {
+                        x_nm: 1.0,
+                        y_nm: 1.0,
+                        z_nm: 1.0,
+                    }),
+                    rotation: Some(ct::Vector3D::default()),
+                    offset: Some(ct::Vector3D::default()),
+                    visible: true,
+                    opacity: 1.0,
+                },
+                "kiapi.board.types.Footprint3DModel",
+            ));
+        footprint
+    }
+
+    #[test]
+    fn model_edit_outcomes_follow_fresh_identity_and_content_not_update_status() {
+        use konnect_ipc::{IpcFootprint3DModelEdit, IpcFootprint3DModelEditOutcome};
+        for mode in 0..6 {
+            let initial = model_footprint();
+            let state = Arc::new(Mutex::new((initial, false)));
+            let held = state.clone();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let observed = calls.clone();
+            let mock = spawn_mock(move |request| {
+                let message = request.message.unwrap();
+                observed.lock().unwrap().push(message.type_url.clone());
+                let mut state = held.lock().unwrap();
+                if message.type_url.ends_with("GetItems") {
+                    if mode == 5 && state.1 {
+                        let mut response = ok_response();
+                        response.status.as_mut().unwrap().status =
+                            kiapi::common::ApiStatusCode::AsBadRequest as i32;
+                        return Some(response);
+                    }
+                    return Some(reply_with(builders::pack_any(
+                        &cc::GetItemsResponse {
+                            status: ct::ItemRequestStatus::IrsOk as i32,
+                            items: vec![builders::pack_any(
+                                &state.0,
+                                "kiapi.board.types.FootprintInstance",
+                            )],
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    )));
+                }
+                if message.type_url.ends_with("BeginCommit") {
+                    return Some(reply_with(builders::pack_any(
+                        &cc::BeginCommitResponse {
+                            id: Some(ct::Kiid {
+                                value: "edit".into(),
+                            }),
+                        },
+                        "kiapi.common.commands.BeginCommitResponse",
+                    )));
+                }
+                if message.type_url.ends_with("EndCommit") {
+                    return Some(reply_with(builders::pack_any(
+                        &cc::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    )));
+                }
+                assert!(
+                    message.type_url.ends_with("UpdateItems"),
+                    "{}",
+                    message.type_url
+                );
+                let update = cc::UpdateItems::decode(message.value.as_slice()).unwrap();
+                state.1 = true;
+                if matches!(mode, 1 | 2 | 4 | 5) {
+                    state.0 =
+                        bt::FootprintInstance::decode(update.items[0].value.as_slice()).unwrap();
+                }
+                if mode == 1 {
+                    state.0.id = Some(ct::Kiid {
+                        value: "different-footprint".into(),
+                    });
+                }
+                if mode == 4 {
+                    let model = state
+                        .0
+                        .definition
+                        .as_mut()
+                        .unwrap()
+                        .items
+                        .iter_mut()
+                        .find(|item| builders::any_is(item, "kiapi.board.types.Footprint3DModel"))
+                        .unwrap();
+                    let mut changed = bt::Footprint3DModel::decode(model.value.as_slice()).unwrap();
+                    changed.filename = "unexpected.step".into();
+                    *model = builders::pack_any(&changed, "kiapi.board.types.Footprint3DModel");
+                }
+                if matches!(mode, 2 | 3 | 4) {
+                    let mut response = ok_response();
+                    response.status.as_mut().unwrap().status =
+                        kiapi::common::ApiStatusCode::AsBadRequest as i32;
+                    response.status.as_mut().unwrap().error_message = "rejected update".into();
+                    return Some(response);
+                }
+                Some(reply_with(builders::pack_any(
+                    &cc::UpdateItemsResponse {
+                        status: ct::ItemRequestStatus::IrsOk as i32,
+                        updated_items: vec![cc::ItemUpdateResult {
+                            status: Some(cc::ItemStatus {
+                                code: cc::ItemStatusCode::IscOk as i32,
+                                error_message: String::new(),
+                            }),
+                            item: None,
+                        }],
+                        ..Default::default()
+                    },
+                    "kiapi.common.commands.UpdateItemsResponse",
+                )))
+            });
+            let client = KiCadIpcClient::new(&mock.url);
+            let before = client
+                .footprint_3d_model_snapshot_in(doc_for("test.kicad_pcb"), "U1")
+                .unwrap();
+            let mut model = before.models[0].clone();
+            model.offset_mm.x = 3.0;
+            let result = client.edit_footprint_3d_models_in(
+                doc_for("test.kicad_pcb"),
+                "U1",
+                before,
+                IpcFootprint3DModelEdit::Replace { index: 0, model },
+            );
+            match mode {
+                2 => assert!(matches!(
+                    result.unwrap(),
+                    IpcFootprint3DModelEditOutcome::Applied { changed: true, .. }
+                )),
+                3 => assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("fresh readback confirmed")),
+                _ => assert!(matches!(
+                    result.unwrap(),
+                    IpcFootprint3DModelEditOutcome::Uncertain { .. }
+                )),
+            }
+            assert!(!calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.ends_with("SaveDocument")));
+        }
+    }
+}
