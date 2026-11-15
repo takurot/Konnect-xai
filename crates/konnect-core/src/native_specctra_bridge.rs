@@ -502,7 +502,7 @@ mod tests {
     ) -> (PathBuf, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let expected_board = board.canonicalize().unwrap().display().to_string();
+        let expected_board = board.to_str().unwrap().to_owned();
         let task = tokio::spawn(async move {
             for (index, response) in responses.into_iter().enumerate() {
                 let (mut stream, _) =
