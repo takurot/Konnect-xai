@@ -106,7 +106,7 @@ fn mk_field(name: &str, text: &str, x_mm: f64, y_mm: f64) -> kiapi::board::types
         text: Some(kiapi::board::types::BoardText {
             text: Some(kiapi::common::types::Text {
                 text: text.to_string(),
-                position: Some(builders::vec2(x_mm, y_mm)),
+                position: Some(builders::vec2(x_mm, y_mm).unwrap()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -118,7 +118,7 @@ fn mk_field(name: &str, text: &str, x_mm: f64, y_mm: f64) -> kiapi::board::types
 fn mk_pad(x_mm: f64, y_mm: f64) -> prost_types::Any {
     builders::pack_any(
         &kiapi::board::types::Pad {
-            position: Some(builders::vec2(x_mm, y_mm)),
+            position: Some(builders::vec2(x_mm, y_mm).unwrap()),
             pad_stack: Some(kiapi::board::types::PadStack {
                 angle: Some(kiapi::common::types::Angle { value_degrees: 0.0 }),
                 ..Default::default()
@@ -154,7 +154,7 @@ fn mk_footprint_r1() -> kiapi::board::types::FootprintInstance {
         id: Some(kiapi::common::types::Kiid {
             value: "r1-kiid".to_string(),
         }),
-        position: Some(builders::vec2(100.0, 100.0)),
+        position: Some(builders::vec2(100.0, 100.0).unwrap()),
         orientation: Some(kiapi::common::types::Angle { value_degrees: 0.0 }),
         reference_field: Some(mk_field("Reference", "R1", 100.0, 98.0)),
         definition: Some(kiapi::board::types::Footprint {
@@ -162,7 +162,7 @@ fn mk_footprint_r1() -> kiapi::board::types::FootprintInstance {
                 mk_pad(99.0, 100.0),
                 mk_pad(101.0, 100.0),
                 builders::pack_any(
-                    &builders::board_segment("F.SilkS", 0.12, 99.5, 99.0, 100.5, 99.0),
+                    &builders::board_segment("F.SilkS", 0.12, 99.5, 99.0, 100.5, 99.0).unwrap(),
                     "kiapi.board.types.BoardGraphicShape",
                 ),
                 mk_model("original.step"),
@@ -442,7 +442,7 @@ fn placement_batch_moves_and_rotates_multiple_footprints_in_one_update() {
         },
     )
     .unwrap();
-    r2.position = Some(builders::vec2(200.0, 100.0));
+    r2.position = Some(builders::vec2(200.0, 100.0).unwrap());
     r2.reference_field
         .as_mut()
         .unwrap()

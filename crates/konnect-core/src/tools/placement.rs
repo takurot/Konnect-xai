@@ -50,6 +50,7 @@ use konnect_sexp::board::{
     board_outline_shape, footprint_courtyards, footprints, CourtyardSource, FootprintCourtyard,
     OutlineShape, PcbConnectivityIndex, Side,
 };
+use konnect_sexp::geometry::round6;
 use konnect_sexp::parser::SexpNode;
 use plan_status::PlanApplicability;
 use serde_json::json;
@@ -843,7 +844,7 @@ async fn handle_place_decoupling(
         "plan_status": plan_status,
         "blocking_reasons": blocking_reasons,
         "applied": applied.iter().map(|p| json!({
-            "reference": p.reference, "x": p.x, "y": p.y, "rotation": p.rotation
+            "reference": p.reference, "x": round6(p.x), "y": round6(p.y), "rotation": p.rotation
         })).collect::<Vec<_>>(),
         "score_before": score_before["score"],
         "score_after": score_written["score"],

@@ -9,6 +9,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_array, with_ipc, ToolContext, ToolDef};
 use anyhow::Context;
+use konnect_sexp::geometry::round6;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -1107,7 +1108,7 @@ async fn handle_get_drc_violations(
             "severity": v.severity,
             "rule": v.rule,
             "description": v.description,
-            "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
+            "pos": v.pos.as_ref().map(|p| json!({ "x": round6(p.x), "y": round6(p.y) })),
             "items": v.items
         })).collect::<Vec<_>>()
     });

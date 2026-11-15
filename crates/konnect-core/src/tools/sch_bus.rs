@@ -24,6 +24,7 @@ use super::sch_wiring::{ambiguous_reference_result, resolve_pin_endpoint};
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, opt_f64, opt_str, require_f64, ToolContext, ToolDef};
+use konnect_sexp::geometry::round6;
 use konnect_sexp::{
     parser::parse_sexp,
     schematic::{
@@ -159,8 +160,8 @@ async fn handle_add_bus(
 
     Ok(CallToolResult::json(&json!({
         "added": "bus",
-        "from": { "x": x1, "y": y1 },
-        "to": { "x": x2, "y": y2 }
+        "from": { "x": round6(x1), "y": round6(y1) },
+        "to": { "x": round6(x2), "y": round6(y2) }
     })))
 }
 
@@ -193,7 +194,7 @@ async fn handle_batch_add_bus(
         inserts.push('\n');
         inserts.push_str("  ");
         inserts.push_str(&format_bus(x1, y1, x2, y2));
-        added.push(json!({ "from": {"x": x1, "y": y1}, "to": {"x": x2, "y": y2} }));
+        added.push(json!({ "from": {"x": round6(x1), "y": round6(y1)}, "to": {"x": round6(x2), "y": round6(y2)} }));
     }
 
     let content = std::fs::read_to_string(&sch_path)?;
@@ -245,8 +246,8 @@ async fn handle_add_bus_entry(
     // segments and only fall back to the convention when geometry cannot
     // decide.
     let far = (
-        konnect_sexp::geometry::round6(x + direction.size().0),
-        konnect_sexp::geometry::round6(y + direction.size().1),
+        round6(x + direction.size().0),
+        round6(y + direction.size().1),
     );
     let (at_on_bus, far_on_bus) = match parse_sexp(&content) {
         Ok(tree) => {
@@ -284,8 +285,8 @@ async fn handle_add_bus_entry(
     };
     let mut response = json!({
         "added": "bus_entry",
-        "wire_side": { "x": wire_side.0, "y": wire_side.1 },
-        "bus_side": { "x": bus_side.0, "y": bus_side.1 }
+        "wire_side": { "x": round6(wire_side.0), "y": round6(wire_side.1) },
+        "bus_side": { "x": round6(bus_side.0), "y": round6(bus_side.1) }
     });
     if let Some(note) = note {
         response["note"] = json!(note);
@@ -367,12 +368,12 @@ async fn handle_connect_pins_to_bus(
         let (entry_x, entry_y, dx, dy, sx, sy) = if horizontal {
             let by = bus_y.unwrap();
             let dir = if by > py { 1.0 } else { -1.0 };
-            let ey = konnect_sexp::geometry::round6(by - dir * size);
+            let ey = round6(by - dir * size);
             (px, ey, dir * size, dir * size, px, py)
         } else {
             let bx = bus_x.unwrap();
             let dir = if bx > px { 1.0 } else { -1.0 };
-            let ex = konnect_sexp::geometry::round6(bx - dir * size);
+            let ex = round6(bx - dir * size);
             (ex, py, dir * size, dir * size, px, py)
         };
 
@@ -403,8 +404,8 @@ async fn handle_connect_pins_to_bus(
 
         added.push(json!({
             "reference": reference, "pin": pin_number, "net": net,
-            "pin_at": { "x": px, "y": py },
-            "entry_at": { "x": entry_x, "y": entry_y }
+            "pin_at": { "x": round6(px), "y": round6(py) },
+            "entry_at": { "x": round6(entry_x), "y": round6(entry_y) }
         }));
     }
 

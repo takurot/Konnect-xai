@@ -14,6 +14,7 @@ use crate::tools::{
 };
 use anyhow::Context;
 use konnect_ipc::client::KiCadIpcClient;
+use konnect_sexp::geometry::round6;
 use konnect_sexp::writer::{
     apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks, new_uuid,
     read_consistent, write_atomic_if_unchanged,
@@ -193,6 +194,7 @@ fn prepare_footprint_source(
              supported because a correct flip must mirror the geometry), got '{layer}'"
         );
     }
+    validate_placement_values(x, y, rotation)?;
     let mut prepared = source.to_string();
     replace_quoted_after(&mut prepared, "(footprint \"", lib_id)?;
     replace_reference(&mut prepared, reference)?;
@@ -207,7 +209,7 @@ fn prepare_footprint_source(
         .find(')')
         .map(|offset| layer_start + offset + 1)
         .context("footprint root layer is unterminated")?;
-    prepared.insert_str(layer_end, &format!("\n\t(at {x} {y} {rotation})"));
+    prepared.insert_str(layer_end, &format!("\n\t{}", format_at(x, y, rotation)));
     konnect_sexp::parse_sexp(&prepared).context("prepared footprint is not valid S-expression")?;
     Ok(prepared)
 }
@@ -365,6 +367,27 @@ fn graphic_layer(node: &konnect_sexp::SexpNode, kind: &str) -> anyhow::Result<St
 
 /// Stroke width in mm: modern `(stroke (width w) …)`, legacy bare `(width w)`.
 /// KiCad's default silkscreen line width stands in when neither is present.
+fn graphic_stroke_style(
+    node: &konnect_sexp::SexpNode,
+) -> anyhow::Result<konnect_ipc::gen::kiapi::common::types::StrokeLineStyle> {
+    use konnect_ipc::gen::kiapi::common::types::StrokeLineStyle as Style;
+    Ok(
+        match node
+            .find("stroke")
+            .and_then(|stroke| stroke.find_str("type"))
+            .unwrap_or("solid")
+        {
+            "default" => Style::SlsDefault,
+            "solid" => Style::SlsSolid,
+            "dash" => Style::SlsDash,
+            "dot" => Style::SlsDot,
+            "dash_dot" => Style::SlsDashdot,
+            "dash_dot_dot" => Style::SlsDashdotdot,
+            other => anyhow::bail!("unsupported graphic stroke style '{other}'"),
+        },
+    )
+}
+
 fn graphic_stroke_width(node: &konnect_sexp::SexpNode) -> f64 {
     node.find("stroke")
         .and_then(|stroke| stroke.find_f64("width"))
@@ -433,11 +456,12 @@ fn text_at(node: &konnect_sexp::SexpNode, kind: &str) -> anyhow::Result<((f64, f
 /// Footprint-local Reference/Value text anchors from the library source, so
 /// placed parts keep the library's text layout (a synthesized offset put the
 /// Reference on the part's own silkscreen — silk_overlap in live DRC).
-pub(crate) fn extract_field_placement(source: &str) -> konnect_ipc::IpcFieldPlacement {
+pub(crate) fn extract_field_placement(
+    source: &str,
+) -> anyhow::Result<konnect_ipc::IpcFieldPlacement> {
     let mut placement = konnect_ipc::IpcFieldPlacement::default();
-    let Ok(footprint) = konnect_sexp::parse_sexp(source) else {
-        return placement;
-    };
+    let footprint = konnect_sexp::parse_sexp(source)?;
+    placement.fields = super::library_footprint::fields(&footprint)?;
     for prop in footprint.find_all("property") {
         let Some(name) = prop.get(1).and_then(|n| n.as_str()) else {
             continue;
@@ -460,13 +484,13 @@ pub(crate) fn extract_field_placement(source: &str) -> konnect_ipc::IpcFieldPlac
             }
         }
     }
-    placement
+    Ok(placement)
 }
 
 pub(crate) fn extract_graphic_definitions(
     source: &str,
 ) -> anyhow::Result<Vec<konnect_ipc::IpcGraphicDefinition>> {
-    extract_graphic_definitions_with_properties(source, true)
+    extract_graphic_definitions_with_properties(source, false)
 }
 
 pub(crate) fn extract_graphic_definitions_without_properties(
@@ -485,6 +509,7 @@ fn extract_graphic_definitions_with_properties(
 
     for line in footprint.find_all("fp_line") {
         graphics.push(Graphic::Line {
+            style: graphic_stroke_style(line)?,
             start: graphic_point(line, "start", "fp_line")?,
             end: graphic_point(line, "end", "fp_line")?,
             layer: graphic_layer(line, "fp_line")?,
@@ -493,6 +518,7 @@ fn extract_graphic_definitions_with_properties(
     }
     for rect in footprint.find_all("fp_rect") {
         graphics.push(Graphic::Rect {
+            style: graphic_stroke_style(rect)?,
             start: graphic_point(rect, "start", "fp_rect")?,
             end: graphic_point(rect, "end", "fp_rect")?,
             layer: graphic_layer(rect, "fp_rect")?,
@@ -502,6 +528,7 @@ fn extract_graphic_definitions_with_properties(
     }
     for circle in footprint.find_all("fp_circle") {
         graphics.push(Graphic::Circle {
+            style: graphic_stroke_style(circle)?,
             center: graphic_point(circle, "center", "fp_circle")?,
             end: graphic_point(circle, "end", "fp_circle")?,
             layer: graphic_layer(circle, "fp_circle")?,
@@ -511,6 +538,7 @@ fn extract_graphic_definitions_with_properties(
     }
     for arc in footprint.find_all("fp_arc") {
         graphics.push(Graphic::Arc {
+            style: graphic_stroke_style(arc)?,
             start: graphic_point(arc, "start", "fp_arc")?,
             mid: graphic_point(arc, "mid", "fp_arc")?,
             end: graphic_point(arc, "end", "fp_arc")?,
@@ -537,6 +565,7 @@ fn extract_graphic_definitions_with_properties(
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         graphics.push(Graphic::Poly {
+            style: graphic_stroke_style(poly)?,
             points,
             layer: graphic_layer(poly, "fp_poly")?,
             width: graphic_stroke_width(poly),
@@ -619,6 +648,7 @@ fn board_footprint_sexp(
     reference: Option<&str>,
     project_dir: Option<&Path>,
 ) -> Result<String, String> {
+    validate_placement_values(x, y, rotation).map_err(|error| error.to_string())?;
     let path = resolve_footprint_path(lib_id, project_dir)?;
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("Cannot read footprint {}: {}", path.display(), e))?;
@@ -639,12 +669,14 @@ fn board_footprint_sexp(
         lib_id, &path, declared,
     )));
     out.push_str(&format!(
-        "\n\t(at {x} {y} {rotation})\n\t(uuid \"{}\")",
+        "\n\t{}\n\t(uuid \"{}\")",
+        format_at(x, y, rotation),
         new_uuid()
     ));
     out.push_str(&content[name_span.end..]);
 
     if rotation != 0.0 {
+        validate_child_rotation(&out, rotation).map_err(|error| error.to_string())?;
         out = apply_rotation_to_children(&out, rotation);
     }
     if let Some(reference) = reference {
@@ -807,15 +839,8 @@ fn normalize_root_angle(degrees: f64) -> f64 {
 /// Render `(at x y angle)`, dropping a zero angle as KiCad's writer does and
 /// trimming trailing zeros from the decimals.
 fn format_at(x: f64, y: f64, angle: f64) -> String {
-    let n = |v: f64| {
-        let s = format!("{v:.6}");
-        let s = s.trim_end_matches('0').trim_end_matches('.').to_string();
-        if s == "-0" {
-            "0".to_string()
-        } else {
-            s
-        }
-    };
+    let n = konnect_sexp::geometry::fmt_mm;
+
     if angle == 0.0 {
         format!("(at {} {})", n(x), n(y))
     } else {
@@ -951,7 +976,7 @@ impl PreparedFootprintPlacement {
             Ok(PreparedIpcFootprint {
                 pads: extract_pad_definitions(&prepared)?,
                 graphics: extract_graphic_definitions(&prepared)?,
-                fields: extract_field_placement(&prepared),
+                fields: extract_field_placement(&prepared)?,
             })
         })()
         .map_err(|error| format!("reference '{reference}', footprint '{lib_id}': {error:#}"));
@@ -1227,6 +1252,33 @@ fn prepare_closed_board_footprint_update(
     Ok(updated)
 }
 
+fn validate_placement_values(x: f64, y: f64, rotation: f64) -> anyhow::Result<()> {
+    konnect_ipc::builders::mm_to_nm(x).context("invalid footprint X coordinate")?;
+    konnect_ipc::builders::mm_to_nm(y).context("invalid footprint Y coordinate")?;
+    anyhow::ensure!(
+        rotation.is_finite() && round6(rotation).is_finite(),
+        "footprint rotation must remain finite when formatted"
+    );
+    Ok(())
+}
+
+fn validate_child_rotation(source: &str, delta: f64) -> anyhow::Result<()> {
+    anyhow::ensure!(delta.is_finite(), "footprint rotation delta must be finite");
+    for start in find_block_starts(source, "at") {
+        let (_, end) = find_balanced_block(source, start).context("invalid footprint anchor")?;
+        let at = konnect_sexp::parse_sexp(&source[start..end])?;
+        let x = at
+            .get_f64(1)
+            .context("invalid footprint child X coordinate")?;
+        let y = at
+            .get_f64(2)
+            .context("invalid footprint child Y coordinate")?;
+        let angle = at.get_f64(3).unwrap_or(0.0);
+        validate_placement_values(x, y, angle + delta)?;
+    }
+    Ok(())
+}
+
 fn update_footprint_placement(
     footprint: &str,
     update: FootprintPlacementUpdate,
@@ -1250,6 +1302,16 @@ fn update_footprint_placement(
         .get_f64(2)
         .context("footprint root placement has an invalid Y position")?;
     let old_rotation = at.get_f64(3).unwrap_or(0.0);
+    validate_placement_values(old_x, old_y, old_rotation)?;
+    match update {
+        FootprintPlacementUpdate::Move { x, y } => validate_placement_values(x, y, old_rotation)?,
+        FootprintPlacementUpdate::Rotate { rotation } => {
+            validate_placement_values(old_x, old_y, rotation)?
+        }
+        FootprintPlacementUpdate::Set { x, y, rotation } => {
+            validate_placement_values(x, y, rotation)?
+        }
+    }
 
     // A move preserves the existing orientation *exactly as spelled* — it is
     // not this tool's business to renormalise an angle the caller did not ask
@@ -1291,6 +1353,7 @@ fn update_footprint_placement(
         FootprintPlacementUpdate::Move { .. } => updated,
         FootprintPlacementUpdate::Rotate { rotation }
         | FootprintPlacementUpdate::Set { rotation, .. } => {
+            validate_child_rotation(&updated, rotation - old_rotation)?;
             apply_rotation_to_children(&updated, rotation - old_rotation)
         }
     };
@@ -1394,31 +1457,7 @@ fn normalize_angle_180(angle: f64) -> f64 {
     }
 }
 
-fn flipped_layer(layer: &str) -> anyhow::Result<String> {
-    const SIDE_PAIRS: &[(&str, &str)] = &[
-        ("F.Cu", "B.Cu"),
-        ("F.Adhes", "B.Adhes"),
-        ("F.Paste", "B.Paste"),
-        ("F.SilkS", "B.SilkS"),
-        ("F.Mask", "B.Mask"),
-        ("F.CrtYd", "B.CrtYd"),
-        ("F.Fab", "B.Fab"),
-    ];
-    for (front, back) in SIDE_PAIRS {
-        if layer == *front {
-            return Ok((*back).to_string());
-        }
-        if layer == *back {
-            return Ok((*front).to_string());
-        }
-    }
-    if layer.starts_with("F.") || layer.starts_with("B.") {
-        anyhow::bail!("unsupported side-specific KiCad layer '{layer}'");
-    }
-    Ok(layer.to_string())
-}
-
-fn flip_layer_block(block: &str) -> anyhow::Result<String> {
+fn flip_layer_block(block: &str, copper_layer_count: usize) -> anyhow::Result<String> {
     let layer = konnect_sexp::parse_sexp(block)?;
     let name = layer
         .get(1)
@@ -1426,11 +1465,14 @@ fn flip_layer_block(block: &str) -> anyhow::Result<String> {
         .context("(layer ...) has no layer name")?;
     Ok(format!(
         "(layer {})",
-        konnect_sexp::quoted(&flipped_layer(name)?)
+        konnect_sexp::quoted(&konnect_ipc::builders::flip_layer(
+            name,
+            copper_layer_count
+        )?)
     ))
 }
 
-fn flip_layers_block(block: &str) -> anyhow::Result<String> {
+fn flip_layers_block(block: &str, copper_layer_count: usize) -> anyhow::Result<String> {
     let layers = konnect_sexp::parse_sexp(block)?;
     let names = layers
         .children()
@@ -1441,7 +1483,8 @@ fn flip_layers_block(block: &str) -> anyhow::Result<String> {
             let name = child
                 .as_str()
                 .context("(layers ...) contains a non-atomic layer name")?;
-            flipped_layer(name).map(|flipped| konnect_sexp::quoted(&flipped))
+            konnect_ipc::builders::flip_layer(name, copper_layer_count)
+                .map(|flipped| konnect_sexp::quoted(&flipped))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(format!("(layers {})", names.join(" ")))
@@ -1490,7 +1533,7 @@ fn toggle_text_mirror(effects: &str) -> anyhow::Result<String> {
     }
 }
 
-fn flip_text_block(block: &str, tag: &str) -> anyhow::Result<String> {
+fn flip_text_block(block: &str, tag: &str, copper_layer_count: usize) -> anyhow::Result<String> {
     let (at_start, at_end) = exactly_one_direct_child(block, tag, "at")?;
     let (x, y, angle, suffix) = at_components(&block[at_start..at_end])?;
     let (layer_start, layer_end) = exactly_one_direct_child(block, tag, "layer")?;
@@ -1500,7 +1543,7 @@ fn flip_text_block(block: &str, tag: &str) -> anyhow::Result<String> {
         .get(1)
         .and_then(konnect_sexp::SexpNode::as_str)
         .context("(layer ...) has no layer name")?;
-    let flipped_layer_name = flipped_layer(layer_name)?;
+    let flipped_layer_name = konnect_ipc::builders::flip_layer(layer_name, copper_layer_count)?;
     let (effects_start, effects_end) = exactly_one_direct_child(block, tag, "effects")?;
     let effects = if flipped_layer_name == layer_name {
         block[effects_start..effects_end].to_string()
@@ -1525,7 +1568,7 @@ fn flip_text_block(block: &str, tag: &str) -> anyhow::Result<String> {
     ))
 }
 
-fn flip_graphic_block(block: &str, tag: &str) -> anyhow::Result<String> {
+fn flip_graphic_block(block: &str, tag: &str, copper_layer_count: usize) -> anyhow::Result<String> {
     let point_tags: &[&str] = match tag {
         "fp_line" | "fp_rect" => &["start", "end"],
         "fp_circle" => &["center", "end"],
@@ -1566,12 +1609,12 @@ fn flip_graphic_block(block: &str, tag: &str) -> anyhow::Result<String> {
     edits.push(SexpEdit::replace(
         layer_start,
         layer_end,
-        flip_layer_block(&block[layer_start..layer_end])?,
+        flip_layer_block(&block[layer_start..layer_end], copper_layer_count)?,
     ));
     Ok(apply_edits(block.to_string(), edits))
 }
 
-fn flip_poly_block(block: &str) -> anyhow::Result<String> {
+fn flip_poly_block(block: &str, copper_layer_count: usize) -> anyhow::Result<String> {
     let (pts_start, pts_end) = exactly_one_direct_child(block, "fp_poly", "pts")?;
     let pts = &block[pts_start..pts_end];
     let mut point_edits = Vec::new();
@@ -1593,7 +1636,7 @@ fn flip_poly_block(block: &str) -> anyhow::Result<String> {
             SexpEdit::replace(
                 layer_start,
                 layer_end,
-                flip_layer_block(&block[layer_start..layer_end])?,
+                flip_layer_block(&block[layer_start..layer_end], copper_layer_count)?,
             ),
         ],
     ))
@@ -1607,12 +1650,18 @@ fn contains_descendant_tag(node: &konnect_sexp::SexpNode, tag: &str) -> bool {
     })
 }
 
-fn flip_pad_block(block: &str) -> anyhow::Result<String> {
+fn flip_pad_block(block: &str, copper_layer_count: usize) -> anyhow::Result<String> {
     let pad = konnect_sexp::parse_sexp(block)?;
     if pad.get(3).and_then(konnect_sexp::SexpNode::as_str) == Some("custom") {
         anyhow::bail!("custom pads are not supported by closed-board footprint flipping");
     }
-    for unsupported in ["offset", "rect_delta", "chamfer_ratio", "primitives"] {
+    for unsupported in [
+        "offset",
+        "rect_delta",
+        "chamfer_ratio",
+        "primitives",
+        "padstack",
+    ] {
         if contains_descendant_tag(&pad, unsupported) {
             anyhow::bail!(
                 "pad geometry containing ({unsupported} ...) is not supported by closed-board footprint flipping"
@@ -1633,7 +1682,7 @@ fn flip_pad_block(block: &str) -> anyhow::Result<String> {
             SexpEdit::replace(
                 layers_start,
                 layers_end,
-                flip_layers_block(&block[layers_start..layers_end])?,
+                flip_layers_block(&block[layers_start..layers_end], copper_layer_count)?,
             ),
         ],
     ))
@@ -1683,7 +1732,7 @@ fn refuse_model_a_flip_would_move(block: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn flip_footprint_block(footprint: &str) -> anyhow::Result<String> {
+fn flip_footprint_block(footprint: &str, copper_layer_count: usize) -> anyhow::Result<String> {
     let root = konnect_sexp::parse_sexp(footprint)?;
     if root.head() != Some("footprint") {
         anyhow::bail!("expected a footprint root");
@@ -1701,7 +1750,10 @@ fn flip_footprint_block(footprint: &str) -> anyhow::Result<String> {
         SexpEdit::replace(
             root_layer_start,
             root_layer_end,
-            flip_layer_block(&footprint[root_layer_start..root_layer_end])?,
+            flip_layer_block(
+                &footprint[root_layer_start..root_layer_end],
+                copper_layer_count,
+            )?,
         ),
     ];
 
@@ -1722,12 +1774,12 @@ fn flip_footprint_block(footprint: &str) -> anyhow::Result<String> {
             // synthetic fixture has only positioned properties, so nothing
             // offline could have caught it.
             "property" if !has_direct_child(block, "property", "at") => None,
-            "property" | "fp_text" => Some(flip_text_block(block, &tag)?),
+            "property" | "fp_text" => Some(flip_text_block(block, &tag, copper_layer_count)?),
             "fp_line" | "fp_rect" | "fp_circle" | "fp_arc" => {
-                Some(flip_graphic_block(block, &tag)?)
+                Some(flip_graphic_block(block, &tag, copper_layer_count)?)
             }
-            "fp_poly" => Some(flip_poly_block(block)?),
-            "pad" => Some(flip_pad_block(block)?),
+            "fp_poly" => Some(flip_poly_block(block, copper_layer_count)?),
+            "pad" => Some(flip_pad_block(block, copper_layer_count)?),
             "model" => {
                 refuse_model_a_flip_would_move(block)?;
                 None
@@ -1798,7 +1850,9 @@ fn prepare_closed_board_footprint_side(
     if current_layer == target_layer {
         return Ok((content.to_string(), false));
     }
-    let flipped = flip_footprint_block(block)
+    let root = konnect_sexp::parse_sexp(content).map_err(|e| ClosedBoardError::Io(e.into()))?;
+    let copper_layer_count = konnect_sexp::layers::copper_layer_count(&root);
+    let flipped = flip_footprint_block(block, copper_layer_count)
         .map_err(|error| ClosedBoardError::Unusable(format!("{error:#}")))?;
     if footprint_layer(&flipped).map_err(ClosedBoardError::Io)? != target_layer {
         return Err(ClosedBoardError::Unusable(format!(
@@ -2305,7 +2359,7 @@ async fn handle_place_component(
         BoardWrite::Ipc(fp) => Ok(CallToolResult::json(&json!({
             "placed": fp.reference,
             "footprint": fp.footprint,
-            "x": fp.position.x, "y": fp.position.y,
+            "x": round6(fp.position.x), "y": round6(fp.position.y),
             "rotation": fp.rotation, "layer": fp.layer,
             "source": "ipc"
         }))),
@@ -2328,7 +2382,7 @@ async fn handle_place_component(
             Ok(CallToolResult::json(&json!({
                 "placed": reference,
                 "footprint": footprint,
-                "x": x, "y": y, "rotation": rotation, "layer": layer,
+                "x": round6(x), "y": round6(y), "rotation": rotation, "layer": layer,
                 "source": "file",
                 "fallback_reason": reason.evidence(),
                 "warning": reason.warning()
@@ -2362,7 +2416,7 @@ async fn handle_move_component(
     .await?
     {
         BoardWrite::Ipc(()) => Ok(CallToolResult::json(
-            &json!({ "moved": reference, "x": x, "y": y, "source": "ipc" }),
+            &json!({ "moved": reference, "x": round6(x), "y": round6(y), "source": "ipc" }),
         )),
         BoardWrite::Refused(result) => Ok(result),
         BoardWrite::File(reason) => {
@@ -2373,8 +2427,8 @@ async fn handle_move_component(
             ) {
                 Ok(()) => Ok(CallToolResult::json(&json!({
                     "moved": reference,
-                    "x": x,
-                    "y": y,
+                    "x": round6(x),
+                    "y": round6(y),
                     "source": "file",
                     "fallback_reason": reason.evidence(),
                     "warning": reason.warning()
@@ -3117,7 +3171,7 @@ async fn handle_repair_corrupted_footprints(
                     &summary.value,
                     &pads,
                     &graphics,
-                    &extract_field_placement(&source),
+                    &extract_field_placement(&source)?,
                     summary.position.x,
                     summary.position.y,
                     summary.rotation,
@@ -3292,7 +3346,7 @@ async fn handle_find_component(
         "reference": fp.reference,
         "value": fp.value,
         "footprint": fp.footprint,
-        "x": fp.position.x, "y": fp.position.y,
+        "x": round6(fp.position.x), "y": round6(fp.position.y),
         "rotation": fp.rotation, "layer": fp.layer
     })))
 }
@@ -3670,7 +3724,7 @@ async fn handle_get_component_list(
                 "reference": fp.reference,
                 "value": fp.value,
                 "footprint": fp.footprint,
-                "x": fp.position.x, "y": fp.position.y,
+                "x": round6(fp.position.x), "y": round6(fp.position.y),
                 "rotation": fp.rotation, "layer": fp.layer
             })
         })
@@ -3741,7 +3795,7 @@ async fn handle_place_array(
         Ok(graphics) => graphics,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
-    let fields = extract_field_placement(&source);
+    let fields = extract_field_placement(&source)?;
 
     let value = footprint
         .split_once(':')
@@ -3805,9 +3859,11 @@ async fn handle_place_array(
                 .with_context(|| format!("failed to prepare {reference}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let presentation = konnect_ipc::FootprintPresentation::from_items(&items)?;
         let chamfers = konnect_ipc::FootprintChamfers::from_items(&items)?;
         c.run_commit("Place footprint array", |c| c.create_items(items))?;
-        c.verify_footprint_chamfers_in(document, &chamfers)?;
+        c.verify_footprint_chamfers_in(document.clone(), &chamfers)?;
+        c.verify_footprint_presentation_in(document, &presentation)?;
 
         let mut created = c
             .list_footprints()?
@@ -3822,8 +3878,8 @@ async fn handle_place_array(
                 })?;
                 Ok(json!({
                     "reference": reference,
-                    "x": footprint.position.x,
-                    "y": footprint.position.y
+                    "x": round6(footprint.position.x),
+                    "y": round6(footprint.position.y)
                 }))
             })
             .collect::<anyhow::Result<Vec<_>>>()
@@ -3885,7 +3941,7 @@ async fn handle_align_components(
                         (value, footprint.position.y)
                     };
                     c.move_footprint(reference, x, y)?;
-                    Ok(json!({ "reference": reference, "x": x, "y": y }))
+                    Ok(json!({ "reference": reference, "x": round6(x), "y": round6(y) }))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()
         })
@@ -3964,7 +4020,7 @@ async fn handle_duplicate_component(
         Ok(graphics) => graphics,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
-    let fields = extract_field_placement(&prepared);
+    let fields = extract_field_placement(&prepared)?;
     let dup_board = board.clone();
     let fp = ipc!(ctx, args, |c| c.place_footprint(
         &dup_board,
@@ -3982,7 +4038,7 @@ async fn handle_duplicate_component(
     Ok(CallToolResult::json(&json!({
         "duplicated_from": reference,
         "new_reference": fp.reference,
-        "x": fp.position.x, "y": fp.position.y
+        "x": round6(fp.position.x), "y": round6(fp.position.y)
     })))
 }
 
@@ -4007,6 +4063,28 @@ async fn handle_get_board_2d_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinate_review_closed_placement_refuses_overflow_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("placement.kicad_pcb");
+        let source = board_with_a_property_before_the_root_at("");
+        std::fs::write(&path, &source).unwrap();
+        for update in [
+            FootprintPlacementUpdate::Move { x: 1e308, y: 20.0 },
+            FootprintPlacementUpdate::Set {
+                x: 10.0,
+                y: 1e308,
+                rotation: 90.0,
+            },
+            FootprintPlacementUpdate::Rotate {
+                rotation: f64::INFINITY,
+            },
+        ] {
+            assert!(update_closed_board_footprint(&path, "R1", update).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        }
+    }
 
     const FOOTPRINT: &str = r#"(footprint "R_0402"
   (version 20240108)
@@ -4047,7 +4125,7 @@ mod tests {
         .unwrap();
         pad.r#type = kiapi::board::types::PadType::PtPth as i32;
         pad.pad_stack.as_mut().unwrap().drill = Some(kiapi::board::types::DrillProperties {
-            diameter: Some(konnect_ipc::builders::vec2(0.000_001, 0.000_001)),
+            diameter: Some(konnect_ipc::builders::vec2(0.000_001, 0.000_001).unwrap()),
             ..Default::default()
         });
         konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad")
@@ -4323,7 +4401,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             rect,
-            Graphic::Rect { layer, width, filled, start, end }
+            Graphic::Rect {style: _, layer, width, filled, start, end }
                 if layer == "F.CrtYd" && *width == 0.05 && !*filled
                     && *start == (-0.8, -0.7) && *end == (0.8, 0.7)
         ));
@@ -4485,6 +4563,108 @@ mod tests {
             assert!(
                 std::fs::read_to_string(board).unwrap().contains(clause),
                 "{clause}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn out_of_range_library_fields_refuse_before_live_mutation() {
+        use konnect_ipc::gen::kiapi;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        for (x, size, thickness, diagnostic) in [
+            ("10000000000000", "1", "0.15", "position"),
+            ("1", "10000000000000", "0.15", "font size"),
+            ("1", "1", "10000000000000", "font thickness"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let board = fallback_fixture(tmp.path());
+            let before = std::fs::read_to_string(&board).unwrap();
+            let mut source = library_footprint();
+            source.insert_str(
+                source.rfind(')').unwrap(),
+                &format!(
+                    r#"(property "LCSC" "C25804" (at {x} 2) (layer "F.Fab")
+                    (effects (font (size {size} 1) (thickness {thickness}))))"#,
+                ),
+            );
+            std::fs::write(
+                tmp.path()
+                    .join("Resistor_SMD.pretty/R_0805_2012Metric.kicad_mod"),
+                source,
+            )
+            .unwrap();
+            let mutations = Arc::new(AtomicUsize::new(0));
+            let count = mutations.clone();
+            let filename = board.to_string_lossy().to_string();
+            let server = crate::test_support::MockIpcServer::spawn(
+                "field-overflow-placement",
+                move |request| {
+                    let command = request.message.unwrap();
+                    let message = if command.type_url.ends_with("GetOpenDocuments") {
+                        Some(konnect_ipc::builders::pack_any(&kiapi::common::commands::GetOpenDocumentsResponse {
+                        documents: vec![kiapi::common::types::DocumentSpecifier {
+                            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                            identifier: Some(kiapi::common::types::document_specifier::Identifier::BoardFilename(filename.clone())),
+                            project: None,
+                        }],
+                    }, "kiapi.common.commands.GetOpenDocumentsResponse"))
+                    } else if command.type_url.ends_with("GetItems") {
+                        Some(konnect_ipc::builders::pack_any(
+                            &kiapi::common::commands::GetItemsResponse {
+                                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                                ..Default::default()
+                            },
+                            "kiapi.common.commands.GetItemsResponse",
+                        ))
+                    } else {
+                        if [
+                            "CreateItems",
+                            "UpdateItems",
+                            "DeleteItems",
+                            "BeginCommit",
+                            "EndCommit",
+                            "SaveDocument",
+                        ]
+                        .iter()
+                        .any(|name| command.type_url.ends_with(name))
+                        {
+                            count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        None
+                    };
+                    kiapi::common::ApiResponse {
+                        status: Some(kiapi::common::ApiResponseStatus {
+                            status: kiapi::common::ApiStatusCode::AsOk as i32,
+                            error_message: String::new(),
+                        }),
+                        message,
+                        header: None,
+                    }
+                },
+            );
+            let result = handle_place_component(
+                &json!({
+                    "board": board, "footprint": "Resistor_SMD:R_0805_2012Metric",
+                    "reference": "R1", "x": 10.0, "y": 20.0,
+                }),
+                &ctx_talking_to(server.address().to_string()),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error);
+            let text = result_text(&result);
+            for expected in ["LCSC", diagnostic, "nanometre range"] {
+                assert!(text.contains(expected), "{diagnostic}: {text}");
+            }
+            assert_eq!(mutations.load(Ordering::SeqCst), 0, "{diagnostic}");
+            assert_eq!(
+                std::fs::read_to_string(&board).unwrap(),
+                before,
+                "{diagnostic}"
             );
         }
     }
@@ -4747,10 +4927,11 @@ mod tests {
             written.contains("(footprint \"Resistor_SMD:R_0805_2012Metric\""),
             "board should carry the Library:Footprint id:\n{written}"
         );
-        assert!(
-            written.contains("(at 50 60 0)"),
-            "placement missing:\n{written}"
-        );
+        let tree = konnect_sexp::parse_sexp(&written).unwrap();
+        let placement = tree.find("footprint").unwrap().find("at").unwrap();
+        assert_eq!(placement.get_f64(1), Some(50.0));
+        assert_eq!(placement.get_f64(2), Some(60.0));
+        assert!(placement.get(3).is_none() || placement.get_f64(3) == Some(0.0));
         assert!(
             written.contains("(property \"Reference\" \"R7\""),
             "{written}"
@@ -4819,6 +5000,35 @@ mod tests {
             "{written}"
         );
         assert!(konnect_sexp::parse_sexp(&written).is_ok());
+    }
+
+    #[tokio::test]
+    async fn fallback_preserves_legacy_unlocked_text_without_rotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = legacy_fallback_fixture(tmp.path());
+        let footprint = tmp.path().join("Legacy.pretty/Socket.kicad_mod");
+        let source = std::fs::read_to_string(&footprint).unwrap();
+        let source = source.replace("(at 0 8.5)", "(at 0 8.5 unlocked)");
+        assert!(source.contains("(at 0 8.5 unlocked)"));
+        std::fs::write(footprint, source).unwrap();
+
+        let result = handle_place_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "footprint": "Legacy:Socket",
+                "reference": "SW1",
+                "x": 20.0,
+                "y": 30.0,
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let written = std::fs::read_to_string(board).unwrap();
+        assert!(written.contains("(at 0 8.5 unlocked)"), "{written}");
+        assert!(written.contains("(fp_text reference \"SW1\""), "{written}");
     }
 
     #[tokio::test]
@@ -5397,8 +5607,113 @@ mod tests {
     }
 
     #[test]
+    fn flip_inner_copper_uses_the_eight_layer_stack() {
+        let source = FLIP_FOOTPRINT.replace("F.SilkS", "In2.Cu");
+        let flipped = flip_footprint_block(&source, 8).unwrap();
+        assert!(flipped.contains("(layer \"In5.Cu\")"), "{flipped}");
+    }
+
+    fn board_with_copper_stack(footprint: &str, count: usize) -> String {
+        let mut layers = String::from("(layers (0 \"F.Cu\" signal)");
+        for inner in 1..count - 1 {
+            layers.push_str(&format!("({inner} \"In{inner}.Cu\" signal)"));
+        }
+        layers.push_str("(31 \"B.Cu\" signal))");
+        flip_board(&[footprint], "\n").replacen("(net 0", &format!("{layers} (net 0"), 1)
+    }
+
+    #[test]
+    fn closed_flip_reads_copper_count_and_keeps_inner_geometry() {
+        let source = FLIP_FOOTPRINT
+            .replace("F.SilkS", "In2.Cu")
+            .replace("\"F.Cu\" \"F.Paste\"", "\"In2.Cu\" \"F.Paste\"");
+        let board = board_with_copper_stack(&source, 8);
+        let (flipped, changed) = prepare_closed_board_footprint_side(&board, "U1", "B.Cu").unwrap();
+        assert!(changed);
+        let parsed = konnect_sexp::parse_sexp(&flipped).unwrap();
+        let footprint = parsed.find("footprint").unwrap();
+        assert_eq!(
+            footprint
+                .find("fp_line")
+                .unwrap()
+                .find("layer")
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .as_str(),
+            Some("In5.Cu")
+        );
+        assert_eq!(
+            footprint
+                .find("pad")
+                .unwrap()
+                .find("layers")
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .as_str(),
+            Some("In5.Cu")
+        );
+        assert_eq!(
+            footprint
+                .find("property")
+                .unwrap()
+                .find("layer")
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .as_str(),
+            Some("In5.Cu")
+        );
+        let (restored, changed) =
+            prepare_closed_board_footprint_side(&flipped, "U1", "F.Cu").unwrap();
+        assert!(changed);
+        let parsed = konnect_sexp::parse_sexp(&restored).unwrap();
+        assert_eq!(
+            parsed
+                .find("footprint")
+                .unwrap()
+                .find("fp_line")
+                .unwrap()
+                .find("layer")
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .as_str(),
+            Some("In2.Cu")
+        );
+    }
+
+    #[test]
+    fn closed_flip_refuses_nested_padstack_geometry_instead_of_leaving_inner_layers() {
+        let source = FLIP_FOOTPRINT.replace(
+            "(roundrect_rratio 0.25)",
+            "(roundrect_rratio 0.25) (padstack (mode custom) (layer \"In2.Cu\" (size 1 2)))",
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("nested.kicad_pcb");
+        let before = board_with_copper_stack(&source, 8);
+        std::fs::write(&path, &before).unwrap();
+        let error = set_closed_board_footprint_side(&path, "U1", "B.Cu").unwrap_err();
+        assert!(format!("{error:?}").contains("padstack"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+    }
+
+    #[test]
+    fn closed_flip_refuses_inner_layer_outside_saved_stack() {
+        let source = FLIP_FOOTPRINT.replace("F.SilkS", "In3.Cu");
+        for board in [
+            board_with_copper_stack(&source, 4),
+            flip_board(&[&source], "\n"),
+        ] {
+            let error = prepare_closed_board_footprint_side(&board, "U1", "B.Cu").unwrap_err();
+            assert!(format!("{error:?}").contains("In3.Cu"));
+        }
+    }
+
+    #[test]
     fn flip_footprint_matches_kicads_library_frame_transform() {
-        let flipped = flip_footprint_block(FLIP_FOOTPRINT).unwrap();
+        let flipped = flip_footprint_block(FLIP_FOOTPRINT, 2).unwrap();
 
         assert!(flipped.contains("(layer \"B.Cu\")"), "{flipped}");
         assert!(flipped.contains("(at 10 20 -30)"), "{flipped}");
@@ -5451,7 +5766,7 @@ mod tests {
             "fixture must carry the metadata property"
         );
 
-        let flipped = flip_footprint_block(&with_metadata)
+        let flipped = flip_footprint_block(&with_metadata, 2)
             .expect("a positionless property must not block the flip");
 
         // Carried through untouched — it has no geometry to mirror.
@@ -5516,7 +5831,7 @@ mod tests {
             let source = FLIP_FOOTPRINT
                 .replace("(offset (xyz 0 0 0))", replacement)
                 .replace("(rotate (xyz 0 0 90))", replacement);
-            let error = flip_footprint_block(&source).unwrap_err().to_string();
+            let error = flip_footprint_block(&source, 2).unwrap_err().to_string();
             assert!(error.contains(needle), "{label}: {error}");
             assert!(error.contains("would have to move it"), "{label}: {error}");
         }
@@ -5527,7 +5842,7 @@ mod tests {
                 .replace("(offset (xyz 0 0 0))", untouched)
                 .replace("(rotate (xyz 0 0 90))", untouched);
             assert!(
-                flip_footprint_block(&source).is_ok(),
+                flip_footprint_block(&source, 2).is_ok(),
                 "{untouched} is not moved by a flip and must be accepted"
             );
         }
@@ -5754,7 +6069,7 @@ mod tests {
             id: Some(kiapi::common::types::Kiid {
                 value: kiid.to_string(),
             }),
-            position: Some(konnect_ipc::builders::vec2(10.0, 20.0)),
+            position: Some(konnect_ipc::builders::vec2(10.0, 20.0).unwrap()),
             orientation: Some(kiapi::common::types::Angle { value_degrees: 0.0 }),
             layer: layer as i32,
             reference_field: Some(kiapi::board::types::Field {
@@ -6056,7 +6371,7 @@ mod tests {
     fn flip_refuses_custom_pad_geometry_instead_of_corrupting_it() {
         let custom = FLIP_FOOTPRINT.replace("roundrect (at 2 3 50)", "custom (at 2 3 50)");
 
-        let error = flip_footprint_block(&custom).unwrap_err();
+        let error = flip_footprint_block(&custom, 2).unwrap_err();
 
         assert!(error.to_string().contains("custom pads"));
     }
@@ -6068,7 +6383,7 @@ mod tests {
             "(roundrect_rratio 0.25)\n    (drill oval 0.4 0.8 (offset 0.2 0.1))",
         );
 
-        let error = flip_footprint_block(&offset_drill).unwrap_err();
+        let error = flip_footprint_block(&offset_drill, 2).unwrap_err();
 
         assert!(error.to_string().contains("offset"), "{error}");
     }
@@ -6080,7 +6395,7 @@ mod tests {
             "(layer \"User.Drawings\")\n    (effects (font (size 1 1)) (justify left))",
         );
 
-        let flipped = flip_footprint_block(&user_text).unwrap();
+        let flipped = flip_footprint_block(&user_text, 2).unwrap();
 
         assert!(flipped.contains("(layer \"User.Drawings\")"), "{flipped}");
         assert!(flipped.contains("(justify left)"), "{flipped}");
@@ -6090,8 +6405,8 @@ mod tests {
     #[test]
     fn supported_footprint_round_trip_restores_the_original_semantics() {
         let no_justify = FLIP_FOOTPRINT.replace(" (justify left)", "");
-        let back = flip_footprint_block(&no_justify).unwrap();
-        let front = flip_footprint_block(&back).unwrap();
+        let back = flip_footprint_block(&no_justify, 2).unwrap();
+        let front = flip_footprint_block(&back, 2).unwrap();
 
         assert_eq!(
             konnect_sexp::parse_sexp(&front).unwrap(),
@@ -6103,9 +6418,9 @@ mod tests {
     fn non_cardinal_root_orientation_round_trips_without_drift() {
         let non_cardinal = FLIP_FOOTPRINT.replace("(at 10 20 30)", "(at 10 20 37.5)");
 
-        let back = flip_footprint_block(&non_cardinal).unwrap();
+        let back = flip_footprint_block(&non_cardinal, 2).unwrap();
         assert!(back.contains("(at 10 20 -37.5)"), "{back}");
-        let front = flip_footprint_block(&back).unwrap();
+        let front = flip_footprint_block(&back, 2).unwrap();
 
         assert_eq!(
             konnect_sexp::parse_sexp(&front).unwrap(),
@@ -6122,10 +6437,10 @@ mod tests {
              (drill oval 0.4 0.8)\n    (layers \"*.Cu\" \"*.Mask\")",
         );
 
-        let back = flip_footprint_block(&through_hole).unwrap();
+        let back = flip_footprint_block(&through_hole, 2).unwrap();
         assert!(back.contains("(layers \"*.Cu\" \"*.Mask\")"), "{back}");
         assert!(back.contains("(drill oval 0.4 0.8)"), "{back}");
-        let front = flip_footprint_block(&back).unwrap();
+        let front = flip_footprint_block(&back, 2).unwrap();
 
         assert_eq!(
             konnect_sexp::parse_sexp(&front).unwrap(),
@@ -6140,7 +6455,7 @@ mod tests {
             "(effects (font (size 1 1)) (justify left))\n    (hide yes)",
         );
 
-        let flipped = flip_footprint_block(&hidden).unwrap();
+        let flipped = flip_footprint_block(&hidden, 2).unwrap();
 
         assert!(flipped.contains("(hide yes)"), "{flipped}");
         assert!(flipped.contains("(justify left mirror)"), "{flipped}");
@@ -6153,9 +6468,9 @@ mod tests {
             "(fp_text reference \"U1\"",
         );
 
-        let back = flip_footprint_block(&legacy).unwrap();
+        let back = flip_footprint_block(&legacy, 2).unwrap();
         assert!(back.contains("(fp_text reference \"U1\""), "{back}");
-        let front = flip_footprint_block(&back).unwrap();
+        let front = flip_footprint_block(&back, 2).unwrap();
 
         assert_eq!(
             konnect_sexp::parse_sexp(&front).unwrap(),
@@ -6551,7 +6866,7 @@ mod tests {
                 }),
                 number: number.to_string(),
                 r#type: konnect_ipc::gen::kiapi::board::types::PadType::PtSmd as i32,
-                position: Some(konnect_ipc::builders::vec2(x, y)),
+                position: Some(konnect_ipc::builders::vec2(x, y).unwrap()),
                 net: Some(konnect_ipc::gen::kiapi::board::types::Net {
                     code: None,
                     name: net.to_string(),
@@ -6566,7 +6881,7 @@ mod tests {
                         layer: konnect_ipc::gen::kiapi::board::types::BoardLayer::BlFCu as i32,
                         shape: konnect_ipc::gen::kiapi::board::types::PadStackShape::PssRoundrect
                             as i32,
-                        size: Some(konnect_ipc::builders::vec2(2.432, 1.524)),
+                        size: Some(konnect_ipc::builders::vec2(2.432, 1.524).unwrap()),
                         corner_rounding_ratio: 0.25,
                         ..Default::default()
                     }],
@@ -6590,14 +6905,14 @@ mod tests {
         let layer = |layer, shape, width, height| PadStackLayer {
             layer,
             shape,
-            size: Some(konnect_ipc::builders::vec2(width, height)),
+            size: Some(konnect_ipc::builders::vec2(width, height).unwrap()),
             ..Default::default()
         };
         konnect_ipc::builders::pack_any(
             &Pad {
                 number: number.to_string(),
                 r#type: PadType::PtPth as i32,
-                position: Some(konnect_ipc::builders::vec2(x, y)),
+                position: Some(konnect_ipc::builders::vec2(x, y).unwrap()),
                 pad_stack: Some(PadStack {
                     layers: vec![
                         BoardLayer::BlFCu as i32,
@@ -6627,7 +6942,7 @@ mod tests {
                     drill: Some(DrillProperties {
                         start_layer: BoardLayer::BlFCu as i32,
                         end_layer: BoardLayer::BlBCu as i32,
-                        diameter: Some(konnect_ipc::builders::vec2(0.8, 1.2)),
+                        diameter: Some(konnect_ipc::builders::vec2(0.8, 1.2).unwrap()),
                         shape: DrillShape::DsOblong as i32,
                         ..Default::default()
                     }),
@@ -6646,7 +6961,7 @@ mod tests {
         use konnect_ipc::gen::kiapi;
         konnect_ipc::builders::pack_any(
             &kiapi::board::types::FootprintInstance {
-                position: Some(konnect_ipc::builders::vec2(100.0, 100.0)),
+                position: Some(konnect_ipc::builders::vec2(100.0, 100.0).unwrap()),
                 reference_field: Some(kiapi::board::types::Field {
                     name: "Reference".to_string(),
                     text: Some(kiapi::board::types::BoardText {
@@ -7287,14 +7602,14 @@ mod field_placement_tests {
 		(layer \"F.Fab\")
 	)
 )";
-        let placement = extract_field_placement(source);
+        let placement = extract_field_placement(source).unwrap();
         assert_eq!(placement.reference_at, Some((0.0, -1.43, 0.0)));
         assert_eq!(placement.value_at, Some((0.0, 1.43, 0.0)));
     }
 
     #[test]
     fn missing_fields_leave_defaults() {
-        let placement = extract_field_placement("(footprint \"bare\")");
+        let placement = extract_field_placement("(footprint \"bare\")").unwrap();
         assert_eq!(placement.reference_at, None);
         assert_eq!(placement.value_at, None);
     }

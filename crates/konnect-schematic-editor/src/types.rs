@@ -3,14 +3,7 @@ use crate::sexp::{atom, qstr, tagged, SexpNode};
 // ---- float formatting -------------------------------------------------------
 
 pub fn fmt_f64(v: f64) -> String {
-    let s = format!("{:.6}", v);
-    let s = s.trim_end_matches('0');
-    let s = s.trim_end_matches('.');
-    if s.is_empty() || s == "-" {
-        "0".to_owned()
-    } else {
-        s.to_owned()
-    }
+    konnect_sexp::geometry::fmt_mm(v)
 }
 
 // ---- At ---------------------------------------------------------------------

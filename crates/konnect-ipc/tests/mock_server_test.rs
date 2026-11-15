@@ -700,6 +700,84 @@ fn a_mixed_response_counts_only_the_successes() {
 /// alongside its pads — a pads-only instance trips lib_footprint_mismatch and
 /// makes courtyard DRC meaningless.
 #[test]
+fn transformed_coordinates_outside_the_nanometre_range_never_send_create_items() {
+    use konnect_ipc::{IpcFieldPlacement, IpcGraphicDefinition, IpcPadDefinition};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mutations = Arc::new(AtomicUsize::new(0));
+    let observed = mutations.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.unwrap();
+        if message.type_url.ends_with("GetOpenDocuments") {
+            Some(open_board_response())
+        } else if message.type_url.ends_with("GetItems") {
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::GetItemsResponse {
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    ..Default::default()
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            )))
+        } else {
+            observed.fetch_add(1, Ordering::SeqCst);
+            panic!("unexpected mutation {}", message.type_url);
+        }
+    });
+    let pad = IpcPadDefinition {
+        number: "1".to_string(),
+        pad_type: "smd".to_string(),
+        shape: "rect".to_string(),
+        x: 9e12,
+        y: 0.0,
+        rotation: 0.0,
+        size_x: 1.0,
+        size_y: 1.0,
+        drill_x: None,
+        drill_y: None,
+        drill_oval: false,
+        layers: vec!["F.Cu".to_string()],
+        roundrect_ratio: 0.0,
+        chamfer_ratio: 0.0,
+        chamfered_corners: None,
+    };
+    let graphic = IpcGraphicDefinition::Line {
+        start: (9e12, 0.0),
+        end: (9e12, 1.0),
+        layer: "F.SilkS".to_string(),
+        width: 0.1,
+        style: kiapi::common::types::StrokeLineStyle::SlsSolid,
+    };
+    let fields = IpcFieldPlacement {
+        reference_at: Some((9e12, 0.0, 0.0)),
+        ..Default::default()
+    };
+    let client = KiCadIpcClient::new(&mock.url);
+    for (pads, graphics, fields) in [
+        (vec![pad], vec![], IpcFieldPlacement::default()),
+        (vec![], vec![graphic], IpcFieldPlacement::default()),
+        (vec![], vec![], fields),
+    ] {
+        let error = client
+            .place_footprint(
+                &mock_board("test.kicad_pcb"),
+                "Lib:Fp",
+                "R1",
+                "R",
+                &pads,
+                &graphics,
+                &fields,
+                9e12,
+                0.0,
+                0.0,
+                "F.Cu",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("nanometre range"), "{error:#}");
+    }
+    assert_eq!(mutations.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn place_footprint_sends_graphics_children() {
     use konnect_ipc::{IpcGraphicDefinition, IpcPadDefinition};
 
@@ -775,6 +853,7 @@ fn place_footprint_sends_graphics_children() {
     }];
     let graphics = vec![
         IpcGraphicDefinition::Rect {
+            style: konnect_ipc::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
             start: (-0.8, -0.7),
             end: (0.8, 0.7),
             layer: "F.CrtYd".to_string(),
@@ -782,6 +861,7 @@ fn place_footprint_sends_graphics_children() {
             filled: false,
         },
         IpcGraphicDefinition::Line {
+            style: konnect_ipc::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
             start: (-0.6, -0.5),
             end: (0.6, -0.5),
             layer: "F.SilkS".to_string(),
@@ -1626,6 +1706,7 @@ fn footprint_with_a_pad_and_a_line(pad_uuid: &str, line_uuid: &str) -> prost_typ
             chamfered_corners: None,
         }],
         &[konnect_ipc::IpcGraphicDefinition::Poly {
+            style: konnect_ipc::gen::kiapi::common::types::StrokeLineStyle::SlsSolid,
             points: vec![(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0)],
             layer: "F.SilkS".to_string(),
             width: 0.12,
@@ -1747,7 +1828,7 @@ fn pad_at(number: &str, x_mm: f64, y_mm: f64, net: &str) -> prost_types::Any {
     builders::pack_any(
         &kiapi::board::types::Pad {
             number: number.to_string(),
-            position: Some(builders::vec2(x_mm, y_mm)),
+            position: Some(builders::vec2(x_mm, y_mm).unwrap()),
             net: Some(kiapi::board::types::Net {
                 code: None,
                 name: net.to_string(),
@@ -1770,12 +1851,12 @@ fn footprint_with_pads(reference: &str, pads: Vec<prost_types::Any>) -> prost_ty
     let mut items = pads;
     // A non-pad child must be skipped rather than decoded as a pad.
     items.push(builders::pack_any(
-        &builders::board_segment("F.SilkS", 0.12, 0.0, 0.0, 1.0, 0.0),
+        &builders::board_segment("F.SilkS", 0.12, 0.0, 0.0, 1.0, 0.0).unwrap(),
         "kiapi.board.types.BoardGraphicShape",
     ));
     builders::pack_any(
         &kiapi::board::types::FootprintInstance {
-            position: Some(builders::vec2(100.0, 100.0)),
+            position: Some(builders::vec2(100.0, 100.0).unwrap()),
             reference_field: Some(kiapi::board::types::Field {
                 name: "Reference".to_string(),
                 text: Some(kiapi::board::types::BoardText {
@@ -2001,9 +2082,9 @@ fn kiid(value: &str) -> kiapi::common::types::Kiid {
 
 #[test]
 fn board_graphics_come_back_with_their_kind_layer_and_identifier() {
-    let mut segment = builders::board_segment("Edge.Cuts", 0.05, 0.0, 0.0, 100.0, 0.0);
+    let mut segment = builders::board_segment("Edge.Cuts", 0.05, 0.0, 0.0, 100.0, 0.0).unwrap();
     segment.id = Some(kiid("edge-top"));
-    let mut text = builders::board_text("F.SilkS", "REV A", 10.0, 20.0, 1.0, 0.0, false);
+    let mut text = builders::board_text("F.SilkS", "REV A", 10.0, 20.0, 1.0, 0.0, false).unwrap();
     text.id = Some(kiid("silk-text"));
 
     // One request asks for four object types, so KiCad answers with a single
@@ -2102,7 +2183,7 @@ fn verified_trace_delete_refuses_a_non_trace_before_delete_items() {
     // The payload is deliberately wire-compatible while the declared type is
     // a Via. Protobuf decoding is permissive, so the reader must discriminate
     // on type_url before interpreting bytes as a trace segment.
-    let mut non_trace = builders::build_track("GND", 7, "F.Cu", 0.25, 1.0, 2.0, 3.0, 4.0);
+    let mut non_trace = builders::build_track("GND", 7, "F.Cu", 0.25, 1.0, 2.0, 3.0, 4.0).unwrap();
     non_trace.id = Some(kiapi::common::types::Kiid {
         value: "via-or-zone".to_string(),
     });
@@ -2153,7 +2234,7 @@ fn verified_trace_delete_targets_one_board_and_returns_observed_preimage() {
     let addressed = Arc::new(Mutex::new(Vec::<String>::new()));
     let addressed_in_mock = addressed.clone();
 
-    let mut track = builders::build_track("GND", 7, "F.Cu", 0.4, 1.0, 2.0, 3.0, 4.0);
+    let mut track = builders::build_track("GND", 7, "F.Cu", 0.4, 1.0, 2.0, 3.0, 4.0).unwrap();
     track.id = Some(kiapi::common::types::Kiid {
         value: "segment-1".to_string(),
     });
@@ -2236,7 +2317,7 @@ fn verified_trace_delete_targets_one_board_and_returns_observed_preimage() {
 
 #[test]
 fn verified_trace_delete_refuses_success_when_readback_still_contains_the_segment() {
-    let mut track = builders::build_track("GND", 7, "F.Cu", 0.25, 1.0, 2.0, 3.0, 4.0);
+    let mut track = builders::build_track("GND", 7, "F.Cu", 0.25, 1.0, 2.0, 3.0, 4.0).unwrap();
     track.id = Some(kiapi::common::types::Kiid {
         value: "segment-1".to_string(),
     });
@@ -3289,6 +3370,159 @@ fn place_footprint_reports_uncertain_when_readback_loses_chamfer_corners() {
             );
         } else {
             assert_eq!(result.unwrap().reference, "U1");
+        }
+    }
+}
+
+#[test]
+fn issue26_placement_checks_field_presentation_and_stroke_readback() {
+    for mode in 0..4 {
+        let observed = Arc::new(Mutex::new(Vec::<prost_types::Any>::new()));
+        let state = observed.clone();
+        let mock = spawn_mock(move |request| {
+            let message = request.message.unwrap();
+            if message.type_url.ends_with("GetOpenDocuments") {
+                return Some(open_board_response());
+            }
+            if message.type_url.ends_with("GetItems") {
+                return Some(reply_with(builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: state.lock().unwrap().clone(),
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                )));
+            }
+            assert!(message.type_url.ends_with("CreateItems"));
+            let create =
+                kiapi::common::commands::CreateItems::decode(message.value.as_slice()).unwrap();
+            let mut held = create.items.clone();
+            if matches!(mode, 1 | 2) {
+                let mut instance =
+                    kiapi::board::types::FootprintInstance::decode(held[0].value.as_slice())
+                        .unwrap();
+                let kind = if mode == 1 {
+                    "kiapi.board.types.Field"
+                } else {
+                    "kiapi.board.types.BoardGraphicShape"
+                };
+                let child = instance
+                    .definition
+                    .as_mut()
+                    .unwrap()
+                    .items
+                    .iter_mut()
+                    .find(|item| builders::any_is(item, kind))
+                    .unwrap();
+                if mode == 1 {
+                    let mut field =
+                        kiapi::board::types::Field::decode(child.value.as_slice()).unwrap();
+                    field
+                        .text
+                        .as_mut()
+                        .unwrap()
+                        .text
+                        .as_mut()
+                        .unwrap()
+                        .attributes
+                        .as_mut()
+                        .unwrap()
+                        .size = None;
+                    *child = builders::pack_any(&field, kind);
+                } else {
+                    let mut graphic =
+                        kiapi::board::types::BoardGraphicShape::decode(child.value.as_slice())
+                            .unwrap();
+                    graphic
+                        .shape
+                        .as_mut()
+                        .unwrap()
+                        .attributes
+                        .as_mut()
+                        .unwrap()
+                        .stroke
+                        .as_mut()
+                        .unwrap()
+                        .style = kiapi::common::types::StrokeLineStyle::SlsSolid as i32;
+                    *child = builders::pack_any(&graphic, kind);
+                }
+                held[0] = builders::pack_any(&instance, "kiapi.board.types.FootprintInstance");
+            }
+            if mode == 3 {
+                held.clear();
+            }
+            *state.lock().unwrap() = held;
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::CreateItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    created_items: create
+                        .items
+                        .into_iter()
+                        .map(|item| kiapi::common::commands::ItemCreationResult {
+                            status: Some(kiapi::common::commands::ItemStatus {
+                                code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                error_message: String::new(),
+                            }),
+                            item: Some(item),
+                        })
+                        .collect(),
+                },
+                "kiapi.common.commands.CreateItemsResponse",
+            )))
+        });
+        let fields = konnect_ipc::IpcFieldPlacement {
+            fields: vec![kiapi::board::types::Field {
+                name: "LCSC".into(),
+                visible: false,
+                text: Some(kiapi::board::types::BoardText {
+                    layer: kiapi::board::types::BoardLayer::BlFFab as i32,
+                    text: Some(kiapi::common::types::Text {
+                        text: "C25804".into(),
+                        position: Some(builders::vec2(0.0, 0.0).unwrap()),
+                        attributes: Some(kiapi::common::types::TextAttributes {
+                            size: Some(builders::vec2(0.8, 0.8).unwrap()),
+                            stroke_width: Some(builders::distance(0.12).unwrap()),
+                            line_spacing: 1.0,
+                            keep_upright: true,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let graphic = konnect_ipc::IpcGraphicDefinition::Line {
+            start: (0.0, 0.0),
+            end: (1.0, 1.0),
+            layer: "F.CrtYd".into(),
+            width: 0.1,
+            style: kiapi::common::types::StrokeLineStyle::SlsDash,
+        };
+        let result = KiCadIpcClient::new(&mock.url).place_footprint(
+            &mock_board("test.kicad_pcb"),
+            "L:F",
+            "U1",
+            "F",
+            &[],
+            &[graphic],
+            &fields,
+            10.0,
+            20.0,
+            0.0,
+            "F.Cu",
+        );
+        if mode == 0 {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(matches!(
+                konnect_ipc::IpcFailure::from_error(result.unwrap_err()),
+                konnect_ipc::IpcFailure::Uncertain(_)
+            ));
         }
     }
 }
