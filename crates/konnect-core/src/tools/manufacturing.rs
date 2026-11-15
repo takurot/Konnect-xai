@@ -2291,3 +2291,121 @@ mod copper_layer_count_tests {
         assert_eq!(control["board_info"]["copper_layers"], 2);
     }
 }
+
+#[cfg(test)]
+mod correction_boundary_tests {
+    use super::*;
+
+    fn policy() -> serde_json::Value {
+        json!({"schema_version":1,"policy_id":"project","provenance":"test fixture",
+            "footprint_rules":[{"id":"fp","footprint_prefix":"Resistor_","rotation_degrees":90}],
+            "component_overrides":[{"id":"component","designator":"R1","offset_x_mm":0.5}]})
+    }
+
+    #[test]
+    fn correction_policy_rejects_ambiguous_identity_and_unsupported_schema() {
+        let good = policy();
+        assert!(parse_jlcpcb_correction_policy(&good.to_string(), "test").is_ok());
+        for (field, value) in [
+            ("schema_version", json!(2)),
+            ("policy_id", json!(" ")),
+            ("provenance", json!("")),
+        ] {
+            let mut bad = good.clone();
+            bad[field] = value;
+            assert!(parse_jlcpcb_correction_policy(&bad.to_string(), "test").is_err());
+        }
+        for (collection, field) in [
+            ("footprint_rules", "id"),
+            ("footprint_rules", "footprint_prefix"),
+            ("component_overrides", "id"),
+            ("component_overrides", "designator"),
+        ] {
+            let mut bad = good.clone();
+            bad[collection][0][field] = json!(" ");
+            assert!(parse_jlcpcb_correction_policy(&bad.to_string(), "test").is_err());
+        }
+        let mut duplicate_footprint = good.clone();
+        duplicate_footprint["footprint_rules"]
+            .as_array_mut()
+            .unwrap()
+            .push(good["footprint_rules"][0].clone());
+        assert!(parse_jlcpcb_correction_policy(&duplicate_footprint.to_string(), "test").is_err());
+        let mut duplicate_id = good.clone();
+        duplicate_id["component_overrides"][0]["id"] = json!("fp");
+        assert!(parse_jlcpcb_correction_policy(&duplicate_id.to_string(), "test").is_err());
+        let mut duplicate_designator = good.clone();
+        let mut second = good["component_overrides"][0].clone();
+        second["id"] = json!("second");
+        duplicate_designator["component_overrides"]
+            .as_array_mut()
+            .unwrap()
+            .push(second);
+        assert!(parse_jlcpcb_correction_policy(&duplicate_designator.to_string(), "test").is_err());
+        for (rotation, x, y) in [
+            (f64::NAN, 0.0, 0.0),
+            (0.0, f64::INFINITY, 0.0),
+            (0.0, 0.0, f64::NEG_INFINITY),
+        ] {
+            assert!(validate_finite_correction("test", "rule", rotation, x, y).is_err());
+        }
+        assert!(validate_finite_correction("test", "rule", -90.0, -0.3, 0.2).is_ok());
+    }
+
+    #[test]
+    fn project_component_override_beats_project_prefix_which_beats_builtin_prefix() {
+        let built_in = parse_jlcpcb_correction_policy(&json!({"schema_version":1,"policy_id":"builtin","provenance":"test",
+            "footprint_rules":[{"id":"builtin-rule","footprint_prefix":"Resistor_","rotation_degrees":180},
+                {"id":"capacitor","footprint_prefix":"Capacitor_","rotation_degrees":45}]}).to_string(), "test").unwrap();
+        let project = parse_jlcpcb_correction_policy(&policy().to_string(), "test").unwrap();
+        let policies = JlcpcbCorrectionPolicies {
+            built_in,
+            project: Some(project),
+        };
+        let component = policies.matching_rule("R1", "Resistor_0805").unwrap();
+        assert_eq!(
+            component.values(),
+            ("project", "component", "component_override", 0.0, 0.5, 0.0)
+        );
+        let footprint = policies.matching_rule("R2", "Resistor_0805").unwrap();
+        assert_eq!(
+            footprint.values(),
+            ("project", "fp", "footprint_rule", 90.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            policies
+                .matching_rule("C1", "Capacitor_0603")
+                .unwrap()
+                .values()
+                .0,
+            "builtin"
+        );
+        assert!(policies.matching_rule("U1", "Unknown").is_none());
+    }
+
+    #[test]
+    fn bom_designators_require_explicit_unique_components_and_matching_cpl_membership() {
+        for source in [
+            "Value\n10k\n",
+            "Reference\n",
+            "Reference\n\"\"\n",
+            "Reference\n\"R1,R1\"\n",
+            "Reference\n\"R1,\"\n",
+            "Reference\nR1-R3\n",
+        ] {
+            assert!(
+                jlcpcb_bom_designators(source).is_err(),
+                "accepted {source:?}"
+            );
+        }
+        for header in ["Reference", "Refs", "Designator"] {
+            let bom = jlcpcb_bom_designators(&format!("{header}\n\"R1, R2\"\nC1\n")).unwrap();
+            assert_eq!(bom, BTreeSet::from(["R1".into(), "R2".into(), "C1".into()]));
+            assert!(jlcpcb_designator_mismatch(&bom, &bom).is_none());
+            let mismatch =
+                jlcpcb_designator_mismatch(&BTreeSet::from(["R1".into(), "U1".into()]), &bom)
+                    .unwrap();
+            assert!(mismatch.contains("U1") && mismatch.contains("R2") && mismatch.contains("C1"));
+        }
+    }
+}
