@@ -2456,3 +2456,95 @@ mod board_evidence_contract_tests {
         assert_eq!(extract_coord("(end 2 3)", "start", 0), None);
     }
 }
+
+#[cfg(test)]
+mod package_preflight_contract_tests {
+    use super::*;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+    fn body(result: CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            other => panic!("expected JSON, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_package_options_are_named_before_ipc_or_output_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let output = dir.path().join("output");
+        let corrections = dir.path().join("corrections.json");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        for (extra, field) in [
+            (json!({"gerber_layers":"F.Cu"}), "gerber_layers"),
+            (json!({"gerber_layers":[7]}), "gerber_layers[0]"),
+            (json!({"position_side":"left"}), "position_side"),
+            (json!({"position_units":"cm"}), "position_units"),
+            (json!({"position_units":"in"}), "position_units"),
+            (
+                json!({"include_assembly":false,"jlcpcb_cpl_corrections_path":corrections}),
+                "jlcpcb_cpl_corrections_path",
+            ),
+            (
+                json!({"fab_house":"pcbway","jlcpcb_cpl_corrections_path":corrections}),
+                "jlcpcb_cpl_corrections_path",
+            ),
+        ] {
+            let mut args = json!({"board":board,"output_dir":output});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let result = handle_export_manufacturing_package(&args, &context())
+                .await
+                .unwrap();
+            assert!(result.is_error);
+            let result = body(result);
+            assert_eq!(result["error"]["kind"], "invalid_argument");
+            assert_eq!(result["error"]["field"], field);
+            assert!(!output.exists());
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), "(kicad_pcb)");
+        }
+    }
+
+    #[tokio::test]
+    async fn pcbway_multilayer_quote_reports_the_requested_and_saved_layer_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb (layers (0 \"F.Cu\" signal) (31 \"B.Cu\" signal)))",
+        )
+        .unwrap();
+        for (layers, price) in [(2, "$5.00"), (8, "$25.00")] {
+            let result = body(
+                handle_estimate_cost(
+                    &json!({"board":board,"fab_house":"pcbway","layers":layers}),
+                    &context(),
+                )
+                .await
+                .unwrap(),
+            );
+            assert_eq!(result["board"]["copper_layers"], layers);
+            assert_eq!(result["board"]["board_copper_layers"], 2);
+            assert_eq!(result["cost_estimate"]["pcb_fabrication"], price);
+            assert_eq!(
+                result["warnings"].as_array().unwrap().len(),
+                usize::from(layers != 2)
+            );
+        }
+    }
+}

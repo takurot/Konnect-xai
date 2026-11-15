@@ -10740,3 +10740,137 @@ mod generated_geometry_contract_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod project_catalog_contract_tests {
+    use super::*;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+    fn body(result: CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            other => panic!("expected JSON, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn project_symbol_search_skips_unreadable_candidates_and_honors_matching_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.kicad_sym");
+        let unreadable = dir.path().join("invalid-utf8.kicad_sym");
+        let valid = dir.path().join("valid.kicad_sym");
+        std::fs::write(&unreadable, [0xff, 0xfe]).unwrap();
+        std::fs::write(&valid,"(kicad_symbol_lib (symbol \"KonnectCoverageUniquePartA\") (symbol \"KonnectCoverageUniquePartB\") (symbol \"Unrelated\"))").unwrap();
+        let mut entries = Vec::new();
+        for (name, path) in [
+            ("Missing", missing),
+            ("Unreadable", unreadable),
+            ("Valid", valid),
+        ] {
+            let uri = path.to_string_lossy().replace('\\', "/");
+            entries.push(format!("(lib (name \"Coverage{name}\") (type \"KiCad\") (uri {}) (options \"\") (descr \"\"))",konnect_sexp::quoted(&uri)));
+        }
+        std::fs::write(
+            dir.path().join("sym-lib-table"),
+            format!("(sym_lib_table {})", entries.join(" ")),
+        )
+        .unwrap();
+        for (query, limit, count) in [
+            ("konnectcoverageuniquepart", 1, 1),
+            ("konnectcoverageuniquepart", 10, 2),
+            ("konnectcoverageuniquepartzz", 10, 0),
+        ] {
+            let result = body(
+                handle_search_symbols(
+                    &json!({"project_dir":dir.path(),"query":query,"limit":limit}),
+                    &context(),
+                )
+                .await
+                .unwrap(),
+            );
+            assert_eq!(result["count"], count);
+            assert!(result["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|hit| hit["library"] == "CoverageValid"));
+        }
+        assert!(
+            handle_search_symbols(&json!({"project_dir":dir.path()}), &context())
+                .await
+                .unwrap()
+                .is_error
+        );
+    }
+
+    #[tokio::test]
+    async fn project_library_lists_distinguish_no_project_from_an_unreadable_project_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("board.kicad_pro");
+        for symbol in [false, true] {
+            let filename = if symbol {
+                "sym-lib-table"
+            } else {
+                "fp-lib-table"
+            };
+            let root = if symbol {
+                "sym_lib_table"
+            } else {
+                "fp_lib_table"
+            };
+            let table = dir.path().join(filename);
+            let source = format!("({root} (lib (name \"ProjectOnly\") (type \"KiCad\") (uri \"relative-library\") (options \"\") (descr \"\")))");
+            std::fs::write(&table, &source).unwrap();
+            let no_project = json!({"scope":"project"});
+            let with_project = json!({"scope":"project","project":project});
+            let empty = if symbol {
+                handle_list_symbol_libraries(&no_project, &context())
+                    .await
+                    .unwrap()
+            } else {
+                handle_list_footprint_libraries(&no_project, &context())
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(body(empty)["count"], 0);
+            let listed = if symbol {
+                handle_list_symbol_libraries(&with_project, &context())
+                    .await
+                    .unwrap()
+            } else {
+                handle_list_footprint_libraries(&with_project, &context())
+                    .await
+                    .unwrap()
+            };
+            let listed = body(listed);
+            assert_eq!(listed["count"], 1);
+            assert_eq!(listed["libraries"][0]["scope"], "project");
+            assert_eq!(std::fs::read_to_string(&table).unwrap(), source);
+            std::fs::write(&table, [0xff, 0xfe]).unwrap();
+            let refusal = if symbol {
+                handle_list_symbol_libraries(&with_project, &context())
+                    .await
+                    .unwrap()
+            } else {
+                handle_list_footprint_libraries(&with_project, &context())
+                    .await
+                    .unwrap()
+            };
+            assert!(refusal.is_error);
+            assert_eq!(std::fs::read(&table).unwrap(), [0xff, 0xfe]);
+        }
+    }
+}
