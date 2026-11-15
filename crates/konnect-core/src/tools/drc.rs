@@ -833,7 +833,8 @@ mod tests {
                 connection: kiapi::board::types::ZoneConnectionStyle::ZcsFull,
             },
             net.netcode,
-        );
+        )
+        .unwrap();
         assert!(!zone.filled && zone.filled_polygons.is_empty());
         let created = client
             .create_items_returning(vec![konnect_ipc::builders::pack_any(

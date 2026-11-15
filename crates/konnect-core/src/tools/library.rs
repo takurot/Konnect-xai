@@ -8,6 +8,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_array, require_str, ToolContext, ToolDef};
 use konnect_schematic_editor::types::fmt_f64;
+use konnect_sexp::geometry::round6;
 use konnect_sexp::parser::{parse_sexp, SexpNode};
 use konnect_sexp::writer::{
     apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks, read_consistent,
@@ -653,13 +654,13 @@ fn build_footprint_graphics(args: &serde_json::Value, name: &str, pads: &[PadGeo
 
     // Courtyard rectangle (F.CrtYd) — required for DRC.
     s.push_str(&format!(
-        "\n  (fp_rect (start {:.4} {:.4}) (end {:.4} {:.4}) (stroke (width 0.05) (type solid)) (fill none) (layer \"F.CrtYd\"))",
-        cmin_x, cmin_y, cmax_x, cmax_y
+        "\n  (fp_rect (start {} {}) (end {} {}) (stroke (width 0.05) (type solid)) (fill none) (layer \"F.CrtYd\"))",
+        fmt_f64(cmin_x), fmt_f64(cmin_y), fmt_f64(cmax_x), fmt_f64(cmax_y)
     ));
     // Silkscreen outline (F.SilkS).
     s.push_str(&format!(
-        "\n  (fp_rect (start {:.4} {:.4}) (end {:.4} {:.4}) (stroke (width 0.12) (type solid)) (fill none) (layer \"F.SilkS\"))",
-        smin_x, smin_y, smax_x, smax_y
+        "\n  (fp_rect (start {} {}) (end {} {}) (stroke (width 0.12) (type solid)) (fill none) (layer \"F.SilkS\"))",
+        fmt_f64(smin_x), fmt_f64(smin_y), fmt_f64(smax_x), fmt_f64(smax_y)
     ));
 
     if let Some(i1) = pin1_index(pads) {
@@ -670,7 +671,7 @@ fn build_footprint_graphics(args: &serde_json::Value, name: &str, pads: &[PadGeo
         let pts = chamfered_rect_points(fmin_x, fmin_y, fmax_x, fmax_y, p1.x, p1.y, chamfer);
         let pts_str: String = pts
             .iter()
-            .map(|(x, y)| format!("(xy {:.4} {:.4}) ", x, y))
+            .map(|(x, y)| format!("(xy {} {}) ", fmt_f64(*x), fmt_f64(*y)))
             .collect();
         s.push_str(&format!(
             "\n  (fp_poly (pts {}) (stroke (width 0.1) (type solid)) (fill none) (layer \"F.Fab\"))",
@@ -695,26 +696,26 @@ fn build_footprint_graphics(args: &serde_json::Value, name: &str, pads: &[PadGeo
             (p1.x, edge + sign * 0.4)
         };
         s.push_str(&format!(
-            "\n  (fp_circle (center {:.4} {:.4}) (end {:.4} {:.4}) (stroke (width 0.1) (type solid)) (fill solid) (layer \"F.SilkS\"))",
-            dx, dy, dx + 0.15, dy
+            "\n  (fp_circle (center {} {}) (end {} {}) (stroke (width 0.1) (type solid)) (fill solid) (layer \"F.SilkS\"))",
+            fmt_f64(dx), fmt_f64(dy), fmt_f64(dx + 0.15), fmt_f64(dy)
         ));
     } else {
         // No pads to mark pin 1 against — plain fab rectangle.
         s.push_str(&format!(
-            "\n  (fp_rect (start {:.4} {:.4}) (end {:.4} {:.4}) (stroke (width 0.1) (type solid)) (fill none) (layer \"F.Fab\"))",
-            fmin_x, fmin_y, fmax_x, fmax_y
+            "\n  (fp_rect (start {} {}) (end {} {}) (stroke (width 0.1) (type solid)) (fill none) (layer \"F.Fab\"))",
+            fmt_f64(fmin_x), fmt_f64(fmin_y), fmt_f64(fmax_x), fmt_f64(fmax_y)
         ));
     }
 
     // Reference (F.SilkS, above) and value (F.Fab, below).
     let cx = (pmin_x + pmax_x) / 2.0;
     s.push_str(&format!(
-        "\n  (fp_text reference \"REF**\" (at {:.4} {:.4} 0) (layer \"F.SilkS\") (effects (font (size 1 1) (thickness 0.15))))",
-        cx, cmin_y - 1.0
+        "\n  (fp_text reference \"REF**\" (at {} {} 0) (layer \"F.SilkS\") (effects (font (size 1 1) (thickness 0.15))))",
+        fmt_f64(cx), fmt_f64(cmin_y - 1.0)
     ));
     s.push_str(&format!(
-        "\n  (fp_text value \"{}\" (at {:.4} {:.4} 0) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))",
-        konnect_sexp::escaped_string(name), cx, cmax_y + 1.0
+        "\n  (fp_text value \"{}\" (at {} {} 0) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))",
+        konnect_sexp::escaped_string(name), fmt_f64(cx), fmt_f64(cmax_y + 1.0)
     ));
 
     s
@@ -804,9 +805,9 @@ async fn handle_create_footprint(
 
         let rotation = pad["rotation"].as_f64().unwrap_or(0.0);
         let at = if rotation == 0.0 {
-            format!("(at {x} {y})")
+            format!("(at {} {})", fmt_f64(x), fmt_f64(y))
         } else {
-            format!("(at {x} {y} {rotation})")
+            format!("(at {} {} {})", fmt_f64(x), fmt_f64(y), fmt_f64(rotation))
         };
 
         let roundrect_ratio = if let Some(ratio) = pad["roundrect_rratio"].as_f64() {
@@ -819,7 +820,7 @@ async fn handle_create_footprint(
         };
 
         let drill_sexp = if let Some(drill) = pad["drill"].as_f64() {
-            format!("(drill {})", drill)
+            format!("(drill {})", fmt_f64(drill))
         } else {
             String::new()
         };
@@ -830,8 +831,8 @@ async fn handle_create_footprint(
             pad_type,
             shape,
             at,
-            w,
-            h,
+            fmt_f64(w),
+            fmt_f64(h),
             layers,
             drill_sexp,
             roundrect_ratio
@@ -1363,7 +1364,10 @@ fn edit_footprint_pad_block(
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(0.0);
             let rot = parts.get(2).map(|s| format!(" {}", s)).unwrap_or_default();
-            new_pad.replace_range(at_pos..at_end, &format!("(at {} {}{})", x, old_y, rot));
+            new_pad.replace_range(
+                at_pos..at_end,
+                &format!("(at {} {}{})", fmt_f64(x), fmt_f64(old_y), rot),
+            );
         }
     }
     if let Some(y) = args["y"].as_f64() {
@@ -1383,7 +1387,10 @@ fn edit_footprint_pad_block(
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(0.0);
             let rot = parts.get(2).map(|s| format!(" {}", s)).unwrap_or_default();
-            new_pad.replace_range(at_pos..at_end, &format!("(at {} {}{})", old_x, y, rot));
+            new_pad.replace_range(
+                at_pos..at_end,
+                &format!("(at {} {}{})", fmt_f64(old_x), fmt_f64(y), rot),
+            );
         }
     }
     if args["width"].as_f64().is_some() || args["height"].as_f64().is_some() {
@@ -1408,7 +1415,10 @@ fn edit_footprint_pad_block(
                 .unwrap_or(0.0);
             let width = args["width"].as_f64().unwrap_or(old_width);
             let height = args["height"].as_f64().unwrap_or(old_height);
-            new_pad.replace_range(size_pos..size_end, &format!("(size {width} {height})"));
+            new_pad.replace_range(
+                size_pos..size_end,
+                &format!("(size {} {})", fmt_f64(width), fmt_f64(height)),
+            );
         }
     }
     if let Some(drill) = args["drill"].as_f64() {
@@ -1417,10 +1427,10 @@ fn edit_footprint_pad_block(
                 .find(')')
                 .map(|i| drill_pos + i + 1)
                 .unwrap_or(new_pad.len());
-            new_pad.replace_range(drill_pos..drill_end, &format!("(drill {drill})"));
+            new_pad.replace_range(drill_pos..drill_end, &format!("(drill {})", fmt_f64(drill)));
         } else {
             let insert_at = new_pad.rfind(')').unwrap_or(new_pad.len());
-            new_pad.insert_str(insert_at, &format!(" (drill {drill})"));
+            new_pad.insert_str(insert_at, &format!(" (drill {})", fmt_f64(drill)));
         }
     }
 
@@ -3116,8 +3126,8 @@ fn emit_pin(
         fmt_f64(angle),
         fmt_f64(length),
         konnect_sexp::escaped_string(name),
-        name_font,
-        name_font,
+        fmt_f64(name_font),
+        fmt_f64(name_font),
         konnect_sexp::escaped_string(number),
         PIN_TEXT,
         PIN_TEXT
@@ -3128,7 +3138,7 @@ fn emit_pin(
 
 fn fmt_pts(pts: &[(f64, f64)]) -> String {
     pts.iter()
-        .map(|(x, y)| format!("(xy {} {})", x, y))
+        .map(|(x, y)| format!("(xy {} {})", fmt_f64(*x), fmt_f64(*y)))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -3137,7 +3147,7 @@ fn g_polyline(pts: &[(f64, f64)], width: f64, fill: &str) -> String {
     format!(
         "\n      (polyline (pts {}) (stroke (width {}) (type default)) (fill (type {})))",
         fmt_pts(pts),
-        width,
+        fmt_f64(width),
         fill
     )
 }
@@ -3145,7 +3155,7 @@ fn g_polyline(pts: &[(f64, f64)], width: f64, fill: &str) -> String {
 fn g_arc(s: (f64, f64), m: (f64, f64), e: (f64, f64), fill: &str) -> String {
     format!(
         "\n      (arc (start {} {}) (mid {} {}) (end {} {}) (stroke (width 0.254) (type default)) (fill (type {})))",
-        s.0, s.1, m.0, m.1, e.0, e.1, fill
+        fmt_f64(s.0), fmt_f64(s.1), fmt_f64(m.0), fmt_f64(m.1), fmt_f64(e.0), fmt_f64(e.1), fill
     )
 }
 
@@ -3928,7 +3938,7 @@ fn distribute_rect_pins(pins: &[serde_json::Value], geoms: &mut [PinGeom]) {
             {
                 candidate -= 2.54;
             }
-            candidate = konnect_sexp::geometry::round6(candidate);
+            candidate = round6(candidate);
             positions.push(candidate);
             occupied.push(candidate);
             candidate -= 2.54;
@@ -4157,13 +4167,13 @@ impl ResolvedPin {
         let mut out = json!({
             "number": self.number,
             "name": self.name,
-            "x": self.x,
-            "y": self.y
+            "x": round6(self.x),
+            "y": round6(self.y)
         });
         // Only when it differs, so the common case stays compact and a moved
         // pin stands out.
         if let (Some((rx, ry)), Some(_)) = (self.requested, self.displacement()) {
-            out["requested"] = json!({ "x": rx, "y": ry });
+            out["requested"] = json!({ "x": round6(rx), "y": round6(ry) });
         }
         out
     }
@@ -5153,8 +5163,8 @@ async fn handle_get_symbol_info(
                 "number": pin.find("number").and_then(|n| n.get(1)).and_then(|n| n.as_str()).unwrap_or(""),
                 "name": pin.find("name").and_then(|n| n.get(1)).and_then(|n| n.as_str()).unwrap_or(""),
                 "type": pin_type,
-                "x": px,
-                "y": py
+                "x": round6(px),
+                "y": round6(py)
             })
         })
         .collect();

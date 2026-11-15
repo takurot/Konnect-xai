@@ -14,6 +14,7 @@ use crate::tools::{
     ToolDef,
 };
 use konnect_schematic_editor as cse;
+use konnect_sexp::geometry::round6;
 use konnect_sexp::{
     parser::parse_sexp,
     schematic::{
@@ -1208,7 +1209,7 @@ async fn handle_run_design_review(
                         "category": "drc",
                         "rule": violation.rule,
                         "message": violation.description,
-                        "location": violation.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
+                        "location": violation.pos.as_ref().map(|p| json!({ "x": round6(p.x), "y": round6(p.y) })),
                         "items": violation.items,
                     })
                 }));

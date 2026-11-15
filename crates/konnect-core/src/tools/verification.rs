@@ -8,6 +8,7 @@ use crate::tool;
 use crate::tools::{
     get_path, opt_str, require_f64, require_str, with_board_ipc_classified, ToolContext, ToolDef,
 };
+use konnect_sexp::geometry::round6;
 use konnect_sexp::writer::{write_atomic_if_unchanged, write_new_atomic};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -305,7 +306,7 @@ async fn handle_run_drc(
                 "severity": v.severity,
                 "rule": v.rule,
                 "description": v.description,
-                "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
+                "pos": v.pos.as_ref().map(|p| json!({ "x": round6(p.x), "y": round6(p.y) })),
                 "items": v.items
             })).collect::<Vec<_>>()
         }))
@@ -1037,8 +1038,8 @@ async fn handle_copy_routing_pattern(
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "copied": new_tracks.len(),
-            "dx": dx,
-            "dy": dy
+            "dx": round6(dx),
+            "dy": round6(dy)
         }))
         .unwrap(),
     ))
@@ -1117,8 +1118,8 @@ fn translate_block(
                         end,
                         format!(
                             "({key} {} {}{})",
-                            konnect_sexp::geometry::round6(x + dx),
-                            konnect_sexp::geometry::round6(y + dy),
+                            konnect_sexp::geometry::fmt_mm(x + dx),
+                            konnect_sexp::geometry::fmt_mm(y + dy),
                             if suffix.is_empty() {
                                 String::new()
                             } else {
@@ -1314,8 +1315,8 @@ async fn handle_check_clearance(
         "ref2": ref2,
         "mode": "anchor",
         "source": source,
-        "pos1": { "x": pos1.0, "y": pos1.1 },
-        "pos2": { "x": pos2.0, "y": pos2.1 },
+        "pos1": { "x": round6(pos1.0), "y": round6(pos1.1) },
+        "pos2": { "x": round6(pos2.0), "y": round6(pos2.1) },
         "measurement": MEASUREMENT_ANCHOR_TO_ANCHOR,
         "anchor_distance_mm": anchor_distance_mm,
         "distance_mm": anchor_distance_mm,
@@ -1392,10 +1393,10 @@ fn side_name(side: konnect_sexp::board::Side) -> &'static str {
 
 fn bbox_json(bbox: (f64, f64, f64, f64)) -> serde_json::Value {
     json!({
-        "min_x": bbox.0,
-        "min_y": bbox.1,
-        "max_x": bbox.2,
-        "max_y": bbox.3
+        "min_x": round6(bbox.0),
+        "min_y": round6(bbox.1),
+        "max_x": round6(bbox.2),
+        "max_y": round6(bbox.3)
     })
 }
 

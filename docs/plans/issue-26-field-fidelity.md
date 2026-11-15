@@ -1,0 +1,212 @@
+# Preserve footprint fields and library presentation
+
+This change implements [Issue #26](https://github.com/takurot/Konnect-xai/issues/26)
+after Issue #14's shared live-footprint validator. Existing target checks,
+reviewed plan revisions, recovery, and readback remain required.
+
+## Synchronize schematic fields
+
+`update_pcb_from_schematic` copies exported custom fields, Datasheet, and
+Description on additions and updates. Reference and Value retain their native
+fields. Footprint selects the library and is not duplicated as custom metadata.
+Duplicate names and the reserved ownership name refuse the operation.
+
+The hidden footprint property `Konnect:schematic_fields` records a versioned
+list of names and values last supplied by the schematic. Initial synchronization
+preserves fields of unknown origin. Later synchronization removes a missing
+schematic field only if its current value still matches the recorded value.
+A field edited only on the board is preserved when the schematic drops it.
+Native Datasheet and Description fields clear to empty text when removed.
+Other board-only fields remain unchanged. Malformed, oversized, duplicate, or
+unsupported ownership records refuse synchronization before mutation.
+
+Ownership and field values affect the reviewed plan revision. A shared live
+readback signature checks the native and custom field text, effects, layers,
+visibility, and the stroke style attached to each graphic's geometry and layer.
+It also checks the footprint's reference, library identity, position, side, and
+existing UUID. Assigned child IDs and full-turn angles do not change the
+presentation. Known parent links must identify the containing footprint.
+Placement, arrays, schematic sync, and library refresh use this same check.
+Missing, ambiguous, unreadable, or changed results after publication report an
+uncertain outcome and require inspection before another mutation.
+
+## Preserve authored fields and strokes
+
+Placement, schematic additions, and library refresh use one shared library
+property parser. Native fields retain their authored layer, position, font
+size, thickness, line spacing, visibility, and upright behavior. Custom library
+properties travel as typed fields and are not duplicated as drawing text.
+Legacy `fp_text reference` and `fp_text value` use the same parser.
+
+Graphic stroke types preserve `solid`, `default`, `dash`, `dot`, `dash_dot`,
+and `dash_dot_dot`. New ordinary graphics explicitly send the native solid
+enum. Equivalent default/solid graphics can remain a no-op, while dashed
+courtyards retain their style across a refresh.
+
+`update_footprints_from_library` accepts `reset_text`, a boolean defaulting to
+`false`. When true, Reference and Value restore the library's presentation
+while retaining their placed text. This choice affects the plan revision.
+The next unchanged refresh returns no-op.
+
+## Refuse lossy live updates
+
+Before preparing an update, the exact live document is serialized through
+`SaveDocumentToString`. Group membership, footprint groups, points, and variant
+state that the bundled IPC model cannot preserve produce a named conflict for
+the affected footprint. Saved disk contents do not substitute for unsaved live
+state. Unrelated footprints and no-op selections do not cause a refusal.
+
+## Validation status
+
+The unchanged native stroke builder was executed in a pinned-rustc harness.
+It returned unknown style `0` where explicit solid `2` was required. This is
+extracted-source reproduction, not a real KiCad session.
+
+At the pre-review checkpoint, the six new shared-library regressions passed in
+an isolated build of the exact source with pinned Rust. Disabling ownership removal and live loss findings in
+temporary source copies makes their two regressions fail. The checkout keeps
+both guards enabled. These checks do not verify served IPC behavior.
+
+Regression tests cover field ownership, first-sync preservation, corruption,
+roundtrip values, live loss findings, field presentation, all native stroke
+styles, reset-text convergence, and revision changes.
+Earlier Cargo results used a shared worktree target and are superseded because
+that cache could reuse another worktree's workspace artifact. Final verification
+must use this worktree's isolated target and exact source. The source harnesses
+are supporting evidence only.
+
+No KiCad installation is available on this host. No real IPC acceptance or
+80-percent coverage claim is made.
+
+The real R1 protocol capture reproduces a further no-op failure: native pads
+carry an inactive chamfer ratio of `0.2`, while the library builder supplies
+`0`. Pad comparison now clears only attributes that the protocol declares
+inactive for that shape. Roundrect radii and chamfered-rectangle radii, ratios,
+and corner selections remain significant. The exact-source harness fails
+before this correction and passes afterward; a native-fixture regression also
+checks these active-value counterexamples. This regression passes in the final
+isolated Cargo run recorded below.
+
+
+Final functional verification at source commit
+`3ff761cc2ebc6080c8dd1111a663d78b2e3358a4` used this worktree's isolated
+`target`, with all workspace packages rebuilt under the serialized verifier:
+
+- Targeted presentation, builder, NNG placement and core tests: 21 passed.
+- `cargo fmt --all -- --check`: passed.
+- `cargo test --workspace --locked --lib --tests`: 2,581 passed, 45 ignored.
+- `cargo test --workspace --locked --doc`: 9 passed, 2 ignored.
+- `cargo clippy --workspace --locked --all-targets -- -D warnings`: passed.
+- Bypassing presentation verification makes its regression fail; restoring the
+  source passes all four presentation tests.
+- Disabling ownership removal and live loss findings makes two of six metadata
+  regressions fail; restoring the source passes all six.
+- `git diff --exit-code` after restoration: passed.
+
+The ignored tests remain unverified. The report and individual logs are in
+`/tmp/konnect-v015/issue26-final/`; the serialized batch exited zero. Line and
+branch coverage for this source are still unmeasured. No 80-percent claim is
+made. Independent review of the final source and real KiCad acceptance remain
+required before treating the issue as complete. Manual cleanup covered only the
+changed code because the deslop tool is unavailable.
+
+
+A final independent review found that KiCad 10.0.5's rectangle serializer always
+emits `corner_radius`, including zero, while the local rectangle builder omits
+that default. Shared presentation verification now treats an omitted radius and
+an explicit zero as the same geometry. Nonzero radii remain significant.
+
+The new regression failed before the correction and all five presentation
+tests passed afterward in an exact-source harness using this worktree's own
+previously built IPC types and builders. This is source-level evidence, not a
+real KiCad session. The four normal gates for this correction are pending.
+
+Serializer evidence is
+[KiCad 10.0.5 `EDA_SHAPE::Serialize`](https://github.com/KiCad/kicad/blob/10.0.5/common/eda_shape.cpp#L234-L240).
+
+
+A follow-up serializer audit reproduced valid point polygons failing presentation
+readback when native KiCad removes repeated closing or adjacent vertices. The
+existing refresh polygon normalizer now lives beside shared presentation
+verification, so both consumers use the same geometry comparison. The added
+normalization removes only identical adjacent point nodes and repeated closing
+point nodes in closed loops. Arc nodes and open loops retain their prior
+behavior. Existing polygon ordering and winding normalization is preserved.
+
+A new presentation regression failed before the correction and passed after it;
+actual coordinate changes still fail verification. All seven tests in the exact presentation module pass, and the two independent
+audit reproducers also pass against the corrected module. These are exact-source
+harness results. Four normal gates for the combined rectangle and polygon
+corrections are pending.
+
+Native behavior follows KiCad10.0.5
+[`UnpackPolyLine`](https://github.com/KiCad/kicad/blob/10.0.5/common/api/api_utils.cpp#L119-L170)
+and
+[`SHAPE_LINE_CHAIN::Append`](https://github.com/KiCad/kicad/blob/10.0.5/libs/kimath/src/geometry/shape_line_chain.cpp#L218-L234).
+
+
+The same native-geometry audit confirmed endpoint-order differences for a
+cardinal semicircle: KiCad's `SetArcGeometry` swaps the endpoints to enforce its
+internal winding. The shared geometry helper now handles rectangle defaults,
+polygon point normalization, and arc endpoint order for both presentation and
+refresh comparison. Arc midpoint values remain exact. Changed endpoints, changed
+midpoints, and the opposite semicircle still fail verification. No coordinate
+tolerance or midpoint-recomputation exception was added.
+
+The new actual-module arc regression failed before the correction and passed
+after it, along with the independent native-shaped arc reproducer. Source-level
+geometry evidence is
+[KiCad10.0.5 `SetArcGeometry`](https://github.com/KiCad/kicad/blob/10.0.5/common/eda_shape.cpp#L1180-L1209).
+The latest four normal gates for all three native-geometry corrections are
+pending. Earlier queued gate wrappers were stopped before acquiring the build
+lane and did not execute checks.
+
+
+## Dependency integration
+
+This branch now builds on Issue17 parent
+`b5c3297ee7c925771b0af2ee3daeb4b29823da68`, which includes the Issue14
+placement-fidelity foundation. The ordinary local merge preserves library
+fields, styles, reset-text and live-loss refusals alongside copper-stack-aware
+pad/graphic/text transforms and geometry-associated readback. Both chamfer and
+layer checks use one in-transaction GetItems snapshot; presentation is still
+verified after publication. Both independent mock fault suites remain.
+
+New custom-field callers carry the actual live copper count. Their glyph mirror
+uses the same side-specific layer mask as ordinary footprint text, including
+inner copper. A new regression first failed for a drawing-layer property that
+was mirrored incorrectly. After the correction it passes inner-copper mapping,
+drawing-layer glyph preservation, reflected positions and invalid inner-layer
+refusal in the exact-source harness. This does not execute native KiCad.
+
+The preceding standalone source05931ad passed formatting, workspace tests and
+doctests, but Clippy found two clone-on-Copy expressions in a new test. Those
+two expressions were corrected in200a2e6. No full-gate pass is attributed to
+05931ad. All four normal gates for this merged candidate are pending.
+
+The checked IPC-builder Result migration remains owned by Issue18, which will
+build on this candidate. This branch does not introduce that API migration.
+The child PR remains Draft because its non-main base does not trigger regular
+CI and real KiCad acceptance and measured coverage remain separate gates.
+
+
+The merged inner-layer regression's new line literal required an explicit solid
+style under Issue26's graphic type. Compiling that exact literal against this
+worktree's IPC types reproduced E0063; adding the fixture's solid style compiled
+successfully. This changes test construction only. The waiting merged gate
+lease was canceled before acquiring the lane, so it provided no gate result.
+
+
+The branch also includes the subsequent Issue17 test-only Clippy correction
+`2c869f996d9e07717b7d6e2450edc4ade5173e17`. It removes a needless struct update
+and borrows a one-item slice. The active verification of1a8782d was canceled
+with its verified descendant processes before merging this correction. That
+run is recorded as canceled, not passed. A fresh four-gate run is required at
+the resulting immutable merged head.
+
+
+The08ec0f9 merged candidate passed formatting, the complete workspace test suite
+and doctests. Its final Clippy check found one nonminimal boolean in the merged
+mock's missing-readback fault condition. Factoring the shared update-applied
+condition preserves both fault modes and the separate postpublication case.
+This is test-only cleanup; a fresh four-gate run verifies the resulting head.
