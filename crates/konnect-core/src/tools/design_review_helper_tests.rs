@@ -236,3 +236,97 @@ async fn bom_health_refuses_a_schematic_it_cannot_load() {
         .unwrap_or_else(|e| e.to_string());
     assert!(message.contains("Failed to load schematic"), "{message}");
 }
+
+#[test]
+fn schematic_scope_defaults_to_file_and_refuses_anything_else() {
+    assert_eq!(requested_schematic_scope(&json!({})).unwrap(), "file");
+    assert_eq!(
+        requested_schematic_scope(&json!({"schematic_scope": null})).unwrap(),
+        "file"
+    );
+    assert_eq!(
+        requested_schematic_scope(&json!({"schematic_scope": "file"})).unwrap(),
+        "file"
+    );
+    assert_eq!(
+        requested_schematic_scope(&json!({"schematic_scope": "hierarchy"})).unwrap(),
+        "hierarchy"
+    );
+    let unknown = requested_schematic_scope(&json!({"schematic_scope": "board"})).unwrap_err();
+    assert!(unknown.is_error);
+    assert!(format!("{:?}", unknown.content).contains("expected 'file' or 'hierarchy'"));
+    let wrong_type = requested_schematic_scope(&json!({"schematic_scope": 3})).unwrap_err();
+    assert!(format!("{:?}", wrong_type.content).contains("expected a string"));
+}
+
+#[test]
+fn an_audit_result_must_be_a_successful_json_object() {
+    let ok = audit_result_json(text_result(r#"{"findings":[]}"#, false)).unwrap();
+    assert!(ok.is_object());
+    let errored = audit_result_json(text_result(r#"{"findings":[]}"#, true)).unwrap_err();
+    assert!(errored.to_string().contains("error result"), "{errored}");
+    let array = audit_result_json(text_result("[1]", false)).unwrap_err();
+    assert!(array.to_string().contains("not a JSON object"), "{array}");
+    let empty = audit_result_json(result_with(vec![], false)).unwrap_err();
+    assert!(empty.to_string().contains("no content"), "{empty}");
+    let image = audit_result_json(result_with(
+        vec![ToolContent::Image {
+            data: String::new(),
+            mime_type: "image/png".into(),
+        }],
+        false,
+    ))
+    .unwrap_err();
+    assert!(image.to_string().contains("non-text"), "{image}");
+    assert!(audit_result_json(text_result("not json", false)).is_err());
+}
+
+fn decoupling_sheet() -> String {
+    let lib = |name: &str, pin_name: &str| {
+        format!(
+            "(symbol \"{name}\" (symbol \"{short}_1_1\" (pin power_in line (at 0 0 0) (length 2.54) (name \"{pin_name}\") (number \"1\"))))",
+            short = name.split(':').nth(1).unwrap()
+        )
+    };
+    let place = |lib_id: &str, reference: &str, x: f64| {
+        format!(
+            "(symbol (lib_id \"{lib_id}\") (at {x} 20 0) (unit 1) (uuid \"{reference}-u\") (property \"Reference\" \"{reference}\" (at {x} 20 0)) (property \"Value\" \"v\" (at {x} 20 0)))"
+        )
+    };
+    format!(
+        "(kicad_sch (version 20250610) (generator \"konnect\") (uuid \"11111111-1111-4111-8111-111111111111\") (paper \"A4\") (lib_symbols {} {} {}) {} {} {})",
+        lib("Chip:MCU", "VCC"),
+        lib("Device:R_Small", "VCC"),
+        lib("Connector:Conn_01x01", "VCC"),
+        place("Chip:MCU", "U1", 20.0),
+        place("Device:R_Small", "R1", 60.0),
+        place("Connector:Conn_01x01", "J1", 100.0),
+    )
+}
+
+#[tokio::test]
+async fn the_decoupling_audit_checks_ics_only_and_flags_an_undecoupled_power_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("d.kicad_sch");
+    std::fs::write(&path, decoupling_sheet()).unwrap();
+    let result = handle_audit_decoupling_file(
+        &json!({"schematic": path.display().to_string()}),
+        &test_ctx(),
+    )
+    .await
+    .unwrap();
+    assert!(!result.is_error);
+    let ToolContent::Text { text } = &result.content[0] else {
+        panic!("expected text");
+    };
+    let body: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        body["total_power_pins"], 1,
+        "resistor and connector are skipped"
+    );
+    assert_eq!(body["pass_count"], 0);
+    let findings = body["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["component"], "U1");
+    assert_eq!(findings[0]["severity"], "error");
+}
