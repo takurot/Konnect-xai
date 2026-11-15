@@ -612,6 +612,9 @@ impl UnreachableReason {
             | nng::Error::ConnectionReset
             | nng::Error::ConnectionAborted
             | nng::Error::Protocol => Self::HandshakeFailed,
+            // NNG leaves ENOTCONN unmapped when a Unix peer closes during negotiation.
+            #[cfg(unix)]
+            nng::Error::SystemErr(code) if code == libc::ENOTCONN as u32 => Self::HandshakeFailed,
             _ => Self::TransportError,
         }
     }
@@ -6040,6 +6043,19 @@ mod diagnostic_tests {
         assert!(diagnostic.contains("[redacted]"), "{diagnostic}");
         assert!(!diagnostic.contains("secret"), "{diagnostic}");
         assert!(!diagnostic.contains("hidden"), "{diagnostic}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_disconnected_unix_socket_reports_a_failed_handshake() {
+        assert_eq!(
+            UnreachableReason::from_dial_error(nng::Error::SystemErr(libc::ENOTCONN as u32)),
+            UnreachableReason::HandshakeFailed,
+        );
+        assert_eq!(
+            UnreachableReason::from_dial_error(nng::Error::SystemErr(libc::EIO as u32)),
+            UnreachableReason::TransportError,
+        );
     }
 
     #[test]

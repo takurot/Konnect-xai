@@ -196,8 +196,9 @@ apart cases that used to share one `false`, and each has a different fix:
 | `transport_error` | Any other dial or send failure. | Read `message`. |
 | `request_failed` | The request did not complete and may have reached the endpoint. A KiCad status in `message` (for example `AS_NOT_READY` while an editor is still loading) proves it did; a receive timeout or a malformed reply does not. | With a KiCad status: wait for the editor to finish loading, then retry. Without one: treat the endpoint as unproven and check what holds the address. |
 
-`handshake_failed` takes NNG's fixed 10-second negotiation limit to appear.
-That is longer than `check_kicad_ui`'s default 5-second budget, which then
+A silent listener takes NNG's fixed 10-second negotiation limit to report
+`handshake_failed`; a listener that closes the connection can fail immediately.
+The silent case exceeds `check_kicad_ui`'s default 5-second budget, which then
 reports `timed_out` instead, so pass `timeout_seconds` above 10 to see it.
 
 ### `access_denied` from a sandboxed AI client
