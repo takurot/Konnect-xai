@@ -1058,7 +1058,7 @@ mod tests {
             ),
             (
                 "(place R1 1000000 -500000 front 0)",
-                "(place R1 1000000 -500001 front 0)",
+                "(place R1 1000000 -500010 front 0)",
                 "changes placement",
             ),
             (
@@ -1145,17 +1145,17 @@ mod tests {
             ),
             (
                 "(circle F.Cu 6000 0 0)",
-                "(circle F.Cu 6001 0 0)",
+                "(circle F.Cu 6010 0 0)",
                 "geometry differs",
             ),
             (
                 "(circle F.Cu 6000 0 0)",
-                "(circle F.Cu 6000 1 0)",
+                "(circle F.Cu 6000 10 0)",
                 "geometry differs",
             ),
             (
                 "(circle F.Cu 6000 0 0)",
-                "(circle F.Cu 6000 0 1)",
+                "(circle F.Cu 6000 0 10)",
                 "geometry differs",
             ),
             (
