@@ -1882,14 +1882,6 @@ mod tests {
     use prost::Message;
     use std::collections::{BTreeMap, BTreeSet};
 
-    /// The serialization KiCad 10 actually writes — produced by running this
-    /// module's hand-written fixture through `kicad-cli fp upgrade` — parses,
-    /// and the two universal flags KiCad stamps into every saved footprint
-    /// (`embedded_fonts no`, `duplicate_pad_numbers_are_jumpers no`, plus
-    /// `remove_unused_layers no` on pads) do not refuse it. The hand-written
-    /// fixture alone cannot catch this class: it shares this module's own
-    /// assumptions about the format (see the fixtures-from-KiCad rule in
-    /// CONTRIBUTING).
     #[test]
     fn pcb_fidelity3_refresh_readback_rejects_nonfinite_corner_ratios_and_keeps_offsets() {
         let expected = instance_for_layer_readback();
@@ -2062,6 +2054,14 @@ mod tests {
         assert!(capture.update_batches.is_empty());
     }
 
+    /// The serialization KiCad 10 actually writes — produced by running this
+    /// module's hand-written fixture through `kicad-cli fp upgrade` — parses,
+    /// and the two universal flags KiCad stamps into every saved footprint
+    /// (`embedded_fonts no`, `duplicate_pad_numbers_are_jumpers no`, plus
+    /// `remove_unused_layers no` on pads) do not refuse it. The hand-written
+    /// fixture alone cannot catch this class: it shares this module's own
+    /// assumptions about the format (see the fixtures-from-KiCad rule in
+    /// CONTRIBUTING).
     #[test]
     fn a_footprint_kicad_saved_is_accepted_not_refused() {
         let source = KICAD_LIBRARY_FOOTPRINT;
