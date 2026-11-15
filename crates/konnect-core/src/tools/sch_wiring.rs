@@ -32,6 +32,10 @@ use serde_json::json;
 #[path = "sch_wire_safety_tests.rs"]
 mod wire_safety_tests;
 
+#[cfg(test)]
+#[path = "sch_wiring_refusal_tests.rs"]
+mod wire_and_label_refusal_tests;
+
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
@@ -2101,7 +2105,7 @@ async fn handle_batch_rotate_labels(
         Err(e) => return Ok(e),
     };
     let mut rotated = 0usize;
-    for label_arg in &labels {
+    for (index, label_arg) in labels.iter().enumerate() {
         let full_args = json!({
             "schematic": sch_path.display().to_string(),
             "net": label_arg["net"],
@@ -2109,7 +2113,16 @@ async fn handle_batch_rotate_labels(
             "y": label_arg["y"],
             "rotation": label_arg["rotation"]
         });
-        handle_rotate_label(&full_args, ctx).await?;
+        let outcome = handle_rotate_label(&full_args, ctx).await?;
+        if outcome.is_error {
+            let reason = match outcome.content.first() {
+                Some(crate::mcp::protocol::ToolContent::Text { text }) => text.as_str(),
+                _ => "rotation was refused",
+            };
+            return Ok(CallToolResult::error(format!(
+                "labels[{index}] was not rotated: {reason} ({rotated} earlier label(s) were already rotated and written)"
+            )));
+        }
         rotated += 1;
     }
     Ok(CallToolResult::json(&json!({ "rotated": rotated })))

@@ -2298,6 +2298,10 @@ fn round3(v: f64) -> f64 {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[path = "placement_net_tests.rs"]
+mod net_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
