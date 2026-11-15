@@ -2285,7 +2285,7 @@ mod palette_boundary_tests {
             json!({"diameter":0.2,"drill":0.3}),
         ] {
             assert!(
-                parse_via_dimensions(&[value.clone()]).is_err(),
+                parse_via_dimensions(std::slice::from_ref(&value)).is_err(),
                 "accepted {value}"
             );
         }

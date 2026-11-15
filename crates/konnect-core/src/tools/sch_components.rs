@@ -8868,10 +8868,10 @@ mod multi_unit_component_tests {
                 "ambiguous_target",
             ),
         ] {
-            let error = component_target_from_source(&path, &source, "U1")
-                .err()
-                .expect("inconsistent component identity must be refused")
-                .into_result();
+            let error = match component_target_from_source(&path, &source, "U1") {
+                Err(error) => error.into_result(),
+                Ok(_) => panic!("inconsistent component identity must be refused"),
+            };
             assert_eq!(extract_error_kind(&error).as_deref(), Some(expected_kind));
             assert_eq!(std::fs::read(&path).unwrap(), original);
         }
