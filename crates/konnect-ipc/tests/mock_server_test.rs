@@ -4339,7 +4339,7 @@ mod v015_footprint_edit_contract_tests {
         let untouched = fp.definition.as_ref().unwrap().items[0].clone();
         let (mock, held) = spawn_board(vec![packed(&fp)]);
         let result = KiCadIpcClient::new(&mock.url)
-            .set_footprint_graphic_points("U1", "target", &[(1.0, 0.0), (1.0, 1.0), (2.0, 1.0)])
+            .set_footprint_graphic_points("U1", "target", &[(2.0, 0.0), (2.0, 1.0), (3.0, 1.0)])
             .unwrap();
         assert_eq!(result, "polygon");
         let held = held.lock().unwrap();
@@ -4356,13 +4356,13 @@ mod v015_footprint_edit_contract_tests {
         assert_eq!(
             points[0].geometry,
             Some(ct::poly_line_node::Geometry::Point(
-                builders::vec2(100.0, 99.0).unwrap()
+                builders::vec2(100.0, 98.0).unwrap()
             ))
         );
         assert_eq!(
             points[2].geometry,
             Some(ct::poly_line_node::Geometry::Point(
-                builders::vec2(101.0, 98.0).unwrap()
+                builders::vec2(101.0, 97.0).unwrap()
             ))
         );
     }
