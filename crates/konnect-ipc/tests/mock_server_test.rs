@@ -4801,22 +4801,26 @@ mod v015_footprint_edit_contract_tests {
             }
         }
         assert!(build(&[], &IpcFieldPlacement::default(), f64::NAN).is_err());
+        // Keep degree-to-radian conversion finite so the derived-angle guards run.
+        let huge_rotation = f64::MAX / 4.0;
         let fields = IpcFieldPlacement {
             reference_at: Some((0.0, 0.0, f64::MAX)),
             ..Default::default()
         };
-        assert!(build(&[], &fields, f64::MAX)
+        assert!(build(&[], &fields, huge_rotation)
             .unwrap_err()
             .to_string()
             .contains("rotation must be finite"));
         let mut overflow_pad = pad;
         overflow_pad.rotation = f64::MAX;
-        assert!(
-            build(&[overflow_pad], &IpcFieldPlacement::default(), f64::MAX)
-                .unwrap_err()
-                .to_string()
-                .contains("rotation must be finite")
-        );
+        assert!(build(
+            &[overflow_pad],
+            &IpcFieldPlacement::default(),
+            huge_rotation
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("rotation must be finite"));
         let mut field = value_field("custom");
         field.name = "MPN".into();
         let text = field.text.as_mut().unwrap().text.as_mut().unwrap();
@@ -4833,7 +4837,7 @@ mod v015_footprint_edit_contract_tests {
                 fields: vec![field],
                 ..Default::default()
             },
-            f64::MAX
+            huge_rotation
         )
         .unwrap_err()
         .to_string()
