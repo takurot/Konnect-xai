@@ -5037,6 +5037,7 @@ mod issue25_batch_native_attributes_tests {
 mod coverage_batch_boundaries {
     use super::*;
     use crate::mcp::protocol::ToolContent;
+    use crate::tools::ToolContext;
     use std::sync::Arc;
 
     fn context() -> Arc<ToolContext> {
