@@ -10156,3 +10156,318 @@ mod issue25_native_attributes_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod coverage_component_observation_contracts {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use std::sync::Arc;
+
+    const ROOT: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const FIRST: &str = "11111111-1111-4111-8111-111111111111";
+    const SECOND: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn source() -> String {
+        format!(
+            r#"(kicad_sch (version 20250610) (generator "eeschema") (uuid "{ROOT}")
+          (lib_symbols (symbol "Test:R"
+            (property "Reference" "R" (at 0 2 0))
+            (property "Value" "R" (at 0 -2 0))
+            (symbol "R_1_1" (pin passive line (at 0 0 0) (length 0) (name "P") (number "1")))))
+          (symbol (lib_id "Test:R") (at 50 60 0) (unit 1) (uuid "{FIRST}")
+            (property "Reference" "R1" (at 52 58 0))
+            (property "Value" "10k" (at 52 62 0))
+            (instances (project "design" (path "/{ROOT}" (reference "R1") (unit 1))))))"#
+        )
+    }
+
+    fn observed_unit_source(source: &str) -> &str {
+        let (start, end) = konnect_sexp::writer::find_direct_child_blocks(source, "kicad_sch")
+            .into_iter()
+            .find(|(start, end)| source[*start..*end].contains(FIRST))
+            .unwrap();
+        &source[start..end]
+    }
+
+    fn fixture(source: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        std::fs::write(&path, source).unwrap();
+        (dir, path)
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn incomplete_instance_metadata_refuses_edits_before_the_source_changes() {
+        let original = source();
+        for corrupted in [
+            original.replace("(reference \"R1\") (unit 1)", "(reference \"R1\")"),
+            original.replace("(project \"design\"", "(project"),
+            original.replace("(reference \"R1\")", "(reference \"R9\")"),
+            original.replace("(reference \"R1\") (unit 1)", "(reference \"R1\") (unit 2)"),
+        ] {
+            let (_dir, path) = fixture(&corrupted);
+            let result = handle_edit_schematic_component(
+                &json!({"schematic": path, "reference": "R1", "value": "changed"}),
+                &context(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{result:?}");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), corrupted);
+        }
+    }
+
+    #[test]
+    fn same_unit_placements_with_distinct_uuids_are_an_ambiguous_component_target() {
+        let original = source();
+        let unit = observed_unit_source(&original).replace(FIRST, SECOND);
+        let duplicated = format!("{} {unit})", &original[..original.len() - 1]);
+        let (_dir, path) = fixture(&duplicated);
+        let error = component_target_from_source(&path, &duplicated, "R1")
+            .unwrap_err()
+            .into_result();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&error).as_deref(),
+            Some("ambiguous_target")
+        );
+    }
+
+    #[test]
+    fn readback_never_combines_uuids_from_two_different_component_references() {
+        let original = source();
+        let unit = observed_unit_source(&original)
+            .replace(FIRST, SECOND)
+            .replace("R1", "R2");
+        let combined = format!("{} {unit})", &original[..original.len() - 1]);
+        let (_dir, path) = fixture(&combined);
+        let observed = cse::Schematic::load(&path).unwrap();
+        let error = component_mutation_readback_from_schematic(
+            &path,
+            &observed,
+            &[FIRST.into(), SECOND.into()],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&error).as_deref(),
+            Some("ambiguous_target")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), combined);
+    }
+
+    #[test]
+    fn readback_does_not_certify_a_field_position_the_saved_document_does_not_show() {
+        let original = source();
+        let (_dir, path) = fixture(&original);
+        let target = component_target_from_source(&path, &original, "R1").unwrap();
+        let document = cse::Schematic::load(&path).unwrap();
+        let observed = component_mutation_readback_from_schematic(
+            &path,
+            &document,
+            &target.uuids(),
+            Some("R1"),
+        )
+        .unwrap();
+        let intent = ComponentMutationIntent::new(target).with_field_placements(
+            vec![(
+                "Value".into(),
+                FieldPlacement {
+                    x: Some(53.0),
+                    ..Default::default()
+                },
+            )],
+            Some(1),
+        );
+        let error = verify_requested_field_placements(&path, &observed, &intent, "post-commit")
+            .unwrap_err();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&error).as_deref(),
+            Some("stale_target")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn malformed_field_coordinates_abort_an_edit_without_committing_sibling_changes() {
+        for placement in ["(at NaN 62 0)", "(at 52 62 NaN)", "(at 52 62 0 extra)"] {
+            let original = source().replace("(at 52 62 0)", placement);
+            let (_dir, path) = fixture(&original);
+            let result = handle_edit_schematic_component(&json!({"schematic": path, "reference": "R1", "fields": {"MPN": "new"}, "field_placements": {"Value": {"hide": true}}}), &context()).await.unwrap();
+            assert!(result.is_error, "{placement}: {result:?}");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+        }
+    }
+
+    #[tokio::test]
+    async fn hiding_and_unhiding_inline_field_flags_keeps_the_original_position() {
+        let original = source().replace("(at 52 62 0)", "(at 52 62 0) (hide yes)");
+        let (_dir, path) = fixture(&original);
+        let result = handle_edit_schematic_component(&json!({"schematic": path, "reference": "R1", "field_placements": {"Value": {"hide": false}}}), &context()).await.unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let tree = parse_sexp(&saved).unwrap();
+        let instance = tree
+            .find_all("symbol")
+            .into_iter()
+            .find(|node| node.find_str("uuid") == Some(FIRST))
+            .unwrap();
+        let value = instance
+            .find_all("property")
+            .into_iter()
+            .find(|node| node.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("Value"))
+            .unwrap();
+        assert_eq!(value.find("at").unwrap().get_f64(1), Some(52.0));
+        assert_eq!(value.find("at").unwrap().get_f64(2), Some(62.0));
+        assert!(value.find("hide").is_none());
+    }
+
+    #[tokio::test]
+    async fn bad_custom_fields_and_native_attributes_refuse_the_whole_edit() {
+        let original = source();
+        let (_dir, path) = fixture(&original);
+        let result = handle_edit_schematic_component(&json!({"schematic": path, "reference": "R1", "dnp": true, "fields": {"MPN": "new", "Reference": "R2"}}), &context()).await.unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn replacement_refuses_to_discard_a_placed_unit_missing_in_the_new_symbol() {
+        let original = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+        let (_, end) = konnect_sexp::writer::find_direct_child_blocks(original, "kicad_sch")
+            .into_iter()
+            .find(|(start, end)| original[*start..*end].starts_with("(lib_symbols"))
+            .unwrap();
+        let mut source = original.to_owned();
+        source.insert_str(end - 1, " (symbol \"Test:Single\" (property \"Reference\" \"U\" (at 0 0 0)) (symbol \"Single_1_1\"))");
+        let (_dir, path) = fixture(&source);
+        let result = handle_replace_component(
+            &json!({"schematic": path, "reference": "U1", "new_lib_id": "Test:Single"}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn filtered_refresh_and_anchor_reset_report_missing_targets_without_mutation() {
+        let original = source();
+        let (_dir, path) = fixture(&original);
+        let refresh = handle_update_symbols_from_library(
+            &json!({"schematic": path, "references": [], "dry_run": true}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!refresh.is_error, "{refresh:?}");
+        assert_eq!(body(&refresh)["updated_count"], 0);
+        let reset = handle_reset_schematic_field_positions(
+            &json!({"schematic": path, "references": ["Missing"], "dry_run": true}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body(&reset)["not_found"], json!(["Missing"]));
+        assert_eq!(body(&reset)["moved_count"], 0);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+    #[tokio::test]
+    async fn anchor_reset_distinguishes_missing_library_anchors_from_missing_properties() {
+        let base = source();
+        for (source, expected_key) in [
+            (
+                base.replace("(property \"Value\" \"R\" (at 0 -2 0))", ""),
+                "no_library_anchor",
+            ),
+            (
+                base.replace("(property \"Value\" \"10k\" (at 52 62 0))", ""),
+                "no_property",
+            ),
+        ] {
+            let (_dir, path) = fixture(&source);
+            let result = handle_reset_schematic_field_positions(
+                &json!({"schematic": path, "references": ["R1"], "dry_run": true}),
+                &context(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{result:?}");
+            assert!(
+                body(&result)[expected_key]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("R1.Value")),
+                "{result:?}"
+            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_skips_an_unidentified_symbol_and_deduplicates_shared_library_anchors() {
+        let original = source();
+        let second = observed_unit_source(&original)
+            .replace(FIRST, SECOND)
+            .replace("R1", "R2");
+        let combined = format!("{} {second})", &original[..original.len() - 1]);
+        let (_dir, path) = fixture(&combined);
+        let result = handle_reset_schematic_field_positions(
+            &json!({"schematic": path, "dry_run": true}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(body(&result)["moved_count"], 4);
+        let unidentified = combined.replace("(property \"Reference\" \"R2\" (at 52 58 0))", "");
+        std::fs::write(&path, &unidentified).unwrap();
+        let result = handle_reset_schematic_field_positions(
+            &json!({"schematic": path, "dry_run": true}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(body(&result)["moved_count"], 2);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), unidentified);
+    }
+    #[test]
+    fn readback_refuses_an_unrequested_mirror_change_in_the_observed_document() {
+        let original = source();
+        let (_dir, path) = fixture(&original);
+        let target = component_target_from_source(&path, &original, "R1").unwrap();
+        for mirror in ["x", "y"] {
+            let observed_source =
+                original.replace("(at 50 60 0)", &format!("(at 50 60 0) (mirror {mirror})"));
+            std::fs::write(&path, observed_source).unwrap();
+            let document = cse::Schematic::load(&path).unwrap();
+            let observed = component_mutation_readback_from_schematic(
+                &path,
+                &document,
+                &target.uuids(),
+                Some("R1"),
+            )
+            .unwrap();
+            let error = verify_component_expectations(&path, &observed, &target.units).unwrap_err();
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&error).as_deref(),
+                Some("stale_target")
+            );
+        }
+    }
+}

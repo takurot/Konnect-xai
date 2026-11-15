@@ -2309,3 +2309,57 @@ mod coverage_export_identity {
         );
     }
 }
+
+#[cfg(test)]
+mod coverage_export_generated_files {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn generated_netlist_is_read_from_the_requested_nested_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("design.kicad_sch");
+        let output = dir.path().join("exports").join("design.net");
+        std::fs::write(&schematic, crate::tools::blank_schematic_template()).unwrap();
+        let executable = cli::test_support::write_script(
+            dir.path(),
+            "netlist-writer",
+            "#!/bin/sh\nprintf '(export (version %s))' \"$7\" > \"$5\"\n",
+            "@echo off\r\n> \"%~5\" echo (export (version %~7))\r\nexit /b 0\r\n",
+        );
+        let config = crate::tools::ServerConfig {
+            kicad_cli: executable.to_str().unwrap().into(),
+            ..Default::default()
+        };
+        let context = ToolContext::new(config, Arc::new(crate::router::ToolRouter::new()));
+        let result = handle_generate_netlist(
+            &json!({"schematic": schematic, "output": output, "format": "xml"}),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let generated = parse_sexp(&std::fs::read_to_string(&output).unwrap()).unwrap();
+        assert_eq!(generated.find_str("version"), Some("kicadxml"));
+    }
+
+    #[tokio::test]
+    async fn connectivity_fix_does_not_collapse_a_short_wire_onto_its_own_other_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        let source = "(kicad_sch (wire (pts (xy 0 0) (xy 0.04 0)) (uuid \"11111111-1111-4111-8111-111111111111\")))";
+        std::fs::write(&path, source).unwrap();
+        let context = ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_fix_connectivity(
+            &json!({"schematic": path, "snap_tolerance": 0.05}),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+    }
+}

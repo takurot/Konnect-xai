@@ -5573,3 +5573,123 @@ mod coverage_hierarchy_graphs {
         assert_eq!(std::fs::read(child).unwrap(), before);
     }
 }
+
+#[cfg(test)]
+mod coverage_sheet_pin_mismatch_reports {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn validation_names_missing_labels_and_missing_parent_pins() {
+        for (parent_pin, child_label) in [(Some("PARENT_ONLY"), None), (None, Some("CHILD_ONLY"))] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root.kicad_sch");
+            let child = dir.path().join("child.kicad_sch");
+            let mut schematic =
+                cse::Schematic::from_source(&root, crate::tools::blank_schematic_template())
+                    .unwrap();
+            let mut sheet = cse::Sheet::new("Child", "child.kicad_sch", 10.0, 20.0, 40.0, 50.0);
+            if let Some(name) = parent_pin {
+                sheet.add_pin(cse::SheetPin::new(name, "input", 50.0, 22.54));
+            }
+            schematic.add_sheet(sheet);
+            std::fs::write(&root, schematic.to_source()).unwrap();
+            let mut schematic =
+                cse::Schematic::from_source(&child, crate::tools::blank_schematic_template())
+                    .unwrap();
+            if let Some(name) = child_label {
+                schematic.add_hierarchical_label(name, "input", 10.0, 20.0);
+            }
+            std::fs::write(&child, schematic.to_source()).unwrap();
+            let before = std::fs::read(&root).unwrap();
+            let context = ToolContext::new(
+                crate::tools::ServerConfig::default(),
+                Arc::new(crate::router::ToolRouter::new()),
+            );
+            let result = handle_validate_sheet_pins(&json!({"schematic": root}), &context)
+                .await
+                .unwrap();
+            assert!(!result.is_error, "{result:?}");
+            let ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text")
+            };
+            let report: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(report["issue_count"], 1);
+            assert!(text.contains(parent_pin.or(child_label).unwrap()), "{text}");
+            assert_eq!(std::fs::read(root).unwrap(), before);
+        }
+    }
+}
+
+#[cfg(test)]
+mod coverage_sheet_precommit_identity {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn every_sheet_item_edit_refuses_a_prospective_result_that_lost_its_bound_identity() {
+        let operations = [
+            (
+                "edit_sheet",
+                json!({"sheet_name": "Child", "new_name": "Renamed"}),
+            ),
+            (
+                "add_sheet_pin",
+                json!({"sheet_name": "Child", "pin_name": "Added", "pin_type": "input", "x": 50, "y": 30}),
+            ),
+            (
+                "edit_sheet_pin",
+                json!({"sheet_name": "Child", "pin_name": "Existing", "new_name": "Renamed"}),
+            ),
+            (
+                "delete_sheet_pin",
+                json!({"sheet_name": "Child", "pin_name": "Existing"}),
+            ),
+            ("import_sheet_pins", json!({"sheet_name": "Child"})),
+        ];
+        for (operation, mut args) in operations {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root.kicad_sch");
+            let child = dir.path().join("child.kicad_sch");
+            let mut schematic =
+                cse::Schematic::from_source(&root, crate::tools::blank_schematic_template())
+                    .unwrap();
+            let mut sheet = cse::Sheet::new("Child", "child.kicad_sch", 10.0, 20.0, 40.0, 50.0);
+            let uuid = sheet.uuid.clone();
+            sheet.add_pin(cse::SheetPin::new("Existing", "input", 50.0, 22.54));
+            schematic.add_sheet(sheet);
+            std::fs::write(&root, schematic.to_source()).unwrap();
+            let mut schematic =
+                cse::Schematic::from_source(&child, crate::tools::blank_schematic_template())
+                    .unwrap();
+            schematic.add_hierarchical_label("Imported", "input", 10.0, 20.0);
+            std::fs::write(&child, schematic.to_source()).unwrap();
+            let before = std::fs::read(&root).unwrap();
+            let child_before = std::fs::read(&child).unwrap();
+            args["schematic"] = json!(root);
+            HIERARCHY_PROSPECTIVE_FAULT.with(|fault| {
+                *fault.borrow_mut() = Some(HierarchyProspectiveFault::Replace {
+                    from: format!("(uuid \"{uuid}\")"),
+                    to: "(uuid \"99999999-9999-4999-8999-999999999999\")".into(),
+                });
+            });
+            let definition = tools()
+                .into_iter()
+                .find(|tool| tool.name == operation)
+                .unwrap();
+            let context = Arc::new(ToolContext::new(
+                crate::tools::ServerConfig::default(),
+                Arc::new(crate::router::ToolRouter::new()),
+            ));
+            let result = (definition.handler)(&args, context).await.unwrap();
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("stale_target"),
+                "{operation}: {result:?}"
+            );
+            assert_eq!(std::fs::read(root).unwrap(), before, "{operation}");
+            assert_eq!(std::fs::read(child).unwrap(), child_before, "{operation}");
+        }
+    }
+}

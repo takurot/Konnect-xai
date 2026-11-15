@@ -5194,3 +5194,70 @@ mod coverage_wiring_safety_paths {
         assert_eq!((added, removed), (0, 0));
     }
 }
+
+#[cfg(test)]
+mod coverage_marker_pair_identity {
+    use super::*;
+
+    fn source(stacked: bool) -> String {
+        let second = if stacked { 0 } else { 10 };
+        format!(
+            r#"(kicad_sch (lib_symbols (symbol "Test:P"
+            (symbol "P_0_1" (pin passive line (at 0 0 0) (length 0) (name "P") (number "1")))
+            (symbol "P_2_1")))
+            (symbol (lib_id "Test:P") (at 0 0 0) (unit 1) (uuid "11111111-1111-4111-8111-111111111111") (property "Reference" "U1"))
+            (symbol (lib_id "Test:P") (at 10 0 0) (unit 1) (uuid "22222222-2222-4222-8222-222222222222") (property "Reference" "U2"))
+            (no_connect (at 0 0) (uuid "33333333-3333-4333-8333-333333333333"))
+            (no_connect (at {second} 0) (uuid "44444444-4444-4444-8444-444444444444")))"#
+        )
+    }
+
+    #[test]
+    fn independent_marker_moves_and_preexisting_stacks_keep_both_stable_identities() {
+        for stacked in [false, true] {
+            let before = source(stacked);
+            let after = before
+                .replace(
+                    "(lib_id \"Test:P\") (at 0 0 0)",
+                    "(lib_id \"Test:P\") (at 5 0 0)",
+                )
+                .replace(
+                    "(lib_id \"Test:P\") (at 10 0 0)",
+                    "(lib_id \"Test:P\") (at 15 0 0)",
+                );
+            let carries =
+                plan_no_connect_carry(&parse_sexp(&before).unwrap(), &parse_sexp(&after).unwrap())
+                    .unwrap();
+            assert_eq!(carries.len(), 2);
+            let saved = apply_no_connect_carries(after, &carries).unwrap();
+            let markers = parse_sexp(&saved).unwrap();
+            let markers = markers.find_all("no_connect");
+            assert_eq!(markers.len(), 2);
+            assert_eq!(
+                markers[0].find_str("uuid"),
+                Some("33333333-3333-4333-8333-333333333333")
+            );
+            assert_eq!(
+                markers[1].find_str("uuid"),
+                Some("44444444-4444-4444-8444-444444444444")
+            );
+            assert_eq!(parse_at(markers[0]).unwrap().0, 5.0);
+            assert_eq!(
+                parse_at(markers[1]).unwrap().0,
+                if stacked { 5.0 } else { 15.0 }
+            );
+        }
+    }
+
+    #[test]
+    fn moving_a_protected_pin_to_another_unit_is_not_a_matching_arrival() {
+        let before = source(false);
+        let after = before.replacen("(unit 1)", "(unit 2)", 1);
+        let result =
+            plan_no_connect_carry(&parse_sexp(&before).unwrap(), &parse_sexp(&after).unwrap());
+        assert!(matches!(
+            result,
+            Err(NoConnectCarryError::Unmappable { .. })
+        ));
+    }
+}

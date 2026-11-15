@@ -5381,3 +5381,61 @@ mod coverage_batch_reports {
         assert!(std::fs::read_to_string(path).unwrap().contains("Keep"));
     }
 }
+
+#[cfg(test)]
+mod coverage_bulk_move_source_boundaries {
+    use super::*;
+    use crate::tools::ToolContext;
+    use std::sync::Arc;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    const SOURCE: &str = "(kicad_sch (lib_symbols) (symbol (lib_id \"Test:R\") (at 50.8 63.5 0) (unit 1) (uuid \"11111111-1111-4111-8111-111111111111\") (property \"Reference\" \"R1\" (at 52 58 0)) (property \"Value\" \"10k\" (at 52 62 0))))";
+
+    #[tokio::test]
+    async fn a_zero_move_keeps_field_text_unchanged_and_reports_missing_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        std::fs::write(&path, SOURCE).unwrap();
+        let result = handle_bulk_move(
+            &json!({"schematic": path, "references": ["Missing", 5, "R1"], "dx": 0, "dy": 0}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert!(format!("{result:?}").contains("Missing"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), SOURCE);
+    }
+
+    #[tokio::test]
+    async fn computed_position_overflow_and_nonfinite_saved_rotation_are_no_write_refusals() {
+        for (source, dx) in [
+            (
+                SOURCE.replace("(at 50.8 63.5 0)", "(at 9000000000000 63.5 0)"),
+                9e12,
+            ),
+            (
+                SOURCE.replace("(at 50.8 63.5 0)", "(at 50.8 63.5 NaN)"),
+                1.27,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("design.kicad_sch");
+            std::fs::write(&path, &source).unwrap();
+            let result = handle_bulk_move(
+                &json!({"schematic": path, "references": ["R1"], "dx": dx, "dy": 0}),
+                &context(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{result:?}");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        }
+    }
+}
