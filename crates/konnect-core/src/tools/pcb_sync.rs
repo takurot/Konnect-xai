@@ -71,10 +71,16 @@ struct UnassignedFootprint {
     board_state: UnassignedBoardState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct SkippedComponent {
     reference: String,
     symbol_path: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+struct AssemblyAttributes {
+    exclude_from_bom: bool,
+    exclude_from_pos_files: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +90,7 @@ struct DesignComponent {
     footprint_id: String,
     symbol_path: String,
     dnp: bool,
+    assembly: AssemblyAttributes,
     pad_nets: BTreeMap<String, String>,
 }
 
@@ -117,6 +124,7 @@ struct BoardFootprint {
     layer: String,
     locked: bool,
     dnp: bool,
+    assembly: AssemblyAttributes,
     not_in_schematic: bool,
 }
 
@@ -173,6 +181,7 @@ enum PlannedChange {
         footprint_id: String,
         symbol_path: String,
         dnp: bool,
+        assembly: AssemblyAttributes,
         pad_nets: BTreeMap<String, String>,
         position: Point,
     },
@@ -182,6 +191,7 @@ enum PlannedChange {
         value: String,
         symbol_path: String,
         dnp: bool,
+        assembly: AssemblyAttributes,
         pad_nets: BTreeMap<String, String>,
         preserve: PreservedBoardState,
     },
@@ -212,6 +222,7 @@ struct SyncPlan {
     /// Survives a conflict: it is a report about the schematic, not a change
     /// the plan would make.
     unassigned: Vec<UnassignedFootprint>,
+    skipped: Vec<SkippedComponent>,
     /// What the live board's measured extent was, set from the snapshot the
     /// plan was made against, so the dry run and the apply report the same.
     /// Not part of the plan's identity: `sync_response` reports it.
@@ -422,12 +433,30 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             let (creates, updates) = build_mutation_items(&plan, &prepared, &snapshot)?;
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
+            let native_expected = native_assembly_expectations(&plan);
             client.run_commit_recovering_in(snapshot.document.clone(), "Update PCB from saved schematic", |client| {
                 create_sync_items_in(client, &snapshot.document, &creates)?;
                 client.update_items_in(snapshot.document.clone(), updates)?;
+                verify_native_assembly_attributes(client, &snapshot.document, &native_expected)?;
                 Ok(())
+            }).map_err(|error| {
+                if error.downcast_ref::<NativeAssemblyVerificationError>().is_some()
+                    && error.downcast_ref::<konnect_ipc::client::IpcOutcomeUnknown>().is_none()
+                    && error.downcast_ref::<konnect_ipc::client::IpcBatchRecovered>().is_none()
+                {
+                    error.context(konnect_ipc::client::IpcOutcomeUnknown {
+                        command: "update_pcb_from_schematic native assembly verification".to_owned(),
+                        reason: "native attribute verification failed after mutation; rollback was attempted, but complete live-state restoration has not been independently verified".to_owned(),
+                    })
+                } else {
+                    error
+                }
             })?;
-            for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected)?
+            for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected, &native_expected)
+                .map_err(|error| error.context(konnect_ipc::client::IpcOutcomeUnknown {
+                    command: "update_pcb_from_schematic final readback".to_owned(),
+                    reason: "the commit was published, but the final live-board readback could not be verified".to_owned(),
+                }))?
             {
                 plan.diagnostics.push(conflict(
                     "board_readback_differs",
@@ -509,6 +538,9 @@ fn sync_response(
         // collection takes a plural noun (docs/NAMING_CONVENTIONS.md); the
         // `coverage` entry beside it is a count category and stays singular.
         "unassigned_footprints": plan.unassigned,
+        "skipped_components": plan.skipped.iter().map(|component| serde_json::json!({
+            "reference": component.reference, "symbol_path": component.symbol_path, "reason": "on_board=no"
+        })).collect::<Vec<_>>(),
         // What added footprints were staged beside: the live board as KiCad
         // measured it, with the classes it would not list (#688). Null only
         // when the plan never reached the board.
@@ -764,6 +796,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 footprint_id: component.footprint_id.clone(),
                 symbol_path: component.symbol_path.clone(),
                 dnp: component.dnp,
+                assembly: component.assembly,
                 pad_nets: component.pad_nets.clone(),
                 position,
             });
@@ -854,6 +887,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             || footprint.value != component.value
             || footprint.symbol_path.as_deref() != Some(component.symbol_path.as_str())
             || footprint.dnp != component.dnp
+            || footprint.assembly != component.assembly
             || changed_pads > 0;
         if needs_update {
             changes.push(PlannedChange::Update {
@@ -862,6 +896,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 value: component.value.clone(),
                 symbol_path: component.symbol_path.clone(),
                 dnp: component.dnp,
+                assembly: component.assembly,
                 pad_nets: component.pad_nets.clone(),
                 preserve: PreservedBoardState {
                     position: footprint.position,
@@ -898,6 +933,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         changes,
         diagnostics,
         unassigned,
+        skipped: design.skipped.clone(),
         // Set by the handler from the snapshot this plan was made against.
         staging: None,
     }
@@ -1046,6 +1082,11 @@ fn plan_revision(netlist_source: &str, board: &BoardState) -> String {
     for footprint in footprints {
         hasher.update(footprint.kiid.as_bytes());
         hasher.update(footprint.reference.as_bytes());
+        hasher.update([
+            u8::from(footprint.dnp),
+            u8::from(footprint.assembly.exclude_from_bom),
+            u8::from(footprint.assembly.exclude_from_pos_files),
+        ]);
         hasher.update(footprint.footprint_id.as_bytes());
         hasher.update(footprint.symbol_path.as_deref().unwrap_or("").as_bytes());
         for (pad, net) in &footprint.pad_nets {
@@ -1141,6 +1182,7 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
             footprint_id,
             symbol_path,
             dnp,
+            assembly: AssemblyAttributes::default(),
             pad_nets: BTreeMap::new(),
         });
     }
@@ -1202,6 +1244,7 @@ fn update_footprint_item(
         value,
         symbol_path,
         dnp,
+        assembly,
         pad_nets,
         ..
     } = change
@@ -1220,6 +1263,7 @@ fn update_footprint_item(
         value,
         symbol_path,
         *dnp,
+        *assembly,
         pad_nets,
         net_codes,
     )?;
@@ -1237,6 +1281,7 @@ fn apply_footprint_fields(
     value: &str,
     symbol_path: &str,
     dnp: bool,
+    assembly: AssemblyAttributes,
     pad_nets: &BTreeMap<String, String>,
     net_codes: &BTreeMap<String, i32>,
 ) -> Result<()> {
@@ -1269,6 +1314,12 @@ fn apply_footprint_fields(
         .attributes
         .get_or_insert_with(Default::default)
         .do_not_populate = dnp;
+
+    for attributes in [&mut footprint.attributes, &mut definition.attributes] {
+        let attributes = attributes.get_or_insert_with(Default::default);
+        attributes.exclude_from_bill_of_materials = assembly.exclude_from_bom;
+        attributes.exclude_from_position_files = assembly.exclude_from_pos_files;
+    }
 
     let mut seen_pads = std::collections::HashSet::new();
     for child in &mut definition.items {
@@ -1431,6 +1482,173 @@ fn footprint_shapes<'a>(
     out
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct NativeAssemblyVerificationError(String);
+
+#[derive(Debug, Clone)]
+struct NativeAssemblyExpectation {
+    kiid: Option<String>,
+    dnp: bool,
+    assembly: AssemblyAttributes,
+}
+
+#[derive(Debug)]
+struct NativeAssemblyObservation {
+    kiid: String,
+    dnp: bool,
+    assembly: AssemblyAttributes,
+}
+
+fn native_assembly_expectations(plan: &SyncPlan) -> BTreeMap<String, NativeAssemblyExpectation> {
+    plan.changes
+        .iter()
+        .map(|change| match change {
+            PlannedChange::Add {
+                reference,
+                dnp,
+                assembly,
+                ..
+            } => (
+                reference.clone(),
+                NativeAssemblyExpectation {
+                    kiid: None,
+                    dnp: *dnp,
+                    assembly: *assembly,
+                },
+            ),
+            PlannedChange::Update {
+                reference,
+                kiid,
+                dnp,
+                assembly,
+                ..
+            } => (
+                reference.clone(),
+                NativeAssemblyExpectation {
+                    kiid: Some(kiid.clone()),
+                    dnp: *dnp,
+                    assembly: *assembly,
+                },
+            ),
+        })
+        .collect()
+}
+
+fn decode_native_assembly_footprint(
+    item: &prost_types::Any,
+) -> Result<konnect_ipc::gen::kiapi::board::types::FootprintInstance> {
+    use konnect_ipc::gen::kiapi::board::types::FootprintInstance;
+    if !konnect_ipc::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
+        return Err(NativeAssemblyVerificationError(format!(
+            "native assembly readback expected FootprintInstance, got {}",
+            item.type_url
+        ))
+        .into());
+    }
+    FootprintInstance::decode(item.value.as_slice()).context(NativeAssemblyVerificationError(
+        "native assembly readback cannot decode FootprintInstance".to_owned(),
+    ))
+}
+
+fn verify_native_assembly_attributes(
+    client: &konnect_ipc::KiCadIpcClient,
+    document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+    expected: &BTreeMap<String, NativeAssemblyExpectation>,
+) -> Result<()> {
+    use konnect_ipc::gen::kiapi::common::types::KiCadObjectType;
+    let items = client
+        .get_items_in(document.clone(), KiCadObjectType::KotPcbFootprint)
+        .context(NativeAssemblyVerificationError(
+            "native assembly readback is unavailable".to_owned(),
+        ))?;
+    verify_native_assembly_snapshot(expected, &items)
+}
+
+fn verify_native_assembly_snapshot(
+    expected: &BTreeMap<String, NativeAssemblyExpectation>,
+    items: &[prost_types::Any],
+) -> Result<()> {
+    let mut observations = BTreeMap::new();
+    let mut kiids = HashSet::new();
+    for item in items {
+        let footprint = decode_native_assembly_footprint(item)?;
+        let kiid = footprint
+            .id
+            .as_ref()
+            .map(|id| id.value.as_str())
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                NativeAssemblyVerificationError(
+                    "native assembly readback footprint has no KIID".to_owned(),
+                )
+            })?;
+        if !kiids.insert(kiid.to_owned()) {
+            return Err(NativeAssemblyVerificationError(format!(
+                "native assembly readback has duplicate KIID {kiid}"
+            ))
+            .into());
+        }
+        let reference = field_text(&footprint.reference_field);
+        if !expected.contains_key(&reference) {
+            continue;
+        }
+        let attributes = footprint.attributes.as_ref();
+        let observation = NativeAssemblyObservation {
+            kiid: kiid.to_owned(),
+            dnp: attributes.is_some_and(|attributes| attributes.do_not_populate),
+            assembly: AssemblyAttributes {
+                exclude_from_bom: attributes
+                    .is_some_and(|attributes| attributes.exclude_from_bill_of_materials),
+                exclude_from_pos_files: attributes
+                    .is_some_and(|attributes| attributes.exclude_from_position_files),
+            },
+        };
+        if observations
+            .insert(reference.clone(), observation)
+            .is_some()
+        {
+            return Err(NativeAssemblyVerificationError(format!(
+                "native assembly readback has ambiguous reference {reference}"
+            ))
+            .into());
+        }
+    }
+    for (reference, want) in expected {
+        let got = observations.get(reference).ok_or_else(|| {
+            NativeAssemblyVerificationError(format!(
+                "cannot verify native assembly attributes for missing footprint {reference}"
+            ))
+        })?;
+        if want.kiid.as_ref().is_some_and(|kiid| kiid != &got.kiid) {
+            return Err(NativeAssemblyVerificationError(format!(
+                "{reference}: native assembly readback KIID {} differs from expected {}",
+                got.kiid,
+                want.kiid.as_deref().unwrap_or_default()
+            ))
+            .into());
+        }
+        for (attribute, sent, observed) in [
+            ("dnp", want.dnp, got.dnp),
+            (
+                "exclude_from_bom",
+                want.assembly.exclude_from_bom,
+                got.assembly.exclude_from_bom,
+            ),
+            (
+                "exclude_from_pos_files",
+                want.assembly.exclude_from_pos_files,
+                got.assembly.exclude_from_pos_files,
+            ),
+        ] {
+            if sent != observed {
+                return Err(NativeAssemblyVerificationError(format!("{reference}: native assembly attribute {attribute} was sent as {sent}, but KiCad reads back {observed}")).into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Read the board back and hold it to what was just sent.
 ///
 /// `create_items`/`update_items` only confirm that KiCad *accepted* each item,
@@ -1443,8 +1661,9 @@ fn footprint_shapes<'a>(
 /// in place it should never fire. `delete_footprint` already re-queries after
 /// mutating; this follows it.
 ///
-/// **It fails the call only on a gained pad.** KiCad has no business inventing
-/// one, so that is unambiguous and is #244's exact signature. A *drop* in
+/// Native assembly differences after publication are uncertain failures.
+/// Gained pads also fail the call because KiCad has no business inventing
+/// them, and that is #244's exact signature. A *drop* in
 /// drawings is reported instead of refused, because it has a benign
 /// explanation this check cannot yet rule out — KiCad re-creates a footprint's
 /// children from the message on deserialize, and if it promotes a `BoardText`
@@ -1456,6 +1675,7 @@ fn verify_board_matches_what_was_sent(
     client: &konnect_ipc::KiCadIpcClient,
     document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
     expected: &BTreeMap<String, FootprintShape>,
+    native_expected: &BTreeMap<String, NativeAssemblyExpectation>,
 ) -> Result<Vec<String>> {
     use konnect_ipc::gen::kiapi;
 
@@ -1466,6 +1686,7 @@ fn verify_board_matches_what_was_sent(
         document.clone(),
         kiapi::common::types::KiCadObjectType::KotPcbFootprint,
     )?;
+    verify_native_assembly_snapshot(native_expected, &items)?;
     let actual = footprint_shapes(items.iter());
 
     let mut corrupted = Vec::new();
@@ -1586,6 +1807,7 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         in_bom: bool,
         on_board: bool,
         dnp: bool,
+        in_pos_files: bool,
     }
 
     let mut flags = Vec::new();
@@ -1600,6 +1822,7 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
             let in_bom = symbol.find_str("in_bom") != Some("no");
             let on_board = symbol.find_str("on_board") != Some("no");
             let dnp = symbol.find_str("dnp") == Some("yes");
+            let in_pos_files = symbol.find_str("in_pos_files") != Some("no");
             let projects = symbol
                 .find("instances")
                 .map(|instances| instances.find_all("project"))
@@ -1621,6 +1844,7 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
                         in_bom,
                         on_board,
                         dnp,
+                        in_pos_files,
                     });
                 }
             }
@@ -1640,6 +1864,7 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
             entry.in_bom != entries[0].in_bom
                 || entry.on_board != entries[0].on_board
                 || entry.dnp != entries[0].dnp
+                || entry.in_pos_files != entries[0].in_pos_files
         }) {
             bail!("multi-unit reference {reference} has inconsistent board/BOM/DNP flags");
         }
@@ -1657,9 +1882,6 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         let Some(entry) = entry else {
             return true;
         };
-        if !entry.in_bom {
-            return false;
-        }
         if !entry.on_board {
             design.skipped.push(SkippedComponent {
                 reference: entry.reference.clone(),
@@ -1668,11 +1890,12 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
             return false;
         }
         component.dnp = entry.dnp;
+        component.assembly = AssemblyAttributes {
+            exclude_from_bom: !entry.in_bom,
+            exclude_from_pos_files: !entry.in_pos_files,
+        };
         true
     });
-    // The same flags govern a component with no footprint: excluded from the
-    // BOM it is dropped, excluded from the board it is skipped by flag rather
-    // than reported as unassigned.
     design.unassigned.retain(|component| {
         let path_match = flags
             .iter()
@@ -1685,9 +1908,6 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         let Some(entry) = entry else {
             return true;
         };
-        if !entry.in_bom {
-            return false;
-        }
         if !entry.on_board {
             design.skipped.push(SkippedComponent {
                 reference: entry.reference.clone(),
@@ -1698,7 +1918,7 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         true
     });
     let mut skipped_references = HashSet::new();
-    for entry in flags.iter().filter(|entry| entry.in_bom && !entry.on_board) {
+    for entry in flags.iter().filter(|entry| !entry.on_board) {
         if !skipped_references.insert(entry.reference.as_str()) {
             continue;
         }
@@ -1725,12 +1945,13 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
     let mut footprints = Vec::new();
     let mut items = BTreeMap::new();
     for item in footprint_items {
-        let instance = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
-            .context("KiCad returned an invalid footprint item")?;
+        let instance = decode_native_assembly_footprint(&item)?;
         let footprint = board_footprint_from_instance(&instance)?;
         let kiid = footprint.kiid.clone();
         footprints.push(footprint);
-        items.insert(kiid, item);
+        if items.insert(kiid.clone(), item).is_some() {
+            bail!("KiCad returned duplicate footprint KIID {kiid}");
+        }
     }
 
     let nets = client.get_nets_in(document.clone())?;
@@ -1871,6 +2092,16 @@ fn board_footprint_from_instance(
             .as_ref()
             .map(|attributes| attributes.do_not_populate)
             .unwrap_or(false),
+        assembly: AssemblyAttributes {
+            exclude_from_bom: footprint
+                .attributes
+                .as_ref()
+                .is_some_and(|attributes| attributes.exclude_from_bill_of_materials),
+            exclude_from_pos_files: footprint
+                .attributes
+                .as_ref()
+                .is_some_and(|attributes| attributes.exclude_from_position_files),
+        },
         not_in_schematic: footprint
             .attributes
             .as_ref()
@@ -2232,6 +2463,7 @@ fn build_added_footprint(
         footprint_id,
         symbol_path,
         dnp,
+        assembly,
         pad_nets,
         position,
     } = change
@@ -2259,6 +2491,7 @@ fn build_added_footprint(
         value,
         symbol_path,
         *dnp,
+        *assembly,
         pad_nets,
         net_codes,
     )?;
@@ -2711,6 +2944,27 @@ mod tests {
         assert!(!component.dnp);
     }
 
+    #[test]
+    fn issue25_bom_exclusion_never_removes_a_part_from_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mount.kicad_sch");
+        std::fs::write(
+            &file,
+            r#"(kicad_sch (uuid "sheet-uuid")
+            (symbol (uuid "symbol-uuid") (in_bom no) (on_board yes) (in_pos_files no) (dnp yes)
+                (instances (project "mount" (path "/sheet-uuid" (reference "R1") (unit 1))))))"#,
+        )
+        .unwrap();
+        let mut design = parse_exported_netlist(ONE_RESISTOR).unwrap();
+        apply_saved_symbol_flags(&[file], &mut design).unwrap();
+        assert_eq!(
+            design.components.len(),
+            1,
+            "BOM exclusion is independent from board membership"
+        );
+        assert!(design.components[0].dnp);
+    }
+
     /// Real `kicad-cli sch export netlist` output: `R1` never had a footprint
     /// assigned, so the export carries no `(footprint …)` node for it and
     /// still nets its pin 1 to `C1`. Provenance in
@@ -2919,6 +3173,152 @@ mod tests {
         assert_eq!(plan.unassigned.len(), 1);
     }
 
+    #[test]
+    fn issue25_assembly_changes_plan_update_and_change_the_revision() {
+        let mut desired = resistor("R1", "/sheet/r1");
+        desired.assembly = AssemblyAttributes {
+            exclude_from_bom: true,
+            exclude_from_pos_files: true,
+        };
+        let design = ExportedDesign {
+            components: vec![desired],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        };
+        let board = board_with(vec![board_resistor("R1", Some("/sheet/r1"))]);
+        let plan = plan_sync("fixture", &design, &board);
+        assert_eq!(plan.status, PlanStatus::Ready);
+        let Some(PlannedChange::Update { assembly, .. }) = plan.changes.first() else {
+            panic!("expected attribute update")
+        };
+        assert!(assembly.exclude_from_bom && assembly.exclude_from_pos_files);
+        let mut updated = board.clone();
+        updated.footprints[0].assembly = *assembly;
+        assert_ne!(
+            plan_revision("fixture", &board),
+            plan_revision("fixture", &updated)
+        );
+        assert_eq!(
+            plan_sync("fixture", &design, &updated).status,
+            PlanStatus::Noop
+        );
+    }
+
+    #[test]
+    fn issue25_native_assembly_attributes_reach_the_instance_and_definition() {
+        use konnect_ipc::gen::kiapi;
+        let item = footprint_with_artwork("U2");
+        let mut footprint =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        let flags = AssemblyAttributes {
+            exclude_from_bom: true,
+            exclude_from_pos_files: true,
+        };
+        apply_footprint_fields(
+            &mut footprint,
+            "U2",
+            "NE555",
+            "/root/u2",
+            true,
+            flags,
+            &BTreeMap::from([("1".to_owned(), "VCC".to_owned())]),
+            &BTreeMap::from([("VCC".to_owned(), 3)]),
+        )
+        .unwrap();
+        for attributes in [
+            footprint.attributes.as_ref(),
+            footprint.definition.as_ref().unwrap().attributes.as_ref(),
+        ] {
+            let attributes = attributes.unwrap();
+            assert!(attributes.do_not_populate);
+            assert!(attributes.exclude_from_bill_of_materials);
+            assert!(attributes.exclude_from_position_files);
+        }
+        let observed = board_footprint_from_instance(&footprint).unwrap();
+        assert_eq!(observed.assembly, flags);
+    }
+
+    #[test]
+    fn issue25_strict_snapshot_binds_updates_to_the_planned_kiid() {
+        use konnect_ipc::gen::kiapi;
+        let sent = footprint_with_artwork("U4");
+        let expected = BTreeMap::from([(
+            "U4".to_owned(),
+            NativeAssemblyExpectation {
+                kiid: Some("u4-kiid".to_owned()),
+                dnp: false,
+                assembly: AssemblyAttributes::default(),
+            },
+        )]);
+        verify_native_assembly_snapshot(&expected, std::slice::from_ref(&sent)).unwrap();
+        let mut replaced =
+            kiapi::board::types::FootprintInstance::decode(sent.value.as_slice()).unwrap();
+        replaced.id = Some(kiapi::common::types::Kiid {
+            value: "replacement-id".to_owned(),
+        });
+        let replaced =
+            konnect_ipc::builders::pack_any(&replaced, "kiapi.board.types.FootprintInstance");
+        let error = verify_native_assembly_snapshot(&expected, &[replaced]).unwrap_err();
+        assert!(
+            error.to_string().contains("differs from expected u4-kiid"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn issue25_strict_snapshot_requires_a_unique_server_assigned_creation() {
+        use konnect_ipc::gen::kiapi;
+        let item = footprint_with_artwork("U4");
+        let expected = BTreeMap::from([(
+            "U4".to_owned(),
+            NativeAssemblyExpectation {
+                kiid: None,
+                dnp: false,
+                assembly: AssemblyAttributes::default(),
+            },
+        )]);
+        verify_native_assembly_snapshot(&expected, std::slice::from_ref(&item)).unwrap();
+        let mut duplicate =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        duplicate.id = Some(kiapi::common::types::Kiid {
+            value: "second-created-id".to_owned(),
+        });
+        let duplicate =
+            konnect_ipc::builders::pack_any(&duplicate, "kiapi.board.types.FootprintInstance");
+        let error =
+            verify_native_assembly_snapshot(&expected, &[item.clone(), duplicate]).unwrap_err();
+        assert!(
+            error.to_string().contains("ambiguous reference U4"),
+            "{error}"
+        );
+        let error =
+            verify_native_assembly_snapshot(&expected, &[item.clone(), item.clone()]).unwrap_err();
+        assert!(error.to_string().contains("duplicate KIID"), "{error}");
+        let mut wrong_type = item.clone();
+        wrong_type.type_url = "type.googleapis.com/kiapi.board.types.Pad".to_owned();
+        let error = verify_native_assembly_snapshot(&expected, &[wrong_type]).unwrap_err();
+        assert!(
+            error.to_string().contains("expected FootprintInstance"),
+            "{error}"
+        );
+        let mut malformed = item.clone();
+        malformed.value = vec![0xff];
+        let error = verify_native_assembly_snapshot(&expected, &[malformed]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot decode FootprintInstance"),
+            "{error}"
+        );
+        let mut missing_id =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        missing_id.id = None;
+        let missing_id =
+            konnect_ipc::builders::pack_any(&missing_id, "kiapi.board.types.FootprintInstance");
+        let error = verify_native_assembly_snapshot(&expected, &[missing_id]).unwrap_err();
+        assert!(error.to_string().contains("has no KIID"), "{error}");
+    }
+
     fn resistor(reference: &str, symbol_path: &str) -> DesignComponent {
         DesignComponent {
             reference: reference.to_string(),
@@ -2926,6 +3326,7 @@ mod tests {
             footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
             symbol_path: symbol_path.to_string(),
             dnp: false,
+            assembly: AssemblyAttributes::default(),
             pad_nets: BTreeMap::from([
                 ("1".to_string(), "VCC".to_string()),
                 ("2".to_string(), "GND".to_string()),
@@ -2950,6 +3351,7 @@ mod tests {
             layer: "F.Cu".to_string(),
             locked: false,
             dnp: false,
+            assembly: AssemblyAttributes::default(),
             not_in_schematic: false,
         }
     }
@@ -2995,6 +3397,7 @@ mod tests {
                     layer: "B.Cu".to_string(),
                     locked: true,
                     dnp: false,
+                    assembly: AssemblyAttributes::default(),
                     not_in_schematic: false,
                 },
                 BoardFootprint {
@@ -3010,6 +3413,7 @@ mod tests {
                     layer: "F.Cu".to_string(),
                     locked: true,
                     dnp: false,
+                    assembly: AssemblyAttributes::default(),
                     not_in_schematic: true,
                 },
             ],
@@ -3176,6 +3580,7 @@ mod tests {
             value: "NE555".to_string(),
             symbol_path: "/root/u1".to_string(),
             dnp: false,
+            assembly: AssemblyAttributes::default(),
             pad_nets: BTreeMap::from([("1".to_string(), "GND".to_string())]),
             preserve: PreservedBoardState {
                 position: Point { x: 25.0, y: 30.0 },
@@ -3227,6 +3632,7 @@ mod tests {
             "NE555",
             "/root/u2",
             false,
+            AssemblyAttributes::default(),
             &BTreeMap::from([("1".to_string(), "VCC".to_string())]),
             &BTreeMap::from([("VCC".to_string(), 3)]),
         )
@@ -3317,6 +3723,7 @@ mod tests {
             "NE555",
             "/root/u3",
             false,
+            AssemblyAttributes::default(),
             &BTreeMap::from([("1".to_string(), "VCC".to_string())]),
             &BTreeMap::new(),
         )
@@ -3374,6 +3781,7 @@ mod tests {
             value: "10k".to_string(),
             symbol_path: "/root/symbol".to_string(),
             dnp: true,
+            assembly: AssemblyAttributes::default(),
             pad_nets: BTreeMap::from([("1".to_string(), "VCC".to_string())]),
             preserve: PreservedBoardState {
                 position: Point { x: 25.0, y: 30.0 },
@@ -3431,6 +3839,7 @@ mod tests {
                 layer: "F.Cu".to_string(),
                 locked: false,
                 dnp: false,
+                assembly: AssemblyAttributes::default(),
                 not_in_schematic: false,
             }],
             routed_nets: BTreeMap::from([("VCC".to_string(), 1)]),
@@ -4508,6 +4917,7 @@ mod tests {
             footprint_id: footprint_id.to_string(),
             symbol_path: format!("/{reference}-uuid"),
             dnp: false,
+            assembly: AssemblyAttributes::default(),
             pad_nets: pads
                 .iter()
                 .map(|pad| (pad.to_string(), format!("{reference}-{pad}")))
@@ -4530,6 +4940,7 @@ mod tests {
             changes,
             diagnostics: Vec::new(),
             unassigned: Vec::new(),
+            skipped: Vec::new(),
             staging: None,
         }
     }
@@ -4768,6 +5179,15 @@ mod tests {
         created: std::sync::Arc<std::sync::Mutex<Vec<prost_types::Any>>>,
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum InvalidFootprintReadback {
+        Rejected,
+        WrongType,
+        Malformed,
+        DuplicateReference,
+        MissingKiid,
+    }
+
     /// What the mock's board holds after `CreateItems`.
     #[derive(Clone, Copy)]
     enum Readback {
@@ -4779,6 +5199,10 @@ mod tests {
         /// What was sent with its mounting style and models, but DNP cleared:
         /// one flag lost while everything the old check looked at survives.
         WithoutDnp,
+        WrongBom,
+        WrongPosition,
+        WrongAssemblyAfterCommit,
+        InvalidAfterCommit(InvalidFootprintReadback),
     }
 
     impl ServedSync {
@@ -4817,6 +5241,7 @@ mod tests {
             let created =
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::<prost_types::Any>::new()));
             let board_items = created.clone();
+            let published = std::sync::atomic::AtomicBool::new(false);
 
             let (temp, board) = project_with_stock_footprints();
             let schematic = temp.path().join("carrier.kicad_sch");
@@ -4849,7 +5274,7 @@ mod tests {
                         let shapes = kiapi::common::types::KiCadObjectType::KotPcbShape as i32;
                         let footprints =
                             kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32;
-                        let items = match outline {
+                        let mut items = match outline {
                             Some(_) if request.types.contains(&shapes) => {
                                 vec![crate::tools::pcb_board::board_mock::listed_item(
                                     kiapi::common::types::KiCadObjectType::KotPcbShape,
@@ -4860,14 +5285,73 @@ mod tests {
                                 .lock()
                                 .unwrap()
                                 .iter()
-                                .map(|item| read_back(item, readback))
+                                .map(|item| {
+                                    read_back(
+                                        item,
+                                        match readback {
+                                            Readback::WrongAssemblyAfterCommit
+                                                if !published
+                                                    .load(std::sync::atomic::Ordering::SeqCst) =>
+                                            {
+                                                Readback::AsSent
+                                            }
+                                            mode => mode,
+                                        },
+                                    )
+                                })
                                 .collect(),
                             _ => Vec::new(),
                         };
+                        let mut status = kiapi::common::types::ItemRequestStatus::IrsOk as i32;
+                        if request.types.contains(&footprints)
+                            && published.load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            if let Readback::InvalidAfterCommit(kind) = readback {
+                                match kind {
+                                    InvalidFootprintReadback::Rejected => {
+                                        status = kiapi::common::types::ItemRequestStatus::IrsUnknown
+                                            as i32
+                                    }
+                                    InvalidFootprintReadback::WrongType => {
+                                        items[0].type_url =
+                                            "type.googleapis.com/kiapi.board.types.Pad".to_owned()
+                                    }
+                                    InvalidFootprintReadback::Malformed => {
+                                        items[0].value = vec![0xff]
+                                    }
+                                    InvalidFootprintReadback::DuplicateReference => {
+                                        let mut duplicate =
+                                            kiapi::board::types::FootprintInstance::decode(
+                                                items[0].value.as_slice(),
+                                            )
+                                            .unwrap();
+                                        duplicate.id = Some(kiapi::common::types::Kiid {
+                                            value: "duplicate-reference-id".to_owned(),
+                                        });
+                                        items.push(konnect_ipc::builders::pack_any(
+                                            &duplicate,
+                                            "kiapi.board.types.FootprintInstance",
+                                        ));
+                                    }
+                                    InvalidFootprintReadback::MissingKiid => {
+                                        let mut footprint =
+                                            kiapi::board::types::FootprintInstance::decode(
+                                                items[0].value.as_slice(),
+                                            )
+                                            .unwrap();
+                                        footprint.id = None;
+                                        items[0] = konnect_ipc::builders::pack_any(
+                                            &footprint,
+                                            "kiapi.board.types.FootprintInstance",
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         return Some(konnect_ipc::builders::pack_any(
                             &kiapi::common::commands::GetItemsResponse {
                                 header: None,
-                                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                                status,
                                 items,
                             },
                             "kiapi.common.commands.GetItemsResponse",
@@ -4917,9 +5401,23 @@ mod tests {
                         ));
                     }
                     if command.type_url.ends_with("CreateItems") {
-                        let request =
+                        let mut request =
                             kiapi::common::commands::CreateItems::decode(command.value.as_slice())
                                 .expect("CreateItems request");
+                        for item in &mut request.items {
+                            let mut footprint = kiapi::board::types::FootprintInstance::decode(
+                                item.value.as_slice(),
+                            )
+                            .unwrap();
+                            let reference = field_text(&footprint.reference_field);
+                            footprint.id = Some(kiapi::common::types::Kiid {
+                                value: format!("created-{reference}"),
+                            });
+                            *item = konnect_ipc::builders::pack_any(
+                                &footprint,
+                                "kiapi.board.types.FootprintInstance",
+                            );
+                        }
                         board_items
                             .lock()
                             .unwrap()
@@ -4969,6 +5467,14 @@ mod tests {
                         ));
                     }
                     if command.type_url.ends_with("EndCommit") {
+                        let request =
+                            kiapi::common::commands::EndCommit::decode(command.value.as_slice())
+                                .unwrap();
+                        if request.action == kiapi::common::commands::CommitAction::CmaDrop as i32 {
+                            board_items.lock().unwrap().clear();
+                        } else {
+                            published.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
                         return Some(konnect_ipc::builders::pack_any(
                             &kiapi::common::commands::EndCommitResponse {},
                             "kiapi.common.commands.EndCommitResponse",
@@ -5085,7 +5591,7 @@ mod tests {
     /// A created item as the mock's board lists it back.
     fn read_back(item: &prost_types::Any, readback: Readback) -> prost_types::Any {
         match readback {
-            Readback::AsSent => item.clone(),
+            Readback::AsSent | Readback::InvalidAfterCommit(_) => item.clone(),
             Readback::WithoutLibraryData => {
                 let mut footprint =
                     konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(
@@ -5098,6 +5604,21 @@ mod tests {
                         !konnect_ipc::builders::any_is(child, "kiapi.board.types.Footprint3DModel")
                     });
                 }
+                konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+            }
+            Readback::WrongBom | Readback::WrongPosition | Readback::WrongAssemblyAfterCommit => {
+                let mut footprint =
+                    konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(
+                        item.value.as_slice(),
+                    )
+                    .unwrap();
+                let attributes = footprint.attributes.get_or_insert_with(Default::default);
+                let flag = if matches!(readback, Readback::WrongPosition) {
+                    &mut attributes.exclude_from_position_files
+                } else {
+                    &mut attributes.exclude_from_bill_of_materials
+                };
+                *flag = !*flag;
                 konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
             }
             Readback::WithoutDnp => {
@@ -5478,34 +5999,140 @@ mod tests {
     /// schematic set it, the final value sent, not the library's: the 0603's
     /// library footprint is not DNP.
     #[tokio::test]
-    async fn the_readback_names_a_single_attribute_the_board_did_not_keep() {
+    async fn issue25_a_lost_native_dnp_flag_aborts_and_attempts_rollback() {
         let served = ServedSync::reading_back(Readback::WithoutDnp).await;
-        let applied = served
-            .apply(&with_dnp(
-                &exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]),
-                "C1",
-            ))
+        let netlist = with_dnp(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]), "C1");
+        let plan = served.dry_run(&netlist).await;
+        assert_eq!(plan["status"], "ready", "{plan}");
+        let (is_error, result) = served
+            .call(serde_json::json!({
+                "schematic": served.schematic, "board": served.board, "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"]
+            }))
             .await;
+        assert!(is_error, "{result}");
+        assert_eq!(result["error"]["kind"], "ipc_outcome_unknown", "{result}");
+        assert_eq!(result["error"]["retry_safe"], false, "{result}");
+        assert_ne!(result["status"], "applied", "{result}");
+        assert!(
+            result.to_string().contains("native assembly attribute dnp"),
+            "{result}"
+        );
+        assert!(
+            served.sent_footprints().is_empty(),
+            "the mock must apply confirmed Drop"
+        );
+    }
 
-        assert_eq!(applied["status"], "applied", "{applied:#}");
+    #[tokio::test]
+    async fn issue25_wrong_bom_or_position_readback_never_reports_applied() {
+        for (readback, attribute) in [
+            (Readback::WrongBom, "exclude_from_bom"),
+            (Readback::WrongPosition, "exclude_from_pos_files"),
+        ] {
+            for excluded in [false, true] {
+                let served = ServedSync::reading_back(readback).await;
+                if excluded {
+                    let source = std::fs::read_to_string(&served.schematic).unwrap();
+                    let (start, end) =
+                        crate::tools::find_all_symbol_instance_blocks(&source, "R1")[0];
+                    let block = source[start..end]
+                        .replace("(in_bom yes)", "(in_bom no)")
+                        .replace("(on_board yes)", "(on_board yes) (in_pos_files no)");
+                    let updated = format!("{}{}{}", &source[..start], block, &source[end..]);
+                    std::fs::write(&served.schematic, updated).unwrap();
+                }
+                let plan = served
+                    .dry_run(&exported_netlist(&[("R1", STOCK_0603, &["1", "2"])]))
+                    .await;
+                assert_eq!(plan["status"], "ready", "{plan}");
+                let (is_error, result) = served
+                    .call(serde_json::json!({
+                        "schematic": served.schematic, "board": served.board, "dry_run": false,
+                        "expected_plan_revision": plan["plan_revision"]
+                    }))
+                    .await;
+                assert!(is_error, "{result}");
+                assert_eq!(result["error"]["kind"], "ipc_outcome_unknown", "{result}");
+                assert_eq!(result["error"]["retry_safe"], false, "{result}");
+                assert_ne!(result["status"], "applied", "{result}");
+                assert!(result.to_string().contains(attribute), "{result}");
+                assert!(served.sent_footprints().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn issue25_postcommit_assembly_loss_is_uncertain_and_preserves_applied_work() {
+        let served = ServedSync::reading_back(Readback::WrongAssemblyAfterCommit).await;
+        let plan = served
+            .dry_run(&exported_netlist(&[("R1", STOCK_0603, &["1", "2"])]))
+            .await;
+        assert_eq!(plan["status"], "ready", "{plan}");
+        let (is_error, result) = served
+            .call(serde_json::json!({
+                "schematic": served.schematic, "board": served.board, "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"]
+            }))
+            .await;
+        assert!(is_error, "{result}");
+        assert_eq!(result["error"]["kind"], "ipc_outcome_unknown", "{result}");
+        assert_eq!(result["error"]["retry_safe"], false, "{result}");
+        assert_ne!(result["status"], "applied", "{result}");
+        assert!(
+            !served.sent_footprints().is_empty(),
+            "published work must not be hidden or blindly retried"
+        );
+    }
+
+    async fn assert_invalid_postpublication_readback(kind: InvalidFootprintReadback) {
+        let served = ServedSync::reading_back(Readback::InvalidAfterCommit(kind)).await;
+        let plan = served
+            .dry_run(&exported_netlist(&[("R1", STOCK_0603, &["1", "2"])]))
+            .await;
+        assert_eq!(plan["status"], "ready", "{plan}");
+        let (is_error, result) = served
+            .call(serde_json::json!({
+                "schematic": served.schematic, "board": served.board, "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"]
+            }))
+            .await;
+        assert!(is_error, "{kind:?}: {result}");
         assert_eq!(
-            applied["diagnostics"].as_array().unwrap().len(),
-            1,
-            "{applied:#}"
+            result["error"]["kind"], "ipc_outcome_unknown",
+            "{kind:?}: {result}"
         );
-        assert_eq!(applied["diagnostics"][0]["code"], "board_readback_differs");
-        let message = applied["diagnostics"][0]["message"].as_str().unwrap();
+        assert_eq!(result["error"]["retry_safe"], false, "{result}");
+        assert_ne!(result["status"], "applied", "{result}");
         assert!(
-            message.contains("C1: sent attributes [dnp, smd], board now has [smd]"),
-            "{message}"
+            !served.sent_footprints().is_empty(),
+            "published work must remain visible"
         );
-        assert!(
-            served.sent_footprints()[0]
-                .attributes
-                .as_ref()
-                .unwrap()
-                .do_not_populate
-        );
+    }
+
+    #[tokio::test]
+    async fn issue25_postpublish_getitems_rejection_is_unknown() {
+        assert_invalid_postpublication_readback(InvalidFootprintReadback::Rejected).await;
+    }
+
+    #[tokio::test]
+    async fn issue25_postpublish_wrong_any_type_is_unknown() {
+        assert_invalid_postpublication_readback(InvalidFootprintReadback::WrongType).await;
+    }
+
+    #[tokio::test]
+    async fn issue25_postpublish_decode_failure_is_unknown() {
+        assert_invalid_postpublication_readback(InvalidFootprintReadback::Malformed).await;
+    }
+
+    #[tokio::test]
+    async fn issue25_postpublish_duplicate_reference_is_unknown() {
+        assert_invalid_postpublication_readback(InvalidFootprintReadback::DuplicateReference).await;
+    }
+
+    #[tokio::test]
+    async fn issue25_postpublish_missing_kiid_is_unknown() {
+        assert_invalid_postpublication_readback(InvalidFootprintReadback::MissingKiid).await;
     }
 
     /// The control for the test above: the same DNP part on a board that kept
@@ -5542,6 +6169,7 @@ mod tests {
             footprint_id: STOCK_0603.into(),
             symbol_path: "/c1-uuid".into(),
             dnp,
+            assembly: AssemblyAttributes::default(),
             pad_nets: BTreeMap::new(),
             position: Point { x: 10.0, y: 10.0 },
         };
