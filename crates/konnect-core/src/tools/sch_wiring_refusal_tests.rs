@@ -52,6 +52,15 @@ fn text(result: &CallToolResult) -> String {
     format!("{:?}", result.content)
 }
 
+fn body(result: &CallToolResult) -> serde_json::Value {
+    match result.content.first() {
+        Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+            serde_json::from_str(text).unwrap()
+        }
+        other => panic!("expected text, got {other:?}"),
+    }
+}
+
 fn p(path: &std::path::Path) -> String {
     path.display().to_string()
 }
@@ -436,4 +445,178 @@ async fn batch_rotate_labels_does_not_report_a_missing_label_as_rotated() {
     .unwrap();
     assert!(r.is_error, "nothing was rotated, yet: {}", text(&r));
     assert!(text(&r).contains("ABSENT"), "{}", text(&r));
+}
+
+const NO_CONNECTS: &str = concat!(
+    "\t(no_connect\n\t\t(at 20 30)\n\t\t(uuid \"nc1\")\n\t)\n",
+    "\t(no_connect\n\t\t(at 40 30)\n\t\t(uuid \"nc2\")\n\t)\n",
+);
+
+#[tokio::test]
+async fn delete_no_connect_removes_the_one_at_the_position_or_refuses() {
+    let (_d, path) = sheet(NO_CONNECTS);
+    let before = read(&path);
+    let r = handle_delete_no_connect(&json!({"schematic": p(&path), "x": 1.0, "y": 1.0}), &ctx())
+        .await
+        .unwrap();
+    assert!(
+        r.is_error && text(&r).contains("No-connect not found"),
+        "{}",
+        text(&r)
+    );
+    assert_eq!(read(&path), before);
+
+    let r = handle_delete_no_connect(
+        &json!({"schematic": p(&path), "x": 20.0, "y": 30.0}),
+        &ctx(),
+    )
+    .await
+    .unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+    let after = read(&path);
+    assert!(!after.contains("nc1") && after.contains("nc2"), "{after}");
+
+    for missing in ["x", "y"] {
+        let mut args = json!({"schematic": p(&path), "x": 40.0, "y": 30.0});
+        args.as_object_mut().unwrap().remove(missing);
+        let r = handle_delete_no_connect(&args, &ctx()).await.unwrap();
+        assert!(r.is_error, "missing {missing}");
+    }
+}
+
+#[tokio::test]
+async fn batch_delete_no_connect_reports_each_miss_and_deletes_the_rest() {
+    let (_d, path) = sheet(NO_CONNECTS);
+    let r = handle_batch_delete_no_connect(
+        &json!({"schematic": p(&path), "positions": [
+            {"x": 20.0, "y": 30.0}, {"x": 20.0, "y": 30.0}, {"x": 9.0, "y": 9.0}, {"x": "bad"}
+        ]}),
+        &ctx(),
+    )
+    .await
+    .unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+    let body = body(&r);
+    assert_eq!(body["deleted"], 1, "a repeated position deletes once");
+    assert_eq!(body["errors"].as_array().unwrap().len(), 2, "{body}");
+    let after = read(&path);
+    assert!(!after.contains("nc1") && after.contains("nc2"), "{after}");
+}
+
+#[tokio::test]
+async fn batch_delete_no_connect_refuses_when_nothing_matches_and_allows_an_empty_list() {
+    let (_d, path) = sheet(NO_CONNECTS);
+    let before = read(&path);
+    let r = handle_batch_delete_no_connect(
+        &json!({"schematic": p(&path), "positions": [{"x": 9.0, "y": 9.0}]}),
+        &ctx(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        r.is_error && text(&r).contains("No no-connects deleted"),
+        "{}",
+        text(&r)
+    );
+    assert_eq!(read(&path), before);
+
+    let r =
+        handle_batch_delete_no_connect(&json!({"schematic": p(&path), "positions": []}), &ctx())
+            .await
+            .unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+    assert_eq!(read(&path), before);
+}
+
+#[tokio::test]
+async fn junctions_are_added_singly_and_in_batches_and_need_both_coordinates() {
+    let (_d, path) = sheet("");
+    let r = handle_add_junction(
+        &json!({"schematic": p(&path), "x": 10.0, "y": 20.0}),
+        &ctx(),
+    )
+    .await
+    .unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+    let r = handle_batch_add_junction(
+        &json!({"schematic": p(&path), "positions": [{"x": 1.0, "y": 2.0}, {"x": 3.0, "y": 4.0}]}),
+        &ctx(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(body(&r)["added"], 2);
+    let tree = parse_sexp(&read(&path)).unwrap();
+    assert_eq!(konnect_sexp::schematic::extract_junctions(&tree).len(), 3);
+
+    let before = read(&path);
+    for missing in ["x", "y"] {
+        let mut args = json!({"schematic": p(&path), "x": 1.0, "y": 1.0});
+        args.as_object_mut().unwrap().remove(missing);
+        assert!(handle_add_junction(&args, &ctx()).await.unwrap().is_error);
+    }
+    assert!(
+        handle_batch_add_junction(&json!({"schematic": p(&path)}), &ctx())
+            .await
+            .unwrap()
+            .is_error
+    );
+    assert_eq!(read(&path), before);
+}
+
+const FOREIGN_NET: &str = concat!(
+    "\t(wire (pts (xy 2.54 -5.08) (xy 2.54 5.08)) (stroke (width 0) (type default)) (uuid \"w-foreign\"))\n",
+    "\t(label \"FOREIGN\" (at 2.54 0 0) (uuid \"l-foreign\"))\n",
+);
+
+#[tokio::test]
+async fn adding_a_wire_across_another_net_is_refused_unless_a_join_is_allowed() {
+    let (_d, path) = sheet(FOREIGN_NET);
+    let before = read(&path);
+    let wire = json!({"schematic": p(&path), "x1": 0.0, "y1": 0.0, "x2": 5.08, "y2": 0.0});
+    let r = handle_add_wire(&wire, &ctx()).await.unwrap();
+    assert!(r.is_error, "{}", text(&r));
+    assert!(text(&r).contains("FOREIGN"), "{}", text(&r));
+    assert_eq!(read(&path), before, "a refused wire must not be written");
+
+    let batch = json!({"schematic": p(&path), "wires": [
+        {"x1": 0.0, "y1": 0.0, "x2": 5.08, "y2": 0.0}
+    ]});
+    let r = handle_batch_add_wire(&batch, &ctx()).await.unwrap();
+    assert!(r.is_error, "{}", text(&r));
+    assert_eq!(read(&path), before);
+
+    let mut allowed = wire.clone();
+    allowed["allow_join"] = json!(true);
+    let r = handle_add_wire(&allowed, &ctx()).await.unwrap();
+    assert!(!r.is_error, "{}", text(&r));
+    assert_ne!(read(&path), before);
+}
+
+#[tokio::test]
+async fn connect_to_net_refuses_an_incomplete_pin_and_a_route_onto_another_net() {
+    let (_d, path) = sheet(FOREIGN_NET);
+    let before = read(&path);
+    let base = json!({"schematic": p(&path), "net": "SIG"});
+    let with = |extra: serde_json::Value| {
+        let mut args = base.clone();
+        for (k, v) in extra.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        args
+    };
+    for (args, needle) in [
+        (with(json!({"reference": "R1"})), "must be given together"),
+        (with(json!({"pin_number": "1"})), "must be given together"),
+        (with(json!({"pin_y": 0.0})), "Missing 'pin_x'"),
+        (with(json!({"pin_x": 5.08})), "Missing 'pin_y'"),
+        (
+            with(json!({"pin_x": 0.0, "pin_y": 0.0, "direction": "right"})),
+            "FOREIGN",
+        ),
+    ] {
+        let r = handle_connect_to_net(&args, &ctx()).await.unwrap();
+        assert!(r.is_error, "{args}: {}", text(&r));
+        assert!(text(&r).contains(needle), "{needle}: {}", text(&r));
+    }
+    assert_eq!(read(&path), before);
 }
