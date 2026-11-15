@@ -963,3 +963,98 @@ mod reload_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod meta_boundary_contract_tests {
+    use super::*;
+    use crate::observability::{CallRecord, CallStatus};
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+
+    fn context() -> Arc<ToolContext> {
+        Arc::new(ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(ToolRouter::new()),
+        ))
+    }
+
+    fn body(result: &CallToolResult) -> Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("text response required");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn unknown_or_empty_toolset_batches_do_not_claim_a_successful_load() {
+        let ctx = context();
+        let before = ctx.router.active_names().await;
+        for names in [json!([]), json!(["unknown"]), json!(["unknown", "unknown"])] {
+            let response = handle_load_toolset(&json!({"name":names}), &ctx).await;
+            assert!(response.is_error);
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&response).as_deref(),
+                Some("invalid_argument")
+            );
+            assert_eq!(ctx.router.active_names().await, before);
+        }
+        assert!(
+            handle_unload_toolset(&json!({"name":"not-a-toolset"}), &ctx)
+                .await
+                .is_error
+        );
+        assert!(
+            !handle_load_toolset(&json!({"name":"project"}), &ctx)
+                .await
+                .is_error
+        );
+        assert!(
+            !handle_unload_toolset(&json!({"name":"project"}), &ctx)
+                .await
+                .is_error
+        );
+        assert!(ctx.router.get_tool("create_project").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn zero_recent_call_limit_reports_all_retained_calls_and_its_actual_limit() {
+        let ctx = context();
+        for index in 0..2 {
+            ctx.observer
+                .record(CallRecord {
+                    call_id: format!("test-{index}"),
+                    ts: index,
+                    tool: "test".into(),
+                    toolset: None,
+                    dur_ms: 0,
+                    status: CallStatus::Ok,
+                    error_kind: None,
+                    args_bytes: 0,
+                    result_bytes: 0,
+                })
+                .await;
+        }
+        let unlimited = body(&handle_get_recent_calls(&json!({"limit":0}), &ctx).await);
+        assert_eq!(unlimited["count"], 2);
+        assert_eq!(unlimited["limit_applied"], 2);
+        assert_eq!(unlimited["calls"][0]["call_id"], "test-1");
+        let limited = body(&handle_get_recent_calls(&json!({"limit":1}), &ctx).await);
+        assert_eq!(limited["count"], 1);
+        assert_eq!(limited["limit_applied"], 1);
+        assert_eq!(limited["calls"][0]["call_id"], "test-1");
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[test]
+    fn executable_identity_rejects_in_place_changes_after_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("candidate");
+        std::fs::write(&path, b"before").unwrap();
+        let file = File::open(&path).unwrap();
+        let captured = ExecutableIdentity::capture(&file, &path).unwrap();
+        captured.verify(&file, &path).unwrap();
+        std::fs::write(&path, b"changed bytes and length").unwrap();
+        let error = captured.verify(&file, &path).unwrap_err();
+        assert!(error.contains("changed after its version probe"), "{error}");
+    }
+}

@@ -403,3 +403,66 @@ mod tests {
         assert_eq!(find_gui(gui_filename(), cli.to_str().unwrap()), Some(gui));
     }
 }
+
+#[cfg(test)]
+mod discovery_contract_tests {
+    use super::*;
+
+    #[test]
+    fn an_explicit_gui_path_wins_over_the_configured_cli_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("selected/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let cli = bin.join(cli_filename());
+        let sibling = bin.join(gui_filename());
+        let explicit = dir.path().join(gui_filename());
+        for path in [&cli, &sibling, &explicit] {
+            std::fs::write(path, b"fixture, never executed").unwrap();
+        }
+        assert_eq!(
+            find_gui(explicit.to_str().unwrap(), cli.to_str().unwrap()),
+            Some(explicit)
+        );
+    }
+
+    #[test]
+    fn explicit_paths_must_exist_and_installation_roots_must_have_a_bin_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing/cli");
+        assert_eq!(resolve_configured(missing.to_str().unwrap()), None);
+        assert_eq!(resolve_configured("  "), None);
+        let existing = dir.path().join("tool");
+        std::fs::write(&existing, b"not launched").unwrap();
+        assert_eq!(
+            resolve_explicit_path(existing.to_str().unwrap()),
+            Some(existing.clone())
+        );
+        assert_eq!(installation_root_from_binary(&existing), None);
+        assert_eq!(
+            installation_root_from_binary(&dir.path().join("bin/tool")),
+            Some(dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn library_roots_include_existing_directories_once_and_preserve_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, "not a library root").unwrap();
+        let mut roots = Vec::new();
+        for path in [
+            first.clone(),
+            file,
+            first.clone(),
+            second.clone(),
+            dir.path().join("missing"),
+        ] {
+            push_existing_unique(&mut roots, path);
+        }
+        assert_eq!(roots, [first, second]);
+    }
+}
