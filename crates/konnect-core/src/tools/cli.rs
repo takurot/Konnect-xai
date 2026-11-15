@@ -4290,3 +4290,107 @@ mod publication_cancellation_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod coverage_cli_boundaries {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn failed_cli_exit_retains_both_diagnostic_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = test_support::write_script(
+            dir.path(), "fails-with-diagnostics",
+            "#!/bin/sh\nprintf 'usage detail\\n'\nprintf 'Error bad argument\\nprogress detail\\n' >&2\nexit 7\n",
+            "@echo off\r\necho usage detail\r\necho Error bad argument 1>&2\r\necho progress detail 1>&2\r\nexit /b 7\r\n",
+        );
+        let error = run_cli(executable.to_str().unwrap(), &[], Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        for expected in [
+            "exited with 7",
+            "stdout:",
+            "usage detail",
+            "stderr:",
+            "Error bad argument",
+            "progress detail",
+        ] {
+            assert!(message.contains(expected), "missing {expected}: {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stderr_alone_does_not_turn_a_successful_cli_into_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = test_support::write_script(
+            dir.path(),
+            "warning-only",
+            "#!/bin/sh\nprintf 'result'\nprintf 'warning detail\\n' >&2\nexit 0\n",
+            "@echo off\r\n<nul set /p =result\r\necho warning detail 1>&2\r\nexit /b 0\r\n",
+        );
+        let captured = run_cli_captured(executable.to_str().unwrap(), &[], Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(captured.stdout, "result");
+        assert_eq!(captured.stderr.trim(), "warning detail");
+        assert_eq!(
+            cli_failure_diagnostics(b"", b" warning detail \n"),
+            "stderr:\nwarning detail"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_export_directory_cannot_satisfy_a_file_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = verify_nonempty_file(directory.path(), "PDF")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not a file"), "{error:#}");
+    }
+
+    #[test]
+    fn partial_item_coordinates_are_withheld_without_losing_identity() {
+        for pos in [
+            json!(null),
+            json!({}),
+            json!({"x": 1}),
+            json!({"y": 2}),
+            json!({"x": "1", "y": 2}),
+            json!({"x": 1, "y": false}),
+        ] {
+            let report = parse_erc_json(&json!({
+                "kicad_version": "10.0.7",
+                "sheets": [{"path": "/", "violations": [{
+                    "severity": "warning", "type": "pin_not_connected", "description": "Open pin",
+                    "items": [{"uuid": "pin-identity", "description": "R1 pin 1", "pos": pos}]
+                }]}]
+            }))
+            .unwrap();
+            let item = &report.violations[0].items[0];
+            assert!(item.pos.is_none(), "{pos}");
+            assert_eq!(item.uuid.as_deref(), Some("pin-identity"));
+            assert_eq!(item.description, "R1 pin 1");
+        }
+    }
+
+    #[test]
+    fn malformed_release_versions_never_gain_coordinate_authority() {
+        for version in [
+            "",
+            ".0.7",
+            "10..7",
+            "10.0.",
+            "10.0.7.1",
+            "10.0.7+vendor",
+            "10.0.18446744073709551616",
+            "１０.0.7",
+        ] {
+            assert_eq!(
+                classify_erc_coordinates(Some(version)).status,
+                ErcCoordinateStatus::Withheld,
+                "{version}"
+            );
+        }
+    }
+}

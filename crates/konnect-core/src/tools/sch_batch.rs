@@ -5032,3 +5032,178 @@ mod issue25_batch_native_attributes_tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
     }
 }
+
+#[cfg(test)]
+mod coverage_batch_boundaries {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use std::sync::Arc;
+
+    fn context() -> Arc<ToolContext> {
+        Arc::new(ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        ))
+    }
+
+    fn body(result: &CallToolResult) -> Value {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text response");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    async fn call(tool: &str, args: &Value) -> CallToolResult {
+        let definition = tools().into_iter().find(|def| def.name == tool).unwrap();
+        (definition.handler)(args, context()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn text_validation_refuses_before_touching_the_document() {
+        let cases = [
+            json!({"text": null}),
+            json!({"x": "left"}),
+            json!({"y": null}),
+            json!({"x": 1e20}),
+            json!({"y": -1e20}),
+            json!({"size": 1e20}),
+            json!({"rotation": 1e308}),
+            json!({"thickness": "thin"}),
+            json!({"thickness": 0}),
+            json!({"thickness": -0.1}),
+            json!({"thickness": 1e20}),
+            json!({"color": "red"}),
+            json!({"color": []}),
+            json!({"color": [0, 0]}),
+            json!({"color": [0, 0, 0, 1, 2]}),
+            json!({"color": ["0", 0, 0]}),
+            json!({"color": [-1, 0, 0]}),
+            json!({"color": [0, 256, 0]}),
+            json!({"color": [0, 0, 0.5]}),
+            json!({"color": [0, 0, 0, "opaque"]}),
+            json!({"color": [0, 0, 0, -0.1]}),
+            json!({"color": [0, 0, 0, 1.1]}),
+            json!({"justify": "diagonal"}),
+            json!({"justify": "top bottom"}),
+            json!({"justify": "left right"}),
+        ];
+        for patch in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("design.kicad_sch");
+            let source = crate::tools::blank_schematic_template();
+            std::fs::write(&path, &source).unwrap();
+            let mut args = json!({"schematic": path, "text": "note", "x": 10, "y": 20});
+            args.as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            let result = call("add_schematic_text", &args).await;
+            assert!(result.is_error, "accepted {patch}: {result:?}");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source, "{patch}");
+        }
+    }
+
+    #[tokio::test]
+    async fn text_effects_are_readable_at_color_and_alignment_boundaries() {
+        for (justify, expected) in [
+            ("", None),
+            (" CENTER ", None),
+            ("top", Some("top")),
+            ("right bottom", Some("right")),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("design.kicad_sch");
+            std::fs::write(&path, crate::tools::blank_schematic_template()).unwrap();
+            let result = call(
+                "add_schematic_text",
+                &json!({
+                    "schematic": path, "text": "note", "x": 10, "y": 20,
+                    "justify": justify, "color": [0, 255, 0, 0], "bold": true, "italic": true,
+                    "thickness": 0.1
+                }),
+            )
+            .await;
+            assert!(!result.is_error, "{result:?}");
+            let (_, tree) = konnect_sexp::schematic::read_schematic(&path).unwrap();
+            let text = tree.find("text").unwrap();
+            let effects = text.find("effects").unwrap();
+            assert_eq!(
+                effects
+                    .find("justify")
+                    .and_then(|node| node.get(1))
+                    .and_then(konnect_sexp::SexpNode::as_str),
+                expected
+            );
+            let font = effects.find("font").unwrap();
+            assert_eq!(font.find_f64("thickness"), Some(0.1));
+            assert_eq!(font.find("color").unwrap().get_f64(2), Some(255.0));
+            assert_eq!(font.find("color").unwrap().get_f64(4), Some(0.0));
+            assert!(font.find("bold").is_some() && font.find("italic").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_attribute_batch_refuses_all_fields_when_any_assignment_is_invalid() {
+        let invalid = [
+            json!({"fields": "not an object"}),
+            json!({"fields": {"MPN": 42}}),
+            json!({"fields": {"Reference": "U9"}}),
+            json!({"fields": {"Missing": "new"}}),
+            json!({"value": "new", "fields": {"Value": "duplicate"}}),
+        ];
+        for patch in invalid {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("design.kicad_sch");
+            let source = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+            std::fs::write(&path, source).unwrap();
+            let mut edit = json!({"reference": "U1", "dnp": true});
+            edit.as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            let result = call(
+                "batch_edit_schematic_components",
+                &json!({"schematic": path, "edits": [edit]}),
+            )
+            .await;
+            assert!(result.is_error, "{patch}: {result:?}");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_or_duplicate_native_batch_specs_leave_every_unit_untouched() {
+        for options in [
+            json!({"edits": null}),
+            json!({"edits": [], "create_missing": "yes"}),
+            json!({"edits": [{"dnp": true}]}),
+            json!({"edits": [{"reference": "U1", "dnp": true}, {"reference": "U1", "in_bom": false}]}),
+            json!({"edits": [{"reference": "U1", "dnp": true}, {"value": "missing reference"}]}),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("design.kicad_sch");
+            let source = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+            std::fs::write(&path, source).unwrap();
+            let mut args = options;
+            args["schematic"] = json!(path);
+            let result = call("batch_edit_schematic_components", &args).await;
+            assert!(result.is_error, "{args}: {result:?}");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_batch_is_a_noop_with_explicit_zero_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        let source = crate::tools::blank_schematic_template();
+        std::fs::write(&path, &source).unwrap();
+        let result = call(
+            "batch_edit_schematic_components",
+            &json!({"schematic": path, "edits": []}),
+        )
+        .await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(body(&result)["updated_count"], 0);
+        assert_eq!(body(&result)["created_unit_copies"], 0);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+    }
+}
