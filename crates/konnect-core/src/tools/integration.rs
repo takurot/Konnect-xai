@@ -4239,3 +4239,73 @@ mod datasheet_boundary_tests {
         assert!(error.contains("Datasheet") && error.contains("Stock"));
     }
 }
+
+#[cfg(test)]
+mod coverage_local_catalog_boundaries {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::ctx_talking_to;
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("text expected")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn local_catalog_stats_and_existing_download_preserve_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("parts.db");
+        let mut ctx = ctx_talking_to(String::new());
+        ctx.config.jlcpcb_db_path = Some(database.clone());
+        assert_eq!(
+            body(&handle_jlcpcb_stats(&json!({}), &ctx).await.unwrap())["exists"],
+            false
+        );
+        {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection.execute_batch("CREATE TABLE components (LCSC TEXT, MFR_Part TEXT, Datasheet TEXT); INSERT INTO components VALUES ('C1','P1',''),('C2','P2','https://example.test/part.pdf');").unwrap();
+        }
+        let before = std::fs::read(&database).unwrap();
+        let stats = body(&handle_jlcpcb_stats(&json!({}), &ctx).await.unwrap());
+        assert_eq!(stats["exists"], true);
+        assert_eq!(stats["part_count"], 2);
+        let download = handle_download_jlcpcb(&json!({}), &ctx).await.unwrap();
+        assert_eq!(body(&download)["status"], "already_exists");
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+        assert!(datasheet_from_catalog(&json!({}), &ctx, Some("C1"), None)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            datasheet_from_catalog(&json!({}), &ctx, None, Some("P2"))
+                .await
+                .unwrap(),
+            Some("https://example.test/part.pdf".into())
+        );
+        assert!(
+            handle_get_datasheet_url(&json!({}), &ctx)
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert_eq!(std::fs::read(database).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn datasheet_enrichment_without_placed_lcsc_targets_preserves_the_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("board.kicad_sch");
+        let source = "(kicad_sch (version 20250114) (uuid root) (lib_symbols))";
+        std::fs::write(&schematic, source).unwrap();
+        let result = handle_enrich_datasheets(
+            &json!({"schematic":schematic}),
+            &ctx_talking_to(String::new()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(body(&result)["updated"], 0);
+        assert_eq!(std::fs::read_to_string(schematic).unwrap(), source);
+    }
+}

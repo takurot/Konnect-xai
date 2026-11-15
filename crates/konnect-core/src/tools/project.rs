@@ -2401,3 +2401,125 @@ mod rename_boundary_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod coverage_project_observation {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("text expected")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn open_project_reports_requested_identity_separately_from_ipc_availability() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let other = dir.path().join("other.kicad_pcb");
+        std::fs::write(&board, "saved board bytes").unwrap();
+        std::fs::write(&other, "other saved bytes").unwrap();
+        let server = spawn_kicad_holding_board(&board, |_| None);
+        let ctx = ctx_talking_to(server.address().into());
+        for (args, expected) in [
+            (json!({}), None),
+            (
+                json!({"path":board.with_extension("kicad_pro")}),
+                Some(true),
+            ),
+            (json!({"path":other}), Some(false)),
+        ] {
+            let result = handle_open_project(&args, &ctx).await.unwrap();
+            assert!(!result.is_error);
+            let body = body(&result);
+            assert_eq!(body["ipc_available"], true);
+            assert_eq!(body["open_board_count"], 1);
+            assert_eq!(body["requested_open"], json!(expected));
+            if expected == Some(false) {
+                assert!(body["requested_check_error"].is_string());
+            }
+        }
+        let offline = handle_open_project(&json!({"path":board}), &ctx_talking_to(String::new()))
+            .await
+            .unwrap();
+        let offline = body(&offline);
+        assert_eq!(offline["ipc_available"], false);
+        assert!(offline["requested_open"].is_null());
+        assert_eq!(offline["requested_board"], board.to_str().unwrap());
+        assert_eq!(std::fs::read_to_string(board).unwrap(), "saved board bytes");
+        assert_eq!(std::fs::read_to_string(other).unwrap(), "other saved bytes");
+    }
+
+    #[tokio::test]
+    async fn open_project_keeps_document_inventory_failure_visible_after_a_successful_ping() {
+        use konnect_ipc::gen::kiapi;
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "saved").unwrap();
+        let server =
+            crate::test_support::MockIpcServer::spawn("project-inventory-refusal", |request| {
+                let inventory = request
+                    .message
+                    .unwrap()
+                    .type_url
+                    .ends_with("GetOpenDocuments");
+                kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: if inventory {
+                            kiapi::common::ApiStatusCode::AsBadRequest
+                        } else {
+                            kiapi::common::ApiStatusCode::AsOk
+                        } as i32,
+                        error_message: if inventory {
+                            "inventory unavailable".into()
+                        } else {
+                            String::new()
+                        },
+                    }),
+                    header: None,
+                    message: None,
+                }
+            });
+        let result = handle_open_project(
+            &json!({"path":board}),
+            &ctx_talking_to(server.address().into()),
+        )
+        .await
+        .unwrap();
+        let result = body(&result);
+        assert_eq!(result["ipc_available"], true);
+        assert_eq!(result["open_board_count"], 0);
+        assert!(result["open_boards_error"]
+            .as_str()
+            .unwrap()
+            .contains("inventory unavailable"));
+        assert_eq!(result["requested_open"], false);
+        assert!(result["requested_check_error"].is_string());
+        assert_eq!(std::fs::read_to_string(board).unwrap(), "saved");
+    }
+
+    #[test]
+    fn project_name_rewrite_preserves_escaped_names_and_unrelated_values() {
+        for old in ["old \\\"quoted", "old\\path", "old\tname"] {
+            let source = format!(
+                "(kicad_sch (project {} (path root)) (property Value {}))",
+                konnect_sexp::quoted(old),
+                konnect_sexp::quoted(old)
+            );
+            let (rewritten, hits) = rewrite_project_references(&source, old, "new", true);
+            assert_eq!(hits, 1);
+            let tree = konnect_sexp::parse_sexp(&rewritten).unwrap();
+            assert_eq!(tree.find_str("project"), Some("new"));
+            assert_eq!(
+                tree.find("property").unwrap().get(2).unwrap().as_str(),
+                Some(old)
+            );
+        }
+        for malformed in ["(project old", "(project other)"] {
+            let (rewritten, hits) = rewrite_project_references(malformed, "old", "new", true);
+            assert_eq!((rewritten, hits), (malformed.to_string(), 0));
+        }
+    }
+}

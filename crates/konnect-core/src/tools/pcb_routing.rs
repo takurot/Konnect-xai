@@ -3431,6 +3431,28 @@ mod route_pad_to_pad_tests {
     }
 
     #[tokio::test]
+    async fn axis_aligned_live_pads_need_only_one_segment() {
+        for (start, end) in [((10.0, 20.0), (10.0, 30.0)), ((10.0, 20.0), (30.0, 20.0))] {
+            let (_dir, board_path) = saved_board();
+            let (named, tracks) = (Named::default(), Tracks::default());
+            let live = vec![
+                footprint("R1", start, &[("1", start.0, start.1)]),
+                footprint("R2", end, &[("2", end.0, end.1)]),
+            ];
+            let server = spawn_live_board(&board_path, live, named, tracks.clone());
+            let result = handle_route_pad_to_pad(
+                &route_args(&board_path, "1"),
+                &ctx_talking_to(server.address().into()),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{result:?}");
+            assert_eq!(*tracks.lock().unwrap(), vec![(start, end)]);
+            assert_eq!(std::fs::read_to_string(board_path).unwrap(), SAVED);
+        }
+    }
+
+    #[tokio::test]
     async fn a_footprint_only_in_the_saved_file_is_refused_without_copper() {
         let (_dir, board_path) = saved_board();
         let tracks = Tracks::default();
@@ -3609,5 +3631,33 @@ mod specctra_preflight_contract_tests {
         assert_eq!(path, ses);
         assert_eq!(session, "session");
         assert_eq!(reverse_manifest, "manifest");
+    }
+}
+
+#[cfg(test)]
+mod coverage_legacy_net_no_write {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::ctx_talking_to;
+
+    #[tokio::test]
+    async fn adding_an_existing_legacy_net_preserves_its_id_and_all_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let source = "(kicad_pcb (version 20240108) (net invalid X) (net 7 GND))";
+        std::fs::write(&board, source).unwrap();
+        let result = handle_add_net(
+            &json!({"board":board,"net_name":"GND"}),
+            &ctx_talking_to(String::new()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("text expected")
+        };
+        let result: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(result["created"], false);
+        assert_eq!(result["net_id"], 7);
+        assert_eq!(std::fs::read_to_string(board).unwrap(), source);
     }
 }

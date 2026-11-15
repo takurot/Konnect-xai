@@ -2373,3 +2373,131 @@ mod palette_boundary_tests {
         assert_eq!(routing_points(malformed), vec![(3.0, 4.0)]);
     }
 }
+
+#[cfg(test)]
+mod coverage_verification_no_write {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::ctx_talking_to;
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("text expected")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn palette_noop_and_invalid_lists_keep_project_bytes_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let project = board.with_extension("kicad_pro");
+        let original = r#"{ "board": {"design_settings": {"track_widths": [0.0,0.25], "via_dimensions": [{"diameter":0.0,"drill":0.0},{"diameter":0.6,"drill":0.3}]}} }"#;
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        std::fs::write(&project, original).unwrap();
+        let ctx = ctx_talking_to(String::new());
+        for extra in [
+            json!({"track_widths":[0,0.25]}),
+            json!({"via_dimensions":[{"diameter":0.6,"drill":0.3}]}),
+        ] {
+            let mut args = json!({"board":board});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let result = handle_set_predefined_sizes(&args, &ctx).await.unwrap();
+            assert!(!result.is_error, "{result:?}");
+            assert_eq!(body(&result)["changed"], json!([]));
+            assert_eq!(std::fs::read_to_string(&project).unwrap(), original);
+        }
+        for extra in [
+            json!({}),
+            json!({"track_widths":null,"via_dimensions":null}),
+            json!({"track_widths":1}),
+            json!({"via_dimensions":{}}),
+            json!({"via_dimensions":[{"diameter":0.6}]}),
+            json!({"track_widths":[-0.1]}),
+        ] {
+            let mut args = json!({"board":board});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(
+                handle_set_predefined_sizes(&args, &ctx)
+                    .await
+                    .unwrap()
+                    .is_error
+            );
+            assert_eq!(std::fs::read_to_string(&project).unwrap(), original);
+        }
+        assert_eq!(std::fs::read_to_string(board).unwrap(), "(kicad_pcb)");
+    }
+
+    #[tokio::test]
+    async fn absent_constraints_are_noops_and_unsafe_layer_names_create_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let rules = board.with_extension("kicad_dru");
+        let ctx = ctx_talking_to(String::new());
+        let noop = handle_set_layer_constraints(&json!({"board":board,"layer":"F.Cu"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(body(&noop)["changed"], json!([]));
+        assert!(!rules.exists());
+        for layer in ["", "F.Cu\"", "F.Cu/other", "F.Cu\n"] {
+            assert!(handle_set_layer_constraints(
+                &json!({"board":board,"layer":layer,"min_clearance":0.2}),
+                &ctx
+            )
+            .await
+            .is_err());
+            assert!(!rules.exists());
+        }
+        assert!(!board.exists());
+    }
+
+    #[tokio::test]
+    async fn routing_copy_requires_every_point_inside_the_selected_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let ctx = ctx_talking_to(String::new());
+        for points in [
+            "(start -1 1) (end 2 2)",
+            "(start 1 -1) (end 2 2)",
+            "(start 1 1) (end 11 2)",
+            "(start 1 1) (end 2 11)",
+            "",
+        ] {
+            let source = format!("(kicad_pcb (segment {points} (uuid original)))");
+            std::fs::write(&board, &source).unwrap();
+            let result = handle_copy_routing_pattern(&json!({"board":board,"src_x1":0,"src_y1":0,"src_x2":10,"src_y2":10,"dest_x":20,"dest_y":20}),&ctx).await.unwrap();
+            assert_eq!(body(&result)["copied"], 0);
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+        }
+    }
+
+    #[tokio::test]
+    async fn design_rule_noop_and_malformed_project_shapes_preserve_saved_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let project = board.with_extension("kicad_pro");
+        let ctx = ctx_talking_to(String::new());
+        for source in [
+            "[]",
+            r#"{"board":[]}"#,
+            r#"{"board":{"design_settings":[]}}"#,
+            r#"{"board":{"design_settings":{"rules":[]}}}"#,
+        ] {
+            std::fs::write(&project, source).unwrap();
+            let result =
+                handle_set_design_rules(&json!({"board":board,"min_clearance":0.2}), &ctx).await;
+            assert!(result.is_err());
+            assert_eq!(std::fs::read_to_string(&project).unwrap(), source);
+        }
+        let source = "{ \"board\": {\"design_settings\": {\"rules\":{}}} }";
+        std::fs::write(&project, source).unwrap();
+        let result = handle_set_design_rules(&json!({"board":board}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(body(&result)["changed"], json!([]));
+        assert_eq!(std::fs::read_to_string(project).unwrap(), source);
+    }
+}
