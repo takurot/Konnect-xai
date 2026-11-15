@@ -31,6 +31,7 @@ pub mod pcb_export;
 pub(crate) mod pcb_footprint_update;
 pub mod pcb_routing;
 pub(crate) mod pcb_sync;
+mod pcb_zone_nets;
 mod placed_footprint_models;
 pub mod placement;
 pub mod project;
