@@ -4063,7 +4063,7 @@ mod v015_client_contract_tests {
                     changed.filename = "unexpected.step".into();
                     *model = builders::pack_any(&changed, "kiapi.board.types.Footprint3DModel");
                 }
-                if matches!(mode, 2 | 3 | 4) {
+                if matches!(mode, 2..=4) {
                     let mut response = ok_response();
                     response.status.as_mut().unwrap().status =
                         kiapi::common::ApiStatusCode::AsBadRequest as i32;
