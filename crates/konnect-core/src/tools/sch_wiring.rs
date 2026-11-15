@@ -4979,3 +4979,100 @@ mod batch_no_connect_tests {
         assert_eq!(out.matches("(no_connect").count(), 0);
     }
 }
+
+#[cfg(test)]
+mod coverage_marker_readback {
+    use super::*;
+    use crate::mcp::error::extract_error_kind;
+
+    fn carry() -> NoConnectCarry {
+        NoConnectCarry {
+            uuid: "marker-1".into(),
+            from: (1.0, 2.0),
+            to: (10.0, 20.0),
+        }
+    }
+
+    #[test]
+    fn marker_readback_refuses_missing_malformed_and_displaced_arrivals() {
+        for source in [
+            "(broken",
+            "(kicad_sch)",
+            "(kicad_sch (no_connect (at 10 20) (uuid \"other\")))",
+            "(kicad_sch (no_connect (uuid \"marker-1\")))",
+            "(kicad_sch (no_connect (at 1 2) (uuid \"marker-1\")))",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("design.kicad_sch");
+            std::fs::write(&path, source).unwrap();
+            let result = observed_no_connect_moves(&path, "move", &[carry()])
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                extract_error_kind(&result).as_deref(),
+                Some("mutation_outcome_uncertain"),
+                "{result:?}"
+            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn marker_readback_reports_observed_coordinates_instead_of_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch (no_connect (at 10.005 20) (uuid \"marker-1\")))",
+        )
+        .unwrap();
+        let observed = observed_no_connect_moves(&path, "move", &[carry()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed[0]["from"], json!({"x": 1.0, "y": 2.0}));
+        assert_eq!(observed[0]["to"], json!({"x": 10.005, "y": 20.0}));
+        assert_eq!(observed[0]["uuid"], "marker-1");
+        assert!(
+            observed_no_connect_moves(&path.with_file_name("missing"), "move", &[])
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn marker_coordinate_rewrite_requires_a_locatable_identity_and_at_clause() {
+        for source in [
+            "(kicad_sch)",
+            "(kicad_sch (no_connect (at 1 2)))",
+            "(kicad_sch (no_connect (uuid \"marker-1\")))",
+            "(kicad_sch (no_connect (at 1 2) (uuid \"other\")))",
+        ] {
+            assert!(
+                apply_no_connect_carries(source.to_owned(), &[carry()]).is_none(),
+                "{source}"
+            );
+        }
+        let source = "(kicad_sch (no_connect (at 1 2) (uuid \"marker-1\")) (text \"unrelated\"))";
+        let rewritten = apply_no_connect_carries(source.to_owned(), &[carry()]).unwrap();
+        let tree = parse_sexp(&rewritten).unwrap();
+        let marker = tree.find("no_connect").unwrap();
+        assert_eq!(parse_at(marker).map(|(x, y, _)| (x, y)), Some((10.0, 20.0)));
+        assert!(rewritten.contains("(text \"unrelated\")"));
+        assert_eq!(
+            apply_no_connect_carries(source.to_owned(), &[]).unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn orphan_pruning_preserves_a_last_wire_when_symbol_pins_are_unresolved() {
+        let removed_tree =
+            parse_sexp("(kicad_sch (wire (pts (xy 0 0) (xy 0 5)) (uuid \"removed\")))").unwrap();
+        let removed = extract_wires(&removed_tree);
+        let source = "(kicad_sch (lib_symbols) (symbol (lib_id \"Unknown:Part\") (at 0 0 0) (unit 1) (uuid \"part\") (property \"Reference\" \"U1\")) (junction (at 0 0) (diameter 0) (color 0 0 0 0) (uuid \"j\")) (wire (pts (xy -5 0) (xy 5 0)) (uuid \"remaining\")))";
+        let (after, pruned) = prune_orphaned_junctions(source.to_owned(), &removed);
+        assert_eq!(pruned, 0);
+        assert_eq!(after, source);
+    }
+}
