@@ -1019,4 +1019,384 @@ mod tests {
             "Freerouting child {pid} survived cancellation"
         );
     }
+
+    fn coverage_settings() -> RouteSettings {
+        RouteSettings {
+            max_passes: None,
+            optimizer_enabled: None,
+            job_timeout_seconds: None,
+            poll_interval: Duration::from_secs(2),
+            overall_timeout: Duration::from_secs(10),
+        }
+    }
+
+    #[test]
+    fn routing_inputs_are_validated_before_starting_a_process_or_creating_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let jar = dir.path().join("router.jar");
+        let dsn = dir.path().join("board.DSN");
+        let ses = dir.path().join("new.ses");
+        std::fs::write(&jar, "fixture jar is never executed").unwrap();
+        std::fs::write(&dsn, "(pcb board)").unwrap();
+        validate_inputs(&jar, &dsn, &ses, &coverage_settings()).unwrap();
+        for (settings, expected) in [
+            (
+                RouteSettings {
+                    max_passes: Some(0),
+                    ..coverage_settings()
+                },
+                "max_passes",
+            ),
+            (
+                RouteSettings {
+                    max_passes: Some(101),
+                    ..coverage_settings()
+                },
+                "max_passes",
+            ),
+            (
+                RouteSettings {
+                    poll_interval: Duration::from_secs(1),
+                    ..coverage_settings()
+                },
+                "poll interval",
+            ),
+            (
+                RouteSettings {
+                    poll_interval: Duration::from_secs(6),
+                    ..coverage_settings()
+                },
+                "poll interval",
+            ),
+            (
+                RouteSettings {
+                    overall_timeout: Duration::ZERO,
+                    ..coverage_settings()
+                },
+                "overall timeout",
+            ),
+            (
+                RouteSettings {
+                    overall_timeout: Duration::from_secs(86401),
+                    ..coverage_settings()
+                },
+                "overall timeout",
+            ),
+            (
+                RouteSettings {
+                    job_timeout_seconds: Some(0),
+                    ..coverage_settings()
+                },
+                "job_timeout_seconds",
+            ),
+            (
+                RouteSettings {
+                    job_timeout_seconds: Some(86401),
+                    ..coverage_settings()
+                },
+                "job_timeout_seconds",
+            ),
+        ] {
+            let error = validate_inputs(&jar, &dsn, &ses, &settings).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+            assert!(!ses.exists());
+        }
+        for settings in [
+            RouteSettings {
+                max_passes: Some(1),
+                job_timeout_seconds: Some(1),
+                ..coverage_settings()
+            },
+            RouteSettings {
+                max_passes: Some(100),
+                job_timeout_seconds: Some(86400),
+                poll_interval: Duration::from_secs(5),
+                overall_timeout: Duration::from_secs(86400),
+                ..coverage_settings()
+            },
+        ] {
+            validate_inputs(&jar, &dsn, &ses, &settings).unwrap();
+        }
+        assert!(validate_inputs(
+            &dir.path().join("missing.jar"),
+            &dsn,
+            &ses,
+            &coverage_settings()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("JAR does not exist"));
+        assert!(validate_inputs(
+            &jar,
+            &dir.path().join("missing.dsn"),
+            &ses,
+            &coverage_settings()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("DSN input"));
+        assert!(validate_inputs(&jar, &jar, &ses, &coverage_settings())
+            .unwrap_err()
+            .to_string()
+            .contains("DSN input"));
+        assert!(validate_inputs(
+            &jar,
+            &dsn,
+            &dir.path().join("output.txt"),
+            &coverage_settings()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains(".ses extension"));
+        std::fs::write(&ses, "existing board routes").unwrap();
+        assert!(validate_inputs(&jar, &dsn, &ses, &coverage_settings())
+            .unwrap_err()
+            .to_string()
+            .contains("already exists"));
+        assert_eq!(
+            std::fs::read_to_string(ses).unwrap(),
+            "existing board routes"
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_diagnostics_do_not_clobber_existing_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("board.ses");
+        assert!(write_diagnostics(&output, "").await.unwrap().is_none());
+        assert!(!output.with_extension("freerouting.log").exists());
+        let log = output.with_extension("freerouting.log");
+        std::fs::write(&log, "previous run evidence").unwrap();
+        let error = write_diagnostics(&output, "new run failure")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "previous run evidence"
+        );
+    }
+
+    // A local stdio fixture exercises the actual JSON-RPC framing without Java
+    // or a global PATH override. Responses are paired with recorded requests;
+    // the initialize notification consumes no response, as MCP requires.
+    #[cfg(unix)]
+    async fn scripted_client(trace: &Path, replies: &[String]) -> LocalMcpClient {
+        let script = r#"trace=$1; shift
+for reply do
+  while IFS= read -r request; do
+    printf '%s\n' "$request" >> "$trace"
+    case "$request" in
+      *'"method":"notifications/initialized"'*) continue ;;
+      *) printf '%s\n' "$reply"; break ;;
+    esac
+  done
+done
+cat >/dev/null"#;
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg("fixture")
+            .arg(trace)
+            .arg(json!({"id":1,"result":{"protocolVersion":"2024-11-05"}}).to_string())
+            .args(replies)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut client = LocalMcpClient {
+            child: Some(child),
+            stdin,
+            stdout,
+            stderr_task: None,
+            next_id: 1,
+            server_protocol_version: String::new(),
+        };
+        client.initialize().await.unwrap();
+        client
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_protocol_refuses_unmatched_errors_and_malformed_tool_results() {
+        let dir = tempfile::tempdir().unwrap();
+        for (reply, expected) in [
+            ("not-json".to_string(), "non-JSON stdout"),
+            (
+                json!({"id":99,"result":{}}).to_string(),
+                "unexpected response id",
+            ),
+            (
+                json!({"id":2,"error":{"message":"router rejected"}}).to_string(),
+                "router rejected",
+            ),
+            (json!({"id":2}).to_string(), "no result"),
+        ] {
+            let mut client = scripted_client(&dir.path().join("protocol.log"), &[reply]).await;
+            let error = client
+                .request("probe", json!({}), Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            client.close().await;
+        }
+        for (result, expected) in [
+            (json!({}), "no tools array"),
+            (json!({"tools":[{"inputSchema":{}}]}), "unnamed tool"),
+            (json!({"tools":[{"name":"route"}]}), "without inputSchema"),
+        ] {
+            let reply = json!({"id":2,"result":result}).to_string();
+            let mut client = scripted_client(&dir.path().join("tools.log"), &[reply]).await;
+            assert!(client
+                .list_tools()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains(expected));
+            client.close().await;
+        }
+        let reply = json!({"id":2,"result":{"isError":true,"content":[{"type":"text","text":"invalid input"}]}}).to_string();
+        let mut client = scripted_client(&dir.path().join("error.log"), &[reply]).await;
+        assert!(client
+            .call_tool("route", json!({}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("returned an error"));
+        client.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_notifications_and_text_results_keep_the_matching_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = format!(
+            "\n{}\n{}",
+            json!({"method":"progress","params":{"percent":10}}),
+            json!({"id":2,"result":{"content":[{"type":"text","text":"{\"sessionId\":\"fixture-session\"}"}]}})
+        );
+        let trace = dir.path().join("trace.log");
+        let mut client = scripted_client(&trace, &[reply]).await;
+        let result = client.call_tool("create_session", json!({})).await.unwrap();
+        assert_eq!(
+            required_string(&result, &["sessionId"], "session id").unwrap(),
+            "fixture-session"
+        );
+        assert_eq!(client.server_protocol_version, "2024-11-05");
+        client.close().await;
+        let requests: Vec<Value> = std::fs::read_to_string(trace)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(requests[0]["method"], "initialize");
+        assert_eq!(requests[1]["method"], "notifications/initialized");
+        assert!(requests[1].get("id").is_none());
+        assert_eq!(requests[2]["params"]["name"], "create_session");
+    }
+
+    #[cfg(unix)]
+    fn coverage_tool_list(include_settings: bool) -> Value {
+        let flat = json!({"type":"object","properties":{"jobId":{"type":"string"},"filePath":{"type":"string"}},"required":["jobId","filePath"]});
+        let path = json!({"type":"object","properties":{"path":{"type":"object","properties":{"jobId":{"type":"string"}},"required":["jobId"]}},"required":["path"]});
+        let body = json!({"type":"object","properties":{"body":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}},"required":["body"]});
+        let mut tools = vec![
+            json!({"name":"create_session","inputSchema":{"type":"object"}}),
+            json!({"name":"enqueue_job","inputSchema":body}),
+            json!({"name":"upload_job_input_from_local_file","inputSchema":flat}),
+            json!({"name":"start_job","inputSchema":path}),
+            json!({"name":"get_job_details","inputSchema":path}),
+            json!({"name":"download_job_output_to_local_file","inputSchema":flat}),
+        ];
+        if include_settings {
+            tools.push(json!({"name":"update_job_settings","inputSchema":{"type":"object"}}));
+        }
+        json!({"tools":tools})
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_routing_state_machine_sends_settings_and_downloads_only_completed_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        for (configure, state) in [
+            (false, "COMPLETED"),
+            (true, "COMPLETED"),
+            (false, "FAILED"),
+            (false, "CANCELLED"),
+            (false, "CANCELED"),
+        ] {
+            let trace = dir.path().join(format!("{configure}-{state}.log"));
+            let mut results = vec![
+                coverage_tool_list(configure),
+                json!({"sessionId":"session-fixture"}),
+                json!({"jobId":"job-fixture"}),
+                json!({}),
+            ];
+            let mut settings = coverage_settings();
+            if configure {
+                settings.max_passes = Some(2);
+                settings.optimizer_enabled = Some(false);
+                settings.job_timeout_seconds = Some(300);
+                results.push(json!({}));
+            }
+            results.extend([json!({}), json!({"state":state}), json!({})]);
+            let replies = results
+                .into_iter()
+                .enumerate()
+                .map(|(index, result)| json!({"id":index + 2,"result":result}).to_string())
+                .collect::<Vec<_>>();
+            let mut client = scripted_client(&trace, &replies).await;
+            let dsn = dir.path().join("input.dsn");
+            let temporary = dir.path().join("output.tmp.ses");
+            let result =
+                run_state_machine(&mut client, &dsn, &temporary, &settings, Instant::now()).await;
+            if state == "COMPLETED" {
+                let evidence = result.unwrap();
+                assert_eq!(evidence.session_id, "session-fixture");
+                assert_eq!(evidence.job_id, "job-fixture");
+                assert_eq!(evidence.final_state, "COMPLETED");
+                assert_eq!(evidence.poll_count, 1);
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&format!("ended in state {state}")));
+            }
+            client.close().await;
+            let requests = std::fs::read_to_string(&trace)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let calls = requests
+                .iter()
+                .filter(|request| request["method"] == "tools/call")
+                .collect::<Vec<_>>();
+            assert_eq!(calls[0]["params"]["name"], "create_session");
+            assert_eq!(
+                calls[1]["params"]["arguments"]["body"]["session_id"],
+                "session-fixture"
+            );
+            assert_eq!(calls[2]["params"]["arguments"]["jobId"], "job-fixture");
+            let update = calls
+                .iter()
+                .find(|request| request["params"]["name"] == "update_job_settings");
+            assert_eq!(update.is_some(), configure);
+            if let Some(update) = update {
+                assert_eq!(
+                    update["params"]["arguments"]["body"],
+                    json!({"maxPasses":2,"optimizer":{"enabled":false},"jobTimeoutString":"00:05:00"})
+                );
+            }
+            assert_eq!(calls.iter().any(|request| request["params"]["name"] == "download_job_output_to_local_file"),state == "COMPLETED");
+            assert!(
+                !temporary.exists(),
+                "the stdio fixture must not impersonate real router output"
+            );
+        }
+    }
 }
