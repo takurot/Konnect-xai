@@ -5154,3 +5154,404 @@ mod issue14_chamfer_tests {
         assert!(!corners.top_left && !corners.top_right && !corners.bottom_right);
     }
 }
+
+#[cfg(test)]
+mod planner_refusal_tests {
+    use super::*;
+
+    fn instance_item(reference: &str, library: Option<(&str, &str)>) -> prost_types::Any {
+        let field = kiapi::board::types::Field {
+            name: "Reference".to_string(),
+            text: Some(kiapi::board::types::BoardText {
+                text: Some(kiapi::common::types::Text {
+                    text: reference.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            visible: true,
+            ..Default::default()
+        };
+        let instance = kiapi::board::types::FootprintInstance {
+            reference_field: Some(field),
+            definition: Some(kiapi::board::types::Footprint {
+                id: library.map(
+                    |(nickname, entry)| kiapi::common::types::LibraryIdentifier {
+                        library_nickname: nickname.to_string(),
+                        entry_name: entry.to_string(),
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        konnect_ipc::builders::pack_any(&instance, "kiapi.board.types.FootprintInstance")
+    }
+
+    fn plan(items: &[prost_types::Any], filters: &UpdateFilters, project: &Path) -> UpdatePlan {
+        plan_updates(
+            &project.join("board.kicad_pcb"),
+            items,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            filters,
+            2,
+        )
+    }
+
+    fn diagnostic_codes(plan: &UpdatePlan) -> Vec<&str> {
+        plan.diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect()
+    }
+
+    fn assert_refused_without_writes(plan: &UpdatePlan) {
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.prepared_items.is_empty());
+        assert!(plan.changes.is_empty());
+        assert_eq!(plan.coverage.conflicts.planned, plan.diagnostics.len());
+        assert_eq!(plan.coverage.changed.planned, 0);
+    }
+
+    fn rejected(args: serde_json::Value) -> ArgumentError {
+        parse_filters(&args).unwrap_err()
+    }
+
+    #[test]
+    fn filter_arguments_are_validated_field_by_field() {
+        let error = rejected(serde_json::json!({ "references": "U1" }));
+        assert_eq!(error.field, "references");
+        assert!(error.reason.contains("array of strings"), "{error}");
+
+        let error = rejected(serde_json::json!({ "references": ["U1", 7] }));
+        assert_eq!(error.field, "references");
+        assert!(error.reason.contains("only strings"), "{error}");
+
+        let error = rejected(serde_json::json!({ "references": ["U1", ""] }));
+        assert!(error.reason.contains("empty strings"), "{error}");
+
+        let error = rejected(serde_json::json!({ "library_ids": { "a": 1 } }));
+        assert_eq!(error.field, "library_ids");
+
+        let error = rejected(serde_json::json!({ "reset_text": "yes" }));
+        assert_eq!(error.field, "reset_text");
+        assert_eq!(error.reason, "must be a boolean");
+        assert_eq!(error.to_string(), "reset_text: must be a boolean");
+    }
+
+    #[test]
+    fn library_ids_must_be_plain_library_footprint_pairs() {
+        for invalid in [
+            "NoColon",
+            ":Entry",
+            "Lib:",
+            "Lib/Sub:Entry",
+            "Lib:Sub/Entry",
+            "Lib\\Sub:Entry",
+        ] {
+            let error = rejected(serde_json::json!({ "library_ids": ["Good:One", invalid] }));
+            assert_eq!(error.field, "library_ids", "{invalid}");
+            assert!(
+                error.reason.contains(invalid),
+                "{invalid}: {}",
+                error.reason
+            );
+        }
+        let parsed = parse_filters(&serde_json::json!({
+            "reset_text": true,
+            "library_ids": ["Good:One"]
+        }))
+        .unwrap();
+        assert!(parsed.reset_text);
+        assert_eq!(parsed.references, None);
+    }
+
+    #[test]
+    fn library_sources_are_refused_before_any_definition_is_built() {
+        let error = parse_library_footprint("NoColon", "(footprint \"X\")").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("non-empty Library:Footprint syntax"),
+            "{error:#}"
+        );
+        let error = parse_library_footprint(":Entry", "(footprint \"X\")").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Library:Footprint"),
+            "{error:#}"
+        );
+        let error = parse_library_footprint("Lib:", "(footprint \"X\")").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Library:Footprint"),
+            "{error:#}"
+        );
+
+        let error = parse_library_footprint("Lib:Entry", "(footprint \"X\"").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("invalid footprint S-expression"),
+            "{error:#}"
+        );
+        let error = parse_library_footprint("Lib:Entry", "(module \"X\")").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("library source root must be a footprint"),
+            "{error:#}"
+        );
+        let error =
+            parse_library_footprint("Lib:Entry", "(footprint \"X\" (zone (net 1)))").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("'zone' is not supported"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_board_footprint_blocks_the_whole_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let broken = prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.FootprintInstance".into(),
+            value: vec![0xff, 0xff, 0xff, 0xff],
+        };
+        let plan = plan(
+            &[broken, instance_item("U1", None)],
+            &UpdateFilters::default(),
+            temp.path(),
+        );
+        assert_refused_without_writes(&plan);
+        assert_eq!(diagnostic_codes(&plan), ["invalid_board_footprint"]);
+        assert_eq!(plan.diagnostics[0].reference, None);
+    }
+
+    #[test]
+    fn repeated_references_conflict_even_without_a_reference_filter() {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = plan(
+            &[instance_item("U1", None), instance_item("U1", None)],
+            &UpdateFilters::default(),
+            temp.path(),
+        );
+        assert_refused_without_writes(&plan);
+        assert_eq!(diagnostic_codes(&plan), ["duplicate_reference"]);
+        assert!(plan.diagnostics[0].message.contains("appears 2 times"));
+        assert_eq!(plan.diagnostics[0].reference.as_deref(), Some("U1"));
+    }
+
+    #[test]
+    fn malformed_library_identifiers_on_the_board_are_reported_per_footprint() {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = plan(
+            &[
+                instance_item("U1", Some(("", "Entry"))),
+                instance_item("U2", Some(("Lib", ""))),
+            ],
+            &UpdateFilters::default(),
+            temp.path(),
+        );
+        assert_refused_without_writes(&plan);
+        assert_eq!(
+            diagnostic_codes(&plan),
+            ["invalid_library_id", "invalid_library_id"]
+        );
+        assert!(plan.diagnostics[0]
+            .message
+            .contains("malformed library id ':Entry'"));
+        assert!(plan.diagnostics[1]
+            .message
+            .contains("malformed library id 'Lib:'"));
+        assert_eq!(plan.coverage.selected.planned, 2);
+    }
+
+    #[test]
+    fn a_library_missing_from_every_table_is_a_resolution_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = plan(
+            &[instance_item(
+                "U1",
+                Some(("NoSuchLibraryForKonnectTests", "Entry")),
+            )],
+            &UpdateFilters::default(),
+            temp.path(),
+        );
+        assert_refused_without_writes(&plan);
+        assert_eq!(
+            diagnostic_codes(&plan),
+            ["footprint_library_resolution_failed"]
+        );
+        assert_eq!(plan.diagnostics[0].reference.as_deref(), Some("U1"));
+    }
+
+    #[test]
+    fn a_library_source_the_rebuild_cannot_represent_is_a_conflict_naming_why() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("Test.pretty");
+        std::fs::create_dir(&library).unwrap();
+        std::fs::write(
+            library.join("Odd.kicad_mod"),
+            "(footprint \"Odd\" (zone (net 1)))",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("fp-lib-table"),
+            "(fp_lib_table (lib (name \"Test\") (type \"KiCad\") (uri \"${KIPRJMOD}/Test.pretty\") (options \"\") (descr \"\")))",
+        )
+        .unwrap();
+
+        let plan = plan(
+            &[instance_item("U1", Some(("Test", "Odd")))],
+            &UpdateFilters::default(),
+            temp.path(),
+        );
+
+        assert_refused_without_writes(&plan);
+        assert_eq!(diagnostic_codes(&plan), ["unsupported_library_footprint"]);
+        assert!(plan.diagnostics[0]
+            .message
+            .contains("'zone' is not supported"));
+    }
+
+    #[test]
+    fn a_library_id_filter_that_matches_nothing_selects_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let filters =
+            parse_filters(&serde_json::json!({ "library_ids": ["Other:Entry"] })).unwrap();
+        let plan = plan(
+            &[
+                instance_item("U1", Some(("Lib", "Entry"))),
+                instance_item("TP1", None),
+            ],
+            &filters,
+            temp.path(),
+        );
+        assert_eq!(plan.status, PlanStatus::Noop);
+        assert_eq!(plan.coverage.selected.planned, 0);
+        assert_eq!(plan.coverage.skipped_unlinked.planned, 0);
+        assert!(plan.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn the_plan_revision_depends_on_filters_and_copper_layer_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let items = [instance_item("TP1", None)];
+        let base = plan(&items, &UpdateFilters::default(), temp.path());
+        let reset = plan(
+            &items,
+            &UpdateFilters {
+                reset_text: true,
+                ..Default::default()
+            },
+            temp.path(),
+        );
+        let four_layers = plan_updates(
+            &temp.path().join("board.kicad_pcb"),
+            &items,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &UpdateFilters::default(),
+            4,
+        );
+        assert_ne!(base.plan_revision, reset.plan_revision);
+        assert_ne!(base.plan_revision, four_layers.plan_revision);
+        assert_eq!(
+            base.plan_revision,
+            plan(&items, &UpdateFilters::default(), temp.path()).plan_revision
+        );
+    }
+
+    fn json_of(result: &CallToolResult) -> serde_json::Value {
+        match result.content.first() {
+            Some(ToolContent::Text { text }) => serde_json::from_str(text).unwrap(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_responses_report_status_coverage_and_undo_honestly() {
+        let temp = tempfile::tempdir().unwrap();
+        let conflict = plan(
+            &[instance_item("U1", None), instance_item("U1", None)],
+            &UpdateFilters::default(),
+            temp.path(),
+        );
+        let body = json_of(&plan_response(&conflict, false));
+        assert_eq!(body["status"], "conflict");
+        assert_eq!(body["coverage"]["conflicts"]["planned"], 1);
+        assert!(body["undo"].is_null());
+        assert_eq!(body["diagnostics"][0]["code"], "duplicate_reference");
+
+        let noop = plan(
+            &[instance_item("TP1", None)],
+            &UpdateFilters::default(),
+            temp.path(),
+        );
+        assert_eq!(json_of(&plan_response(&noop, false))["status"], "noop");
+        let applied = json_of(&plan_response(&noop, true));
+        assert_eq!(applied["status"], "applied");
+        assert!(applied["undo"].as_str().unwrap().contains("Ctrl-Z"));
+
+        let ready = UpdatePlan {
+            status: PlanStatus::Ready,
+            ..plan(&[], &UpdateFilters::default(), temp.path())
+        };
+        assert_eq!(json_of(&plan_response(&ready, false))["status"], "ready");
+
+        let preflight = json_of(&preflight_conflict("board is not open"));
+        assert_eq!(preflight["status"], "conflict");
+        assert_eq!(preflight["diagnostics"][0]["code"], "preflight_conflict");
+        assert_eq!(preflight["diagnostics"][0]["message"], "board is not open");
+        assert_eq!(preflight["coverage"]["conflicts"]["planned"], 1);
+    }
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_missing_board_file_is_refused_before_any_ipc() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("absent.kicad_pcb");
+        let result = handle_update_footprints_from_library(
+            &serde_json::json!({ "board": missing }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("file_not_found")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_filter_is_refused_with_the_offending_field_and_leaves_the_board_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        let before = "(kicad_pcb (version 20240108))";
+        std::fs::write(&board, before).unwrap();
+        let result = handle_update_footprints_from_library(
+            &serde_json::json!({ "board": board, "references": "U1" }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        let Some(ToolContent::Text { text }) = result.content.first() else {
+            panic!("expected text");
+        };
+        assert!(text.contains("Argument 'references' is invalid"), "{text}");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+    }
+}
