@@ -4471,6 +4471,34 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn pcb_final_saved_legacy_chamfer_is_reported_when_a_different_board_is_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("requested.kicad_pcb");
+        let source = SAVED_BOARD_WITH_R1.replace(
+            "(roundrect_rratio 0.25)",
+            "(roundrect_rratio 0.25) (chamfer_ratio 0.2) (chamfer top_left bottom_right)",
+        );
+        std::fs::write(&board, &source).unwrap();
+        let other_board = directory.path().join("other.kicad_pcb");
+        std::fs::write(&other_board, "(kicad_pcb)").unwrap();
+        let server = spawn_kicad_holding(&other_board, vec![]);
+        let result = handle_get_component_pads(
+            &json!({"board":board,"reference":"R1"}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+        let body = parsed(&result);
+        assert_eq!(body["source"], "file");
+        assert_eq!(body["pads"][0]["shape"], "chamfered_rect");
+        assert_eq!(body["pads"][0]["chamfer_ratio"], 0.2);
+        assert_eq!(body["pads"][0]["chamfered_corners"]["top_left"], true);
+        assert_eq!(body["pads"][0]["chamfered_corners"]["bottom_right"], true);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+
     #[test]
     fn coordinate_review_closed_placement_refuses_overflow_without_writing() {
         let directory = tempfile::tempdir().unwrap();

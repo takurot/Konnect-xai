@@ -6142,6 +6142,136 @@ mod board_boundary_contract_tests {
         assert!(saved.contains("(drill 3.2)"));
     }
 
+    #[tokio::test]
+    async fn pcb_final_live_size_replaces_only_named_edge_segments_in_one_commit() {
+        use prost::Message;
+        use std::sync::{Arc, Mutex};
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("board.kicad_pcb");
+        let source = "(kicad_pcb (version 20240108))";
+        std::fs::write(&board, source).unwrap();
+        let mut items = Vec::new();
+        for (id, layer) in [
+            ("edge-a", "Edge.Cuts"),
+            ("edge-b", "Edge.Cuts"),
+            ("silk", "F.SilkS"),
+        ] {
+            let mut shape = builders::board_segment(layer, 0.05, 0.0, 0.0, 10.0, 0.0).unwrap();
+            shape.id = Some(kiapi::common::types::Kiid { value: id.into() });
+            items.push(builders::pack_any(
+                &shape,
+                "kiapi.board.types.BoardGraphicShape",
+            ));
+        }
+        let capture = Arc::new(Mutex::new((
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+            Vec::<prost_types::Any>::new(),
+        )));
+        let captured = capture.clone();
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            let mut capture = captured.lock().unwrap();
+            if command.type_url.ends_with("GetItems") {
+                Some(builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: items.clone(),
+                        ..Default::default()
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ))
+            } else if command.type_url.ends_with("BeginCommit") {
+                capture.0.push("begin".into());
+                Some(builders::pack_any(
+                    &kiapi::common::commands::BeginCommitResponse {
+                        id: Some(kiapi::common::types::Kiid {
+                            value: "outline-commit".into(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                ))
+            } else if command.type_url.ends_with("DeleteItems") {
+                capture.0.push("delete".into());
+                let request =
+                    kiapi::common::commands::DeleteItems::decode(command.value.as_slice()).unwrap();
+                capture.1 = request.item_ids.iter().map(|id| id.value.clone()).collect();
+                let deleted_items = request
+                    .item_ids
+                    .into_iter()
+                    .map(|id| kiapi::common::commands::ItemDeletionResult {
+                        id: Some(id),
+                        status: kiapi::common::commands::ItemDeletionStatus::IdsOk as i32,
+                    })
+                    .collect();
+                Some(builders::pack_any(
+                    &kiapi::common::commands::DeleteItemsResponse {
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        deleted_items,
+                        ..Default::default()
+                    },
+                    "kiapi.common.commands.DeleteItemsResponse",
+                ))
+            } else if command.type_url.ends_with("CreateItems") {
+                capture.0.push("create".into());
+                let request =
+                    kiapi::common::commands::CreateItems::decode(command.value.as_slice()).unwrap();
+                capture.2 = request.items.clone();
+                let created_items = request
+                    .items
+                    .into_iter()
+                    .map(|item| kiapi::common::commands::ItemCreationResult {
+                        status: Some(kiapi::common::commands::ItemStatus {
+                            code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                            error_message: String::new(),
+                        }),
+                        item: Some(item),
+                    })
+                    .collect();
+                Some(builders::pack_any(
+                    &kiapi::common::commands::CreateItemsResponse {
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        created_items,
+                        ..Default::default()
+                    },
+                    "kiapi.common.commands.CreateItemsResponse",
+                ))
+            } else if command.type_url.ends_with("EndCommit") {
+                capture.0.push("end".into());
+                Some(builders::pack_any(
+                    &kiapi::common::commands::EndCommitResponse {},
+                    "kiapi.common.commands.EndCommitResponse",
+                ))
+            } else {
+                None
+            }
+        });
+        let result = handle_set_board_size(
+            &json!({"board":board,"width":20.0,"height":30.0}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        let body: serde_json::Value = serde_json::from_str(text(&result)).unwrap();
+        assert_eq!(body["source"], "ipc");
+        assert_eq!(body["replaced_segments"], 2);
+        let capture = capture.lock().unwrap();
+        assert_eq!(capture.0, ["begin", "delete", "create", "end"]);
+        assert_eq!(capture.1, ["edge-a", "edge-b"]);
+        assert_eq!(capture.2.len(), 4);
+        let shapes = capture
+            .2
+            .iter()
+            .map(|item| {
+                kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(shapes
+            .iter()
+            .all(|shape| shape.layer == kiapi::board::types::BoardLayer::BlEdgeCuts as i32));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+
     #[test]
     fn rounded_outline_rejects_nonfinite_and_degenerate_dimensions() {
         for (coordinates, field) in [

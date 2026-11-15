@@ -1883,6 +1883,77 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
+    fn pcb_final_minimal_library_refresh_preserves_optional_fields_and_neutral_layer_text() {
+        let source = r#"(footprint "Socket" (layer "F.Cu")
+            (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+            (pad "2" smd rect (at 2 0) (size 1 1) (layers "F.Cu"))
+            (fp_text user "neutral note" (at 1 2) (layer "Cmts.User")
+                (effects (font (size 1 1) (thickness 0.15)))))"#;
+        let library = parse_library_footprint("Test:Socket", source).unwrap();
+        let mut current = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+        current.attributes = None;
+        let prepared = build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::from([("ROW1".into(), 11), ("COL1".into(), 12)]),
+            &BTreeSet::new(),
+            true,
+            2,
+        )
+        .unwrap();
+        let updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        assert_eq!(updated.reference_field, current.reference_field);
+        assert_eq!(updated.value_field, current.value_field);
+        assert_eq!(updated.datasheet_field, current.datasheet_field);
+        assert_eq!(updated.description_field, current.description_field);
+        let note = updated
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .find(|item| builders::any_is(item, "kiapi.board.types.BoardText"))
+            .unwrap();
+        let note = kiapi::board::types::BoardText::decode(note.value.as_slice()).unwrap();
+        assert_eq!(note.layer, builders::layer_from_name("Cmts.User") as i32);
+        assert!(!note.text.unwrap().attributes.unwrap().mirrored);
+    }
+
+    #[test]
+    fn pcb_final_unrouted_connected_pad_removal_refuses_and_readback_is_scoped_to_the_target() {
+        let source = r#"(footprint "Socket" (layer "F.Cu")
+            (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu")))"#;
+        let library = parse_library_footprint("Test:Socket", source).unwrap();
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let original = current.clone();
+        let error = build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::from([("ROW1".into(), 11), ("COL1".into(), 12)]),
+            &BTreeSet::new(),
+            false,
+            2,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("removes connected pad 2"));
+        assert_eq!(current, original);
+        let expected = instance_for_layer_readback();
+        let wanted = builders::pack_any(&expected, "kiapi.board.types.FootprintInstance");
+        let signature = footprint_layer_states(std::slice::from_ref(&wanted)).unwrap();
+        let mut other = expected.clone();
+        other.id = Some(kiapi::common::types::Kiid {
+            value: "another-footprint".into(),
+        });
+        let reference = field("Reference", "OTHER1", 0.0, 0.0, true);
+        other.reference_field = Some(reference.clone());
+        other.definition.as_mut().unwrap().reference_field = Some(reference);
+        let unrelated = builders::pack_any(&other, "kiapi.board.types.FootprintInstance");
+        verify_footprint_layer_readback(&signature, &[unrelated.clone(), wanted]).unwrap();
+        assert!(verify_footprint_layer_readback(&signature, &[unrelated]).is_err());
+    }
+
+    #[test]
     fn pcb_fidelity3_refresh_readback_rejects_nonfinite_corner_ratios_and_keeps_offsets() {
         let expected = instance_for_layer_readback();
         let signature = footprint_layer_states(&[builders::pack_any(
