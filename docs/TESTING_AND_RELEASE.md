@@ -42,6 +42,27 @@ real-KiCad tests and platform-specific hosted checks are separate evidence;
 their absence never counts as a local pass. Coverage must be reported with
 its command and measured scope, including unavailable branch instrumentation.
 
+## Measuring Coverage
+
+Workspace line and branch coverage (stable toolchain needs `RUSTC_BOOTSTRAP=1`
+for branch instrumentation, which is otherwise unavailable):
+
+```sh
+RUSTC_BOOTSTRAP=1 cargo llvm-cov --workspace --locked --lib --tests --branch
+```
+
+Use a private `CARGO_TARGET_DIR` when other builds share the checkout. The
+viewer crate and ignored real-KiCad tests are outside this measurement.
+
+Umask probe tests (`konnect-sexp` `mode_probe::run_under_umask`) re-run the
+test binary under `umask 277` or `umask 777`. Under coverage that child writes
+its `.profraw` with the umask applied, which can leave a mode-000 file, and
+`llvm-profdata merge` then dies with a SIGTRAP (`InstrProfError::take`) after
+every test has passed. The probe now points the child's `LLVM_PROFILE_FILE` at
+a scratch directory, so no unreadable profile reaches the merge. If the
+SIGTRAP returns, look for `----------` entries in
+`target/llvm-cov-target/*.profraw` and trace which test spawns a child process.
+
 ## Coverage Map
 
 | Area | Source of tests |
