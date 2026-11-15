@@ -3425,6 +3425,57 @@ mod tests {
         assert_ne!(next.plan_revision, changed.plan_revision);
     }
 
+    #[test]
+    fn issue26_a_changed_schematic_field_on_a_synced_footprint_plans_an_update_then_noops() {
+        let with_lcsc = |code: &str| {
+            ONE_RESISTOR.replace(
+                "(value \"10k\")",
+                &format!("(value \"10k\") (fields (field (name \"LCSC\") \"{code}\"))"),
+            )
+        };
+        let old_netlist = with_lcsc("C25804");
+        let old_design = parse_exported_netlist(&old_netlist).unwrap();
+        let mut footprint = board_resistor("R1", Some("/sheet-uuid/symbol-uuid"));
+        footprint.pad_nets = old_design.components[0].pad_nets.clone();
+        let seeded = plan_sync(
+            &old_netlist,
+            &old_design,
+            &board_with(vec![footprint.clone()]),
+        );
+        let [PlannedChange::Update { properties, .. }] = seeded.changes.as_slice() else {
+            panic!("seeding update expected: {:?}", seeded.changes);
+        };
+        assert_eq!(properties["LCSC"], "C25804");
+        footprint.properties = properties.clone();
+        assert_eq!(
+            plan_sync(
+                &old_netlist,
+                &old_design,
+                &board_with(vec![footprint.clone()])
+            )
+            .status,
+            PlanStatus::Noop,
+            "the footprint starts synced to C25804"
+        );
+
+        let new_netlist = with_lcsc("C25805");
+        let new_design = parse_exported_netlist(&new_netlist).unwrap();
+        let plan = plan_sync(
+            &new_netlist,
+            &new_design,
+            &board_with(vec![footprint.clone()]),
+        );
+        assert_eq!(plan.status, PlanStatus::Ready);
+        let [PlannedChange::Update { properties, .. }] = plan.changes.as_slice() else {
+            panic!("one update expected: {:?}", plan.changes);
+        };
+        assert_eq!(properties["LCSC"], "C25805");
+
+        footprint.properties = properties.clone();
+        let after = plan_sync(&new_netlist, &new_design, &board_with(vec![footprint]));
+        assert_eq!(after.status, PlanStatus::Noop);
+    }
+
     const ONE_RESISTOR: &str = r#"
 (export
   (components
@@ -3479,6 +3530,52 @@ mod tests {
             "BOM exclusion is independent from board membership"
         );
         assert!(design.components[0].dnp);
+    }
+
+    #[test]
+    fn issue25_bom_excluded_part_is_added_to_the_board_and_an_off_board_part_is_not() {
+        let netlist = ONE_RESISTOR
+            .replace(
+                "  (nets",
+                r#"    (comp
+      (ref "R2")
+      (value "1k")
+      (footprint "Resistor_SMD:R_0603_1608Metric")
+      (sheetpath (names "/Power/") (tstamps "/sheet-uuid/"))
+      (tstamps "symbol-uuid-2")
+      (units (unit (name "A") (pins (pin (num "1")) (pin (num "2")))))))
+  (nets"#,
+            )
+            .replacen("symbol-uuid\")\n      (units (unit (name \"A\") (pins (pin (num \"1\")) (pin (num \"2\")))))))", "symbol-uuid\")\n      (units (unit (name \"A\") (pins (pin (num \"1\")) (pin (num \"2\"))))))", 1);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mount.kicad_sch");
+        std::fs::write(
+            &file,
+            r#"(kicad_sch (uuid "sheet-uuid")
+            (symbol (uuid "symbol-uuid") (in_bom no) (on_board yes) (in_pos_files yes) (dnp no)
+                (instances (project "mount" (path "/sheet-uuid" (reference "R1") (unit 1)))))
+            (symbol (uuid "symbol-uuid-2") (in_bom yes) (on_board no) (in_pos_files yes) (dnp no)
+                (instances (project "mount" (path "/sheet-uuid" (reference "R2") (unit 1))))))"#,
+        )
+        .unwrap();
+        let mut design = parse_exported_netlist(&netlist).unwrap();
+        assert_eq!(design.components.len(), 2, "{netlist}");
+        apply_saved_symbol_flags(&[file], &mut design).unwrap();
+        let plan = plan_sync(&netlist, &design, &board_with(Vec::new()));
+        let added: Vec<&str> = plan
+            .changes
+            .iter()
+            .filter_map(|change| match change {
+                PlannedChange::Add { reference, .. } => Some(reference.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            added,
+            vec!["R1"],
+            "in_bom=no is still placed; on_board=no is not"
+        );
+        assert_eq!(plan.counts.skipped_by_flag.planned, 1);
     }
 
     /// Real `kicad-cli sch export netlist` output: `R1` never had a footprint
@@ -6306,6 +6403,8 @@ mod tests {
         board: PathBuf,
         exported: PathBuf,
         created: std::sync::Arc<std::sync::Mutex<Vec<prost_types::Any>>>,
+        live_pcb: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        begins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -6370,6 +6469,10 @@ mod tests {
             let created =
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::<prost_types::Any>::new()));
             let board_items = created.clone();
+            let live_pcb = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+            let live_pcb_for_mock = live_pcb.clone();
+            let begins = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let begins_for_mock = begins.clone();
             let published = std::sync::atomic::AtomicBool::new(false);
 
             let (temp, board) = project_with_stock_footprints();
@@ -6496,6 +6599,9 @@ mod tests {
                         return Some(crate::tools::pcb_board::board_mock::kicad_bounding_boxes(
                             command,
                             |kiid| {
+                                if kiid.starts_with("created-") {
+                                    return (0.0, 0.0, 1.0, 1.0);
+                                }
                                 assert_eq!(kiid, "outline", "only the outline is listed");
                                 outline.expect("an outline to measure")
                             },
@@ -6511,15 +6617,20 @@ mod tests {
                         return Some(konnect_ipc::builders::pack_any(
                             &kiapi::common::commands::SavedDocumentResponse {
                                 document: request.document,
-                                contents: String::from_utf8_lossy(include_bytes!(
-                                    "../../tests/fixtures/specctra_two_resistors.kicad_pcb"
-                                ))
-                                .into_owned(),
+                                contents: live_pcb_for_mock.lock().unwrap().clone().unwrap_or_else(
+                                    || {
+                                        String::from_utf8_lossy(include_bytes!(
+                                            "../../tests/fixtures/specctra_two_resistors.kicad_pcb"
+                                        ))
+                                        .into_owned()
+                                    },
+                                ),
                             },
                             "kiapi.common.commands.SavedDocumentResponse",
                         ));
                     }
                     if command.type_url.ends_with("BeginCommit") {
+                        begins_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         return Some(konnect_ipc::builders::pack_any(
                             &kiapi::common::commands::BeginCommitResponse {
                                 id: Some(kiapi::common::types::Kiid {
@@ -6631,6 +6742,8 @@ mod tests {
                 board,
                 exported,
                 created,
+                live_pcb,
+                begins,
             }
         }
 
@@ -7150,6 +7263,44 @@ mod tests {
         assert!(
             served.sent_footprints().is_empty(),
             "the mock must apply confirmed Drop"
+        );
+    }
+
+    /// #26 on the sync path: a live footprint that KiCad holds in a group is
+    /// refused before any commit opens, so the update cannot drop the group.
+    #[tokio::test]
+    async fn issue26_sync_refuses_a_grouped_live_footprint_before_any_commit() {
+        let served = ServedSync::reading_back(Readback::AsSent).await;
+        let netlist = exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]);
+        let applied = served.apply(&netlist).await;
+        assert_eq!(applied["status"], "applied", "{applied:#}");
+        let begins_after_add = served.begins.load(std::sync::atomic::Ordering::SeqCst);
+
+        let changed = netlist.replace("(value \"part\")", "(value \"changed\")");
+        let plan = served.dry_run(&changed).await;
+        assert_eq!(
+            plan["status"], "ready",
+            "a value change is a plain update: {plan:#}"
+        );
+
+        *served.live_pcb.lock().unwrap() =
+            Some("(kicad_pcb (group \"Assembly\" (members \"created-C1\")))".to_owned());
+        let (is_error, refused) = served
+            .call(serde_json::json!({
+                "schematic": served.schematic, "board": served.board, "dry_run": false,
+                "expected_plan_revision": plan["plan_revision"]
+            }))
+            .await;
+        let text = refused.to_string();
+        assert!(
+            text.contains("unsupported_live_footprint_state"),
+            "is_error={is_error} {refused:#}"
+        );
+        assert_ne!(refused["status"], "applied", "{refused:#}");
+        assert_eq!(
+            served.begins.load(std::sync::atomic::Ordering::SeqCst),
+            begins_after_add,
+            "no commit may open for the refused update"
         );
     }
 
