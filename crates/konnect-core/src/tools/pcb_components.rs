@@ -4555,11 +4555,11 @@ mod tests {
                 "pad {number} size"
             );
             assert_eq!(
-                copper.chamfer_ratio as f64,
+                copper.chamfer_ratio,
                 pad.find_f64("chamfer_ratio").unwrap_or(0.0),
                 "pad {number} chamfer ratio"
             );
-            let corners = copper.chamfered_corners.clone().unwrap_or_default();
+            let corners = copper.chamfered_corners.unwrap_or_default();
             let expected = |name: &str| {
                 pad.find("chamfer")
                     .and_then(konnect_sexp::SexpNode::children)
