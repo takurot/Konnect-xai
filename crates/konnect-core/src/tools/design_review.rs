@@ -1763,6 +1763,10 @@ fn test_ctx() -> ToolContext {
 }
 
 #[cfg(test)]
+#[path = "design_review_helper_tests.rs"]
+mod helper_tests;
+
+#[cfg(test)]
 mod review_completion_tests {
     use super::*;
     use konnect_sexp::schematic::HierarchicalSheetSpec;
