@@ -4024,6 +4024,14 @@ type SymbolRect = Option<(f64, f64, f64, f64)>;
 mod library_path_tests;
 
 #[cfg(test)]
+#[path = "library_pad_edit_tests.rs"]
+mod library_pad_edit_tests;
+
+#[cfg(test)]
+#[path = "library_validation_tests.rs"]
+mod library_validation_tests;
+
+#[cfg(test)]
 mod omitted_rect_pin_tests {
     use super::*;
     use crate::mcp::handler::McpHandler;
