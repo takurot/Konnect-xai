@@ -497,10 +497,12 @@ mod tests {
 
     async fn coverage_bridge_server(
         root: &Path,
+        board: &Path,
         responses: Vec<serde_json::Value>,
     ) -> (PathBuf, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let expected_board = board.canonicalize().unwrap().display().to_string();
         let task = tokio::spawn(async move {
             for (index, response) in responses.into_iter().enumerate() {
                 let (mut stream, _) =
@@ -508,7 +510,7 @@ mod tests {
                         .await
                         .unwrap()
                         .unwrap();
-                let request = tokio::time::timeout(Duration::from_secs(3), async {
+                let (request, request_body) = tokio::time::timeout(Duration::from_secs(3), async {
                     let mut request = Vec::new();
                     while !request.windows(4).any(|window| window == b"\r\n\r\n") {
                         let mut chunk = [0u8; 1024];
@@ -517,7 +519,33 @@ mod tests {
                         request.extend_from_slice(&chunk[..count]);
                         assert!(request.len() <= 8192, "request exceeded fixture bound");
                     }
-                    String::from_utf8(request).unwrap()
+                    let header_end = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .unwrap()
+                        + 4;
+                    let headers = std::str::from_utf8(&request[..header_end])
+                        .unwrap()
+                        .to_string();
+                    let content_length = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map_or(0, |(_, value)| value.trim().parse::<usize>().unwrap());
+                    let request_length = header_end.checked_add(content_length).unwrap();
+                    assert!(
+                        request_length <= 8192,
+                        "request body exceeded fixture bound"
+                    );
+                    while request.len() < request_length {
+                        let mut chunk = [0u8; 1024];
+                        let limit = (request_length - request.len()).min(chunk.len());
+                        let count = stream.read(&mut chunk[..limit]).await.unwrap();
+                        assert!(count > 0, "client closed before sending the complete body");
+                        request.extend_from_slice(&chunk[..count]);
+                    }
+                    assert_eq!(request.len(), request_length);
+                    (headers, request[header_end..].to_vec())
                 })
                 .await
                 .unwrap();
@@ -527,6 +555,14 @@ mod tests {
                     "POST /v1/export-specctra-dsn "
                 };
                 assert!(request.starts_with(method), "{request}");
+                if index == 0 {
+                    assert!(request_body.is_empty());
+                } else {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&request_body).unwrap(),
+                        serde_json::json!({"expected_board": expected_board})
+                    );
+                }
                 assert!(request
                     .to_ascii_lowercase()
                     .contains(&format!("authorization: bearer {}", "fixture".repeat(8))));
@@ -566,7 +602,8 @@ mod tests {
             let mut status =
                 json!({"success":true,"native_specctra_export":true,"protocol_version":1,"pid":42});
             status[key] = value;
-            let (registration, server) = coverage_bridge_server(dir.path(), vec![status]).await;
+            let (registration, server) =
+                coverage_bridge_server(dir.path(), &board, vec![status]).await;
             let error = try_registration(dir.path(), &registration, &board)
                 .await
                 .unwrap_err();
@@ -625,7 +662,7 @@ mod tests {
             } else {
                 bytes.len() as u64
             };
-            let (registration, server) = coverage_bridge_server(&root, vec![
+            let (registration, server) = coverage_bridge_server(&root, &board, vec![
                 json!({"success":true,"native_specctra_export":true,"protocol_version":1,"pid":42}),
                 json!({"success":true,"protocol_version":1,"pid":42,"board_path":board,"dsn_path":dsn,"dsn_bytes":size}),
             ]).await;
