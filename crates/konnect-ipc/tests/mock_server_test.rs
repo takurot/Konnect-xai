@@ -4119,3 +4119,597 @@ mod v015_client_contract_tests {
         }
     }
 }
+
+mod v015_footprint_edit_contract_tests {
+    use super::*;
+    use kiapi::board::types as bt;
+    use kiapi::common::{commands as cc, types as ct};
+
+    #[derive(Default)]
+    struct HeldBoard {
+        items: Vec<prost_types::Any>,
+        updates: Vec<Vec<prost_types::Any>>,
+        commands: Vec<String>,
+        commit_actions: Vec<i32>,
+    }
+
+    fn footprint(reference: &str, children: Vec<prost_types::Any>) -> bt::FootprintInstance {
+        let packed = footprint_with_pads(reference, vec![]);
+        let mut footprint = bt::FootprintInstance::decode(packed.value.as_slice()).unwrap();
+        footprint.id = Some(ct::Kiid {
+            value: format!("{reference}-id"),
+        });
+        footprint.definition.as_mut().unwrap().items = children;
+        footprint
+    }
+
+    fn packed(footprint: &bt::FootprintInstance) -> prost_types::Any {
+        builders::pack_any(footprint, "kiapi.board.types.FootprintInstance")
+    }
+
+    fn spawn_board(items: Vec<prost_types::Any>) -> (MockKicad, Arc<Mutex<HeldBoard>>) {
+        let held = Arc::new(Mutex::new(HeldBoard {
+            items,
+            ..Default::default()
+        }));
+        let state = held.clone();
+        let mock = spawn_mock(move |request| {
+            let message = request.message.unwrap();
+            let mut state = state.lock().unwrap();
+            state.commands.push(message.type_url.clone());
+            let body = match builders::any_type_name(&message) {
+                "kiapi.common.commands.GetOpenDocuments" => return Some(open_board_response()),
+                "kiapi.common.commands.GetItems" => builders::pack_any(
+                    &cc::GetItemsResponse {
+                        status: ct::ItemRequestStatus::IrsOk as i32,
+                        items: state.items.clone(),
+                        ..Default::default()
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ),
+                "kiapi.common.commands.BeginCommit" => builders::pack_any(
+                    &cc::BeginCommitResponse {
+                        id: Some(ct::Kiid {
+                            value: "edit".into(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                ),
+                "kiapi.common.commands.EndCommit" => {
+                    let command = cc::EndCommit::decode(message.value.as_slice()).unwrap();
+                    state.commit_actions.push(command.action);
+                    builders::pack_any(
+                        &cc::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    )
+                }
+                "kiapi.common.commands.UpdateItems" => {
+                    let update = cc::UpdateItems::decode(message.value.as_slice()).unwrap();
+                    state.updates.push(update.items.clone());
+                    for item in &update.items {
+                        let updated = bt::FootprintInstance::decode(item.value.as_slice()).unwrap();
+                        let existing = state
+                            .items
+                            .iter_mut()
+                            .find(|existing| {
+                                builders::any_is(existing, "kiapi.board.types.FootprintInstance")
+                                    && bt::FootprintInstance::decode(existing.value.as_slice())
+                                        .is_ok_and(|fp| fp.id == updated.id)
+                            })
+                            .expect("updated footprint already belongs to the board");
+                        *existing = item.clone();
+                    }
+                    builders::pack_any(
+                        &cc::UpdateItemsResponse {
+                            status: ct::ItemRequestStatus::IrsOk as i32,
+                            updated_items: update
+                                .items
+                                .into_iter()
+                                .map(|item| cc::ItemUpdateResult {
+                                    status: Some(cc::ItemStatus {
+                                        code: cc::ItemStatusCode::IscOk as i32,
+                                        error_message: String::new(),
+                                    }),
+                                    item: Some(item),
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.UpdateItemsResponse",
+                    )
+                }
+                other => panic!("unexpected board command {other}"),
+            };
+            Some(reply_with(body))
+        });
+        (mock, held)
+    }
+
+    fn polygon(id: &str, outlines: usize, holes: usize) -> bt::BoardGraphicShape {
+        let outline = ct::PolyLine {
+            closed: true,
+            nodes: [(100.0, 99.0), (101.0, 99.0), (101.0, 98.0)]
+                .into_iter()
+                .map(|(x, y)| ct::PolyLineNode {
+                    geometry: Some(ct::poly_line_node::Geometry::Point(
+                        builders::vec2(x, y).unwrap(),
+                    )),
+                })
+                .collect(),
+        };
+        bt::BoardGraphicShape {
+            id: Some(ct::Kiid { value: id.into() }),
+            layer: bt::BoardLayer::BlFSilkS as i32,
+            shape: Some(ct::GraphicShape {
+                geometry: Some(ct::graphic_shape::Geometry::Polygon(ct::PolySet {
+                    polygons: (0..outlines)
+                        .map(|_| ct::PolygonWithHoles {
+                            outline: Some(outline.clone()),
+                            holes: vec![outline.clone(); holes],
+                        })
+                        .collect(),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn footprint_graphic_observation_marks_only_unambiguous_simple_polygons_editable() {
+        let mut children = Vec::new();
+        for shape in [
+            polygon("simple", 1, 0),
+            polygon("holed", 1, 1),
+            polygon("multiple", 2, 0),
+            polygon("", 1, 0),
+        ] {
+            children.push(builders::pack_any(
+                &shape,
+                "kiapi.board.types.BoardGraphicShape",
+            ));
+        }
+        children.extend([
+            builders::pack_any(
+                &builders::board_segment("F.SilkS", 0.1, 100.0, 99.0, 101.0, 99.0).unwrap(),
+                "kiapi.board.types.BoardGraphicShape",
+            ),
+            builders::pack_any(
+                &bt::BoardGraphicShape::default(),
+                "kiapi.board.types.BoardGraphicShape",
+            ),
+            prost_types::Any {
+                type_url: "kiapi.board.types.BoardGraphicShape".into(),
+                value: vec![0xff],
+            },
+            any_item(),
+        ]);
+        let mut fp = footprint("U1", children);
+        fp.orientation = Some(ct::Angle {
+            value_degrees: 90.0,
+        });
+        let (mock, held) = spawn_board(vec![packed(&footprint("U2", vec![])), packed(&fp)]);
+        let graphics = KiCadIpcClient::new(&mock.url)
+            .list_footprint_graphics("U1")
+            .unwrap();
+        assert_eq!(graphics.len(), 5);
+        assert!(graphics[0].editable);
+        assert_eq!(graphics[0].uuid, "simple");
+        assert_eq!(
+            (graphics[0].points[0].x, graphics[0].points[0].y),
+            (1.0, 0.0)
+        );
+        assert!(graphics[1..].iter().all(|graphic| !graphic.editable));
+        assert_eq!((graphics[1].outlines, graphics[1].holes), (1, 1));
+        assert_eq!(graphics[2].outlines, 2);
+        assert_eq!(graphics[4].kind, "segment");
+        assert!(held.lock().unwrap().updates.is_empty());
+
+        let mut missing = footprint("U1", vec![]);
+        missing.definition = None;
+        let (mock, _) = spawn_board(vec![packed(&missing)]);
+        assert!(KiCadIpcClient::new(&mock.url)
+            .list_footprint_graphics("U1")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn polygon_edit_writes_board_coordinates_only_for_the_named_child() {
+        let mut fp = footprint(
+            "U1",
+            vec![
+                builders::pack_any(
+                    &polygon("other", 1, 0),
+                    "kiapi.board.types.BoardGraphicShape",
+                ),
+                prost_types::Any {
+                    type_url: "kiapi.board.types.BoardGraphicShape".into(),
+                    value: vec![0xff],
+                },
+                builders::pack_any(
+                    &polygon("target", 1, 0),
+                    "kiapi.board.types.BoardGraphicShape",
+                ),
+            ],
+        );
+        fp.orientation = Some(ct::Angle {
+            value_degrees: 90.0,
+        });
+        let untouched = fp.definition.as_ref().unwrap().items[0].clone();
+        let (mock, held) = spawn_board(vec![packed(&fp)]);
+        let result = KiCadIpcClient::new(&mock.url)
+            .set_footprint_graphic_points("U1", "target", &[(1.0, 0.0), (1.0, 1.0), (2.0, 1.0)])
+            .unwrap();
+        assert_eq!(result, "polygon");
+        let held = held.lock().unwrap();
+        assert_eq!(held.updates.len(), 1);
+        let updated = bt::FootprintInstance::decode(held.updates[0][0].value.as_slice()).unwrap();
+        let children = updated.definition.unwrap().items;
+        assert_eq!(children[0], untouched);
+        let target = bt::BoardGraphicShape::decode(children[2].value.as_slice()).unwrap();
+        let ct::graphic_shape::Geometry::Polygon(polyset) = target.shape.unwrap().geometry.unwrap()
+        else {
+            panic!("polygon")
+        };
+        let points = &polyset.polygons[0].outline.as_ref().unwrap().nodes;
+        assert_eq!(
+            points[0].geometry,
+            Some(ct::poly_line_node::Geometry::Point(
+                builders::vec2(100.0, 99.0).unwrap()
+            ))
+        );
+        assert_eq!(
+            points[2].geometry,
+            Some(ct::poly_line_node::Geometry::Point(
+                builders::vec2(101.0, 98.0).unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn unsupported_polygon_edits_refuse_before_update_items() {
+        for (shape, uuid, points) in [
+            (
+                polygon("target", 1, 1),
+                "target",
+                vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+            ),
+            (
+                polygon("target", 2, 0),
+                "target",
+                vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+            ),
+            (
+                polygon("target", 1, 0),
+                "target",
+                vec![(0.0, 0.0), (1.0, 0.0)],
+            ),
+            (
+                polygon("target", 1, 0),
+                "missing",
+                vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+            ),
+        ] {
+            let fp = footprint(
+                "U1",
+                vec![builders::pack_any(
+                    &shape,
+                    "kiapi.board.types.BoardGraphicShape",
+                )],
+            );
+            let before = packed(&fp);
+            let (mock, held) = spawn_board(vec![before.clone()]);
+            assert!(KiCadIpcClient::new(&mock.url)
+                .set_footprint_graphic_points("U1", uuid, &points)
+                .is_err());
+            let held = held.lock().unwrap();
+            assert!(held.updates.is_empty());
+            assert_eq!(held.items, vec![before]);
+        }
+    }
+
+    fn value_field(value: &str) -> bt::Field {
+        bt::Field {
+            name: "Value".into(),
+            text: Some(bt::BoardText {
+                text: Some(ct::Text {
+                    text: value.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn value_edit_updates_both_copies_only_on_the_requested_footprint() {
+        for definition_copy in [false, true] {
+            let mut fp = footprint("U1", vec![]);
+            fp.value_field = Some(value_field("old"));
+            if definition_copy {
+                fp.definition.as_mut().unwrap().value_field = Some(value_field("old"));
+            }
+            let other = packed(&footprint("U2", vec![]));
+            let malformed = prost_types::Any {
+                type_url: "kiapi.board.types.FootprintInstance".into(),
+                value: vec![0xff],
+            };
+            let (mock, held) = spawn_board(vec![malformed, other.clone(), packed(&fp)]);
+            KiCadIpcClient::new(&mock.url)
+                .set_footprint_value("U1", "new")
+                .unwrap();
+            let held = held.lock().unwrap();
+            assert_eq!(held.updates.len(), 1);
+            let fp = bt::FootprintInstance::decode(held.updates[0][0].value.as_slice()).unwrap();
+            assert_eq!(fp.id.unwrap().value, "U1-id");
+            assert_eq!(
+                fp.value_field.unwrap().text.unwrap().text.unwrap().text,
+                "new"
+            );
+            if definition_copy {
+                assert_eq!(
+                    fp.definition
+                        .unwrap()
+                        .value_field
+                        .unwrap()
+                        .text
+                        .unwrap()
+                        .text
+                        .unwrap()
+                        .text,
+                    "new"
+                );
+            }
+            assert!(held.items.contains(&other));
+        }
+        for reference in ["U1", "missing"] {
+            let (mock, held) = spawn_board(vec![packed(&footprint("U1", vec![]))]);
+            assert!(KiCadIpcClient::new(&mock.url)
+                .set_footprint_value(reference, "new")
+                .is_err());
+            assert!(held.lock().unwrap().updates.is_empty());
+        }
+    }
+
+    #[test]
+    fn placement_batches_validate_identity_and_report_observed_positions() {
+        use konnect_ipc::IpcFootprintPlacement;
+        let requested = IpcFootprintPlacement {
+            reference: "U1".into(),
+            x: 100.0,
+            y: 100.0,
+            rotation: 0.0,
+        };
+        let (mock, held) = spawn_board(vec![]);
+        let client = KiCadIpcClient::new(&mock.url);
+        assert!(client.set_footprint_placements(&[]).unwrap().is_empty());
+        assert!(client
+            .set_footprint_placements(&[requested.clone(), requested.clone()])
+            .is_err());
+        assert!(held.lock().unwrap().commands.is_empty());
+        for delta in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)] {
+            let mut target = requested.clone();
+            target.x += delta.0;
+            target.y += delta.1;
+            let other = packed(&footprint("U2", vec![]));
+            let (mock, held) = spawn_board(vec![
+                any_item(),
+                other.clone(),
+                packed(&footprint("U1", vec![])),
+            ]);
+            let observed = KiCadIpcClient::new(&mock.url)
+                .set_footprint_placements(&[target.clone()])
+                .unwrap();
+            assert_eq!(
+                (observed[0].x, observed[0].y, observed[0].rotation),
+                (target.x, target.y, target.rotation)
+            );
+            let held = held.lock().unwrap();
+            assert_eq!(held.updates.len(), 1);
+            assert!(held.items.contains(&other));
+            assert_eq!(held.updates[0].len(), 1);
+        }
+        for (items, requests) in [
+            (
+                vec![
+                    packed(&footprint("U1", vec![])),
+                    packed(&footprint("U1", vec![])),
+                ],
+                vec![requested.clone()],
+            ),
+            (vec![], vec![requested.clone()]),
+            (
+                vec![],
+                vec![
+                    requested.clone(),
+                    IpcFootprintPlacement {
+                        reference: "U2".into(),
+                        ..requested
+                    },
+                ],
+            ),
+        ] {
+            let (mock, held) = spawn_board(items);
+            assert!(KiCadIpcClient::new(&mock.url)
+                .set_footprint_placements(&requests)
+                .is_err());
+            let held = held.lock().unwrap();
+            assert!(held.updates.is_empty());
+            assert!(held
+                .commands
+                .iter()
+                .any(|command| command.ends_with("EndCommit")));
+            assert_eq!(held.commit_actions, vec![cc::CommitAction::CmaDrop as i32]);
+        }
+    }
+    #[test]
+    fn board_graphics_keep_text_box_and_dimension_origins_distinct() {
+        let items = vec![
+            builders::pack_any(
+                &bt::BoardText {
+                    id: Some(ct::Kiid {
+                        value: "text".into(),
+                    }),
+                    text: Some(ct::Text {
+                        position: Some(builders::vec2(2.0, 3.0).unwrap()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "kiapi.board.types.BoardText",
+            ),
+            builders::pack_any(
+                &bt::BoardTextBox {
+                    id: Some(ct::Kiid {
+                        value: "box".into(),
+                    }),
+                    textbox: Some(ct::TextBox {
+                        top_left: Some(builders::vec2(4.0, 5.0).unwrap()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "kiapi.board.types.BoardTextBox",
+            ),
+            builders::pack_any(
+                &bt::Dimension {
+                    id: Some(ct::Kiid {
+                        value: "dimension".into(),
+                    }),
+                    text: Some(ct::Text {
+                        position: Some(builders::vec2(6.0, 7.0).unwrap()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "kiapi.board.types.Dimension",
+            ),
+            prost_types::Any {
+                type_url: "kiapi.board.types.BoardText".into(),
+                value: vec![0xff],
+            },
+            any_item(),
+        ];
+        let (mock, held) = spawn_board(items);
+        let graphics = KiCadIpcClient::new(&mock.url)
+            .get_board_graphics_in(doc_for("test.kicad_pcb"))
+            .unwrap();
+        assert_eq!(graphics.len(), 3);
+        for (graphic, (id, kind, x, y)) in graphics.iter().zip([
+            ("text", "text", 2.0, 3.0),
+            ("box", "textbox", 4.0, 5.0),
+            ("dimension", "dimension", 6.0, 7.0),
+        ]) {
+            assert_eq!((graphic.uuid.as_str(), graphic.kind.as_str()), (id, kind));
+            let position = graphic.origin.as_ref().unwrap();
+            assert_eq!((position.x, position.y), (x, y));
+        }
+        assert!(held.lock().unwrap().updates.is_empty());
+    }
+
+    #[test]
+    fn fanout_resolves_only_named_nets_and_creates_one_undo_group() {
+        let created = Arc::new(Mutex::new(Vec::new()));
+        let captured = created.clone();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let mock = spawn_mock(move |request| {
+            let message = request.message.unwrap();
+            observed.lock().unwrap().push(message.type_url.clone());
+            let body = match builders::any_type_name(&message) {
+                "kiapi.common.commands.GetOpenDocuments" => return Some(open_board_response()),
+                "kiapi.board.commands.GetNets" => builders::pack_any(
+                    &kiapi::board::commands::NetsResponse {
+                        nets: vec![bt::Net {
+                            name: "GND".into(),
+                            code: Some(bt::NetCode { value: 7 }),
+                        }],
+                    },
+                    "kiapi.board.commands.NetsResponse",
+                ),
+                "kiapi.common.commands.BeginCommit" => builders::pack_any(
+                    &cc::BeginCommitResponse {
+                        id: Some(ct::Kiid {
+                            value: "fanout".into(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                ),
+                "kiapi.common.commands.EndCommit" => {
+                    let command = cc::EndCommit::decode(message.value.as_slice()).unwrap();
+                    assert_eq!(command.action, cc::CommitAction::CmaCommit as i32);
+                    builders::pack_any(
+                        &cc::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    )
+                }
+                "kiapi.common.commands.CreateItems" => {
+                    let command = cc::CreateItems::decode(message.value.as_slice()).unwrap();
+                    *captured.lock().unwrap() = command.items.clone();
+                    builders::pack_any(
+                        &cc::CreateItemsResponse {
+                            status: ct::ItemRequestStatus::IrsOk as i32,
+                            created_items: command
+                                .items
+                                .into_iter()
+                                .map(|item| cc::ItemCreationResult {
+                                    status: Some(cc::ItemStatus {
+                                        code: cc::ItemStatusCode::IscOk as i32,
+                                        error_message: String::new(),
+                                    }),
+                                    item: Some(item),
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.CreateItemsResponse",
+                    )
+                }
+                other => panic!("unexpected fanout command {other}"),
+            };
+            Some(reply_with(body))
+        });
+        let count = KiCadIpcClient::new(&mock.url)
+            .apply_fanout(
+                &[
+                    ("".into(), 0.0, 0.0, 1.0, 1.0),
+                    ("GND".into(), 2.0, 2.0, 3.0, 3.0),
+                ],
+                &[("".into(), 1.0, 1.0), ("GND".into(), 3.0, 3.0)],
+                "F.Cu",
+                0.25,
+                0.3,
+                0.6,
+            )
+            .unwrap();
+        assert_eq!(count, 4);
+        let created = created.lock().unwrap();
+        for index in 0..2 {
+            let track = bt::Track::decode(created[index].value.as_slice()).unwrap();
+            let net = track.net.unwrap();
+            assert_eq!(net.code.unwrap().value, if index == 0 { 0 } else { 7 });
+            assert_eq!(net.name, if index == 0 { "" } else { "GND" });
+            let via = bt::Via::decode(created[index + 2].value.as_slice()).unwrap();
+            assert_eq!(
+                via.net.unwrap().code.unwrap().value,
+                if index == 0 { 0 } else { 7 }
+            );
+        }
+        let calls = calls.lock().unwrap();
+        for command in ["BeginCommit", "CreateItems", "EndCommit"] {
+            assert_eq!(
+                calls.iter().filter(|call| call.ends_with(command)).count(),
+                1
+            );
+        }
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.ends_with("GetNets"))
+                .count(),
+            2
+        );
+    }
+}
