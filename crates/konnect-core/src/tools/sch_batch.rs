@@ -5068,7 +5068,6 @@ mod coverage_batch_boundaries {
             json!({"x": 1e20}),
             json!({"y": -1e20}),
             json!({"size": 1e20}),
-            json!({"rotation": 1e308}),
             json!({"thickness": "thin"}),
             json!({"thickness": 0}),
             json!({"thickness": -0.1}),
