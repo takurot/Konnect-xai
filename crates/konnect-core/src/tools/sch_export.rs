@@ -2181,3 +2181,131 @@ mod coverage_export_boundaries {
         );
     }
 }
+
+#[cfg(test)]
+mod coverage_export_identity {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use std::sync::Arc;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn uuidless_netlist_units_keep_their_own_positions_and_net_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        let mut source = String::from(
+            r#"(kicad_sch (lib_symbols (symbol "Test:Two"
+            (symbol "Two_1_1" (pin passive line (at 0 0 0) (length 0) (name "A") (number "1")))
+            (symbol "Two_2_1" (pin passive line (at 0 0 0) (length 0) (name "B") (number "2")))))"#,
+        );
+        for (reference, unit, x, y, net) in [
+            ("R1", 1, 10, 0, "N1"),
+            ("R1", 2, 20, 0, "N2"),
+            ("R1", 1, 30, 0, "N3"),
+            ("R1", 1, 10, 10, "N4"),
+            ("R2", 1, 40, 0, "N5"),
+        ] {
+            source.push_str(&format!("(symbol (lib_id \"Test:Two\") (at {x} {y} 0) (unit {unit}) (property \"Reference\" \"{reference}\")) (label \"{net}\" (at {x} {y} 0))"));
+        }
+        source.push(')');
+        std::fs::write(&path, source).unwrap();
+        let result = handle_export_netlist_summary(&json!({"schematic": path}), &context())
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let result = body(&result);
+        assert_eq!(result["component_count"], 5);
+        for (component, (x, y, pin, net)) in result["components"].as_array().unwrap().iter().zip([
+            (10, 0, "1", "N1"),
+            (20, 0, "2", "N2"),
+            (30, 0, "1", "N3"),
+            (10, 10, "1", "N4"),
+            (40, 0, "1", "N5"),
+        ]) {
+            assert_eq!(component["pin_count"], 1, "{component}");
+            assert_eq!(component["pins"][0]["x"].as_f64(), Some(f64::from(x)));
+            assert_eq!(component["pins"][0]["y"].as_f64(), Some(f64::from(y)));
+            assert_eq!(component["pins"][0]["number"], pin);
+            assert_eq!(component["pins"][0]["net"], net);
+        }
+    }
+
+    #[test]
+    fn erc_without_locations_or_sheet_paths_still_counts_selected_findings() {
+        let report = cli::parse_erc_json(
+            &json!({"kicad_version": "10.0.7", "sheets": [{"violations": [
+                {"severity": "error", "type": "electrical", "description": "error", "items": []},
+                {"severity": "warning", "type": "style", "description": "warning"},
+                {"severity": "info", "type": "note", "description": "info", "items": [{}]}
+            ]}]}),
+        )
+        .unwrap();
+        for (severity, count) in [("error", 1), ("warning", 2), ("info", 3)] {
+            let response = erc_response(&report, severity);
+            assert_eq!(response["total"], count);
+            assert_eq!(response["errors"], 1);
+            assert!(response["violations"][0].get("sheet").is_none());
+            assert!(response["violations"][0].get("x").is_none());
+            assert!(response["violations"][0].get("y").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn connectivity_preview_and_already_connected_tee_do_not_write() {
+        let sources = [
+            ("(kicad_sch (wire (pts (xy 0 0) (xy 10.04 0)) (uuid \"w\")) (label \"N\" (at 10 0 0)))", true, 1),
+            ("(kicad_sch (wire (pts (xy -10 0) (xy 10 0)) (uuid \"rail\")) (wire (pts (xy 0 0) (xy 0 10)) (uuid \"tap\")))", false, 0),
+            ("(kicad_sch (wire (pts (xy 0 0) (xy 10 0)) (uuid \"w\")))", false, 0),
+        ];
+        for (source, dry_run, count) in sources {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("design.kicad_sch");
+            std::fs::write(&path, source).unwrap();
+            let result = handle_fix_connectivity(
+                &json!({"schematic": path, "dry_run": dry_run}),
+                &context(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{result:?}");
+            assert_eq!(body(&result)["fixes_found"], count);
+            assert_eq!(body(&result)["applied"], false);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        }
+    }
+
+    #[tokio::test]
+    async fn reciprocal_wire_snapping_keeps_the_smaller_identity_stationary_in_either_order() {
+        let source = "(kicad_sch (wire (pts (xy 0 0) (xy 10 0)) (uuid \"wire-z\")) (wire (pts (xy 10.04 0) (xy 20 0)) (uuid \"wire-a\")))";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        std::fs::write(&path, source).unwrap();
+        let result = handle_fix_connectivity(&json!({"schematic": path}), &context())
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(body(&result)["fixes_found"], 1);
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            observed_wire_endpoint(&saved, "wire-a", WireEndpoint::Start).unwrap(),
+            (10.04, 0.0)
+        );
+        assert_eq!(
+            observed_wire_endpoint(&saved, "wire-z", WireEndpoint::End).unwrap(),
+            (10.04, 0.0)
+        );
+    }
+}

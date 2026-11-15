@@ -5076,3 +5076,114 @@ mod coverage_marker_readback {
         assert_eq!(after, source);
     }
 }
+
+#[cfg(test)]
+mod coverage_wiring_safety_paths {
+    use super::*;
+    use std::sync::Arc;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn coordinate_connection_refuses_joining_named_nets_until_explicitly_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        let source = "(kicad_sch (label \"LEFT\" (at 0 0 0)) (label \"RIGHT\" (at 10 0 0)))";
+        std::fs::write(&path, source).unwrap();
+        let mut args = json!({"schematic": path, "x1": 0, "y1": 0, "x2": 10, "y2": 0});
+        let result = handle_add_schematic_connection(&args, &context())
+            .await
+            .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        args["allow_join"] = json!(true);
+        let result = handle_add_schematic_connection(&args, &context())
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let (_, tree) = read_schematic(&path).unwrap();
+        let wires = extract_wires(&tree);
+        assert!(!wires.is_empty());
+        assert!(wires.iter().any(|wire| (wire.x1, wire.y1) == (0.0, 0.0)));
+        assert!(wires.iter().any(|wire| (wire.x2, wire.y2) == (10.0, 0.0)));
+    }
+
+    #[tokio::test]
+    async fn unresolved_named_pin_geometry_refuses_without_any_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        let source = "(kicad_sch (lib_symbols) (symbol (lib_id \"Unavailable:Part\") (at 10 20 0) (unit 1) (uuid \"part\") (property \"Reference\" \"U1\")))";
+        std::fs::write(&path, source).unwrap();
+        let result = handle_connect_to_net(
+            &json!({"schematic": path, "reference": "U1", "pin_number": "1", "net": "SIG"}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert!(format!("{result:?}").contains("Library symbol"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn label_moves_keep_unrelated_incomplete_nodes_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        let incomplete = "(label (at 1 2 0)) (global_label \"INCOMPLETE\")";
+        let source =
+            format!("(kicad_sch {incomplete} (label \"GOOD\" (at 10 20 0) (uuid \"good\")))");
+        std::fs::write(&path, &source).unwrap();
+        let result = handle_move_labels_by_offset(
+            &json!({"schematic": path, "net": "GOOD", "dx": 1, "dy": 2}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(saved.contains(incomplete), "{saved}");
+        let moved: Vec<_> = find_label_blocks(&saved)
+            .into_iter()
+            .filter(|label| label.net == "GOOD")
+            .collect();
+        assert_eq!(moved.len(), 1);
+        assert_eq!((moved[0].x, moved[0].y), (11.0, 22.0));
+    }
+
+    #[test]
+    fn junction_reconciliation_keeps_unknown_pin_geometry_and_rejects_unreadable_sources() {
+        let unknown = "(symbol (lib_id \"Unknown:Part\") (at 0 0 0) (unit 1) (uuid \"part\") (property \"Reference\" \"U1\"))";
+        let source = format!("(kicad_sch {unknown} (junction (at 0 0) (uuid \"dot\")) (wire (pts (xy -5 0) (xy 5 0)) (uuid \"wire\")))");
+        let (saved, added, removed) = reconcile_junctions_at(source.clone(), &[(0.0, 0.0)]);
+        assert_eq!((added, removed), (0, 0));
+        assert_eq!(saved, source);
+        let source = "(broken";
+        let (saved, added, removed) = reconcile_junctions_at(source.to_owned(), &[(0.0, 0.0)]);
+        assert_eq!((added, removed), (0, 0));
+        assert_eq!(saved, source);
+        let source = "(kicad_sch (junction (uuid \"no-location\")) (wire (pts (xy -5 0) (xy 5 0)) (uuid \"wire\")))";
+        let (saved, _, removed) = reconcile_junctions_at(source.to_owned(), &[(0.0, 0.0)]);
+        assert_eq!(removed, 0);
+        assert!(saved.contains("(junction (uuid \"no-location\"))"));
+    }
+
+    #[test]
+    fn pin_protection_planning_never_writes_a_source_it_cannot_read() {
+        let path = std::path::Path::new("design.kicad_sch");
+        let source = include_str!("../../tests/fixtures/no_connect_carry_kicad10.kicad_sch");
+        let mut schematic = cse::Schematic::from_source(path, source).unwrap();
+        let before = schematic.to_source();
+        let result = carry_no_connects(path, "(broken", &mut schematic).unwrap_err();
+        assert!(result.is_error);
+        assert_eq!(schematic.to_source(), before);
+        let (after, added, removed) =
+            reconcile_junctions_for_placement("(kicad_sch (wire", "(also-broken".to_owned());
+        assert_eq!(after, "(also-broken");
+        assert_eq!((added, removed), (0, 0));
+    }
+}
