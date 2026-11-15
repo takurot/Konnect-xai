@@ -5674,6 +5674,16 @@ mod recovery_tests {
     }
 
     fn exercise(scenario: Scenario) -> (Result<()>, Vec<String>, Duration) {
+        // Leave scheduling headroom while retaining late and exhausted replies.
+        let receive_timeout = Duration::from_millis(200);
+        let recovery_budget = Duration::from_secs(2);
+        let late_reply_delay = Duration::from_millis(500);
+        let exhausted_reply_delay = Duration::from_secs(3);
+        let cleanup_delay = Duration::from_millis(2400);
+        assert!(late_reply_delay > receive_timeout);
+        assert!(late_reply_delay < receive_timeout + recovery_budget);
+        assert!(exhausted_reply_delay > receive_timeout + recovery_budget);
+        assert!(late_reply_delay + cleanup_delay > receive_timeout + recovery_budget);
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let address = format!(
             "inproc://bounded-recovery-{}",
@@ -5763,7 +5773,7 @@ mod recovery_tests {
                     }
                     "BeginCommit" => {
                         if matches!(scenario, Scenario::BeginLate) {
-                            std::thread::sleep(Duration::from_millis(140));
+                            std::thread::sleep(late_reply_delay);
                         }
                         response.message = Some(pack_any(
                             &kiapi::common::commands::BeginCommitResponse {
@@ -5778,9 +5788,9 @@ mod recovery_tests {
                         mutated = true;
                         if !matches!(scenario, Scenario::Success | Scenario::PublishLate) {
                             std::thread::sleep(if matches!(scenario, Scenario::Exhausted) {
-                                Duration::from_millis(800)
+                                exhausted_reply_delay
                             } else {
-                                Duration::from_millis(140)
+                                late_reply_delay
                             });
                         }
                         if matches!(scenario, Scenario::Malformed) {
@@ -5797,10 +5807,10 @@ mod recovery_tests {
                             .unwrap()
                             .push(format!("action:{}", command.action));
                         if matches!(scenario, Scenario::PublishLate) {
-                            std::thread::sleep(Duration::from_millis(140));
+                            std::thread::sleep(late_reply_delay);
                         }
                         if matches!(scenario, Scenario::CleanupSlow) {
-                            std::thread::sleep(Duration::from_millis(480));
+                            std::thread::sleep(cleanup_delay);
                         }
                         if matches!(scenario, Scenario::DropFailed) {
                             response.status.as_mut().unwrap().status =
@@ -5833,8 +5843,8 @@ mod recovery_tests {
                 )?;
                 Ok(())
             },
-            Duration::from_millis(60),
-            Duration::from_millis(400),
+            receive_timeout,
+            recovery_budget,
         );
         let elapsed = started.elapsed();
         control.close();
@@ -5874,10 +5884,29 @@ mod recovery_tests {
                 .count(),
             2
         );
+        let rpc_order = calls
+            .iter()
+            .filter(|name| !name.starts_with("action:"))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rpc_order,
+            [
+                "GetOpenDocuments",
+                "SaveDocumentToString",
+                "BeginCommit",
+                "Ping",
+                "GetOpenDocuments",
+                "EndCommit",
+                "GetOpenDocuments",
+                "SaveDocumentToString",
+            ]
+        );
     }
 
     #[test]
     fn bounded_recovery_never_claims_unproven_rollback() {
+        let elapsed_bound = Duration::from_millis(2700);
         for scenario in [
             Scenario::Exhausted,
             Scenario::DropFailed,
@@ -5894,7 +5923,7 @@ mod recovery_tests {
             let failure = IpcFailure::from_error(result.unwrap_err());
             assert!(matches!(failure, IpcFailure::Uncertain(_)), "{failure:?}");
             assert!(
-                elapsed < Duration::from_millis(650),
+                elapsed < elapsed_bound,
                 "shared budget exceeded: {elapsed:?}"
             );
             if matches!(
