@@ -629,7 +629,9 @@ fn parse_library_property(
                 if !x.is_finite() || !y.is_finite() || !rotation.is_finite() {
                     bail!("property '{name}' position and rotation must be finite");
                 }
-                position = Some(konnect_ipc::builders::vec2(x, y));
+                position = Some(konnect_ipc::builders::vec2(x, y).with_context(|| {
+                    format!("property '{name}' position is outside the nanometre range")
+                })?);
             }
             "layer" => {
                 if layer.is_some() {
@@ -691,7 +693,7 @@ fn parse_library_property(
 
     let position = match position {
         Some(position) => position,
-        None if !require_typed_field => konnect_ipc::builders::vec2(0.0, 0.0),
+        None if !require_typed_field => konnect_ipc::builders::vec2(0.0, 0.0)?,
         None => bail!("property '{name}' is missing its 'at' clause"),
     };
     let layer = match layer {
@@ -702,8 +704,8 @@ fn parse_library_property(
     let mut attributes = match attributes {
         Some(attributes) => attributes,
         None if !require_typed_field => kiapi::common::types::TextAttributes {
-            size: Some(konnect_ipc::builders::vec2(1.0, 1.0)),
-            stroke_width: Some(konnect_ipc::builders::distance(0.15)),
+            size: Some(konnect_ipc::builders::vec2(1.0, 1.0)?),
+            stroke_width: Some(konnect_ipc::builders::distance(0.15)?),
             line_spacing: 1.0,
             keep_upright: true,
             multiline: true,
@@ -904,9 +906,11 @@ fn parse_property_effects(
         vertical_alignment: vertical as i32,
         angle: None,
         line_spacing: line_spacing.unwrap_or(1.0),
-        stroke_width: Some(konnect_ipc::builders::distance(
-            thickness.unwrap_or(width * 0.15),
-        )),
+        stroke_width: Some(
+            konnect_ipc::builders::distance(thickness.unwrap_or(width * 0.15)).with_context(
+                || format!("property '{name}' font thickness is outside the nanometre range"),
+            )?,
+        ),
         italic: italic.unwrap_or(false),
         bold: bold.unwrap_or(false),
         underlined: false,
@@ -914,7 +918,9 @@ fn parse_property_effects(
         mirrored,
         multiline: true,
         keep_upright: true,
-        size: Some(konnect_ipc::builders::vec2(width, height)),
+        size: Some(konnect_ipc::builders::vec2(width, height).with_context(|| {
+            format!("property '{name}' font size is outside the nanometre range")
+        })?),
     })
 }
 
@@ -1358,6 +1364,24 @@ mod issue26_tests {
         assert!(!blocked.contains_key("safe"));
         assert!(live_loss_diagnostics("(not_a_board)").is_err());
         assert!(live_loss_diagnostics("(kicad_pcb (footprint \"MissingUuid\"))").is_err());
+    }
+
+    #[test]
+    fn library_field_values_keep_nanometre_precision() {
+        let root = konnect_sexp::parse_sexp(
+            r#"(footprint "Test:Field"
+            (property "LCSC" "C25804" (at 1.123456 2) (layer "F.Fab")
+                (effects (font (size 1.234567 1) (thickness 0.123456)))))"#,
+        )
+        .unwrap();
+        let fields = fields(&root).unwrap();
+        assert_eq!(fields.len(), 1);
+        let text = fields[0].text.as_ref().unwrap().text.as_ref().unwrap();
+        assert_eq!(text.text, "C25804");
+        assert_eq!(text.position.as_ref().unwrap().x_nm, 1_123_456);
+        let attributes = text.attributes.as_ref().unwrap();
+        assert_eq!(attributes.size.as_ref().unwrap().x_nm, 1_234_567);
+        assert_eq!(attributes.stroke_width.as_ref().unwrap().value_nm, 123_456);
     }
 
     #[test]

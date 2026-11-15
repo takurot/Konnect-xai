@@ -15,6 +15,7 @@ use crate::tools::{
     require_str, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
+use konnect_sexp::geometry::round6;
 use konnect_sexp::schematic::{format_hierarchical_sheet, HierarchicalSheetSpec};
 use konnect_sexp::writer::{write_atomic_if_unchanged, write_new_atomic};
 use konnect_sexp::{
@@ -719,14 +720,14 @@ fn sheet_json(sheet: &cse::Sheet, project_name: &str) -> Value {
         "name": sheet.name(),
         "file": sheet.file(),
         "uuid": sheet.uuid,
-        "x": x,
-        "y": y,
+        "x": round6(x),
+        "y": round6(y),
         "width": sheet.width,
         "height": sheet.height,
         "page": sheet.page(project_name),
         "pins": sheet.pins.iter().map(|p| {
             let (px, py) = p.position();
-            json!({ "name": p.name, "pin_type": p.pin_type, "x": px, "y": py })
+            json!({ "name": p.name, "pin_type": p.pin_type, "x": round6(px), "y": round6(py) })
         }).collect::<Vec<_>>()
     })
 }
@@ -1389,7 +1390,7 @@ async fn handle_move_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
                 }
             }
             Ok(CallToolResult::json(
-                &json!({ "moved": sheet_name, "x": x, "y": y, "changed": changed }),
+                &json!({ "moved": sheet_name, "x": round6(x), "y": round6(y), "changed": changed }),
             ))
         }
         None => Ok(CallToolResult::error(format!(
@@ -2128,8 +2129,8 @@ async fn handle_add_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resul
         "added_pin": pin_name,
         "sheet": sheet_name,
         "pin_type": pin_type,
-        "x": saved.at.x,
-        "y": saved.at.y,
+        "x": round6(saved.at.x),
+        "y": round6(saved.at.y),
         "side": sheet_pin_side_for_rotation(saved.at.rotation)
     })))
 }
@@ -2244,8 +2245,8 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
     let summary = json!({
         "name": saved.name,
         "pin_type": saved.pin_type,
-        "x": saved.at.x,
-        "y": saved.at.y,
+        "x": round6(saved.at.x),
+        "y": round6(saved.at.y),
         "side": sheet_pin_side_for_rotation(saved.at.rotation)
     });
 
@@ -2369,7 +2370,7 @@ fn collect_pin_mismatches(
                     "file": sheet.file(),
                     "pin": pin.name,
                     "kind": if side.is_some() { "pin_position_mismatch" } else { "invalid_pin_rotation" },
-                    "stored_position": { "x": x, "y": y, "rotation": pin.at.rotation },
+                    "stored_position": { "x": round6(x), "y": round6(y), "rotation": pin.at.rotation },
                     "expected_edge": expected_edge.map(|edge| json!({
                         "side": side,
                         "axis": edge.axis,

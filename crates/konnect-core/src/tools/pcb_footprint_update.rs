@@ -1475,7 +1475,7 @@ fn transform_library_property(
         konnect_ipc::builders::nm_to_mm(footprint_position.y_nm),
         footprint_rotation,
     );
-    text.position = Some(konnect_ipc::builders::vec2(board_x, board_y));
+    text.position = Some(konnect_ipc::builders::vec2(board_x, board_y)?);
 
     let attributes = text
         .attributes
@@ -1491,8 +1491,14 @@ fn transform_library_property(
     } else {
         local_angle
     };
+    let field_rotation = local_angle + footprint_rotation;
+    anyhow::ensure!(
+        field_rotation.is_finite(),
+        "property '{}' rotation must remain finite",
+        property.name
+    );
     attributes.angle = Some(kiapi::common::types::Angle {
-        value_degrees: readable_property_angle(local_angle + footprint_rotation),
+        value_degrees: readable_property_angle(field_rotation),
     });
     if is_back {
         if is_side_specific_layer(board_text.layer) {
@@ -2023,7 +2029,7 @@ mod tests {
             builders::pack_any(&item, "kiapi.board.types.Pad")
         };
         let current = kiapi::board::types::FootprintInstance {
-            position: Some(builders::vec2(10.0, 20.0)),
+            position: Some(builders::vec2(10.0, 20.0).unwrap()),
             orientation: Some(kiapi::common::types::Angle {
                 value_degrees: 90.0,
             }),
@@ -2056,7 +2062,7 @@ mod tests {
         );
 
         let mut moved = current.clone();
-        moved.position = Some(builders::vec2(99.0, 99.0));
+        moved.position = Some(builders::vec2(99.0, 99.0).unwrap());
         moved.definition.as_mut().unwrap().items = vec![pad("1", None)];
         let diverged = PreservedState::derive(&current, &moved, &old_nets);
         assert!(
@@ -2097,6 +2103,85 @@ mod tests {
     }
 
     #[test]
+    fn refresh_fields_refuse_nonfinite_rotation_before_preparing_a_write() {
+        use kiapi::board::types::BoardLayer;
+
+        for (layer, local_angle, is_back, expected_angle) in [
+            (BoardLayer::BlFCu, f64::MAX, false, 54.0),
+            (BoardLayer::BlBCu, -f64::MAX, true, 20.0),
+        ] {
+            let mut property = field("LCSC", "C25804", 1.0, 2.0, true);
+            let board_text = property.text.as_mut().unwrap();
+            board_text.layer = BoardLayer::BlFFab as i32;
+            let attributes = board_text
+                .text
+                .as_mut()
+                .unwrap()
+                .attributes
+                .as_mut()
+                .unwrap();
+            attributes.stroke_width = Some(builders::distance(0.15).unwrap());
+            attributes.line_spacing = 1.0;
+            attributes.keep_upright = true;
+            attributes.angle.as_mut().unwrap().value_degrees = local_angle;
+            let before_property = property.clone();
+            let mut current = current_instance(layer);
+            current.orientation.as_mut().unwrap().value_degrees = f64::MAX / 4.0;
+            let before_current = current.clone();
+            let mut library =
+                parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+            library.properties = vec![property.clone()];
+            let result = build_updated_instance(
+                &current,
+                &library,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                false,
+                2,
+            );
+            let error = result.expect_err("nonfinite field rotation prepared a write");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("LCSC")
+                    && message.contains("rotation")
+                    && message.contains("finite"),
+                "{message}"
+            );
+            assert_eq!(current, before_current);
+            assert_eq!(property, before_property);
+
+            property
+                .text
+                .as_mut()
+                .unwrap()
+                .text
+                .as_mut()
+                .unwrap()
+                .attributes
+                .as_mut()
+                .unwrap()
+                .angle
+                .as_mut()
+                .unwrap()
+                .value_degrees = 17.0;
+            let transformed = transform_library_property(
+                &property,
+                &builders::vec2(10.0, 20.0).unwrap(),
+                37.0,
+                is_back,
+                2,
+            )
+            .unwrap();
+            let text = transformed.text.unwrap().text.unwrap();
+            assert_eq!(text.text, "C25804");
+            assert_eq!(
+                text.attributes.unwrap().angle.unwrap().value_degrees,
+                expected_angle
+            );
+        }
+    }
+
+    #[test]
     fn issue26_custom_field_mirroring_uses_the_live_stack_and_side_mask() {
         use kiapi::board::types::BoardLayer;
         for (layer, expected_layer, mirrored) in [
@@ -2113,20 +2198,25 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .mirrored = false;
-            let transformed =
-                transform_library_property(&property, &builders::vec2(10.0, 20.0), 0.0, true, 4)
-                    .unwrap();
+            let transformed = transform_library_property(
+                &property,
+                &builders::vec2(10.0, 20.0).unwrap(),
+                0.0,
+                true,
+                4,
+            )
+            .unwrap();
             let text = transformed.text.unwrap();
             assert_eq!(text.layer, expected_layer as i32);
             let text = text.text.unwrap();
-            assert_eq!(text.position, Some(builders::vec2(11.0, 18.0)));
+            assert_eq!(text.position, Some(builders::vec2(11.0, 18.0).unwrap()));
             assert_eq!(text.attributes.unwrap().mirrored, mirrored);
         }
         let mut unsupported = field("Assembly", "Custom", 1.0, 2.0, true);
         unsupported.text.as_mut().unwrap().layer = BoardLayer::BlIn3Cu as i32;
         assert!(transform_library_property(
             &unsupported,
-            &builders::vec2(10.0, 20.0),
+            &builders::vec2(10.0, 20.0).unwrap(),
             0.0,
             true,
             4,
@@ -2162,7 +2252,7 @@ mod tests {
             .attributes
             .as_mut()
             .unwrap()
-            .size = Some(builders::vec2(2.0, 2.0));
+            .size = Some(builders::vec2(2.0, 2.0).unwrap());
         let preserved = build_updated_instance(
             &applied,
             &library,
@@ -2329,9 +2419,9 @@ mod tests {
             visible,
             text: Some(kiapi::board::types::BoardText {
                 text: Some(kiapi::common::types::Text {
-                    position: Some(builders::vec2(x, y)),
+                    position: Some(builders::vec2(x, y).unwrap()),
                     attributes: Some(kiapi::common::types::TextAttributes {
-                        size: Some(builders::vec2(1.25, 1.25)),
+                        size: Some(builders::vec2(1.25, 1.25).unwrap()),
                         angle: Some(kiapi::common::types::Angle {
                             value_degrees: 17.0,
                         }),
@@ -2359,7 +2449,7 @@ mod tests {
                     code: Some(kiapi::board::types::NetCode { value: net_code }),
                     name: net_name.to_string(),
                 }),
-                position: Some(builders::vec2(100.0, 50.0)),
+                position: Some(builders::vec2(100.0, 50.0).unwrap()),
                 ..Default::default()
             },
             "kiapi.board.types.Pad",
@@ -2375,7 +2465,7 @@ mod tests {
             id: Some(kiapi::common::types::Kiid {
                 value: "instance-kiid".to_string(),
             }),
-            position: Some(builders::vec2(100.0, 50.0)),
+            position: Some(builders::vec2(100.0, 50.0).unwrap()),
             orientation: Some(kiapi::common::types::Angle {
                 value_degrees: 37.0,
             }),
@@ -2402,7 +2492,7 @@ mod tests {
                 ..Default::default()
             }),
             overrides: Some(kiapi::board::types::FootprintDesignRuleOverrides {
-                copper_clearance: Some(builders::distance(0.3)),
+                copper_clearance: Some(builders::distance(0.3).unwrap()),
                 ..Default::default()
             }),
             symbol_path: Some(kiapi::common::types::SheetPath {
@@ -3034,7 +3124,8 @@ mod tests {
                             0.0,
                             1.0,
                             0.0,
-                        );
+                        )
+                        .unwrap();
                         if index == 1 && change_style {
                             graphic
                                 .shape
@@ -3068,7 +3159,8 @@ mod tests {
             layer_readback_instance(vec![builders::pack_any(
                 &builders::board_arc(
                     "F.SilkS", 0.12, start.0, start.1, mid.0, mid.1, end.0, end.1,
-                ),
+                )
+                .unwrap(),
                 "kiapi.board.types.BoardGraphicShape",
             )])
         };
@@ -3623,7 +3715,7 @@ mod tests {
                     stack.drill = Some(kiapi::board::types::DrillProperties {
                         start_layer: kiapi::board::types::BoardLayer::BlUndefined as i32,
                         end_layer: kiapi::board::types::BoardLayer::BlUndefined as i32,
-                        diameter: Some(builders::vec2(0.0, 0.0)),
+                        diameter: Some(builders::vec2(0.0, 0.0).unwrap()),
                         shape: kiapi::board::types::DrillShape::DsUndefined as i32,
                         ..Default::default()
                     });

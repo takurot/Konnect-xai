@@ -327,10 +327,10 @@ mod tests {
                 layer: board::BoardLayer::BlFFab as i32,
                 text: Some(common::Text {
                     text: "Example".into(),
-                    position: Some(crate::builders::vec2(1.0, 2.0)),
+                    position: Some(crate::builders::vec2(1.0, 2.0).unwrap()),
                     attributes: Some(common::TextAttributes {
-                        size: Some(crate::builders::vec2(0.8, 0.9)),
-                        stroke_width: Some(crate::builders::distance(0.12)),
+                        size: Some(crate::builders::vec2(0.8, 0.9).unwrap()),
+                        stroke_width: Some(crate::builders::distance(0.12).unwrap()),
                         line_spacing: 1.0,
                         keep_upright: true,
                         multiline: true,
@@ -526,7 +526,8 @@ mod tests {
     #[test]
     fn presentation_accepts_native_zero_rectangle_radius_but_checks_nonzero_radius() {
         let mut footprint = board::FootprintInstance::decode(item().value.as_slice()).unwrap();
-        let rectangle = crate::builders::board_rectangle("F.CrtYd", 0.1, 0.0, 0.0, 1.0, 2.0, false);
+        let rectangle =
+            crate::builders::board_rectangle("F.CrtYd", 0.1, 0.0, 0.0, 1.0, 2.0, false).unwrap();
         footprint.definition.as_mut().unwrap().items = vec![crate::builders::pack_any(
             &rectangle,
             "kiapi.board.types.BoardGraphicShape",
@@ -554,7 +555,8 @@ mod tests {
         let points = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)];
         let polygon_item = |points: &[(f64, f64)]| {
             let mut footprint = board::FootprintInstance::decode(item().value.as_slice()).unwrap();
-            let graphic = crate::builders::board_polygon("F.CrtYd", 0.1, false, &[points.to_vec()]);
+            let graphic =
+                crate::builders::board_polygon("F.CrtYd", 0.1, false, &[points.to_vec()]).unwrap();
             footprint.definition.as_mut().unwrap().items = vec![crate::builders::pack_any(
                 &graphic,
                 "kiapi.board.types.BoardGraphicShape",
@@ -579,9 +581,9 @@ mod tests {
         let arc = common::PolyLineNode {
             geometry: Some(common::poly_line_node::Geometry::Arc(
                 common::ArcStartMidEnd {
-                    start: Some(crate::builders::vec2(0.0, 0.0)),
-                    mid: Some(crate::builders::vec2(1.0, 1.0)),
-                    end: Some(crate::builders::vec2(2.0, 0.0)),
+                    start: Some(crate::builders::vec2(0.0, 0.0).unwrap()),
+                    mid: Some(crate::builders::vec2(1.0, 1.0).unwrap()),
+                    end: Some(crate::builders::vec2(2.0, 0.0).unwrap()),
                 },
             )),
         };
@@ -593,7 +595,7 @@ mod tests {
         assert_eq!(arcs.nodes.len(), 2);
         let point = common::PolyLineNode {
             geometry: Some(common::poly_line_node::Geometry::Point(
-                crate::builders::vec2(0.0, 0.0),
+                crate::builders::vec2(0.0, 0.0).unwrap(),
             )),
         };
         let mut open = common::PolyLine {
@@ -611,7 +613,8 @@ mod tests {
             let mut footprint = board::FootprintInstance::decode(item().value.as_slice()).unwrap();
             let graphic = crate::builders::board_arc(
                 "F.CrtYd", 0.1, start.0, start.1, mid.0, mid.1, end.0, end.1,
-            );
+            )
+            .unwrap();
             footprint.definition.as_mut().unwrap().items = vec![crate::builders::pack_any(
                 &graphic,
                 "kiapi.board.types.BoardGraphicShape",
