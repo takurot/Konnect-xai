@@ -3571,7 +3571,7 @@ mod tests {
             r#"(kicad_sch (uuid "sheet-uuid")
             (symbol (in_bom no))
             (symbol (uuid "without-reference") (on_board no)
-                (instances (project "defaults" (path "/" (unit 1))))))
+                (instances (project "defaults" (path "/" (unit 1)))))
             (symbol (uuid "symbol-uuid") (on_board no)
                 (instances (project "foreign" (path "/other-root" (reference "R1") (unit 1)))))
             (symbol (uuid "symbol-uuid")
@@ -3600,10 +3600,8 @@ mod tests {
                     (path "/root" (reference "R1") (unit 1))
                     (path "/root" (reference "R1") (unit 2))))))"#
         );
-        // Match by reference when the export's instance path is outside this
-        // small saved root; the saved flag itself must belong to that root.
         std::fs::write(&file, source).unwrap();
-        apply_saved_symbol_flags(&[file.clone()], &mut design).unwrap();
+        apply_saved_symbol_flags(std::slice::from_ref(&file), &mut design).unwrap();
         assert!(design.unassigned.is_empty());
         assert_eq!(design.components.len(), 2);
         assert_eq!(design.skipped.len(), 1);
