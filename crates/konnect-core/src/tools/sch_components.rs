@@ -7249,6 +7249,136 @@ mod multi_unit_component_tests {
 )
 "#;
 
+    #[test]
+    fn private_fields_keep_their_privacy_and_escaped_text_when_edited_and_moved() {
+        let source = SCHEMATIC.replace(
+            r#"(property "Note" "OLD""#,
+            r#"(property private "Note" "old \"quoted\" path\\value""#,
+        );
+        let value = r#"new "quoted" path\value"#;
+        let (edited, counts) = set_property_value(&source, "U1", "Note", value, true).unwrap();
+        assert_eq!(counts.updated, 1);
+        assert_eq!(counts.added, 1);
+        let placement = FieldPlacement {
+            x: Some(101.0),
+            y: Some(102.0),
+            rotation: Some(45.0),
+            hide: Some(false),
+        };
+        let (moved, touched) =
+            set_property_placement(&edited, "U1", "Note", &placement, Some(1)).unwrap();
+        assert_eq!(touched, 1);
+        let tree = parse_sexp(&moved).unwrap();
+        let private = tree
+            .find_all("symbol")
+            .into_iter()
+            .flat_map(|symbol| symbol.find_all("property"))
+            .find(|property| {
+                property.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("private")
+            })
+            .unwrap();
+        assert_eq!(
+            private.get(2).and_then(konnect_sexp::SexpNode::as_str),
+            Some("Note")
+        );
+        assert_eq!(
+            private.get(3).and_then(konnect_sexp::SexpNode::as_str),
+            Some(value)
+        );
+        assert_eq!(private.find("at").unwrap().get_f64(1), Some(101.0));
+        assert_eq!(private.find("at").unwrap().get_f64(2), Some(102.0));
+        assert!(private.find("hide").is_none());
+    }
+
+    #[test]
+    fn property_and_instance_writers_refuse_missing_targets_instead_of_editing_a_neighbour() {
+        assert!(set_property_value(SCHEMATIC, "U404", "Value", "new", false)
+            .unwrap_err()
+            .contains("not found"));
+        assert!(set_property_value(SCHEMATIC, "U1", "Absent", "new", false)
+            .unwrap_err()
+            .contains("missing"));
+        let placement = FieldPlacement {
+            hide: Some(false),
+            ..Default::default()
+        };
+        for (reference, field, unit) in [
+            ("U404", "Value", None),
+            ("U1", "Absent", None),
+            ("U1", "Value", Some(99)),
+        ] {
+            assert!(set_property_placement(SCHEMATIC, reference, field, &placement, unit).is_err());
+        }
+        assert!(rewrite_instance_references(SCHEMATIC, "U1", "U99")
+            .unwrap_err()
+            .contains("not found"));
+        assert!(rewrite_instance_references(SCHEMATIC, "U0", "U1")
+            .unwrap_err()
+            .contains("netlist still reads"));
+    }
+
+    #[tokio::test]
+    async fn replacement_refuses_out_of_range_units_and_inconsistent_library_identity() {
+        for fault in [
+            "explicit_zero",
+            "explicit_too_large",
+            "too_few_units",
+            "inconsistent_ids",
+            "missing_reference",
+        ] {
+            let (_dir, path) = fixture();
+            let mut source = SCHEMATIC.to_owned();
+            let mut args =
+                json!({"schematic": path, "reference": "U1", "new_lib_id": "Test:DUAL_NEW"});
+            match fault {
+                "explicit_zero" | "explicit_too_large" => {
+                    let blocks = find_all_symbol_instance_blocks(&source, "U1");
+                    source.replace_range(blocks[1].0..blocks[1].1, "");
+                    args["unit"] = json!(if fault == "explicit_zero" { 0 } else { 3 });
+                }
+                "too_few_units" => source = source.replace("DUAL_NEW_2_1", "DUAL_NEW_1_2"),
+                "inconsistent_ids" => {
+                    let blocks = find_all_symbol_instance_blocks(&source, "U1");
+                    let (start, end) = blocks[1];
+                    let second = source[start..end]
+                        .replace("(lib_id \"Test:DUAL\")", "(lib_id \"Test:DUAL_NEW\")");
+                    source.replace_range(start..end, &second);
+                }
+                "missing_reference" => args["reference"] = json!("U404"),
+                _ => unreachable!(),
+            }
+            std::fs::write(&path, &source).unwrap();
+            let result = handle_replace_component(&args, &context()).await.unwrap();
+            assert!(result.is_error, "{fault}: {result:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source, "{fault}");
+        }
+    }
+
+    #[tokio::test]
+    async fn grouping_mixed_invalid_selections_refuses_without_writing() {
+        for references in [json!(["U404"]), json!([42]), json!(["U404", "U404", 42])] {
+            let (_dir, path) = fixture();
+            let before = std::fs::read(&path).unwrap();
+            let result = handle_group_components(
+                &json!({"schematic": path, "references": references, "group_name": "test"}),
+                &context(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{result:?}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn component_deletion_refuses_an_empty_selection_or_a_missing_item_uuid() {
+        let (_dir, path) = fixture();
+        for uuids in [Vec::new(), vec!["not-an-item".to_string()]] {
+            assert!(plan_component_and_item_deletions(&path, SCHEMATIC, &[], &uuids).is_err());
+        }
+        assert_eq!(std::fs::read_to_string(path).unwrap(), SCHEMATIC);
+    }
+
     fn context() -> ToolContext {
         ToolContext::new(
             ServerConfig {

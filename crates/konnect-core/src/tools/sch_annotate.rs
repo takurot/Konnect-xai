@@ -2220,3 +2220,124 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod annotation_evidence_contract_tests {
+    use super::*;
+
+    const SOURCE: &str = include_str!("../../tests/fixtures/annotate_duplicates.kicad_sch");
+
+    #[test]
+    fn annotation_readback_refuses_count_path_reference_and_property_loss() {
+        let before = placed_symbols(&parse_sexp(SOURCE).unwrap()).unwrap();
+        let project = before[0].paths[0].project.clone();
+        let plan = plan_annotation(&before, &project, true);
+        let edited = apply_edits(
+            SOURCE.to_owned(),
+            plan_edits(SOURCE, &before, &plan).unwrap(),
+        );
+        let after = placed_symbols(&parse_sexp(&edited).unwrap()).unwrap();
+        verify_applied(&before, &after, &plan).unwrap();
+        for (fault, expected) in [
+            ("count", "symbol count changed"),
+            ("uuid", "vanished"),
+            ("path_count", "lost or gained an instance path"),
+            ("path_identity", "lost instance path"),
+            ("reference", "expected"),
+            ("property", "Reference property reads"),
+        ] {
+            let mut incomplete = after.clone();
+            match fault {
+                "count" => {
+                    incomplete.pop();
+                }
+                "uuid" => incomplete[0].uuid = "different-symbol".into(),
+                "path_count" => incomplete[0].paths.clear(),
+                "path_identity" => incomplete[0].paths[0].path = "/different-sheet".into(),
+                "reference" => incomplete[0].paths[0].reference = "wrong-reference".into(),
+                "property" => incomplete[0].property_reference = "wrong-property".into(),
+                _ => unreachable!(),
+            }
+            let error = verify_applied(&before, &incomplete, &plan).unwrap_err();
+            assert!(error.contains(expected), "{fault}: {error}");
+        }
+    }
+
+    #[test]
+    fn derived_library_units_follow_inheritance_and_bound_missing_or_cyclic_parents() {
+        let source = r#"(kicad_sch (lib_symbols
+            (symbol "Test:Parent" (symbol "Parent_1_1") (symbol "Parent_2_1"))
+            (symbol "Test:Child" (extends "Test:Parent"))
+            (symbol "Test:Orphan" (extends "Test:Missing"))
+            (symbol "Test:LoopA" (extends "Test:LoopB"))
+            (symbol "Test:LoopB" (extends "Test:LoopA"))))"#;
+        let units = lib_symbol_units(&parse_sexp(source).unwrap());
+        assert_eq!(units["Test:Child"], 2);
+        assert_eq!(units["Test:Parent"], 2);
+        assert_eq!(units["Test:Orphan"], 1);
+        assert_eq!(units["Test:LoopA"], 1);
+        assert_eq!(units["Test:LoopB"], 1);
+    }
+
+    #[test]
+    fn an_instance_without_paths_is_unresolved_instead_of_assigned_a_guessed_reference() {
+        let mut symbols = placed_symbols(&parse_sexp(SOURCE).unwrap()).unwrap();
+        let project = symbols[0].paths[0].project.clone();
+        let uuid = symbols[0].uuid.clone();
+        symbols[0].paths.clear();
+        let plan = plan_annotation(&symbols, &project, true);
+        assert!(plan
+            .unresolved
+            .iter()
+            .any(|entry| entry.uuids.contains(&uuid) && entry.reason == REASON_NO_INSTANCE));
+        assert!(!plan
+            .assignments
+            .iter()
+            .any(|assignment| assignment.uuid == uuid));
+    }
+
+    #[test]
+    fn multi_unit_package_requires_consistent_values_distinct_units_and_valid_unit_ranges() {
+        let source = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+        let symbols = placed_symbols(&parse_sexp(source).unwrap()).unwrap();
+        let package: Vec<_> = symbols
+            .into_iter()
+            .filter(|symbol| symbol.property_reference == "U1")
+            .collect();
+        assert_eq!(
+            package_identity(&package.iter().collect::<Vec<_>>()),
+            Identity::OnePackage
+        );
+        for fault in [
+            "value",
+            "unit_range",
+            "duplicate_unit",
+            "missing_definition",
+            "mixed_library",
+        ] {
+            let mut ambiguous = package.clone();
+            match fault {
+                "value" => ambiguous[0].value = "different".into(),
+                "unit_range" => ambiguous[0].unit = u32::MAX,
+                "duplicate_unit" => ambiguous[0].unit = ambiguous[1].unit,
+                "missing_definition" => ambiguous[0].unit_count = None,
+                "mixed_library" => ambiguous[0].lib_symbol = "Other:Part".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    package_identity(&ambiguous.iter().collect::<Vec<_>>()),
+                    Identity::Unproven(_)
+                ),
+                "{fault}"
+            );
+        }
+        let mut invalid_single = package[0].clone();
+        invalid_single.unit_count = Some(1);
+        invalid_single.unit = 2;
+        assert!(matches!(
+            package_identity(&[&invalid_single]),
+            Identity::Unproven(_)
+        ));
+    }
+}
