@@ -10484,11 +10484,11 @@ mod v015_library_readback_tests {
         for (extra_pins, reason) in [
             (json!([]), "exactly 1 output pin but 0"),
             (
-                json!([{"number":"3","type":"output"},{"number":"4","type":"output"}]),
+                json!([{"number":"3","name":"Y","type":"output"},{"number":"4","name":"Z","type":"output"}]),
                 "exactly 1 output pin but 2",
             ),
             (
-                json!([{"number":"3","type":"output"},{"number":"4","type":"passive"}]),
+                json!([{"number":"3","name":"Y","type":"output"},{"number":"4","name":"EXTRA","type":"passive"}]),
                 "only supports input/output/power pins",
             ),
         ] {
