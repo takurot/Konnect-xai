@@ -4712,4 +4712,352 @@ mod v015_footprint_edit_contract_tests {
             2
         );
     }
+    #[test]
+    fn public_footprint_builder_preserves_oval_drills_and_optional_field_angles() {
+        use konnect_ipc::{IpcFieldPlacement, IpcPadDefinition};
+        let build = |pads: &[IpcPadDefinition], fields: &IpcFieldPlacement, angle| {
+            KiCadIpcClient::build_footprint_item(
+                "Test:Part",
+                "U1",
+                "value",
+                pads,
+                &[],
+                fields,
+                0.0,
+                0.0,
+                angle,
+                "B.Cu",
+            )
+        };
+        let pad = IpcPadDefinition {
+            number: "1".into(),
+            pad_type: "thru_hole".into(),
+            shape: "oval".into(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            size_x: 1.0,
+            size_y: 1.5,
+            drill_x: Some(0.3),
+            drill_y: Some(0.5),
+            drill_oval: true,
+            layers: vec!["*.Cu".into(), "*.Mask".into()],
+            roundrect_ratio: 0.0,
+            chamfer_ratio: 0.0,
+            chamfered_corners: None,
+        };
+        for attributes in [
+            None,
+            Some(ct::TextAttributes {
+                angle: Some(ct::Angle {
+                    value_degrees: 170.0,
+                }),
+                keep_upright: false,
+                ..Default::default()
+            }),
+        ] {
+            let mut field = value_field("custom");
+            field.name = "MPN".into();
+            let text = field.text.as_mut().unwrap().text.as_mut().unwrap();
+            text.position = Some(ct::Vector2::default());
+            text.attributes = attributes.clone();
+            let fields = IpcFieldPlacement {
+                fields: vec![field],
+                ..Default::default()
+            };
+            let item = build(std::slice::from_ref(&pad), &fields, 90.0).unwrap();
+            let fp = bt::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            assert_eq!(
+                fp.reference_field.unwrap().text.unwrap().layer,
+                bt::BoardLayer::BlBSilkS as i32
+            );
+            let children = fp.definition.unwrap().items;
+            let native_pad = bt::Pad::decode(
+                children
+                    .iter()
+                    .find(|item| builders::any_is(item, "kiapi.board.types.Pad"))
+                    .unwrap()
+                    .value
+                    .as_slice(),
+            )
+            .unwrap();
+            let drill = native_pad.pad_stack.unwrap().drill.unwrap();
+            assert_eq!(drill.shape, bt::DrillShape::DsOblong as i32);
+            assert_eq!(drill.diameter, Some(builders::vec2(0.3, 0.5).unwrap()));
+            let native_field = bt::Field::decode(
+                children
+                    .iter()
+                    .find(|item| builders::any_is(item, "kiapi.board.types.Field"))
+                    .unwrap()
+                    .value
+                    .as_slice(),
+            )
+            .unwrap();
+            let observed = native_field.text.unwrap().text.unwrap().attributes;
+            if attributes.is_some() {
+                assert_eq!(observed.unwrap().angle.unwrap().value_degrees, 260.0);
+            } else {
+                assert_eq!(observed, None);
+            }
+        }
+        assert!(build(&[], &IpcFieldPlacement::default(), f64::NAN).is_err());
+        let fields = IpcFieldPlacement {
+            reference_at: Some((0.0, 0.0, f64::MAX)),
+            ..Default::default()
+        };
+        assert!(build(&[], &fields, f64::MAX)
+            .unwrap_err()
+            .to_string()
+            .contains("rotation must be finite"));
+        let mut overflow_pad = pad;
+        overflow_pad.rotation = f64::MAX;
+        assert!(
+            build(&[overflow_pad], &IpcFieldPlacement::default(), f64::MAX)
+                .unwrap_err()
+                .to_string()
+                .contains("rotation must be finite")
+        );
+        let mut field = value_field("custom");
+        field.name = "MPN".into();
+        let text = field.text.as_mut().unwrap().text.as_mut().unwrap();
+        text.position = Some(ct::Vector2::default());
+        text.attributes = Some(ct::TextAttributes {
+            angle: Some(ct::Angle {
+                value_degrees: f64::MAX,
+            }),
+            ..Default::default()
+        });
+        assert!(build(
+            &[],
+            &IpcFieldPlacement {
+                fields: vec![field],
+                ..Default::default()
+            },
+            f64::MAX
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("rotation must be finite"));
+    }
+
+    #[test]
+    fn component_lookups_skip_unreadable_items_and_never_mutate_an_unrelated_reference() {
+        let malformed = prost_types::Any {
+            type_url: "kiapi.board.types.FootprintInstance".into(),
+            value: vec![0xff],
+        };
+        let other = packed(&footprint("U2", vec![]));
+        let (mock, held) = spawn_board(vec![malformed, other.clone()]);
+        let client = KiCadIpcClient::new(&mock.url);
+        assert!(client.get_footprint("missing").unwrap().is_none());
+        assert!(client.move_footprint("missing", 1.0, 2.0).is_err());
+        assert!(client.rotate_footprint("missing", 90.0).is_err());
+        assert!(client.list_footprint_graphics("missing").is_err());
+        let held = held.lock().unwrap();
+        assert!(held.updates.is_empty());
+        assert!(held.items.contains(&other));
+    }
+
+    #[test]
+    fn commit_failures_distinguish_known_rejection_from_unknown_mutation() {
+        for mode in 0..4 {
+            let actions = Arc::new(Mutex::new(Vec::new()));
+            let observed = actions.clone();
+            let mock = spawn_mock(move |request| {
+                let message = request.message.unwrap();
+                if message.type_url.ends_with("BeginCommit") {
+                    return Some(reply_with(builders::pack_any(
+                        &cc::BeginCommitResponse {
+                            id: Some(ct::Kiid {
+                                value: "batch".into(),
+                            }),
+                        },
+                        "kiapi.common.commands.BeginCommitResponse",
+                    )));
+                }
+                let mut response = ok_response();
+                if message.type_url.ends_with("RunAction") {
+                    if mode == 3 {
+                        response.status = None;
+                    } else if mode == 2 {
+                        response.status.as_mut().unwrap().status =
+                            kiapi::common::ApiStatusCode::AsBadRequest as i32;
+                    }
+                    return Some(response);
+                }
+                assert!(message.type_url.ends_with("EndCommit"));
+                let command = cc::EndCommit::decode(message.value.as_slice()).unwrap();
+                observed.lock().unwrap().push(command.action);
+                if command.action == cc::CommitAction::CmaCommit as i32 || matches!(mode, 1 | 2) {
+                    response.status.as_mut().unwrap().status =
+                        kiapi::common::ApiStatusCode::AsBadRequest as i32;
+                    response.status.as_mut().unwrap().error_message = "commit refused".into();
+                } else {
+                    response.message = Some(builders::pack_any(
+                        &cc::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    ));
+                }
+                Some(response)
+            });
+            let error = KiCadIpcClient::new(&mock.url)
+                .run_commit("test", |client| client.run_action("test.action"))
+                .unwrap_err();
+            if mode == 0 {
+                assert!(error.to_string().contains("changes dropped"));
+                assert!(!matches!(
+                    konnect_ipc::IpcFailure::from_error(error),
+                    konnect_ipc::IpcFailure::Uncertain(_)
+                ));
+            } else {
+                assert!(matches!(
+                    konnect_ipc::IpcFailure::from_error(error),
+                    konnect_ipc::IpcFailure::Uncertain(_)
+                ));
+            }
+            let expected = match mode {
+                0 | 1 => vec![
+                    cc::CommitAction::CmaCommit as i32,
+                    cc::CommitAction::CmaDrop as i32,
+                ],
+                2 => vec![cc::CommitAction::CmaDrop as i32],
+                _ => vec![],
+            };
+            assert_eq!(
+                *actions.lock().unwrap(),
+                expected,
+                "unknown operation must not trigger a blind drop"
+            );
+        }
+    }
+
+    #[test]
+    fn flip_rejections_and_fresh_identity_mismatch_never_report_a_successful_flip() {
+        for mode in 0..3 {
+            let mut fp = footprint("U1", vec![]);
+            fp.layer = bt::BoardLayer::BlFCu as i32;
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let observed = calls.clone();
+            let flipped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let state = flipped.clone();
+            let mock = spawn_mock(move |request| {
+                let message = request.message.unwrap();
+                observed.lock().unwrap().push(message.type_url.clone());
+                let body = match builders::any_type_name(&message) {
+                    "kiapi.common.commands.GetOpenDocuments" => return Some(open_board_response()),
+                    "kiapi.common.commands.GetItems" => {
+                        let mut observed = fp.clone();
+                        if mode == 1 && state.load(std::sync::atomic::Ordering::SeqCst) {
+                            observed.id = Some(ct::Kiid {
+                                value: "replacement".into(),
+                            });
+                            observed.layer = bt::BoardLayer::BlBCu as i32;
+                        }
+                        builders::pack_any(
+                            &cc::GetItemsResponse {
+                                status: ct::ItemRequestStatus::IrsOk as i32,
+                                items: vec![packed(&observed)],
+                                ..Default::default()
+                            },
+                            "kiapi.common.commands.GetItemsResponse",
+                        )
+                    }
+                    "kiapi.common.commands.BeginCommit" => builders::pack_any(
+                        &cc::BeginCommitResponse {
+                            id: Some(ct::Kiid {
+                                value: "flip".into(),
+                            }),
+                        },
+                        "kiapi.common.commands.BeginCommitResponse",
+                    ),
+                    "kiapi.common.commands.EndCommit" => builders::pack_any(
+                        &cc::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    ),
+                    "kiapi.board.commands.FlipItems" => {
+                        if mode == 0 {
+                            let mut response = ok_response();
+                            response.status.as_mut().unwrap().status =
+                                kiapi::common::ApiStatusCode::AsBadRequest as i32;
+                            return Some(response);
+                        }
+                        state.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let mut receipt = fp.clone();
+                        receipt.layer = bt::BoardLayer::BlBCu as i32;
+                        builders::pack_any(
+                            &kiapi::board::commands::FlipItemsResponse {
+                                status: ct::ItemRequestStatus::IrsOk as i32,
+                                flipped_items: vec![kiapi::board::commands::ItemFlipResult {
+                                    status: Some(cc::ItemStatus {
+                                        code: cc::ItemStatusCode::IscOk as i32,
+                                        error_message: String::new(),
+                                    }),
+                                    item: Some(if mode == 2 {
+                                        any_item()
+                                    } else {
+                                        packed(&receipt)
+                                    }),
+                                }],
+                                ..Default::default()
+                            },
+                            "kiapi.board.commands.FlipItemsResponse",
+                        )
+                    }
+                    other => panic!("unexpected flip command {other}"),
+                };
+                Some(reply_with(body))
+            });
+            let result = KiCadIpcClient::new(&mock.url).flip_footprint("U1", "B.Cu");
+            if mode == 1 {
+                let konnect_ipc::IpcFlipOutcome::Uncertain { reason, .. } = result.unwrap() else {
+                    panic!("identity mismatch is uncertain")
+                };
+                assert!(reason.contains("KIID"));
+            } else {
+                assert!(result.is_err());
+            }
+            assert!(
+                !calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|command| command.ends_with("GetVersion")),
+                "ordinary refusals are not an unsupported KiCad version"
+            );
+        }
+    }
+
+    #[test]
+    fn nonpolygon_edit_refusal_preserves_the_child_and_unknown_geometry_is_not_an_origin() {
+        let mut segment = builders::board_segment("F.SilkS", 0.1, 0.0, 0.0, 1.0, 1.0).unwrap();
+        segment.id = Some(ct::Kiid {
+            value: "line".into(),
+        });
+        let before = packed(&footprint(
+            "U1",
+            vec![builders::pack_any(
+                &segment,
+                "kiapi.board.types.BoardGraphicShape",
+            )],
+        ));
+        let (mock, held) = spawn_board(vec![before.clone()]);
+        assert!(KiCadIpcClient::new(&mock.url)
+            .set_footprint_graphic_points("U1", "line", &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)])
+            .is_err());
+        let held = held.lock().unwrap();
+        assert!(held.updates.is_empty());
+        assert_eq!(held.items, vec![before]);
+        drop(held);
+        let shape = builders::pack_any(
+            &bt::BoardGraphicShape::default(),
+            "kiapi.board.types.BoardGraphicShape",
+        );
+        let (mock, _) = spawn_board(vec![shape]);
+        let observed = KiCadIpcClient::new(&mock.url)
+            .get_board_graphics_in(doc_for("test.kicad_pcb"))
+            .unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].kind, "shape");
+        assert!(observed[0].origin.is_none());
+    }
 }
