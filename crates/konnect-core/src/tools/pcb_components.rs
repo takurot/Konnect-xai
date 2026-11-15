@@ -4493,9 +4493,17 @@ mod tests {
         let body = parsed(&result);
         assert_eq!(body["source"], "file");
         assert_eq!(body["pads"][0]["shape"], "chamfered_rect");
-        assert_eq!(body["pads"][0]["chamfer_ratio"], 0.2);
-        assert_eq!(body["pads"][0]["chamfered_corners"]["top_left"], true);
-        assert_eq!(body["pads"][0]["chamfered_corners"]["bottom_right"], true);
+        assert_eq!(
+            body["pads"][0]["copper_layers"].as_array().unwrap().len(),
+            1
+        );
+        let copper = &body["pads"][0]["copper_layers"][0];
+        assert_eq!(copper["layer"], "F.Cu");
+        assert_eq!(copper["chamfer_ratio"], 0.2);
+        assert_eq!(copper["chamfered_corners"]["top_left"], true);
+        assert_eq!(copper["chamfered_corners"]["bottom_right"], true);
+        assert_eq!(copper["chamfered_corners"]["top_right"], false);
+        assert_eq!(copper["chamfered_corners"]["bottom_left"], false);
         assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
     }
 
