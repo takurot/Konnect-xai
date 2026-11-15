@@ -8717,6 +8717,53 @@ mod multi_unit_component_tests {
     }
 
     #[test]
+    fn component_source_refuses_inconsistent_instance_reference_and_duplicate_fields() {
+        let (_directory, path) = fixture();
+        let original = std::fs::read(&path).unwrap();
+        for (source, expected_kind) in [
+            (
+                SCHEMATIC.replacen("(reference \"U1\")", "(reference \"U9\")", 1),
+                "stale_target",
+            ),
+            (
+                SCHEMATIC.replacen("(reference \"U1\")", "", 1),
+                "stale_target",
+            ),
+            (
+                SCHEMATIC.replacen(
+                    "(property \"Note\" \"OLD\"",
+                    "(property private \"Value\" \"OTHER\"",
+                    1,
+                ),
+                "ambiguous_target",
+            ),
+        ] {
+            let error = component_target_from_source(&path, &source, "U1")
+                .err()
+                .expect("inconsistent component identity must be refused")
+                .into_result();
+            assert_eq!(extract_error_kind(&error).as_deref(), Some(expected_kind));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn private_component_fields_survive_bound_target_observation() {
+        let (_directory, path) = fixture();
+        let source = SCHEMATIC.replacen(
+            "(property \"Note\" \"OLD\"",
+            "(property private \"Note\" \"PRIVATE\"",
+            1,
+        );
+        let target = component_target_from_source(&path, &source, "U1").unwrap();
+        assert_eq!(target.units[0].fields["Note"], "PRIVATE");
+        let committed = cse::Schematic::load(&path).unwrap();
+        let error = component_mutation_readback_from_schematic(&path, &committed, &[], Some("U1"))
+            .unwrap_err();
+        assert_eq!(extract_error_kind(&error).as_deref(), Some("stale_target"));
+    }
+
+    #[test]
     fn shared_readback_refuses_wrong_document_and_mismatched_fields() {
         let (directory, path) = fixture();
         let other = directory.path().join("other.kicad_sch");
