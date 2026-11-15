@@ -6342,6 +6342,10 @@ mod tests {
 /// instances path — which is where KiCad reads the designator for the netlist
 /// — on the old value (#157).
 #[cfg(test)]
+#[path = "sch_components_refusal_tests.rs"]
+mod component_refusal_tests;
+
+#[cfg(test)]
 mod edit_component_tests {
     use super::*;
     use crate::router::ToolRouter;
