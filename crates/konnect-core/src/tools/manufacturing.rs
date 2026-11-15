@@ -2409,3 +2409,50 @@ mod correction_boundary_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod board_evidence_contract_tests {
+    use super::*;
+
+    #[test]
+    fn numeric_net_references_count_once_and_nested_zone_arcs_are_not_tracks() {
+        let numeric = konnect_sexp::parse_sexp("(kicad_pcb (segment (net 1)) (via (net 1)) (arc (net 2)) (pad (net 0)) (zone (net 2) (polygon (pts (arc (start 0 0) (mid 1 1) (end 2 0))))))").unwrap();
+        assert_eq!(count_nets_and_tracks(&numeric), (2, 3));
+        let named = konnect_sexp::parse_sexp("(kicad_pcb (net 1 \"GND\") (segment (net 1)) (via (net \"GND\")) (footprint (pad (net \"SIG\"))) (net \"\"))").unwrap();
+        assert_eq!(count_nets_and_tracks(&named), (2, 2));
+    }
+
+    #[test]
+    fn dimension_estimation_combines_all_edge_extrema_and_ignores_non_edges() {
+        let source = "(kicad_pcb\n (gr_line (start 5 6) (end -3 -4) (layer \"Edge.Cuts\"))\n (gr_line (start 8 -8) (end -6 9) (layer \"Edge.Cuts\"))\n (gr_line (start -100 -100) (end 100 100) (layer \"F.SilkS\"))\n)";
+        assert_eq!(estimate_board_dimensions(source), (14.0, 17.0));
+        assert_eq!(estimate_board_dimensions("(kicad_pcb)"), (0.0, 0.0));
+        assert_eq!(
+            estimate_board_dimensions("(gr_line (start bad 0) (end 1 1) (layer \"Edge.Cuts\"))\n"),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            estimate_board_dimensions("(gr_line (start 1 2) (end bad 3) (layer \"Edge.Cuts\"))\n"),
+            (0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn setup_and_outline_coordinate_extraction_return_no_evidence_for_bad_fields() {
+        assert_eq!(
+            find_setup_value("(setup (min_trace_width 0.127))", "min_trace_width"),
+            Some(0.127)
+        );
+        for source in [
+            "(setup)",
+            "(setup (min_trace_width nope))",
+            "(setup (min_trace_width 0.127",
+        ] {
+            assert_eq!(find_setup_value(source, "min_trace_width"), None);
+        }
+        assert_eq!(extract_coord("(start 2.01 -3.5)", "start", 1), Some(-3.5));
+        assert_eq!(extract_coord("(start 2.01)", "start", 2), None);
+        assert_eq!(extract_coord("(start nope 1)", "start", 0), None);
+        assert_eq!(extract_coord("(end 2 3)", "start", 0), None);
+    }
+}

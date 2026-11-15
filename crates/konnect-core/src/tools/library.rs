@@ -10544,3 +10544,199 @@ mod v015_library_readback_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod generated_geometry_contract_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn pad(number: &str, x: f64, y: f64) -> PadGeom {
+        PadGeom {
+            number: number.into(),
+            pad_type: "smd".into(),
+            x,
+            y,
+            w: 1.0,
+            h: 1.0,
+        }
+    }
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn body(result: CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            other => panic!("expected JSON result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pin_one_silkscreen_dots_follow_all_four_pad_edges() {
+        for (x, y, dx, dy) in [
+            (-3.0, 0.0, -4.05, 0.0),
+            (3.0, 0.0, 4.05, 0.0),
+            (0.0, -3.0, 0.0, -4.05),
+            (0.0, 3.0, 0.0, 4.05),
+        ] {
+            let pads = [pad("1", x, y), pad("2", -x, -y)];
+            let graphics = build_footprint_graphics(
+                &json!({"body_width":2.0,"body_height":2.0}),
+                "Part",
+                &pads,
+            );
+            let root =
+                konnect_sexp::parse_sexp(&format!("(footprint \"Part\" {graphics})")).unwrap();
+            let dot = root.find("fp_circle").unwrap().find("center").unwrap();
+            assert_eq!((dot.get_f64(1), dot.get_f64(2)), (Some(dx), Some(dy)));
+            let fab = root.find("fp_poly").unwrap();
+            assert_eq!(fab.find("pts").unwrap().find_all("xy").len(), 5);
+            assert_eq!(fab.find_str("layer"), Some("F.Fab"));
+        }
+    }
+
+    #[test]
+    fn chamfer_clamps_at_every_corner_and_zero_keeps_a_rectangle() {
+        for corner in [(0.0, 0.0), (4.0, 0.0), (4.0, 2.0), (0.0, 2.0)] {
+            assert_eq!(
+                nearest_corner(0.0, 0.0, 4.0, 2.0, corner.0, corner.1),
+                corner
+            );
+            let points = chamfered_rect_points(0.0, 0.0, 4.0, 2.0, corner.0, corner.1, 10.0);
+            assert_eq!(points.len(), 5);
+            assert!(!points.contains(&corner));
+            assert_eq!(
+                chamfered_rect_points(0.0, 0.0, 4.0, 2.0, corner.0, corner.1, 0.0).len(),
+                4
+            );
+        }
+        assert_eq!(point_toward((1.0, 2.0), (1.0, 2.0), 0.5), (1.0, 2.0));
+        assert_eq!(point_toward((0.0, 0.0), (3.0, 4.0), 5.0), (3.0, 4.0));
+    }
+
+    #[test]
+    fn model_metadata_handles_absence_and_defaults_each_transform_axis() {
+        for args in [
+            json!({"model":false}),
+            json!({"model":{"path":""}}),
+            json!({"model":{"path":7}}),
+        ] {
+            assert_eq!(build_model_sexp(&args), "");
+        }
+        let source = build_model_sexp(&json!({"model":{"path":"path with \"quotes\".step",
+            "offset":{"x":2.0},"scale":{"y":3.0},"rotate":{"z":90.0}}}));
+        let node = konnect_sexp::parse_sexp(&source).unwrap();
+        assert_eq!(
+            node.get(1).and_then(konnect_sexp::SexpNode::as_str),
+            Some("path with \"quotes\".step")
+        );
+        for (tag, expected) in [
+            ("offset", [2.0, 0.0, 0.0]),
+            ("scale", [1.0, 3.0, 1.0]),
+            ("rotate", [0.0, 0.0, 90.0]),
+        ] {
+            let xyz = node.find(tag).unwrap().find("xyz").unwrap();
+            assert_eq!(
+                [
+                    xyz.get_f64(1).unwrap(),
+                    xyz.get_f64(2).unwrap(),
+                    xyz.get_f64(3).unwrap()
+                ],
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_library_lists_are_sorted_truncated_and_ignore_non_footprint_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let footprints = dir.path().join("Contract.pretty");
+        std::fs::create_dir(&footprints).unwrap();
+        std::fs::write(footprints.join("Z.kicad_mod"), "(footprint \"Z\")").unwrap();
+        std::fs::write(footprints.join("A.kicad_mod"), "(footprint \"A\")").unwrap();
+        std::fs::write(footprints.join("notes.txt"), "unrelated").unwrap();
+        let result = body(
+            handle_list_library_footprints(&json!({"library_path":footprints}), &context())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["count"], 2);
+        assert_eq!(result["footprints"], json!(["A", "Z"]));
+        let invalid = handle_list_library_footprints(
+            &json!({"library_path":dir.path().join("absent")}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(invalid.is_error);
+        let lib = dir.path().join("Contract.kicad_sym");
+        std::fs::write(
+            &lib,
+            "(kicad_symbol_lib (symbol \"Alpha\") (symbol \"Beta\"))",
+        )
+        .unwrap();
+        for limit in [0, 1, 3] {
+            let result = body(
+                handle_list_symbols_in_library(
+                    &json!({"library_path":lib,"limit":limit}),
+                    &context(),
+                )
+                .await
+                .unwrap(),
+            );
+            assert_eq!(result["count"], 2);
+            assert_eq!(
+                result["symbols"].as_array().unwrap().len(),
+                usize::min(limit, 2)
+            );
+            assert_eq!(result["truncated"], limit < 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn symbol_info_preserves_local_properties_and_inherited_pin_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("Contract.kicad_sym");
+        std::fs::write(&lib,r#"(kicad_symbol_lib
+            (symbol "Base" (symbol "Base_1_1" (pin input line (number "1") (name "IN") (at 2 3 0))))
+            (symbol "Derived" (extends "Base") (property "Reference" "U") (property "MPN" "part-number")
+                (symbol "Derived_1_1" (pin output line (number "2") (name "OUT")))))"#).unwrap();
+        let uri = lib.to_string_lossy().replace('\\', "/");
+        std::fs::write(dir.path().join("sym-lib-table"),format!("(sym_lib_table (lib (name \"ContractCoverage\") (type \"KiCad\") (uri {}) (options \"\") (descr \"\")))",konnect_sexp::quoted(&uri))).unwrap();
+        let result = body(
+            handle_get_symbol_info(
+                &json!({"lib_id":"ContractCoverage:Derived","project_dir":dir.path()}),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["properties"]["MPN"], "part-number");
+        let pins = result["pins"].as_array().unwrap();
+        assert_eq!(pins.len(), 2);
+        let output = pins.iter().find(|pin| pin["number"] == "2").unwrap();
+        assert_eq!(
+            (output["x"].as_f64(), output["y"].as_f64()),
+            (Some(0.0), Some(0.0))
+        );
+        let input = pins.iter().find(|pin| pin["number"] == "1").unwrap();
+        assert_eq!(
+            (input["x"].as_f64(), input["y"].as_f64()),
+            (Some(2.0), Some(3.0))
+        );
+    }
+}
