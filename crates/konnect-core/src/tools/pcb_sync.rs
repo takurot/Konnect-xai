@@ -6948,7 +6948,7 @@ mod tests {
     #[tokio::test]
     async fn a_stale_reviewed_plan_is_refused_before_any_commit() {
         let sync = ServedSync::new().await;
-        let netlist = exported_netlist(&[("R1", "Resistor_SMD:R_0805_2012Metric", &["1", "2"])]);
+        let netlist = exported_netlist(&[("R1", STOCK_0603, &["1", "2"])]);
         let plan = sync.dry_run(&netlist).await;
         assert_eq!(plan["status"], "ready");
         let (_, result) = sync
@@ -6970,7 +6970,7 @@ mod tests {
     #[tokio::test]
     async fn applying_an_already_synchronized_plan_is_a_noop_without_another_commit() {
         let sync = ServedSync::new().await;
-        let netlist = exported_netlist(&[("R1", "Resistor_SMD:R_0805_2012Metric", &["1", "2"])]);
+        let netlist = exported_netlist(&[("R1", STOCK_0603, &["1", "2"])]);
         assert_eq!(sync.apply(&netlist).await["status"], "applied");
         let before = sync.begins.load(std::sync::atomic::Ordering::SeqCst);
         let plan = sync.dry_run(&netlist).await;
