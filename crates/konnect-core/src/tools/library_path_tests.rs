@@ -276,7 +276,7 @@ fn flatten_lib_table_follows_nested_tables_and_attaches_resolved_paths() {
          (lib (name \"Ref\") (type \"Table\") (uri \"{}\")) \
          (lib (name \"Gone\") (type \"Table\") (uri \"/no/such/table\")) \
          (lib (name \"Unres\") (type \"KiCad\") (uri \"${{KONNECT_TEST_UNSET_VAR}}/x\")))",
-        nested.display()
+        sexp_path(&nested)
     );
     let libs = flatten_lib_table(&outer, 0, None);
     let names: Vec<&str> = libs.iter().filter_map(|l| l["nickname"].as_str()).collect();
@@ -304,7 +304,7 @@ fn flatten_lib_table_stops_following_tables_past_the_depth_limit() {
     .unwrap();
     let outer = format!(
         "(fp_lib_table (lib (name \"Ref\") (type \"Table\") (uri \"{}\")))",
-        nested.display()
+        sexp_path(&nested)
     );
     assert_eq!(flatten_lib_table(&outer, 0, None).len(), 1);
     assert!(flatten_lib_table(&outer, MAX_LIB_TABLE_DEPTH, None).is_empty());
@@ -355,7 +355,7 @@ fn resolve_footprint_path_prefers_the_project_table_entry() {
     std::fs::write(pretty.join("R_X.kicad_mod"), "").unwrap();
     let project = project_with_fp_table(&format!(
         "(lib (name \"Mine\") (type \"KiCad\") (uri \"{}\"))\n(lib (name \"Broken\") (type \"KiCad\") (uri \"${{KONNECT_TEST_UNSET_VAR}}/x\"))\n",
-        pretty.display()
+        sexp_path(&pretty)
     ));
     assert_eq!(
         resolve_footprint_path("Mine:R_X", Some(project.path())).unwrap(),
@@ -414,4 +414,10 @@ fn a_project_root_is_the_directory_holding_a_library_table() {
         project_root_for(&sheet).unwrap().as_deref(),
         Some(project.path())
     );
+}
+
+/// Escapes a path for embedding in a quoted s-expression string, where `\\` is an escape
+/// character (Windows separators would otherwise be consumed).
+fn sexp_path(path: &std::path::Path) -> String {
+    path.display().to_string().replace('\\', "\\\\")
 }
