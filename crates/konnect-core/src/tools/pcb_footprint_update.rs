@@ -30,16 +30,10 @@ struct LibraryFootprint {
     models: Vec<kiapi::board::types::Footprint3DModel>,
 }
 
-#[derive(Debug)]
-struct ParsedLibraryProperties {
-    datasheet: Option<String>,
-    description: Option<String>,
-    custom: Vec<kiapi::board::types::Field>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ChangedDomain {
+    Text,
     Pads,
     Graphics,
     Attributes,
@@ -56,6 +50,7 @@ struct PreparedUpdate {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 struct UpdateFilters {
+    reset_text: bool,
     references: Option<BTreeSet<String>>,
     library_ids: Option<BTreeSet<String>>,
 }
@@ -193,6 +188,10 @@ pub(crate) fn tool() -> ToolDef {
                     "items": { "type": "string" },
                     "description": "Optional exact Library:Footprint allowlist"
                 },
+                "reset_text": {
+                    "type": "boolean", "default": false,
+                    "description": "Restore Reference and Value presentation from the library while retaining their placed text"
+                },
                 "dry_run": {
                     "type": "boolean",
                     "default": true,
@@ -287,6 +286,29 @@ pub(crate) async fn handle_update_footprints_from_library(
                 copper_layer_count,
             );
 
+            if !plan.prepared_items.is_empty() {
+                let source = client.save_document_to_string_in(document.clone())?;
+                let blocked = super::library_footprint::live_loss_diagnostics(&source)?;
+                let mut hasher = Sha256::new();
+                hasher.update(plan.plan_revision.as_bytes());
+                hasher.update(serde_json::to_vec(&blocked).expect("loss findings serialize"));
+                plan.plan_revision = format!("{:x}", hasher.finalize());
+                for item in &plan.prepared_items {
+                    let instance = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+                    let id = instance.id.as_ref().context("updated footprint has no UUID")?;
+                    if let Some(reason) = blocked.get(&id.value) {
+                        let reference = field_text(&instance.reference_field);
+                        plan.diagnostics.push(UpdateDiagnostic { code: "unsupported_live_footprint_state".into(), message: format!("{reference}: {reason}"), reference: Some(reference) });
+                    }
+                }
+                if !plan.diagnostics.is_empty() {
+                    plan.status = PlanStatus::Conflict;
+                    plan.coverage.conflicts.planned = plan.diagnostics.len();
+                    plan.prepared_items.clear();
+                    plan.changes.clear();
+                    plan.coverage.changed.planned = 0;
+                }
+            }
             if dry_run || plan.status == PlanStatus::Conflict {
                 return Ok(plan_response(&plan, false));
             }
@@ -308,6 +330,7 @@ pub(crate) async fn handle_update_footprints_from_library(
             }
 
             let update_count = plan.prepared_items.len();
+            let presentation = konnect_ipc::FootprintPresentation::from_items(&plan.prepared_items)?;
             let expected_layers = footprint_layer_states(&plan.prepared_items)?;
             let chamfers = konnect_ipc::FootprintChamfers::from_items(&plan.prepared_items)?;
             let mutation = client.run_commit("Update footprints from libraries", |client| {
@@ -335,6 +358,7 @@ pub(crate) async fn handle_update_footprints_from_library(
                 }
                 return Err(error);
             }
+            client.verify_footprint_presentation_in(document, &presentation)?;
             plan.coverage.selected.applied = plan.coverage.selected.planned;
             plan.coverage.changed.applied = update_count;
             plan.coverage.unchanged.applied = plan.coverage.unchanged.planned;
@@ -742,7 +766,15 @@ fn parse_filters(args: &serde_json::Value) -> std::result::Result<UpdateFilters,
         Ok(parsed)
     }
 
+    let reset_text = match args.get("reset_text") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| ArgumentError {
+            field: "reset_text".into(),
+            reason: "must be a boolean".into(),
+        })?,
+    };
     Ok(UpdateFilters {
+        reset_text,
         references: parse(args, "references")?,
         library_ids: parse(args, "library_ids")?,
     })
@@ -943,6 +975,7 @@ fn plan_updates(
             &library,
             net_codes,
             routed_nets,
+            filters.reset_text,
             copper_layer_count,
         ) {
             Ok(prepared) => prepared,
@@ -1015,14 +1048,32 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     }
 
     super::library_footprint::validate_supported_children(&root)?;
-    let properties = parse_library_properties(&root)?;
+    let fields = super::library_footprint::fields(&root)?;
+    let value = |name: &str| {
+        fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| field_text(&Some(field.clone())))
+    };
+    let datasheet = value("Datasheet");
+    let description_field = value("Description");
+    let properties = fields
+        .iter()
+        .filter(|field| {
+            !matches!(
+                field.name.as_str(),
+                "Reference" | "Value" | "Datasheet" | "Description"
+            )
+        })
+        .cloned()
+        .collect();
     let pads = super::pcb_components::extract_pad_definitions(source)?;
     // Custom properties travel as typed Field items below. Treating visible
     // properties as generic graphics as well would duplicate their text.
     let graphics = super::pcb_components::extract_graphic_definitions_without_properties(source)?;
     let models = super::library_footprint::models(&root)?;
     let attributes = super::library_footprint::attributes(&root)?;
-    let definition = kiapi::board::types::Footprint {
+    let mut definition = kiapi::board::types::Footprint {
         id: Some(kiapi::common::types::LibraryIdentifier {
             library_nickname: library_nickname.to_string(),
             entry_name: entry_name.to_string(),
@@ -1031,379 +1082,26 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         ..Default::default()
     };
 
+    for field in fields {
+        match field.name.as_str() {
+            "Reference" => definition.reference_field = Some(field),
+            "Value" => definition.value_field = Some(field),
+            "Datasheet" => definition.datasheet_field = Some(field),
+            "Description" => definition.description_field = Some(field),
+            _ => {}
+        }
+    }
+
     Ok(LibraryFootprint {
         library_id: library_id.to_string(),
         definition,
         attributes,
-        datasheet: properties.datasheet,
-        description_field: properties.description,
-        properties: properties.custom,
+        datasheet,
+        description_field,
+        properties,
         pads,
         graphics,
         models,
-    })
-}
-
-fn parse_library_properties(root: &konnect_sexp::SexpNode) -> Result<ParsedLibraryProperties> {
-    let mut names = BTreeSet::new();
-    let mut datasheet = None;
-    let mut description = None;
-    let mut custom = Vec::new();
-    for property in root.find_all("property") {
-        let name = property
-            .get(1)
-            .and_then(konnect_sexp::SexpNode::as_str)
-            .context("property is missing its name")?;
-        if !names.insert(name.to_string()) {
-            bail!("property '{name}' appears more than once in the library footprint");
-        }
-
-        // Mandatory and custom properties share one lossless clause validator.
-        // The mandatory values keep their existing first-class IPC fields; the
-        // shared parser proves that none of their authored clauses would be
-        // silently ignored without requiring a typed custom Field.
-        let mandatory = matches!(name, "Reference" | "Value" | "Datasheet" | "Description");
-        let parsed = parse_library_property(property, !mandatory)?;
-        let value = property
-            .get(2)
-            .and_then(konnect_sexp::SexpNode::as_str)
-            .with_context(|| format!("property '{name}' is missing its value"))?;
-        match name {
-            "Reference" | "Value" => {}
-            "Datasheet" => datasheet = Some(value.to_string()),
-            "Description" => description = Some(value.to_string()),
-            _ => custom.push(parsed.context("custom property did not produce a typed field")?),
-        }
-    }
-
-    Ok(ParsedLibraryProperties {
-        datasheet,
-        description,
-        custom,
-    })
-}
-
-/// Convert a footprint property into the typed `Field` shape carried by
-/// KiCad's IPC model. Mandatory properties are validated through this same
-/// path and then stored in their existing first-class fields. Unknown clauses
-/// refuse here: accepting a property while dropping part of its authored
-/// presentation would make the refresh lossy even when its value survived.
-fn parse_library_property(
-    property: &konnect_sexp::SexpNode,
-    require_typed_field: bool,
-) -> Result<Option<kiapi::board::types::Field>> {
-    use kiapi::common::types::LockedState;
-
-    let name = property
-        .get(1)
-        .and_then(konnect_sexp::SexpNode::as_str)
-        .context("property is missing its name")?;
-    let value = property
-        .get(2)
-        .and_then(konnect_sexp::SexpNode::as_str)
-        .with_context(|| format!("property '{name}' is missing its value"))?;
-    let mut position = None;
-    let mut rotation = 0.0;
-    let mut layer = None;
-    let mut hidden = None;
-    let mut knockout = None;
-    let mut attributes = None;
-    let mut identifier = None;
-
-    for clause in property.children().unwrap_or_default().iter().skip(3) {
-        let tag = clause
-            .head()
-            .with_context(|| format!("property '{name}' contains an unsupported atom"))?;
-        match tag {
-            "at" => {
-                if position.is_some() {
-                    bail!("property '{name}' contains duplicate 'at' clauses");
-                }
-                let count = clause.children().map_or(0, |children| children.len());
-                if !matches!(count, 3 | 4) {
-                    bail!("property '{name}' 'at' must contain x, y, and optional rotation");
-                }
-                let x = clause
-                    .get_f64(1)
-                    .with_context(|| format!("property '{name}' has an invalid X position"))?;
-                let y = clause
-                    .get_f64(2)
-                    .with_context(|| format!("property '{name}' has an invalid Y position"))?;
-                rotation = clause.get_f64(3).unwrap_or(0.0);
-                if !x.is_finite() || !y.is_finite() || !rotation.is_finite() {
-                    bail!("property '{name}' position and rotation must be finite");
-                }
-                position = Some(konnect_ipc::builders::vec2(x, y));
-            }
-            "layer" => {
-                if layer.is_some() {
-                    bail!("property '{name}' contains duplicate 'layer' clauses");
-                }
-                let layer_name = clause
-                    .get(1)
-                    .and_then(konnect_sexp::SexpNode::as_str)
-                    .filter(|name| !name.is_empty())
-                    .with_context(|| format!("property '{name}' has no layer name"))?;
-                if clause.children().map_or(0, |children| children.len()) != 2 {
-                    bail!("property '{name}' 'layer' must name exactly one layer");
-                }
-                layer = Some(
-                    konnect_ipc::builders::try_layer_from_name(layer_name)
-                        .with_context(|| format!("property '{name}' has an unsupported layer"))?
-                        as i32,
-                );
-            }
-            "hide" => {
-                if hidden.is_some() {
-                    bail!("property '{name}' contains duplicate 'hide' clauses");
-                }
-                hidden = Some(property_yes_no(clause, name, "hide")?);
-            }
-            "knockout" => {
-                if knockout.is_some() {
-                    bail!("property '{name}' contains duplicate 'knockout' clauses");
-                }
-                knockout = Some(property_yes_no(clause, name, "knockout")?);
-            }
-            "uuid" | "tstamp" => {
-                if let Some(previous) = identifier {
-                    bail!(
-                        "property '{name}' contains multiple identifier clauses ('{previous}' and '{tag}')"
-                    );
-                }
-                identifier = Some(tag);
-                if clause.children().map_or(0, |children| children.len()) != 2
-                    || clause
-                        .get(1)
-                        .and_then(konnect_sexp::SexpNode::as_str)
-                        .is_none_or(str::is_empty)
-                {
-                    bail!("property '{name}' '{tag}' must contain exactly one identifier");
-                }
-            }
-            "effects" => {
-                if attributes.is_some() {
-                    bail!("property '{name}' contains duplicate 'effects' clauses");
-                }
-                attributes = Some(parse_property_effects(clause, name)?);
-            }
-            unsupported => {
-                bail!("property '{name}' clause '{unsupported}' is not supported losslessly")
-            }
-        }
-    }
-
-    if !require_typed_field {
-        return Ok(None);
-    }
-
-    let position =
-        position.with_context(|| format!("property '{name}' is missing its 'at' clause"))?;
-    let layer =
-        layer.with_context(|| format!("property '{name}' is missing its 'layer' clause"))?;
-    let mut attributes =
-        attributes.with_context(|| format!("property '{name}' is missing its 'effects' clause"))?;
-    attributes.angle = Some(kiapi::common::types::Angle {
-        value_degrees: rotation,
-    });
-    Ok(Some(kiapi::board::types::Field {
-        id: None,
-        name: name.to_string(),
-        text: Some(kiapi::board::types::BoardText {
-            // A library child's UUID is definition-local and cannot be reused
-            // across placed instances. Let KiCad assign the board child ID.
-            id: None,
-            text: Some(kiapi::common::types::Text {
-                position: Some(position),
-                attributes: Some(attributes),
-                text: value.to_string(),
-                hyperlink: String::new(),
-            }),
-            layer,
-            knockout: knockout.unwrap_or(false),
-            locked: LockedState::LsUnlocked as i32,
-            parent: None,
-        }),
-        visible: !hidden.unwrap_or(false),
-    }))
-}
-
-fn property_yes_no(clause: &konnect_sexp::SexpNode, name: &str, tag: &str) -> Result<bool> {
-    if clause.children().map_or(0, |children| children.len()) != 2 {
-        bail!("property '{name}' '{tag}' must contain exactly one yes/no value");
-    }
-    match clause.get(1).and_then(konnect_sexp::SexpNode::as_str) {
-        Some("yes") => Ok(true),
-        Some("no") => Ok(false),
-        _ => bail!("property '{name}' '{tag}' must be yes or no"),
-    }
-}
-
-fn parse_property_effects(
-    effects: &konnect_sexp::SexpNode,
-    name: &str,
-) -> Result<kiapi::common::types::TextAttributes> {
-    use kiapi::common::types::{HorizontalAlignment, VerticalAlignment};
-
-    let mut font = None;
-    let mut horizontal = HorizontalAlignment::HaCenter;
-    let mut vertical = VerticalAlignment::VaCenter;
-    let mut mirrored = false;
-    for clause in effects.children().unwrap_or_default().iter().skip(1) {
-        let tag = clause
-            .head()
-            .with_context(|| format!("property '{name}' effects contain an unsupported atom"))?;
-        match tag {
-            "font" => {
-                if font.replace(clause).is_some() {
-                    bail!("property '{name}' contains duplicate font clauses");
-                }
-            }
-            "justify" => {
-                for value in clause.children().unwrap_or_default().iter().skip(1) {
-                    match value.as_str().with_context(|| {
-                        format!("property '{name}' justify contains a non-atom")
-                    })? {
-                        "left" if horizontal == HorizontalAlignment::HaCenter => {
-                            horizontal = HorizontalAlignment::HaLeft
-                        }
-                        "right" if horizontal == HorizontalAlignment::HaCenter => {
-                            horizontal = HorizontalAlignment::HaRight
-                        }
-                        "top" if vertical == VerticalAlignment::VaCenter => {
-                            vertical = VerticalAlignment::VaTop
-                        }
-                        "bottom" if vertical == VerticalAlignment::VaCenter => {
-                            vertical = VerticalAlignment::VaBottom
-                        }
-                        "mirror" if !mirrored => mirrored = true,
-                        "left" | "right" => bail!(
-                            "property '{name}' has conflicting horizontal justification"
-                        ),
-                        "top" | "bottom" => {
-                            bail!("property '{name}' has conflicting vertical justification")
-                        }
-                        "mirror" => bail!("property '{name}' repeats mirrored justification"),
-                        unsupported => bail!(
-                            "property '{name}' justification '{unsupported}' is not supported losslessly"
-                        ),
-                    }
-                }
-            }
-            unsupported => bail!(
-                "property '{name}' effects clause '{unsupported}' is not supported losslessly"
-            ),
-        }
-    }
-    let font =
-        font.with_context(|| format!("property '{name}' effects are missing the font clause"))?;
-
-    let mut font_name = String::new();
-    let mut size = None;
-    let mut thickness = None;
-    let mut bold = None;
-    let mut italic = None;
-    let mut line_spacing = None;
-    for clause in font.children().unwrap_or_default().iter().skip(1) {
-        let tag = clause
-            .head()
-            .with_context(|| format!("property '{name}' font contains an unsupported atom"))?;
-        match tag {
-            "face" => {
-                if !font_name.is_empty() {
-                    bail!("property '{name}' contains duplicate font face clauses");
-                }
-                font_name = clause
-                    .get(1)
-                    .and_then(konnect_sexp::SexpNode::as_str)
-                    .filter(|face| !face.is_empty())
-                    .with_context(|| format!("property '{name}' font face is invalid"))?
-                    .to_string();
-            }
-            "size" => {
-                if size.is_some() {
-                    bail!("property '{name}' contains duplicate font size clauses");
-                }
-                if clause.children().map_or(0, |children| children.len()) != 3 {
-                    bail!("property '{name}' font size must contain width and height");
-                }
-                let width = clause
-                    .get_f64(1)
-                    .with_context(|| format!("property '{name}' font width is invalid"))?;
-                let height = clause
-                    .get_f64(2)
-                    .with_context(|| format!("property '{name}' font height is invalid"))?;
-                if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
-                    bail!("property '{name}' font size must be finite and positive");
-                }
-                size = Some((width, height));
-            }
-            "thickness" => {
-                if thickness.is_some() {
-                    bail!("property '{name}' contains duplicate font thickness clauses");
-                }
-                let value = clause
-                    .get_f64(1)
-                    .with_context(|| format!("property '{name}' font thickness is invalid"))?;
-                if clause.children().map_or(0, |children| children.len()) != 2
-                    || !value.is_finite()
-                    || value <= 0.0
-                {
-                    bail!("property '{name}' font thickness must be finite and positive");
-                }
-                thickness = Some(value);
-            }
-            "bold" => {
-                if bold.is_some() {
-                    bail!("property '{name}' contains duplicate font 'bold' clauses");
-                }
-                bold = Some(property_yes_no(clause, name, "font bold")?);
-            }
-            "italic" => {
-                if italic.is_some() {
-                    bail!("property '{name}' contains duplicate font 'italic' clauses");
-                }
-                italic = Some(property_yes_no(clause, name, "font italic")?);
-            }
-            "line_spacing" => {
-                if line_spacing.is_some() {
-                    bail!("property '{name}' contains duplicate font 'line_spacing' clauses");
-                }
-                let value = clause
-                    .get_f64(1)
-                    .with_context(|| format!("property '{name}' line spacing is invalid"))?;
-                if clause.children().map_or(0, |children| children.len()) != 2
-                    || !value.is_finite()
-                    || value <= 0.0
-                {
-                    bail!("property '{name}' line spacing must be finite and positive");
-                }
-                line_spacing = Some(value);
-            }
-            unsupported => {
-                bail!("property '{name}' font clause '{unsupported}' is not supported losslessly")
-            }
-        }
-    }
-    let (width, height) =
-        size.with_context(|| format!("property '{name}' font is missing its size"))?;
-    Ok(kiapi::common::types::TextAttributes {
-        font_name,
-        horizontal_alignment: horizontal as i32,
-        vertical_alignment: vertical as i32,
-        angle: None,
-        line_spacing: line_spacing.unwrap_or(1.0),
-        stroke_width: Some(konnect_ipc::builders::distance(
-            thickness.unwrap_or(width * 0.15),
-        )),
-        italic: italic.unwrap_or(false),
-        bold: bold.unwrap_or(false),
-        underlined: false,
-        visible: true,
-        mirrored,
-        multiline: false,
-        keep_upright: false,
-        size: Some(konnect_ipc::builders::vec2(width, height)),
     })
 }
 
@@ -1412,6 +1110,7 @@ fn build_updated_instance(
     library: &LibraryFootprint,
     net_codes: &BTreeMap<String, i32>,
     routed_nets: &BTreeSet<String>,
+    reset_text: bool,
     copper_layer_count: usize,
 ) -> Result<PreparedUpdate> {
     let current_definition = current
@@ -1576,6 +1275,51 @@ fn build_updated_instance(
     }
     updated.attributes = Some(attributes);
 
+    if reset_text {
+        for (name, library_field) in [
+            ("Reference", &library.definition.reference_field),
+            ("Value", &library.definition.value_field),
+        ] {
+            let Some(library_field) = library_field else {
+                continue;
+            };
+            let mut field = transform_library_property(
+                library_field,
+                &position,
+                rotation,
+                is_back,
+                copper_layer_count,
+            )?;
+            let value = if name == "Reference" {
+                field_text(&current.reference_field)
+            } else {
+                field_text(&current.value_field)
+            };
+            field
+                .text
+                .as_mut()
+                .context("library field has no board text")?
+                .text
+                .as_mut()
+                .context("library field has no text")?
+                .text = value;
+            if name == "Reference" {
+                updated.reference_field = Some(field.clone());
+                updated
+                    .definition
+                    .as_mut()
+                    .context("updated footprint has no definition")?
+                    .reference_field = Some(field);
+            } else {
+                updated.value_field = Some(field.clone());
+                updated
+                    .definition
+                    .as_mut()
+                    .context("updated footprint has no definition")?
+                    .value_field = Some(field);
+            }
+        }
+    }
     let changed_domains = changed_domains(current, &updated)?;
     let preserved = PreservedState::derive(current, &updated, &old_nets);
     Ok(PreparedUpdate {
@@ -1704,7 +1448,9 @@ fn transform_library_property(
         value_degrees: readable_property_angle(local_angle + footprint_rotation),
     });
     if is_back {
-        attributes.mirrored = !attributes.mirrored;
+        if is_side_specific_layer(board_text.layer) {
+            attributes.mirrored = !attributes.mirrored;
+        }
         let layer = kiapi::board::types::BoardLayer::try_from(board_text.layer)
             .with_context(|| format!("property '{}' has an invalid layer", property.name))?;
         let layer_name = konnect_ipc::builders::layer_name(layer)
@@ -1752,23 +1498,27 @@ fn mirror_graphic(
     let point = |(x, y): (f64, f64)| (x, -y);
     Ok(match graphic {
         Graphic::Line {
+            style,
             start,
             end,
             layer,
             width,
         } => Graphic::Line {
+            style: *style,
             start: point(*start),
             end: point(*end),
             layer: konnect_ipc::builders::flip_layer(layer, copper_layer_count)?,
             width: *width,
         },
         Graphic::Rect {
+            style,
             start,
             end,
             layer,
             width,
             filled,
         } => Graphic::Rect {
+            style: *style,
             start: point(*start),
             end: point(*end),
             layer: konnect_ipc::builders::flip_layer(layer, copper_layer_count)?,
@@ -1776,12 +1526,14 @@ fn mirror_graphic(
             filled: *filled,
         },
         Graphic::Circle {
+            style,
             center,
             end,
             layer,
             width,
             filled,
         } => Graphic::Circle {
+            style: *style,
             center: point(*center),
             end: point(*end),
             layer: konnect_ipc::builders::flip_layer(layer, copper_layer_count)?,
@@ -1789,12 +1541,14 @@ fn mirror_graphic(
             filled: *filled,
         },
         Graphic::Arc {
+            style,
             start,
             mid,
             end,
             layer,
             width,
         } => Graphic::Arc {
+            style: *style,
             start: point(*end),
             mid: point(*mid),
             end: point(*start),
@@ -1802,11 +1556,13 @@ fn mirror_graphic(
             width: *width,
         },
         Graphic::Poly {
+            style,
             points,
             layer,
             width,
             filled,
         } => Graphic::Poly {
+            style: *style,
             points: points.iter().copied().map(point).collect(),
             layer: konnect_ipc::builders::flip_layer(layer, copper_layer_count)?,
             width: *width,
@@ -1880,6 +1636,11 @@ fn changed_domains(
     }
     let current_graphics = normalized_graphics(current_definition)?;
     let updated_graphics = normalized_graphics(updated_definition)?;
+    if normalized_field(&current.reference_field)? != normalized_field(&updated.reference_field)?
+        || normalized_field(&current.value_field)? != normalized_field(&updated.value_field)?
+    {
+        changed.insert(ChangedDomain::Text);
+    }
     if current_graphics != updated_graphics {
         changed.insert(ChangedDomain::Graphics);
     }
@@ -1906,6 +1667,15 @@ fn changed_domains(
     Ok(changed)
 }
 
+fn normalized_field(
+    field: &Option<kiapi::board::types::Field>,
+) -> Result<Option<kiapi::board::types::Field>> {
+    field
+        .as_ref()
+        .map(konnect_ipc::normalize_footprint_field)
+        .transpose()
+}
+
 fn normalized_items(
     definition: &kiapi::board::types::Footprint,
     suffix: &str,
@@ -1925,16 +1695,13 @@ fn normalized_items(
                 if let Some(stack) = pad.pad_stack.as_mut() {
                     stack.layers.sort_unstable();
                     for layer in &mut stack.copper_layers {
-                        if !matches!(
-                            layer.shape(),
-                            kiapi::board::types::PadStackShape::PssRoundrect
-                                | kiapi::board::types::PadStackShape::PssChamferedrect
-                        ) {
+                        let roundrect = kiapi::board::types::PadStackShape::PssRoundrect as i32;
+                        let chamfered = kiapi::board::types::PadStackShape::PssChamferedrect as i32;
+                        // KiCad populates defaults even when the shape does not use them.
+                        if layer.shape != roundrect && layer.shape != chamfered {
                             layer.corner_rounding_ratio = 0.0;
                         }
-                        if layer.shape
-                            != kiapi::board::types::PadStackShape::PssChamferedrect as i32
-                        {
+                        if layer.shape != chamfered {
                             layer.chamfer_ratio = 0.0;
                             layer.chamfered_corners = None;
                         }
@@ -1959,12 +1726,8 @@ fn normalized_items(
                 }
                 Ok(pad.encode_to_vec())
             } else if suffix == "Field" {
-                let mut field = kiapi::board::types::Field::decode(item.value.as_slice())?;
-                field.id = None;
-                if let Some(text) = field.text.as_mut() {
-                    text.id = None;
-                }
-                Ok(field.encode_to_vec())
+                let field = kiapi::board::types::Field::decode(item.value.as_slice())?;
+                Ok(konnect_ipc::normalize_footprint_field(&field)?.encode_to_vec())
             } else {
                 Ok(item.value.clone())
             }
@@ -2003,38 +1766,7 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                                     }
                                     stroke.color = None;
                                 }
-                                if let Some(
-                                    kiapi::common::types::graphic_shape::Geometry::Polygon(polyset),
-                                ) = graphic.geometry.as_mut()
-                                {
-                                    normalize_polyset(polyset);
-                                }
-                                if let Some(kiapi::common::types::graphic_shape::Geometry::Arc(
-                                    arc,
-                                )) = graphic.geometry.as_mut()
-                                {
-                                    if arc.start.as_ref().zip(arc.end.as_ref()).is_some_and(
-                                        |(start, end)| {
-                                            (start.x_nm, start.y_nm) > (end.x_nm, end.y_nm)
-                                        },
-                                    ) {
-                                        std::mem::swap(&mut arc.start, &mut arc.end);
-                                    }
-                                }
-                                if let Some(
-                                    kiapi::common::types::graphic_shape::Geometry::Rectangle(
-                                        rectangle,
-                                    ),
-                                ) = graphic.geometry.as_mut()
-                                {
-                                    if rectangle
-                                        .corner_radius
-                                        .as_ref()
-                                        .is_some_and(|radius| radius.value_nm == 0)
-                                    {
-                                        rectangle.corner_radius = None;
-                                    }
-                                }
+                                konnect_ipc::normalize_footprint_graphic_geometry(graphic);
                             }
                             shape.encode_to_vec()
                         },
@@ -2056,52 +1788,6 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
         .collect::<std::result::Result<Vec<_>, _>>()?;
     graphics.sort();
     Ok(graphics)
-}
-
-fn normalize_polyset(polyset: &mut kiapi::common::types::PolySet) {
-    for polygon in &mut polyset.polygons {
-        if let Some(outline) = polygon.outline.as_mut() {
-            normalize_polyline(outline);
-        }
-        for hole in &mut polygon.holes {
-            normalize_polyline(hole);
-        }
-        polygon.holes.sort_by_key(prost::Message::encode_to_vec);
-    }
-    polyset.polygons.sort_by_key(prost::Message::encode_to_vec);
-}
-
-fn normalize_polyline(polyline: &mut kiapi::common::types::PolyLine) {
-    if !polyline.closed || polyline.nodes.len() < 2 {
-        return;
-    }
-    let candidates = [
-        polyline.nodes.clone(),
-        polyline.nodes.iter().cloned().rev().collect(),
-    ];
-    let mut best: Option<(Vec<u8>, Vec<kiapi::common::types::PolyLineNode>)> = None;
-    for nodes in candidates {
-        for offset in 0..nodes.len() {
-            let rotated = nodes[offset..]
-                .iter()
-                .chain(nodes[..offset].iter())
-                .cloned()
-                .collect::<Vec<_>>();
-            let encoded = rotated
-                .iter()
-                .flat_map(prost::Message::encode_to_vec)
-                .collect::<Vec<_>>();
-            if best
-                .as_ref()
-                .is_none_or(|(best_encoded, _)| encoded < *best_encoded)
-            {
-                best = Some((encoded, rotated));
-            }
-        }
-    }
-    if let Some((_, nodes)) = best {
-        polyline.nodes = nodes;
-    }
 }
 
 fn library_owned_attributes(
@@ -2340,6 +2026,215 @@ mod tests {
         );
     }
 
+    #[test]
+    fn authored_mandatory_library_fields_are_retained() {
+        let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+        let reference = library
+            .definition
+            .reference_field
+            .as_ref()
+            .expect("library Reference field");
+        let attributes = reference
+            .text
+            .as_ref()
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap()
+            .attributes
+            .as_ref()
+            .unwrap();
+        assert!(attributes.stroke_width.as_ref().unwrap().value_nm > 0);
+        assert_eq!(attributes.line_spacing, 1.0);
+        assert!(attributes.keep_upright);
+    }
+
+    #[test]
+    fn issue26_custom_field_mirroring_uses_the_live_stack_and_side_mask() {
+        use kiapi::board::types::BoardLayer;
+        for (layer, expected_layer, mirrored) in [
+            (BoardLayer::BlIn1Cu, BoardLayer::BlIn2Cu, true),
+            (BoardLayer::BlDwgsUser, BoardLayer::BlDwgsUser, false),
+        ] {
+            let mut property = field("Assembly", "Custom", 1.0, 2.0, true);
+            let text = property.text.as_mut().unwrap();
+            text.layer = layer as i32;
+            text.text
+                .as_mut()
+                .unwrap()
+                .attributes
+                .as_mut()
+                .unwrap()
+                .mirrored = false;
+            let transformed =
+                transform_library_property(&property, &builders::vec2(10.0, 20.0), 0.0, true, 4)
+                    .unwrap();
+            let text = transformed.text.unwrap();
+            assert_eq!(text.layer, expected_layer as i32);
+            let text = text.text.unwrap();
+            assert_eq!(text.position, Some(builders::vec2(11.0, 18.0)));
+            assert_eq!(text.attributes.unwrap().mirrored, mirrored);
+        }
+        let mut unsupported = field("Assembly", "Custom", 1.0, 2.0, true);
+        unsupported.text.as_mut().unwrap().layer = BoardLayer::BlIn3Cu as i32;
+        assert!(transform_library_property(
+            &unsupported,
+            &builders::vec2(10.0, 20.0),
+            0.0,
+            true,
+            4,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn issue26_reset_text_restores_effects_retains_values_and_converges() {
+        let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let first = build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+            2,
+        )
+        .unwrap();
+        let mut applied =
+            kiapi::board::types::FootprintInstance::decode(first.item.value.as_slice()).unwrap();
+        applied
+            .reference_field
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .attributes
+            .as_mut()
+            .unwrap()
+            .size = Some(builders::vec2(2.0, 2.0));
+        let preserved = build_updated_instance(
+            &applied,
+            &library,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+            2,
+        )
+        .unwrap();
+        assert!(!preserved.changed_domains.contains(&ChangedDomain::Text));
+        let reset = build_updated_instance(
+            &applied,
+            &library,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            true,
+            2,
+        )
+        .unwrap();
+        assert!(reset.changed_domains.contains(&ChangedDomain::Text));
+        let reset =
+            kiapi::board::types::FootprintInstance::decode(reset.item.value.as_slice()).unwrap();
+        assert_eq!(field_text(&reset.reference_field), "SW1");
+        assert_eq!(field_text(&reset.value_field), "Socket Value");
+        let repeated = build_updated_instance(
+            &reset,
+            &library,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            true,
+            2,
+        )
+        .unwrap();
+        assert!(
+            repeated.changed_domains.is_empty(),
+            "{:?}",
+            repeated.changed_domains
+        );
+    }
+
+    #[test]
+    fn issue26_reset_text_is_typed_and_changes_reviewed_revision() {
+        assert!(parse_filters(&json!({"reset_text":"true"})).is_err());
+        assert!(!parse_filters(&json!({})).unwrap().reset_text);
+        let (_temp, board, items) = plan_fixture();
+        let initial = plan_updates(
+            &board,
+            &items,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &parse_filters(&json!({})).unwrap(),
+            2,
+        );
+        let reset = plan_updates(
+            &board,
+            &items,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &parse_filters(&json!({"reset_text":true})).unwrap(),
+            2,
+        );
+        assert_ne!(initial.plan_revision, reset.plan_revision);
+    }
+
+    #[test]
+    fn issue26_dashed_courtyard_survives_refresh_and_then_is_noop() {
+        let source = KICAD_LIBRARY_FOOTPRINT.replace("(type solid)", "(type dash)");
+        let library = parse_library_footprint("Test:Socket", &source).unwrap();
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let first = build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+            2,
+        )
+        .unwrap();
+        let applied =
+            kiapi::board::types::FootprintInstance::decode(first.item.value.as_slice()).unwrap();
+        let styles = applied
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| builders::any_is(item, "kiapi.board.types.BoardGraphicShape"))
+            .map(|item| {
+                kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+                    .unwrap()
+                    .shape
+                    .unwrap()
+                    .attributes
+                    .unwrap()
+                    .stroke
+                    .unwrap()
+                    .style
+            })
+            .collect::<Vec<_>>();
+        assert!(!styles.is_empty());
+        assert!(styles
+            .iter()
+            .all(|style| *style == kiapi::common::types::StrokeLineStyle::SlsDash as i32));
+        let repeated = build_updated_instance(
+            &applied,
+            &library,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+            2,
+        )
+        .unwrap();
+        assert!(
+            repeated.changed_domains.is_empty(),
+            "{:?}",
+            repeated.changed_domains
+        );
+    }
+
     const KICAD_LIBRARY_FOOTPRINT: &str =
         include_str!("../../tests/fixtures/socket_kicad10.kicad_mod");
 
@@ -2569,6 +2464,7 @@ mod tests {
                 end: (3.0, 4.0),
                 layer: "In2.Cu".to_string(),
                 width: 0.1,
+                style: kiapi::common::types::StrokeLineStyle::SlsSolid,
             });
         library
             .graphics
@@ -2586,9 +2482,15 @@ mod tests {
             .expect("fixture contains a custom property");
         field.text.as_mut().unwrap().layer = kiapi::board::types::BoardLayer::BlIn2Cu as i32;
         let field_name = field.name.clone();
-        let prepared =
-            build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new(), 8)
-                .unwrap();
+        let prepared = build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+            8,
+        )
+        .unwrap();
         let updated =
             kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
         let definition = updated.definition.as_ref().unwrap();
@@ -2633,18 +2535,29 @@ mod tests {
         assert!(
             matches!(graphic, konnect_ipc::IpcGraphicDefinition::Line { layer, .. } if layer == "In5.Cu")
         );
-        assert!(
-            build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new(), 2)
-                .is_err()
-        );
+        assert!(build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+            2
+        )
+        .is_err());
     }
 
     fn instance_for_layer_readback() -> kiapi::board::types::FootprintInstance {
         let current = current_instance(kiapi::board::types::BoardLayer::BlBCu);
         let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
-        let prepared =
-            build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new(), 8)
-                .unwrap();
+        let prepared = build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+            8,
+        )
+        .unwrap();
         kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap()
     }
 
@@ -3161,6 +3074,7 @@ mod tests {
             &library,
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::from(["ROW1".to_string(), "COL1".to_string()]),
+            false,
             2,
         )
         .unwrap();
@@ -3314,6 +3228,7 @@ mod tests {
             &library,
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
+            false,
             2,
         )
         .unwrap();
@@ -3361,6 +3276,7 @@ mod tests {
             &library,
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::from(["COL1".to_string()]),
+            false,
             2,
         )
         .unwrap_err();
@@ -3512,6 +3428,7 @@ mod tests {
             &library,
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
+            false,
             2,
         )
         .unwrap_err();
@@ -3523,11 +3440,11 @@ mod tests {
 
     #[test]
     fn parser_rejects_lossy_graphic_and_pad_clauses() {
-        let dashed = LIBRARY_FOOTPRINT.replace(
+        let unsupported_stroke = LIBRARY_FOOTPRINT.replace(
             "(stroke (width 0.12) (type solid))",
-            "(stroke (width 0.12) (type dash))",
+            "(stroke (width 0.12) (type invalid_style))",
         );
-        let error = parse_library_footprint("Test:Socket", &dashed).unwrap_err();
+        let error = parse_library_footprint("Test:Socket", &unsupported_stroke).unwrap_err();
         assert!(error.to_string().contains("stroke type"), "{error:#}");
 
         let solder_margin = LIBRARY_FOOTPRINT.replace(
@@ -3602,13 +3519,15 @@ mod tests {
                     value_degrees: rotation,
                 });
                 let first =
-                    build_updated_instance(&current, &library, &net_codes, &routed, 2).unwrap();
+                    build_updated_instance(&current, &library, &net_codes, &routed, false, 2)
+                        .unwrap();
                 let applied =
                     kiapi::board::types::FootprintInstance::decode(first.item.value.as_slice())
                         .unwrap();
 
                 let second =
-                    build_updated_instance(&applied, &library, &net_codes, &routed, 2).unwrap();
+                    build_updated_instance(&applied, &library, &net_codes, &routed, false, 2)
+                        .unwrap();
 
                 assert!(
                     second.changed_domains.is_empty(),
@@ -3628,6 +3547,7 @@ mod tests {
             &library,
             &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
             &BTreeSet::new(),
+            false,
             2,
         )
         .unwrap();
@@ -3733,6 +3653,82 @@ mod tests {
         assert!(changed_domains(&roundtripped, &prepared)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn issue26_native_inactive_pad_defaults_do_not_change_domains() {
+        use kiapi::board::types::{Pad, PadStackShape};
+
+        let instance = kiapi::board::types::FootprintInstance::decode(
+            include_bytes!("../../tests/fixtures/issue_474_r1.ipc.bin").as_slice(),
+        )
+        .unwrap();
+        let original = instance.definition.unwrap();
+        let mut canonical = original.clone();
+        let mut native_defaults = 0;
+        for item in &mut canonical.items {
+            if !builders::any_is(item, "kiapi.board.types.Pad") {
+                continue;
+            }
+            let mut pad = Pad::decode(item.value.as_slice()).unwrap();
+            for layer in &mut pad.pad_stack.as_mut().unwrap().copper_layers {
+                assert_ne!(layer.shape, PadStackShape::PssChamferedrect as i32);
+                assert_eq!(layer.chamfer_ratio, 0.2);
+                native_defaults += 1;
+                layer.chamfer_ratio = 0.0;
+                layer.chamfered_corners = None;
+                if layer.shape != PadStackShape::PssRoundrect as i32 {
+                    layer.corner_rounding_ratio = 0.0;
+                }
+            }
+            *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+        }
+        assert!(native_defaults > 0);
+        assert_eq!(
+            normalized_items(&original, "Pad").unwrap(),
+            normalized_items(&canonical, "Pad").unwrap()
+        );
+
+        for shape in [PadStackShape::PssRoundrect, PadStackShape::PssChamferedrect] {
+            let mut baseline = canonical.clone();
+            let item = baseline
+                .items
+                .iter_mut()
+                .find(|item| builders::any_is(item, "kiapi.board.types.Pad"))
+                .unwrap();
+            let mut pad = Pad::decode(item.value.as_slice()).unwrap();
+            let layer = &mut pad.pad_stack.as_mut().unwrap().copper_layers[0];
+            layer.shape = shape as i32;
+            layer.corner_rounding_ratio = 0.2;
+            layer.chamfer_ratio = 0.1;
+            *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+            let expected = normalized_items(&baseline, "Pad").unwrap();
+            for change in 0..3 {
+                if change != 0 && shape != PadStackShape::PssChamferedrect {
+                    continue;
+                }
+                let mut changed = baseline.clone();
+                let item = changed
+                    .items
+                    .iter_mut()
+                    .find(|item| builders::any_is(item, "kiapi.board.types.Pad"))
+                    .unwrap();
+                let mut pad = Pad::decode(item.value.as_slice()).unwrap();
+                let layer = &mut pad.pad_stack.as_mut().unwrap().copper_layers[0];
+                match change {
+                    0 => layer.corner_rounding_ratio = 0.3,
+                    1 => layer.chamfer_ratio = 0.3,
+                    _ => {
+                        layer.chamfered_corners = Some(kiapi::board::types::ChamferedRectCorners {
+                            top_left: true,
+                            ..Default::default()
+                        });
+                    }
+                }
+                *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+                assert_ne!(expected, normalized_items(&changed, "Pad").unwrap());
+            }
+        }
     }
 
     fn plan_item(reference: &str, library_id: Option<&str>, kiid: &str) -> prost_types::Any {
@@ -3976,14 +3972,16 @@ mod tests {
         let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
         let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
         let routed = BTreeSet::new();
-        let applied = build_updated_instance(&current, &base, &net_codes, &routed, 2).unwrap();
+        let applied =
+            build_updated_instance(&current, &base, &net_codes, &routed, false, 2).unwrap();
         let applied =
             kiapi::board::types::FootprintInstance::decode(applied.item.value.as_slice()).unwrap();
         let changed_source =
             LIBRARY_FOOTPRINT.replace("new-datasheet.pdf", "replacement-datasheet.pdf");
         let changed = parse_library_footprint("Test:Socket", &changed_source).unwrap();
 
-        let prepared = build_updated_instance(&applied, &changed, &net_codes, &routed, 2).unwrap();
+        let prepared =
+            build_updated_instance(&applied, &changed, &net_codes, &routed, false, 2).unwrap();
 
         assert_eq!(
             prepared.changed_domains,
@@ -4147,6 +4145,7 @@ mod tests {
 
     struct PlannerMock {
         url: String,
+        live_source: std::sync::Arc<std::sync::Mutex<String>>,
         readback_fault: std::sync::Arc<std::sync::Mutex<ReadbackFault>>,
         copper_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
         capture: std::sync::Arc<std::sync::Mutex<MutationCapture>>,
@@ -4179,6 +4178,9 @@ mod tests {
         Unreadable,
         Unavailable,
         RollbackFailure,
+        MissingAfterCommit,
+        FieldsAfterCommit,
+        StyleAfterCommit,
     }
 
     fn api_refused(message: &str) -> kiapi::common::ApiResponse {
@@ -4221,6 +4223,10 @@ mod tests {
         let board_name = board.to_string_lossy().to_string();
         let capture = std::sync::Arc::new(std::sync::Mutex::new(MutationCapture::default()));
         let captured = capture.clone();
+        let live_source = std::sync::Arc::new(std::sync::Mutex::new(
+            std::fs::read_to_string(board).unwrap(),
+        ));
+        let snapshot = live_source.clone();
         let copper_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2));
         let live_copper_count = copper_count.clone();
         let readback_fault = std::sync::Arc::new(std::sync::Mutex::new(ReadbackFault::None));
@@ -4246,6 +4252,18 @@ mod tests {
                             }],
                         },
                         "kiapi.common.commands.GetOpenDocumentsResponse",
+                    ))
+                } else if message.type_url.ends_with("SaveDocumentToString") {
+                    let request = kiapi::common::commands::SaveDocumentToString::decode(
+                        message.value.as_slice(),
+                    )
+                    .unwrap();
+                    api_reply(builders::pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            document: request.document,
+                            contents: snapshot.lock().unwrap().clone(),
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
                     ))
                 } else if message.type_url.ends_with("GetBoardEnabledLayers") {
                     api_reply(builders::pack_any(
@@ -4288,17 +4306,74 @@ mod tests {
                             .unwrap();
                         continue;
                     }
+                    let published = captured
+                        .lock()
+                        .unwrap()
+                        .commit_actions
+                        .contains(&kiapi::common::commands::CommitAction::CmaCommit);
+                    let mut returned = footprint.clone();
+                    if published
+                        && matches!(
+                            readback,
+                            ChamferReadback::FieldsAfterCommit | ChamferReadback::StyleAfterCommit
+                        )
+                    {
+                        let mut instance = kiapi::board::types::FootprintInstance::decode(
+                            returned.value.as_slice(),
+                        )
+                        .unwrap();
+                        let wanted = if matches!(readback, ChamferReadback::FieldsAfterCommit) {
+                            "kiapi.board.types.Field"
+                        } else {
+                            "kiapi.board.types.BoardGraphicShape"
+                        };
+                        let child = instance
+                            .definition
+                            .as_mut()
+                            .unwrap()
+                            .items
+                            .iter_mut()
+                            .find(|item| builders::any_is(item, wanted))
+                            .unwrap();
+                        if matches!(readback, ChamferReadback::FieldsAfterCommit) {
+                            let mut field =
+                                kiapi::board::types::Field::decode(child.value.as_slice()).unwrap();
+                            field.visible = !field.visible;
+                            *child = builders::pack_any(&field, wanted);
+                        } else {
+                            let mut shape = kiapi::board::types::BoardGraphicShape::decode(
+                                child.value.as_slice(),
+                            )
+                            .unwrap();
+                            shape
+                                .shape
+                                .as_mut()
+                                .unwrap()
+                                .attributes
+                                .as_mut()
+                                .unwrap()
+                                .stroke
+                                .as_mut()
+                                .unwrap()
+                                .style = kiapi::common::types::StrokeLineStyle::SlsDash as i32;
+                            *child = builders::pack_any(&shape, wanted);
+                        }
+                        returned =
+                            builders::pack_any(&instance, "kiapi.board.types.FootprintInstance");
+                    }
                     let items = if command.types
                         == vec![kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32]
                     {
                         let fault = *live_readback_fault.lock().unwrap();
-                        if update_applied
+                        if (update_applied
                             && (matches!(fault, ReadbackFault::MissingFootprint)
-                                || matches!(readback, ChamferReadback::Missing))
+                                || matches!(readback, ChamferReadback::Missing)))
+                            || (published
+                                && matches!(readback, ChamferReadback::MissingAfterCommit))
                         {
                             Vec::new()
                         } else {
-                            let mut observed = footprint.clone();
+                            let mut observed = returned;
                             if update_applied
                                 && matches!(
                                     fault,
@@ -4503,11 +4578,81 @@ mod tests {
         });
         PlannerMock {
             url,
+            live_source,
             readback_fault,
             copper_count,
             capture,
             _thread: thread,
         }
+    }
+
+    #[tokio::test]
+    async fn issue26_postpublication_missing_fields_or_styles_remain_uncertain() {
+        for mode in [
+            ChamferReadback::MissingAfterCommit,
+            ChamferReadback::FieldsAfterCommit,
+            ChamferReadback::StyleAfterCommit,
+        ] {
+            let (_temp, board, items) = plan_fixture();
+            let server = spawn_planner_mock_readback(&board, items[2].clone(), false, mode);
+            let context = test_context(&server.url);
+            let dry = handle_update_footprints_from_library(&json!({"board":board}), &context)
+                .await
+                .unwrap();
+            let revision = result_json(&dry)["plan_revision"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let result = handle_update_footprints_from_library(
+                &json!({"board":board,"dry_run":false,"expected_plan_revision":revision}),
+                &context,
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error);
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("ipc_outcome_unknown")
+            );
+            let capture = server.capture.lock().unwrap();
+            assert_eq!(capture.update_batches, vec![1]);
+            assert_eq!(
+                capture.commit_actions,
+                vec![kiapi::common::commands::CommitAction::CmaCommit]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn issue26_unsaved_group_membership_refuses_before_any_mutation() {
+        let (_temp, board, items) = plan_fixture();
+        let id = kiapi::board::types::FootprintInstance::decode(items[2].value.as_slice())
+            .unwrap()
+            .id
+            .unwrap()
+            .value;
+        let server = spawn_planner_mock(&board, items[2].clone(), false);
+        *server.live_source.lock().unwrap() = format!(
+            "(kicad_pcb (group \"Unsaved assembly\" (members {})))",
+            konnect_sexp::quoted(&id)
+        );
+        let before = std::fs::read(&board).unwrap();
+        let result = handle_update_footprints_from_library(
+            &json!({"board":board}),
+            &test_context(&server.url),
+        )
+        .await
+        .unwrap();
+        let response = result_json(&result);
+        assert_eq!(response["status"], "conflict");
+        assert!(response["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unsaved assembly"));
+        let capture = server.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 0);
+        assert!(capture.update_batches.is_empty());
+        assert_eq!(std::fs::read(board).unwrap(), before);
     }
 
     #[tokio::test]
