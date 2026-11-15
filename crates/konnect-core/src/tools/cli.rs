@@ -4290,3 +4290,277 @@ mod publication_cancellation_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod coverage_cli_boundaries {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn failed_cli_exit_retains_both_diagnostic_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = test_support::write_script(
+            dir.path(), "fails-with-diagnostics",
+            "#!/bin/sh\nprintf 'usage detail\\n'\nprintf 'Error bad argument\\nprogress detail\\n' >&2\nexit 7\n",
+            "@echo off\r\necho usage detail\r\necho Error bad argument 1>&2\r\necho progress detail 1>&2\r\nexit /b 7\r\n",
+        );
+        let error = run_cli(executable.to_str().unwrap(), &[], Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        for expected in [
+            "exited with 7",
+            "stdout:",
+            "usage detail",
+            "stderr:",
+            "Error bad argument",
+            "progress detail",
+        ] {
+            assert!(message.contains(expected), "missing {expected}: {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stderr_alone_does_not_turn_a_successful_cli_into_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = test_support::write_script(
+            dir.path(),
+            "warning-only",
+            "#!/bin/sh\nprintf 'result'\nprintf 'warning detail\\n' >&2\nexit 0\n",
+            "@echo off\r\n<nul set /p =result\r\necho warning detail 1>&2\r\nexit /b 0\r\n",
+        );
+        let captured = run_cli_captured(executable.to_str().unwrap(), &[], Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(captured.stdout, "result");
+        assert_eq!(captured.stderr.trim(), "warning detail");
+        assert_eq!(
+            cli_failure_diagnostics(b"", b" warning detail \n"),
+            "stderr:\nwarning detail"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_export_directory_cannot_satisfy_a_file_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = verify_nonempty_file(directory.path(), "PDF")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not a file"), "{error:#}");
+    }
+
+    #[test]
+    fn partial_item_coordinates_are_withheld_without_losing_identity() {
+        for pos in [
+            json!(null),
+            json!({}),
+            json!({"x": 1}),
+            json!({"y": 2}),
+            json!({"x": "1", "y": 2}),
+            json!({"x": 1, "y": false}),
+        ] {
+            let report = parse_erc_json(&json!({
+                "kicad_version": "10.0.7",
+                "sheets": [{"path": "/", "violations": [{
+                    "severity": "warning", "type": "pin_not_connected", "description": "Open pin",
+                    "items": [{"uuid": "pin-identity", "description": "R1 pin 1", "pos": pos}]
+                }]}]
+            }))
+            .unwrap();
+            let item = &report.violations[0].items[0];
+            assert!(item.pos.is_none(), "{pos}");
+            assert_eq!(item.uuid.as_deref(), Some("pin-identity"));
+            assert_eq!(item.description, "R1 pin 1");
+        }
+    }
+
+    #[test]
+    fn malformed_release_versions_never_gain_coordinate_authority() {
+        for version in [
+            "",
+            ".0.7",
+            "10..7",
+            "10.0.",
+            "10.0.7.1",
+            "10.0.7+vendor",
+            "10.0.18446744073709551616",
+            "１０.0.7",
+        ] {
+            assert_eq!(
+                classify_erc_coordinates(Some(version)).status,
+                ErcCoordinateStatus::Withheld,
+                "{version}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod coverage_cli_artifact_lifecycle {
+    use super::*;
+    use serde_json::json;
+
+    fn files_cli(dir: &Path, position: usize, files: &[(&str, &str)]) -> PathBuf {
+        let mut unix = String::from("#!/bin/sh\nset -e\n");
+        let mut windows = String::from("@echo off\r\n");
+        for (name, data) in files {
+            unix.push_str(&format!("printf '%s' '{data}' > \"${position}/{name}\"\n"));
+            if data.is_empty() {
+                windows.push_str(&format!("type nul > \"%~{position}\\{name}\"\r\n"));
+            } else {
+                windows.push_str(&format!("> \"%~{position}\\{name}\" echo {data}\r\n"));
+            }
+        }
+        unix.push_str("exit 0\n");
+        windows.push_str("exit /b 0\r\n");
+        test_support::write_script(dir, "produces-artifacts", &unix, &windows)
+    }
+
+    #[tokio::test]
+    async fn gerbers_publish_only_this_boards_verified_plots_and_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = files_cli(
+            dir.path(),
+            5,
+            &[
+                ("design-F_Cu.gbr", "copper front"),
+                ("design-B_Cu.GBR", "copper back"),
+                ("design-job.gbrjob", "job"),
+                ("other-F_Cu.gbr", "foreign plot"),
+                ("design-notes.txt", "notes"),
+                ("design-no-extension", "not a plot"),
+            ],
+        );
+        let board = dir.path().join("design.kicad_pcb");
+        let output = dir.path().join("gerbers");
+        let files = export_gerber(cli.to_str().unwrap(), &board, &output, &["F.Cu", "B.Cu"])
+            .await
+            .unwrap();
+        let names: Vec<_> = files
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["design-B_Cu.GBR", "design-F_Cu.gbr", "design-job.gbrjob"]
+        );
+        assert!(!output.join("other-F_Cu.gbr").exists());
+        assert!(!output.join("design-notes.txt").exists());
+        assert!(!output.join("design-no-extension").exists());
+        assert!(files
+            .iter()
+            .all(|path| std::fs::metadata(path).unwrap().len() > 0));
+    }
+
+    #[tokio::test]
+    async fn insufficient_or_empty_gerber_plots_preserve_previous_exports() {
+        for files in [
+            vec![("design-F_Cu.gbr", "one plot")],
+            vec![("design-F_Cu.gbr", "")],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cli = files_cli(dir.path(), 5, &files);
+            let output = dir.path().join("gerbers");
+            std::fs::create_dir(&output).unwrap();
+            let previous = output.join("design-F_Cu.gbr");
+            std::fs::write(&previous, "previous plot").unwrap();
+            let error = export_gerber(
+                cli.to_str().unwrap(),
+                &dir.path().join("design.kicad_pcb"),
+                &output,
+                &["F.Cu", "B.Cu"],
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("plot file") || error.to_string().contains("empty file"),
+                "{error:#}"
+            );
+            assert_eq!(std::fs::read_to_string(previous).unwrap(), "previous plot");
+        }
+    }
+
+    #[tokio::test]
+    async fn drill_exports_publish_sorted_drills_and_ignore_other_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = files_cli(
+            dir.path(),
+            6,
+            &[
+                ("design-PTH.drl", "plated"),
+                ("design-NPTH.drl", "unplated"),
+                ("design-map.pdf", "map"),
+            ],
+        );
+        let output = dir.path().join("drills");
+        let files = export_drill(
+            cli.to_str().unwrap(),
+            &dir.path().join("design.kicad_pcb"),
+            &output,
+        )
+        .await
+        .unwrap();
+        let names: Vec<_> = files
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["design-NPTH.drl", "design-PTH.drl"]);
+        assert!(!output.join("design-map.pdf").exists());
+        assert!(drill_files_in(&dir.path().join("absent")).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_replacement_restores_the_previous_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("export.pdf");
+        std::fs::write(&destination, "previous").unwrap();
+        let staging = export_staging_dir(&destination).unwrap();
+        let staged = staging.path().join("export.pdf");
+        std::fs::write(&staged, "new").unwrap();
+        let remove_staged = staged.clone();
+        let error = publish_verified_file_with(
+            staged,
+            destination.clone(),
+            "PDF".into(),
+            staging.clone(),
+            move || {
+                std::fs::remove_file(remove_staged).unwrap();
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("failed to publish"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), "previous");
+        assert!(!staging.path().join(".konnect-previous-export.pdf").exists());
+    }
+
+    #[tokio::test]
+    async fn drc_items_are_enriched_from_the_board_or_reported_unavailable() {
+        for source in [Some("(kicad_pcb (gr_line (start 0 0) (end 1 0) (stroke (width 0.1) (type solid)) (layer \"Edge.Cuts\") (uuid \"edge\")))"), Some("(broken"), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("design.kicad_pcb");
+            if let Some(source) = source { std::fs::write(&board, source).unwrap(); }
+            std::fs::write(board.with_extension("kicad_sch"), "(kicad_sch)").unwrap();
+            let report = dir.path().join("report.json");
+            std::fs::write(&report, serde_json::to_vec(&json!({
+                "violations": [{"type": "clearance", "severity": "error", "items": [{"uuid": "edge", "description": "edge", "pos": {"x": 0, "y": 0}}]}],
+                "schematic_parity": []
+            })).unwrap()).unwrap();
+            let cli = test_support::write_script(dir.path(), "drc-with-items", &format!("#!/bin/sh\ncp \"{}\" \"$4\"\nprintf '%s\\n' '{PARITY_NOT_RUN}' >&2\n", report.display()), &format!("@echo off\r\ncopy /Y \"{}\" \"%~4\" >nul\r\necho {PARITY_NOT_RUN} 1>&2\r\nexit /b 0\r\n", report.display()));
+            let result = run_drc(cli.to_str().unwrap(), &board, false).await.unwrap();
+            let item = &result.violations[0].items[0];
+            assert_eq!(item.uuid.as_deref(), Some("edge"));
+            assert!(result.schematic_parity.is_none());
+            assert!(result.schematic_parity_diagnostic.as_deref().unwrap().contains("exists but could not be read"));
+            if source.is_some_and(|source| source.starts_with("(kicad_pcb")) {
+                assert_eq!(item.ownership_status, Some(OwnershipStatus::Resolved));
+                assert_eq!(item.item_kind.as_deref(), Some("gr_line"));
+                assert_eq!(item.layer.as_deref(), Some("Edge.Cuts"));
+            } else {
+                assert_eq!(item.ownership_status, Some(OwnershipStatus::Unavailable));
+                assert!(result.ownership_diagnostic.is_some());
+            }
+            assert!(!board.with_extension("drc.json").exists());
+        }
+    }
+}

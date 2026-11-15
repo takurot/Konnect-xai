@@ -5119,3 +5119,604 @@ mod page_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod coverage_hierarchy_boundaries {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use std::sync::Arc;
+
+    async fn call(tool: &str, args: &Value) -> CallToolResult {
+        let definition = tools().into_iter().find(|def| def.name == tool).unwrap();
+        let context = Arc::new(ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        ));
+        (definition.handler)(args, context).await.unwrap()
+    }
+
+    async fn fixture() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.kicad_sch");
+        std::fs::write(&path, crate::tools::blank_schematic_template()).unwrap();
+        let added = call(
+            "add_hierarchical_sheet",
+            &json!({
+                "schematic": path, "sheet_name": "Child", "sheet_file": "child.kicad_sch",
+                "x": 10, "y": 20, "width": 30, "height": 40
+            }),
+        )
+        .await;
+        assert!(!added.is_error, "{added:?}");
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn hierarchy_argument_refusals_preserve_parent_and_child() {
+        let cases = [
+            ("add_hierarchical_sheet", json!({})),
+            (
+                "add_hierarchical_sheet",
+                json!({"sheet_file": "new.kicad_sch", "width": 0}),
+            ),
+            (
+                "add_hierarchical_sheet",
+                json!({"sheet_file": "new.kicad_sch", "height": "tall"}),
+            ),
+            (
+                "add_hierarchical_sheet",
+                json!({"sheet_file": "../escape.kicad_sch"}),
+            ),
+            ("add_hierarchical_sheet", json!({"sheet_file": "wrong.txt"})),
+            (
+                "add_hierarchical_sheet",
+                json!({"sheet_file": "missing/new.kicad_sch"}),
+            ),
+            (
+                "add_hierarchical_sheet",
+                json!({"sheet_file": "root.kicad_sch"}),
+            ),
+            (
+                "add_hierarchical_sheet",
+                json!({"sheet_file": "new.kicad_sch", "sheet_name": "Child"}),
+            ),
+            ("edit_sheet", json!({})),
+            (
+                "edit_sheet",
+                json!({"sheet_name": "Missing", "new_name": "Other"}),
+            ),
+            ("edit_sheet", json!({"sheet_name": "Child"})),
+            ("edit_sheet", json!({"sheet_name": "Child", "width": -1})),
+            (
+                "edit_sheet",
+                json!({"sheet_name": "Child", "height": false}),
+            ),
+            ("move_sheet", json!({})),
+            ("move_sheet", json!({"sheet_name": "Child"})),
+            ("move_sheet", json!({"sheet_name": "Child", "x": 5})),
+            (
+                "move_sheet",
+                json!({"sheet_name": "Missing", "x": 5, "y": 6}),
+            ),
+            ("delete_sheet", json!({})),
+            ("delete_sheet", json!({"sheet_name": "Missing"})),
+            ("duplicate_sheet", json!({})),
+            ("duplicate_sheet", json!({"source_sheet_name": "Child"})),
+            (
+                "duplicate_sheet",
+                json!({"source_sheet_name": "Child", "new_sheet_name": "Copy"}),
+            ),
+            (
+                "duplicate_sheet",
+                json!({"source_sheet_name": "Child", "new_sheet_name": "Child", "new_file": "copy.kicad_sch"}),
+            ),
+            (
+                "duplicate_sheet",
+                json!({"source_sheet_name": "Missing", "new_sheet_name": "Copy", "new_file": "copy.kicad_sch"}),
+            ),
+            (
+                "duplicate_sheet",
+                json!({"source_sheet_name": "Child", "new_sheet_name": "Copy", "new_file": "../copy.kicad_sch"}),
+            ),
+            (
+                "duplicate_sheet",
+                json!({"source_sheet_name": "Child", "new_sheet_name": "Copy", "new_file": "child.kicad_sch"}),
+            ),
+            ("add_sheet_pin", json!({})),
+            ("add_sheet_pin", json!({"sheet_name": "Child"})),
+            (
+                "add_sheet_pin",
+                json!({"sheet_name": "Child", "pin_name": "P"}),
+            ),
+            (
+                "add_sheet_pin",
+                json!({"sheet_name": "Child", "pin_name": "P", "pin_type": "power"}),
+            ),
+            (
+                "add_sheet_pin",
+                json!({"sheet_name": "Child", "pin_name": "P", "pin_type": "input"}),
+            ),
+            (
+                "add_sheet_pin",
+                json!({"sheet_name": "Child", "pin_name": "P", "pin_type": "input", "x": 40}),
+            ),
+            (
+                "add_sheet_pin",
+                json!({"sheet_name": "Child", "pin_name": "P", "pin_type": "input", "x": 40, "y": 25, "side": "diagonal"}),
+            ),
+            (
+                "add_sheet_pin",
+                json!({"sheet_name": "Missing", "pin_name": "P", "pin_type": "input", "x": 40, "y": 25}),
+            ),
+            ("edit_sheet_pin", json!({})),
+            ("edit_sheet_pin", json!({"sheet_name": "Child"})),
+            (
+                "edit_sheet_pin",
+                json!({"sheet_name": "Child", "pin_name": "P", "pin_type": "power"}),
+            ),
+            (
+                "edit_sheet_pin",
+                json!({"sheet_name": "Child", "pin_name": "P", "side": "diagonal"}),
+            ),
+            (
+                "edit_sheet_pin",
+                json!({"sheet_name": "Missing", "pin_name": "P", "new_name": "Q"}),
+            ),
+            (
+                "edit_sheet_pin",
+                json!({"sheet_name": "Child", "pin_name": "Missing", "new_name": "Q"}),
+            ),
+            ("delete_sheet_pin", json!({})),
+            ("delete_sheet_pin", json!({"sheet_name": "Child"})),
+            (
+                "delete_sheet_pin",
+                json!({"sheet_name": "Missing", "pin_name": "P"}),
+            ),
+            (
+                "delete_sheet_pin",
+                json!({"sheet_name": "Child", "pin_name": "Missing"}),
+            ),
+        ];
+        let (_dir, path) = fixture().await;
+        let before = std::fs::read(&path).unwrap();
+        let child = path.with_file_name("child.kicad_sch");
+        let child_before = std::fs::read(&child).unwrap();
+        for (tool, mut args) in cases {
+            args["schematic"] = json!(path);
+            let result = call(tool, &args).await;
+            assert!(result.is_error, "{tool} accepted {args}: {result:?}");
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{tool}: {args}");
+            assert_eq!(
+                std::fs::read(&child).unwrap(),
+                child_before,
+                "{tool}: {args}"
+            );
+            assert!(!path.with_file_name("copy.kicad_sch").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn sheet_edits_report_and_commit_only_the_requested_metadata() {
+        let (_dir, path) = fixture().await;
+        let child_before = std::fs::read(path.with_file_name("child.kicad_sch")).unwrap();
+        let args = json!({"schematic": path, "sheet_name": "Child", "new_name": "Renamed", "new_file": "renamed.kicad_sch", "x": 20, "y": 30, "width": 40, "height": 50});
+        let result = call("edit_sheet", &args).await;
+        assert!(!result.is_error, "{result:?}");
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            body["changed_fields"],
+            json!(["name", "file", "position", "size"])
+        );
+        let saved = cse::Schematic::load(&path).unwrap();
+        let sheet = saved.sheets.by_name("Renamed").unwrap();
+        assert_eq!(sheet.file(), "renamed.kicad_sch");
+        assert_eq!(sheet.position(), (20.0, 30.0));
+        assert_eq!((sheet.width, sheet.height), (40.0, 50.0));
+        assert_eq!(
+            std::fs::read(path.with_file_name("child.kicad_sch")).unwrap(),
+            child_before
+        );
+        let before = std::fs::read(&path).unwrap();
+        let unchanged = call("edit_sheet", &json!({"schematic": path, "sheet_name": "Renamed", "new_name": "Renamed", "new_file": "renamed.kicad_sch", "x": 20, "y": 30, "width": 40, "height": 50})).await;
+        assert!(!unchanged.is_error, "{unchanged:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod coverage_hierarchy_graphs {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use std::sync::Arc;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn body(result: &CallToolResult) -> Value {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn document(path: &Path, children: &[(&str, &str)]) {
+        let mut schematic =
+            cse::Schematic::from_source(path, crate::tools::blank_schematic_template()).unwrap();
+        for (name, file) in children {
+            schematic.add_sheet(cse::Sheet::new(*name, *file, 10.0, 20.0, 40.0, 50.0));
+        }
+        std::fs::write(path, schematic.to_source()).unwrap();
+    }
+
+    fn errors(node: &Value, messages: &mut Vec<String>) {
+        if let Some(error) = node["error"].as_str() {
+            messages.push(error.to_owned());
+        }
+        if let Some(children) = node["children"].as_array() {
+            for child in children {
+                errors(child, messages);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cyclic_hierarchy_is_bounded_for_read_validation_and_renumbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root.kicad_sch");
+        let child = dir.path().join("child.kicad_sch");
+        document(&root, &[("Child", "child.kicad_sch")]);
+        document(&child, &[("Back", "root.kicad_sch")]);
+        let report = handle_get_sheet_hierarchy(&json!({"schematic": root}), &context())
+            .await
+            .unwrap();
+        let mut messages = Vec::new();
+        errors(&body(&report), &mut messages);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("cycle detected")),
+            "{messages:?}"
+        );
+        let valid = handle_validate_sheet_pins(&json!({"schematic": root}), &context())
+            .await
+            .unwrap();
+        assert!(!valid.is_error, "{valid:?}");
+        let pages = handle_renumber_sheet_pages(&json!({"schematic": root}), &context())
+            .await
+            .unwrap();
+        assert!(!pages.is_error, "{pages:?}");
+        assert_eq!(body(&pages)["renumbered_count"], 2);
+        assert_eq!(
+            cse::Schematic::load(&root)
+                .unwrap()
+                .sheets
+                .by_name("Child")
+                .unwrap()
+                .page("root"),
+            Some("2")
+        );
+        assert_eq!(
+            cse::Schematic::load(&child)
+                .unwrap()
+                .sheets
+                .by_name("Back")
+                .unwrap()
+                .page("root"),
+            Some("3")
+        );
+    }
+
+    #[tokio::test]
+    async fn deep_hierarchy_reports_its_limit_and_missing_children_are_named() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_HIERARCHY_DEPTH + 1 {
+            let path = dir.path().join(format!("sheet{index}.kicad_sch"));
+            let next = format!("sheet{}.kicad_sch", index + 1);
+            document(&path, &[("Child", &next)]);
+        }
+        let root = dir.path().join("sheet0.kicad_sch");
+        let result = handle_get_sheet_hierarchy(&json!({"schematic": root}), &context())
+            .await
+            .unwrap();
+        let mut messages = Vec::new();
+        errors(&body(&result), &mut messages);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("max hierarchy depth")),
+            "{messages:?}"
+        );
+        let valid = handle_validate_sheet_pins(&json!({"schematic": root}), &context())
+            .await
+            .unwrap();
+        assert!(!valid.is_error, "{valid:?}");
+        let last = dir
+            .path()
+            .join(format!("sheet{}.kicad_sch", MAX_HIERARCHY_DEPTH + 1));
+        let result = handle_get_sheet_hierarchy(&json!({"schematic": last}), &context())
+            .await
+            .unwrap();
+        assert!(body(&result)["children"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn missing_root_and_child_files_are_explicit_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("missing.kicad_sch");
+        for result in [
+            handle_get_sheet_hierarchy(&json!({"schematic": root}), &context())
+                .await
+                .unwrap(),
+            handle_renumber_sheet_pages(&json!({"schematic": root}), &context())
+                .await
+                .unwrap(),
+            handle_validate_sheet_pins(&json!({"schematic": root}), &context())
+                .await
+                .unwrap(),
+        ] {
+            assert!(result.is_error, "{result:?}");
+        }
+        document(&root, &[("Missing", "child.kicad_sch")]);
+        let source = std::fs::read(&root).unwrap();
+        let result = handle_import_sheet_pins(
+            &json!({"schematic": root, "sheet_name": "Missing"}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        let result = handle_duplicate_sheet(&json!({"schematic": root, "source_sheet_name": "Missing", "new_sheet_name": "Copy", "new_file": "copy.kicad_sch"}), &context()).await.unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read(&root).unwrap(), source);
+        assert!(!dir.path().join("copy.kicad_sch").exists());
+        std::fs::create_dir(dir.path().join("directory.kicad_sch")).unwrap();
+        let result = handle_add_hierarchical_sheet(&json!({"schematic": root, "sheet_name": "Directory", "sheet_file": "directory.kicad_sch"}), &context()).await.unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read(root).unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn imported_pin_names_are_unique_and_unknown_shapes_become_passive() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root.kicad_sch");
+        let child = dir.path().join("child.kicad_sch");
+        document(&root, &[("Child", "child.kicad_sch")]);
+        document(&child, &[]);
+        let mut schematic = cse::Schematic::load(&root).unwrap();
+        schematic
+            .sheets
+            .by_name_mut("Child")
+            .unwrap()
+            .add_pin(cse::SheetPin::new("Existing", "input", 50.0, 22.54));
+        schematic.overwrite().unwrap();
+        let mut schematic = cse::Schematic::load(&child).unwrap();
+        for (name, shape) in [
+            ("Existing", "input"),
+            ("New", "output"),
+            ("New", "output"),
+            ("Future", "unknown_future_shape"),
+        ] {
+            schematic.add_hierarchical_label(name, shape, 10.0, 20.0);
+        }
+        schematic.overwrite().unwrap();
+        let imported = handle_import_sheet_pins(
+            &json!({"schematic": root, "sheet_name": "Child"}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!imported.is_error, "{imported:?}");
+        assert_eq!(body(&imported)["imported_pins"], json!(["New", "Future"]));
+        let saved = cse::Schematic::load(&root).unwrap();
+        let sheet = saved.sheets.by_name("Child").unwrap();
+        assert_eq!(sheet.pins.len(), 3);
+        assert_eq!(sheet.pin_by_name("Future").unwrap().pin_type, "passive");
+        let before = std::fs::read(&root).unwrap();
+        let imported = handle_import_sheet_pins(
+            &json!({"schematic": root, "sheet_name": "Child"}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body(&imported)["imported_pins"], json!([]));
+        assert_eq!(std::fs::read(root).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn adding_a_blank_existing_child_keeps_its_bytes_and_ignores_nonnumeric_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root.kicad_sch");
+        document(
+            &root,
+            &[
+                ("Unpaged", "unused.kicad_sch"),
+                ("Nonnumeric", "unused.kicad_sch"),
+                ("Seven", "unused.kicad_sch"),
+            ],
+        );
+        let mut schematic = cse::Schematic::load(&root).unwrap();
+        let root_path = format!("/{}", schematic.uuid.as_deref().unwrap());
+        schematic
+            .sheets
+            .by_name_mut("Nonnumeric")
+            .unwrap()
+            .set_page("root", &root_path, "appendix");
+        schematic
+            .sheets
+            .by_name_mut("Seven")
+            .unwrap()
+            .set_page("root", &root_path, "7");
+        schematic.overwrite().unwrap();
+        let child = dir.path().join("blank.kicad_sch");
+        document(&child, &[]);
+        let before = std::fs::read(&child).unwrap();
+        let added = handle_add_hierarchical_sheet(
+            &json!({"schematic": root, "sheet_name": "Blank", "sheet_file": "blank.kicad_sch"}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!added.is_error, "{added:?}");
+        assert_eq!(body(&added)["reused_existing_file"], true);
+        assert_eq!(body(&added)["sheet"]["page"], "8");
+        assert_eq!(body(&added)["patched_symbol_instances"], 0);
+        assert_eq!(std::fs::read(child).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod coverage_sheet_pin_mismatch_reports {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn validation_names_missing_labels_and_missing_parent_pins() {
+        for (parent_pin, child_label) in [(Some("PARENT_ONLY"), None), (None, Some("CHILD_ONLY"))] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root.kicad_sch");
+            let child = dir.path().join("child.kicad_sch");
+            let mut schematic =
+                cse::Schematic::from_source(&root, crate::tools::blank_schematic_template())
+                    .unwrap();
+            let mut sheet = cse::Sheet::new("Child", "child.kicad_sch", 10.0, 20.0, 40.0, 50.0);
+            if let Some(name) = parent_pin {
+                sheet.add_pin(cse::SheetPin::new(name, "input", 50.0, 22.54));
+            }
+            schematic.add_sheet(sheet);
+            std::fs::write(&root, schematic.to_source()).unwrap();
+            let mut schematic =
+                cse::Schematic::from_source(&child, crate::tools::blank_schematic_template())
+                    .unwrap();
+            if let Some(name) = child_label {
+                schematic.add_hierarchical_label(name, "input", 10.0, 20.0);
+            }
+            std::fs::write(&child, schematic.to_source()).unwrap();
+            let before = std::fs::read(&root).unwrap();
+            let context = ToolContext::new(
+                crate::tools::ServerConfig::default(),
+                Arc::new(crate::router::ToolRouter::new()),
+            );
+            let result = handle_validate_sheet_pins(&json!({"schematic": root}), &context)
+                .await
+                .unwrap();
+            assert!(!result.is_error, "{result:?}");
+            let ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text")
+            };
+            let report: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(report["issue_count"], 1);
+            assert!(text.contains(parent_pin.or(child_label).unwrap()), "{text}");
+            assert_eq!(std::fs::read(root).unwrap(), before);
+        }
+    }
+}
+
+#[cfg(test)]
+mod coverage_sheet_precommit_identity {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn every_sheet_item_edit_refuses_a_prospective_result_that_lost_its_bound_identity() {
+        let operations = [
+            (
+                "edit_sheet",
+                json!({"sheet_name": "Child", "new_name": "Renamed"}),
+            ),
+            (
+                "add_sheet_pin",
+                json!({"sheet_name": "Child", "pin_name": "Added", "pin_type": "input", "x": 50, "y": 30}),
+            ),
+            (
+                "edit_sheet_pin",
+                json!({"sheet_name": "Child", "pin_name": "Existing", "new_name": "Renamed"}),
+            ),
+            (
+                "delete_sheet_pin",
+                json!({"sheet_name": "Child", "pin_name": "Existing"}),
+            ),
+            ("import_sheet_pins", json!({"sheet_name": "Child"})),
+        ];
+        for (operation, mut args) in operations {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root.kicad_sch");
+            let child = dir.path().join("child.kicad_sch");
+            let mut schematic =
+                cse::Schematic::from_source(&root, crate::tools::blank_schematic_template())
+                    .unwrap();
+            let mut sheet = cse::Sheet::new("Child", "child.kicad_sch", 10.0, 20.0, 40.0, 50.0);
+            let uuid = sheet.uuid.clone();
+            sheet.add_pin(cse::SheetPin::new("Existing", "input", 50.0, 22.54));
+            schematic.add_sheet(sheet);
+            std::fs::write(&root, schematic.to_source()).unwrap();
+            let mut schematic =
+                cse::Schematic::from_source(&child, crate::tools::blank_schematic_template())
+                    .unwrap();
+            schematic.add_hierarchical_label("Imported", "input", 10.0, 20.0);
+            std::fs::write(&child, schematic.to_source()).unwrap();
+            let before = std::fs::read(&root).unwrap();
+            let child_before = std::fs::read(&child).unwrap();
+            args["schematic"] = json!(root);
+            HIERARCHY_PROSPECTIVE_FAULT.with(|fault| {
+                *fault.borrow_mut() = Some(HierarchyProspectiveFault::Replace {
+                    from: format!("(uuid \"{uuid}\")"),
+                    to: "(uuid \"99999999-9999-4999-8999-999999999999\")".into(),
+                });
+            });
+            let definition = tools()
+                .into_iter()
+                .find(|tool| tool.name == operation)
+                .unwrap();
+            let context = Arc::new(ToolContext::new(
+                crate::tools::ServerConfig::default(),
+                Arc::new(crate::router::ToolRouter::new()),
+            ));
+            let result = (definition.handler)(&args, context).await.unwrap();
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("stale_target"),
+                "{operation}: {result:?}"
+            );
+            assert_eq!(std::fs::read(root).unwrap(), before, "{operation}");
+            assert_eq!(std::fs::read(child).unwrap(), child_before, "{operation}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod coverage_legacy_uuid_insertion_boundary {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn a_uuidless_parent_with_inline_metadata_refuses_before_creating_its_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.kicad_sch");
+        let source = "(kicad_sch\n  (version 20250610) (lib_symbols)\n)\n";
+        std::fs::write(&path, source).unwrap();
+        let context = ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let error = handle_add_hierarchical_sheet(
+            &json!({"schematic": path, "sheet_name": "Child", "sheet_file": "child.kicad_sch"}),
+            &context,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("not line-oriented"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        assert!(!dir.path().join("child.kicad_sch").exists());
+    }
+}

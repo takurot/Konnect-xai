@@ -1644,3 +1644,168 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod identity_boundary_tests {
+    use super::*;
+
+    fn pcb_request() -> serde_json::Value {
+        json!({"editor":"pcb", "project_name":"board", "project_path":"/design",
+            "document_path":"/design/board.kicad_pcb", "object_kiid":"item-1",
+            "operation":"add", "object_kiids":["item-1"]})
+    }
+
+    #[test]
+    fn selection_identity_requires_nonempty_project_and_editor_specific_document() {
+        let good = pcb_request();
+        assert!(parse_selection_target(&good).is_ok());
+        for (key, value) in [
+            ("editor", json!("viewer")),
+            ("project_name", json!("")),
+            ("project_path", json!("")),
+            ("document_path", json!("")),
+            ("sheet_instance_path", json!(["root"])),
+            ("sheet_path_human_readable", json!("/")),
+        ] {
+            let mut args = good.clone();
+            args[key] = value;
+            assert!(parse_selection_target(&args).is_err(), "accepted {args}");
+        }
+        let mut schematic = good;
+        schematic["editor"] = json!("schematic");
+        schematic["document_path"] = serde_json::Value::Null;
+        schematic["sheet_instance_path"] = json!(["root", "child"]);
+        schematic["sheet_path_human_readable"] = json!("/child");
+        let target = parse_selection_target(&schematic).unwrap();
+        assert_eq!(target.sheet_instance_path.unwrap().kiids, ["root", "child"]);
+        for value in [
+            json!([]),
+            json!([""]),
+            json!(["root", ""]),
+            json!([7]),
+            json!("root"),
+        ] {
+            schematic["sheet_instance_path"] = value;
+            assert!(parse_selection_target(&schematic).is_err());
+        }
+        schematic["sheet_instance_path"] = json!(["root"]);
+        schematic["document_path"] = json!("/design/board.kicad_pcb");
+        assert!(parse_selection_target(&schematic).is_err());
+    }
+
+    #[test]
+    fn navigation_identity_never_accepts_two_identifiers_or_empty_sheet_entries() {
+        let good = pcb_request();
+        assert!(parse_navigation_target_request(&good).is_ok());
+        for key in ["project_name", "project_path", "document_path"] {
+            let mut args = good.clone();
+            args[key] = json!("");
+            assert!(parse_navigation_target_request(&args).is_err());
+        }
+        for (object, human) in [
+            (json!(""), json!(null)),
+            (json!(null), json!("")),
+            (json!(null), json!(null)),
+            (json!("id"), json!("R1")),
+        ] {
+            let mut args = good.clone();
+            args["object_kiid"] = object;
+            args["human_reference"] = human;
+            assert!(parse_navigation_target_request(&args).is_err());
+        }
+        let mut args = good;
+        args["object_kiid"] = json!(null);
+        args["human_reference"] = json!("R1");
+        assert!(parse_navigation_target_request(&args).is_ok());
+        args["editor"] = json!("schematic");
+        for sheet in [json!([]), json!(["root", ""]), json!([1])] {
+            args["sheet_instance_path"] = sheet;
+            assert!(parse_navigation_target_request(&args).is_err());
+        }
+        args["sheet_instance_path"] = json!(["root"]);
+        assert!(parse_navigation_target_request(&args).is_ok());
+    }
+
+    #[test]
+    fn mutation_identity_rejects_malformed_objects_before_a_live_request() {
+        let good = pcb_request();
+        for (field, value) in [
+            ("operation", json!("replace")),
+            ("editor", json!("viewer")),
+            ("project_name", json!("")),
+            ("project_path", json!("")),
+            ("document_path", json!("")),
+            ("object_kiids", json!([7])),
+            ("object_kiids", json!([""])),
+            ("object_kiids", json!(["a", "a"])),
+            ("object_kiids", json!([])),
+            ("sheet_instance_path", json!(["root"])),
+            ("sheet_path_human_readable", json!("/")),
+        ] {
+            let mut args = good.clone();
+            args[field] = value;
+            assert!(
+                parse_selection_mutation_request(&args).is_err(),
+                "accepted {args}"
+            );
+        }
+        let mut args = good;
+        args["operation"] = json!("clear");
+        assert!(parse_selection_mutation_request(&args).is_err());
+        args["object_kiids"] = json!([]);
+        assert!(parse_selection_mutation_request(&args).is_ok());
+        args["operation"] = json!("remove");
+        assert!(parse_selection_mutation_request(&args).is_err());
+        args["object_kiids"] = json!(["item-1"]);
+        args["editor"] = json!("schematic");
+        for value in [json!([]), json!(["root", ""]), json!([false])] {
+            args["sheet_instance_path"] = value;
+            assert!(parse_selection_mutation_request(&args).is_err());
+        }
+        args["sheet_instance_path"] = json!(["root", "child"]);
+        let request = parse_selection_mutation_request(&args).unwrap();
+        assert_eq!(request.structural_targets.len(), 1);
+        assert_eq!(
+            request.structural_targets[0].object_kiid.as_deref(),
+            Some("item-1")
+        );
+        assert_eq!(
+            request.live_document.sheet_instance_path.unwrap().kiids,
+            ["root", "child"]
+        );
+    }
+
+    #[test]
+    fn cross_probe_requires_complete_identity_for_both_documents() {
+        let good = json!({"source_editor":"pcb", "project_name":"board", "project_path":"/design",
+            "schematic_document_path":"/design/board.kicad_sch",
+            "pcb_document_path":"/design/board.kicad_pcb", "source_object_kiid":"item-1",
+            "schematic_sheet_instance_path":["root"]});
+        let request = parse_cross_probe_request(&good).unwrap();
+        let pcb = live_cross_probe_document(&request, IpcEditorKind::Pcb);
+        let sch = live_cross_probe_document(&request, IpcEditorKind::Schematic);
+        assert!(pcb.document_path.is_some() && pcb.sheet_instance_path.is_none());
+        assert!(sch.document_path.is_none() && sch.sheet_instance_path.is_some());
+        for key in [
+            "project_name",
+            "project_path",
+            "schematic_document_path",
+            "pcb_document_path",
+            "source_object_kiid",
+        ] {
+            let mut args = good.clone();
+            args[key] = json!("");
+            assert!(parse_cross_probe_request(&args).is_err());
+        }
+        for value in [json!([]), json!([""]), json!([7])] {
+            let mut args = good.clone();
+            args["schematic_sheet_instance_path"] = value;
+            assert!(parse_cross_probe_request(&args).is_err());
+        }
+        let mut args = good;
+        args["source_editor"] = json!("schematic");
+        assert!(parse_cross_probe_request(&args).is_ok());
+        args["source_editor"] = json!("viewer");
+        assert!(parse_cross_probe_request(&args).is_err());
+    }
+}

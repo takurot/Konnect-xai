@@ -471,3 +471,63 @@ mod tests {
         assert!(guidance.contains("Linux:"));
     }
 }
+
+#[cfg(test)]
+mod provenance_contract_tests {
+    use super::*;
+
+    #[test]
+    fn a_version_claim_requires_a_single_nonempty_konnect_version_token() {
+        for invalid in [
+            "",
+            "other 1.2.3",
+            "konnect ",
+            "konnect 1.2.3 unexpected",
+            "konnect 1.2.3\textra",
+        ] {
+            assert_eq!(parse_konnect_version(invalid), None, "{invalid:?}");
+        }
+        assert_eq!(parse_konnect_version("konnect  1.2.3  "), Some("1.2.3"));
+        assert_eq!(sanitize_version_line("\u{1b}\n\r\t"), None);
+        assert_eq!(sanitize_version_line("1.2.3\u{0}\n"), Some("1.2.3".into()));
+        assert_eq!(sanitize_version_line(&"x".repeat(201)).unwrap().len(), 200);
+    }
+
+    #[test]
+    fn malformed_or_non_executable_plugin_manifests_never_claim_a_pcm_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let executable = bin.join("fixture-executable");
+        let manifest = dir.path().join("plugin.json");
+        for source in [
+            "not JSON",
+            "{}",
+            r#"{"identifier":"com.github.mixelpixx.konnect","runtime":{"type":"python"}}"#,
+            r#"{"identifier":"com.github.mixelpixx.konnect"}"#,
+        ] {
+            std::fs::write(&manifest, source).unwrap();
+            let classification = classify_installation(&executable);
+            assert_eq!(classification.name, "unknown", "{source}");
+            assert!(classification.manifest_path.is_none());
+        }
+    }
+
+    #[test]
+    fn restart_advice_distinguishes_proven_newer_binaries_and_pcm_updates_from_unknown_state() {
+        let unknown = restart_guidance("unknown", None);
+        let older = restart_guidance("unknown", Some(false));
+        assert_eq!(unknown, older);
+        assert!(!unknown.iter().any(|line| line.contains("newer binary")));
+        let newer = restart_guidance("unknown", Some(true));
+        assert_eq!(newer.len(), unknown.len() + 1);
+        assert!(newer
+            .iter()
+            .any(|line| line.contains("newer binary is proven")));
+        let pcm = restart_guidance("kicad_pcm", None);
+        assert_eq!(pcm.len(), unknown.len() + 1);
+        assert!(pcm
+            .iter()
+            .any(|line| line.contains("Plugin and Content Manager")));
+    }
+}

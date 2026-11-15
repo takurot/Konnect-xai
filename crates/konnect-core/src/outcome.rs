@@ -332,3 +332,55 @@ mod writer_ratchet_tests {
         assert_eq!(actual, expected);
     }
 }
+
+#[cfg(test)]
+mod outcome_boundary_contract_tests {
+    use super::*;
+
+    #[test]
+    fn outcome_attachment_preserves_non_object_and_non_text_responses() {
+        let mut cases = vec![
+            CallToolResult {
+                content: Vec::new(),
+                is_error: true,
+            },
+            CallToolResult {
+                content: vec![ToolContent::Image {
+                    data: "image".into(),
+                    mime_type: "image/png".into(),
+                }],
+                is_error: false,
+            },
+        ];
+        cases.extend(
+            ["ordinary text", "null", "[]", "42", r#""string""#]
+                .into_iter()
+                .map(CallToolResult::text),
+        );
+        for response in cases {
+            let before = serde_json::to_value(&response).unwrap();
+            let after = attach(response, json!({"status":"complete"}));
+            assert_eq!(serde_json::to_value(&after).unwrap(), before);
+            assert_eq!(status(&after), None);
+        }
+    }
+
+    #[test]
+    fn unknown_or_non_string_outcome_status_is_never_promoted_to_complete() {
+        for invalid in [json!("success"), json!(null), json!(true), json!(7)] {
+            let response = CallToolResult::json(&json!({"outcome":{"status":invalid}}));
+            assert_eq!(status(&response), None);
+        }
+        for (value, expected) in [
+            ("complete", OutcomeStatus::Complete),
+            ("partial", OutcomeStatus::Partial),
+            ("failed", OutcomeStatus::Failed),
+            ("uncertain", OutcomeStatus::Uncertain),
+        ] {
+            assert_eq!(
+                status(&CallToolResult::json(&json!({"outcome":{"status":value}}))),
+                Some(expected)
+            );
+        }
+    }
+}

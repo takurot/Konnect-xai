@@ -440,3 +440,96 @@ macro_rules! label_collection {
 label_collection!(LabelCollection, Label);
 label_collection!(GlobalLabelCollection, GlobalLabel);
 label_collection!(HierarchicalLabelCollection, HierarchicalLabel);
+
+#[cfg(test)]
+mod label_presentation_contract_tests {
+    use super::*;
+    use crate::sexp::parser::parse;
+
+    #[test]
+    fn rotating_authored_labels_preserves_font_and_unknown_children_and_updates_only_justification()
+    {
+        for kind in ["label", "global_label", "hierarchical_label"] {
+            let source = parse(&format!(r#"({kind} "SIG" (shape input) (at 1 2 0)
+                (effects (font (size 1.5 1.5) (thickness 0.2) bold) (justify center) (future_font yes))
+                (fields_autoplaced) (future_label "keep") (uuid id))"#)).unwrap();
+            for (rotation, side) in [(180.0, "right"), (90.0, "left")] {
+                let rotated = match kind {
+                    "label" => {
+                        let mut label = Label::from_sexp(&source).unwrap();
+                        label.set_rotation(rotation);
+                        label.to_sexp()
+                    }
+                    "global_label" => {
+                        let mut label = GlobalLabel::from_sexp(&source).unwrap();
+                        label.set_rotation(rotation);
+                        label.to_sexp()
+                    }
+                    _ => {
+                        let mut label = HierarchicalLabel::from_sexp(&source).unwrap();
+                        label.set_rotation(rotation);
+                        label.to_sexp()
+                    }
+                };
+                let effects = rotated.find("effects").unwrap();
+                assert_eq!(
+                    effects.find("font"),
+                    source.find("effects").unwrap().find("font")
+                );
+                assert_eq!(
+                    effects.find("future_font"),
+                    source.find("effects").unwrap().find("future_font")
+                );
+                let justify = effects.find("justify").unwrap().scalar_args();
+                assert_eq!(justify[0], side);
+                assert_eq!(justify.contains(&"bottom"), kind == "label");
+                assert_eq!(rotated.find("future_label"), source.find("future_label"));
+                assert_eq!(
+                    rotated.find("fields_autoplaced"),
+                    source.find("fields_autoplaced")
+                );
+                assert_eq!(
+                    rotated.find("at").unwrap().scalar_args()[2]
+                        .parse::<f64>()
+                        .unwrap(),
+                    rotation
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn optional_label_shapes_survive_roundtrip_without_inventing_absent_shapes() {
+        for shape in ["", "(shape input)"] {
+            let plain = parse(&format!(r#"(label "A" (at 1 2) {shape} (uuid p))"#)).unwrap();
+            let hierarchy = parse(&format!(
+                r#"(hierarchical_label "A" (at 1 2) {shape} (uuid h))"#
+            ))
+            .unwrap();
+            assert_eq!(
+                Label::from_sexp(&plain).unwrap().to_sexp().find("shape"),
+                plain.find("shape")
+            );
+            assert_eq!(
+                HierarchicalLabel::from_sexp(&hierarchy)
+                    .unwrap()
+                    .to_sexp()
+                    .find("shape"),
+                hierarchy.find("shape")
+            );
+        }
+    }
+
+    #[test]
+    fn global_label_property_updates_preserve_one_named_property_and_unrelated_values() {
+        let mut label = GlobalLabel::new("SIG", "input", 1.0, 2.0);
+        label.set_property("MPN", "initial");
+        label.set_property("BoardOnly", "retain");
+        label.set_property("MPN", "updated \"quoted\" value");
+        assert_eq!(label.properties.len(), 2);
+        assert_eq!(label.property("MPN"), Some("updated \"quoted\" value"));
+        let loaded = GlobalLabel::from_sexp(&label.to_sexp()).unwrap();
+        assert_eq!(loaded.property("MPN"), label.property("MPN"));
+        assert_eq!(loaded.property("BoardOnly"), Some("retain"));
+    }
+}

@@ -4676,3 +4676,173 @@ mod tests {
         assert!(result.is_error);
     }
 }
+
+#[cfg(test)]
+mod placement_boundary_contract_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::ctx_talking_to;
+
+    fn outline(footprints: &str) -> String {
+        format!(
+            r#"(kicad_pcb (version 20240108)
+            (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+            (net 1 "GND")
+            (gr_line (start 0 0) (end 30 0) (stroke (width 0.05) (type solid)) (layer "Edge.Cuts"))
+            (gr_line (start 30 0) (end 30 30) (stroke (width 0.05) (type solid)) (layer "Edge.Cuts"))
+            (gr_line (start 30 30) (end 0 30) (stroke (width 0.05) (type solid)) (layer "Edge.Cuts"))
+            (gr_line (start 0 30) (end 0 0) (stroke (width 0.05) (type solid)) (layer "Edge.Cuts"))
+            {footprints})"#
+        )
+    }
+
+    fn footprint(reference: &str, x: f64, y: f64, side: &str, geometry: &str) -> String {
+        format!(
+            r#"(footprint "Test:Part" (layer "{side}.Cu") (at {x} {y})
+            (uuid "footprint-{reference}")
+            (property "Reference" "{reference}" (at 0 0) (layer "{side}.SilkS"))
+            (property "Value" "part" (at 0 0) (layer "{side}.Fab"))
+            {geometry})"#
+        )
+    }
+
+    fn courtyard(side: &str) -> String {
+        format!(
+            r#"(fp_rect (start -1 -1) (end 1 1) (stroke (width 0.05) (type solid)) (fill none) (layer "{side}.CrtYd"))"#
+        )
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("text response required");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn score_checks_every_outline_edge_and_never_mutates_the_board() {
+        for (x, y) in [(-2.0, 15.0), (15.0, -2.0), (32.0, 15.0), (15.0, 32.0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("edge.kicad_pcb");
+            let source = outline(&footprint("A1", x, y, "F", &courtyard("F")));
+            std::fs::write(&board, &source).unwrap();
+            let result =
+                handle_score_placement(&json!({"board": board}), &ctx_talking_to(String::new()))
+                    .await
+                    .unwrap();
+            assert!(!result.is_error, "{result:?}");
+            let result = body(&result);
+            assert!(
+                result["hard_failures"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|failure| failure["kind"] == "outside_outline"),
+                "{result}"
+            );
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+        }
+    }
+
+    #[tokio::test]
+    async fn position_only_footprints_do_not_invent_courtyard_collisions() {
+        for geometries in [
+            (String::new(), courtyard("F")),
+            (courtyard("F"), String::new()),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("anchors.kicad_pcb");
+            let source = outline(
+                &(footprint("A1", 15.0, 15.0, "F", &geometries.0)
+                    + &footprint("A2", 15.0, 15.0, "F", &geometries.1)),
+            );
+            std::fs::write(&board, &source).unwrap();
+            let result =
+                handle_score_placement(&json!({"board": board}), &ctx_talking_to(String::new()))
+                    .await
+                    .unwrap();
+            assert!(!result.is_error, "{result:?}");
+            assert!(!body(&result)["hard_failures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|failure| failure["kind"] == "courtyard_overlap"));
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_placement_moves_around_a_held_obstacle_only_on_the_same_side() {
+        let mut targets = Vec::new();
+        for side in ["F", "B"] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("held.kicad_pcb");
+            let source = outline(
+                &(footprint("A1", 15.0, 15.0, "F", &courtyard("F"))
+                    + &footprint("A2", 4.0, 4.0, side, &courtyard(side))),
+            );
+            std::fs::write(&board, &source).unwrap();
+            let args = json!({"board": board, "locked": ["A2"]});
+            let ctx = ctx_talking_to(String::new());
+            let result = handle_auto_place(&args, &ctx).await.unwrap();
+            assert!(!result.is_error, "{result:?}");
+            let plan = body(&result);
+            assert_eq!(plan["planned_moves"].as_array().unwrap().len(), 1);
+            assert_eq!(plan["planned_moves"][0]["reference"], "A1");
+            let target = &plan["planned_moves"][0]["to"];
+            targets.push((target["x"].as_f64().unwrap(), target["y"].as_f64().unwrap()));
+            assert_eq!(body(&handle_auto_place(&args, &ctx).await.unwrap()), plan);
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+        }
+        assert_ne!(targets[0], targets[1]);
+        assert!((targets[0].0 - 4.0).abs() >= 2.0 || (targets[0].1 - 4.0).abs() >= 2.0);
+        assert_eq!(targets[1], (3.81, 3.81));
+    }
+
+    #[tokio::test]
+    async fn decoupling_distinguishes_missing_geometry_from_an_absent_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("unmeasured.kicad_pcb");
+        let broken = r#"(fp_rect (start bad 0) (end 1 1) (layer "F.CrtYd"))"#;
+        let source = outline(
+            &(footprint("U1", 10.0, 10.0, "F", &courtyard("F"))
+                + &footprint("C1", 15.0, 15.0, "F", broken)),
+        );
+        std::fs::write(&board, &source).unwrap();
+        let result = handle_place_decoupling(
+            &json!({"board": board, "ic_reference": "U1", "capacitor_references": ["C1"]}),
+            &ctx_talking_to(String::new()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let text = format!("{result:?}");
+        assert!(text.contains("no usable courtyard geometry"), "{text}");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn fine_pitch_fanout_keeps_native_net_identity_and_refuses_offline_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("fine-pitch.kicad_pcb");
+        let mut pads = String::new();
+        for row in 0..3 {
+            for column in 0..3 {
+                let number = row * 3 + column + 1;
+                pads.push_str(&format!(r#"(pad "{number}" smd circle (at {} {}) (size 0.2 0.2) (layers "F.Cu") (net 1 "GND"))"#, column as f64 * 0.5, row as f64 * 0.5));
+            }
+        }
+        let source = outline(&footprint("U1", 10.0, 10.0, "F", &pads));
+        std::fs::write(&board, &source).unwrap();
+        let ctx = ctx_talking_to(String::new());
+        let mut args = json!({"board": board, "reference": "U1"});
+        let result = handle_bga_fanout(&args, &ctx).await.unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let plan = body(&result);
+        assert_eq!(plan["pitch_detected_mm"], 0.5);
+        assert_eq!(plan["track_width_mm"], 0.1);
+        assert_eq!(plan["vias"].as_array().unwrap().len(), 1);
+        assert_eq!(plan["vias"][0]["net"], "GND");
+        args["apply"] = json!(true);
+        assert!(handle_bga_fanout(&args, &ctx).await.unwrap().is_error);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+}

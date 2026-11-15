@@ -1071,3 +1071,128 @@ mod field_anchor_tests {
         assert_eq!(field_anchors(&sch, "Device:R").value_at, None);
     }
 }
+
+#[cfg(test)]
+mod library_boundary_contract_tests {
+    use super::*;
+
+    #[test]
+    fn resolver_skips_missing_unreadable_and_wrong_symbol_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.kicad_sym");
+        let invalid_utf8 = dir.path().join("invalid.kicad_sym");
+        let wrong = dir.path().join("wrong.kicad_sym");
+        let valid = dir.path().join("valid.kicad_sym");
+        std::fs::write(&invalid_utf8, [0xff, 0xfe]).unwrap();
+        std::fs::write(&wrong, "(kicad_symbol_lib (symbol \"Other\"))").unwrap();
+        std::fs::write(
+            &valid,
+            "(kicad_symbol_lib (symbol \"Part\" (property \"Reference\" \"U\")))",
+        )
+        .unwrap();
+        let source = move |_: &str| {
+            vec![
+                missing.clone(),
+                invalid_utf8.clone(),
+                wrong.clone(),
+                valid.clone(),
+            ]
+        };
+        assert!(resolve_lib_symbol("no-library", &source).is_none());
+        let resolved = resolve_lib_symbol("Lib:Part", &source).unwrap();
+        assert!(resolved.starts_with("(symbol \"Lib:Part\""));
+        assert!(resolve_lib_symbol("Lib:Missing", &source).is_none());
+        assert!(library_exists("Lib", &source));
+    }
+
+    #[test]
+    fn cyclic_and_dangling_inheritance_terminate_and_keep_child_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Lib.kicad_sym");
+        std::fs::write(
+            &file,
+            r#"(kicad_symbol_lib
+            (symbol "Child" (extends "Parent") (in_bom no) (property "Reference" "X")
+                (symbol "Child_1_1" (rectangle (start 1 1) (end 2 2))))
+            (symbol "Parent" (extends "Child") (in_bom yes) (on_board no)
+                (property "Reference" "U") (property "Value" "parent")
+                (symbol "Parent_1_1" (circle (center 0 0) (radius 10)))
+                (symbol "Parent_2_1") (symbol "not_a_unit") (symbol) (property))
+            (symbol "Dangling" (extends "Absent") (property "Value" "retained")))"#,
+        )
+        .unwrap();
+        let source = move |_: &str| vec![file.clone()];
+        let child = resolve_lib_symbol_flattened_node("Lib:Child", &source).unwrap();
+        assert_eq!(child.get_value("in_bom"), Some("no"));
+        assert_eq!(child.get_value("on_board"), Some("no"));
+        assert!(child.find("extends").is_none());
+        let units = child.find_all("symbol");
+        assert_eq!(units.len(), 2);
+        assert!(units
+            .iter()
+            .any(|unit| unit.value() == Some("Child_1_1") && unit.find("rectangle").is_some()));
+        assert!(units.iter().any(|unit| unit.value() == Some("Child_2_1")));
+        let reference = child
+            .find_all("property")
+            .into_iter()
+            .find(|p| p.value() == Some("Reference"))
+            .unwrap();
+        assert_eq!(reference.scalar_args(), vec!["Reference", "X"]);
+        let dangling = resolve_lib_symbol_flattened_node("Lib:Dangling", &source).unwrap();
+        assert!(dangling.find("extends").is_none());
+        assert_eq!(symbol_unit_count("Lib:Dangling", &source), None);
+    }
+
+    #[test]
+    fn unit_suffix_validation_excludes_unrelated_and_incomplete_names() {
+        for name in [
+            "Other_1_1",
+            "Part",
+            "Part_1",
+            "Part__1",
+            "Part_1_",
+            "Part_x_1",
+            "Part_1_x",
+            "Part_extra_1_1",
+        ] {
+            assert!(unit_suffix_of(name, "Part").is_none(), "{name}");
+        }
+        assert_eq!(unit_suffix_of("Part_12_2", "Part"), Some("_12_2"));
+    }
+
+    #[test]
+    fn field_anchors_ignore_incomplete_fields_and_nested_properties() {
+        let node = parser::parse(
+            r#"(symbol "Part"
+            (property) (property "Reference" "U")
+            (property "Reference" "U" (at invalid 2))
+            (property "Reference" "U" (at 1 2))
+            (property "Value" "V" (at 3 4 90))
+            (property "Other" "x" (at 50 60))
+            (symbol "Part_1_1" (property "Reference" "nested" (at 100 100))))"#,
+        )
+        .unwrap();
+        let anchors = field_anchors_of(&node);
+        assert_eq!(anchors.reference_at, Some((1.0, 2.0, 0.0)));
+        assert_eq!(anchors.value_at, Some((3.0, 4.0, 90.0)));
+    }
+
+    #[test]
+    fn suggestions_read_symdir_names_ignore_other_files_and_respect_zero_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("C_Polarized.kicad_sym"),
+            "(kicad_symbol_lib (symbol \"C_Polarized\"))",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("C_Polarized.txt"), "ignored").unwrap();
+        let path = dir.path().to_path_buf();
+        let source = move |_: &str| vec![path.clone()];
+        assert_eq!(
+            suggest_symbols("Device:CP", 3, &source),
+            vec!["Device:C_Polarized"]
+        );
+        assert!(suggest_symbols("Device:CP", 0, &source).is_empty());
+        assert!(suggest_symbols("no-library", 3, &source).is_empty());
+    }
+}

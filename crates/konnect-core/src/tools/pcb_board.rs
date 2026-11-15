@@ -4226,6 +4226,26 @@ mod delete_graphics_tests {
     }
 
     #[tokio::test]
+    async fn pcb_fidelity3_anonymous_live_graphics_are_never_sent_to_delete_items() {
+        let (_dir, board) = board_file();
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        let server = spawn_kicad_with_shapes(&board, vec![("", "Edge.Cuts")], deleted.clone());
+        let result = handle_delete_graphics(
+            &json!({"board":board,"layer":"Edge.Cuts","dry_run":false}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text: body } = &result.content[0] else {
+            panic!("expected text refusal");
+        };
+        assert!(body.contains("no identifier"), "{body}");
+        assert!(deleted.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
+    }
+
+    #[tokio::test]
     async fn clearing_edge_cuts_leaves_the_rest_of_the_board() {
         let (_dir, board) = board_file();
 
@@ -6012,6 +6032,335 @@ mod coordinate_review_extents_tests {
         let absent = response(None);
         for field in ["x_min", "y_min", "x_max", "y_max", "width", "height"] {
             assert!(absent[field].is_null(), "{absent}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod board_boundary_contract_tests {
+    use super::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+    use super::*;
+    use konnect_ipc::gen::kiapi;
+
+    fn text(result: &CallToolResult) -> &str {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("text response required");
+        };
+        text
+    }
+
+    #[tokio::test]
+    async fn pcb_fidelity3_noncanonical_layer_names_refuse_without_changing_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let source = "(kicad_pcb (layers (0 \"F.Cu\" signal) (31 \"B.Cu\" signal)))";
+        std::fs::write(&board, source).unwrap();
+        let result = handle_add_layer(
+            &json!({"board":board,"layer_name":"Custom.Cu","layer_type":"signal"}),
+            &ctx_talking_to(String::new()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(text(&result).contains("not a KiCAD layer name"));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn pcb_fidelity3_live_outline_replacement_refuses_a_nonsegment_outline_before_mutation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let source = "(kicad_pcb (version 20240108))";
+        std::fs::write(&board, source).unwrap();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let observed = writes.clone();
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                let shape =
+                    builders::board_rectangle("Edge.Cuts", 0.05, 0.0, 0.0, 10.0, 10.0, false)
+                        .unwrap();
+                Some(builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: vec![builders::pack_any(
+                            &shape,
+                            "kiapi.board.types.BoardGraphicShape",
+                        )],
+                        ..Default::default()
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ))
+            } else {
+                observed.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+        });
+        let result = handle_set_board_size(
+            &json!({"board":board,"width":20.0,"height":30.0}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(text(&result).contains("rectangle"));
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn pcb_fidelity3_project_mounting_hole_library_preserves_its_fields_and_geometry() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
+        let pretty = dir.path().join("MountingHole.pretty");
+        std::fs::create_dir(&pretty).unwrap();
+        // A project library fixture, with a marker proving that exact source was used.
+        let library = r#"(footprint "MountingHole_3.2mm_M3" (layer "F.Cu")
+            (property "Reference" "REF**" (at 0 -3) (layer "F.SilkS"))
+            (property "Value" "MountingHole" (at 0 3) (layer "F.Fab"))
+            (property "ProjectMarker" "preserve me" (at 1 2) (layer "Cmts.User"))
+            (fp_circle (center 0 0) (end 2 0) (stroke (width 0.1) (type solid)) (fill none) (layer "F.CrtYd"))
+            (pad "" np_thru_hole circle (at 0 0) (size 3.2 3.2) (drill 3.2) (layers "*.Cu" "*.Mask")))"#;
+        std::fs::write(pretty.join("MountingHole_3.2mm_M3.kicad_mod"), library).unwrap();
+        std::fs::write(dir.path().join("fp-lib-table"),"(fp_lib_table\n (lib (name \"MountingHole\") (type \"KiCad\") (uri \"${KIPRJMOD}/MountingHole.pretty\") (options \"\") (descr \"\")))").unwrap();
+        let result = handle_add_mounting_hole(
+            &json!({"board":board,"x":5.0,"y":6.0,"reference":"H1"}),
+            &ctx_talking_to(String::new()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        let body: serde_json::Value = serde_json::from_str(text(&result)).unwrap();
+        assert_eq!(body["geometry"], "library");
+        let saved = std::fs::read_to_string(&board).unwrap();
+        assert!(saved.contains("preserve me"));
+        assert!(saved.contains("(fp_circle"));
+        assert!(saved.contains("(drill 3.2)"));
+    }
+
+    #[tokio::test]
+    async fn pcb_final_live_size_replaces_only_named_edge_segments_in_one_commit() {
+        use prost::Message;
+        use std::sync::{Arc, Mutex};
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("board.kicad_pcb");
+        let source = "(kicad_pcb (version 20240108))";
+        std::fs::write(&board, source).unwrap();
+        let mut items = Vec::new();
+        for (id, layer) in [
+            ("edge-a", "Edge.Cuts"),
+            ("edge-b", "Edge.Cuts"),
+            ("silk", "F.SilkS"),
+        ] {
+            let mut shape = builders::board_segment(layer, 0.05, 0.0, 0.0, 10.0, 0.0).unwrap();
+            shape.id = Some(kiapi::common::types::Kiid { value: id.into() });
+            items.push(builders::pack_any(
+                &shape,
+                "kiapi.board.types.BoardGraphicShape",
+            ));
+        }
+        let capture = Arc::new(Mutex::new((
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+            Vec::<prost_types::Any>::new(),
+        )));
+        let captured = capture.clone();
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            let mut capture = captured.lock().unwrap();
+            if command.type_url.ends_with("GetItems") {
+                Some(builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: items.clone(),
+                        ..Default::default()
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ))
+            } else if command.type_url.ends_with("BeginCommit") {
+                capture.0.push("begin".into());
+                Some(builders::pack_any(
+                    &kiapi::common::commands::BeginCommitResponse {
+                        id: Some(kiapi::common::types::Kiid {
+                            value: "outline-commit".into(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                ))
+            } else if command.type_url.ends_with("DeleteItems") {
+                capture.0.push("delete".into());
+                let request =
+                    kiapi::common::commands::DeleteItems::decode(command.value.as_slice()).unwrap();
+                capture.1 = request.item_ids.iter().map(|id| id.value.clone()).collect();
+                let deleted_items = request
+                    .item_ids
+                    .into_iter()
+                    .map(|id| kiapi::common::commands::ItemDeletionResult {
+                        id: Some(id),
+                        status: kiapi::common::commands::ItemDeletionStatus::IdsOk as i32,
+                    })
+                    .collect();
+                Some(builders::pack_any(
+                    &kiapi::common::commands::DeleteItemsResponse {
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        deleted_items,
+                        ..Default::default()
+                    },
+                    "kiapi.common.commands.DeleteItemsResponse",
+                ))
+            } else if command.type_url.ends_with("CreateItems") {
+                capture.0.push("create".into());
+                let request =
+                    kiapi::common::commands::CreateItems::decode(command.value.as_slice()).unwrap();
+                capture.2 = request.items.clone();
+                let created_items = request
+                    .items
+                    .into_iter()
+                    .map(|item| kiapi::common::commands::ItemCreationResult {
+                        status: Some(kiapi::common::commands::ItemStatus {
+                            code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                            error_message: String::new(),
+                        }),
+                        item: Some(item),
+                    })
+                    .collect();
+                Some(builders::pack_any(
+                    &kiapi::common::commands::CreateItemsResponse {
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        created_items,
+                        ..Default::default()
+                    },
+                    "kiapi.common.commands.CreateItemsResponse",
+                ))
+            } else if command.type_url.ends_with("EndCommit") {
+                capture.0.push("end".into());
+                Some(builders::pack_any(
+                    &kiapi::common::commands::EndCommitResponse {},
+                    "kiapi.common.commands.EndCommitResponse",
+                ))
+            } else {
+                None
+            }
+        });
+        let result = handle_set_board_size(
+            &json!({"board":board,"width":20.0,"height":30.0}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        let body: serde_json::Value = serde_json::from_str(text(&result)).unwrap();
+        assert_eq!(body["source"], "ipc");
+        assert_eq!(body["replaced_segments"], 2);
+        let capture = capture.lock().unwrap();
+        assert_eq!(capture.0, ["begin", "delete", "create", "end"]);
+        assert_eq!(capture.1, ["edge-a", "edge-b"]);
+        assert_eq!(capture.2.len(), 4);
+        let shapes = capture
+            .2
+            .iter()
+            .map(|item| {
+                kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(shapes
+            .iter()
+            .all(|shape| shape.layer == kiapi::board::types::BoardLayer::BlEdgeCuts as i32));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+
+    #[test]
+    fn rounded_outline_rejects_nonfinite_and_degenerate_dimensions() {
+        for (coordinates, field) in [
+            ([f64::NAN, 0.0, 10.0, 10.0, 1.0], "corner_radius"),
+            ([0.0, 0.0, f64::INFINITY, 10.0, 1.0], "corner_radius"),
+            ([0.0, 0.0, 0.0, 10.0, 1.0], "x2"),
+            ([0.0, 0.0, 10.0, 0.0, 1.0], "y2"),
+            ([0.0, 0.0, 10.0, 10.0, -1.0], "corner_radius"),
+        ] {
+            let [x1, y1, x2, y2, radius] = coordinates;
+            assert_eq!(
+                rounded_rectangle_outline(x1, y1, x2, y2, radius)
+                    .unwrap_err()
+                    .0,
+                field
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_zone_with_too_few_vertices_refuses_without_changing_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let source = "(kicad_pcb (version 20240108))";
+        std::fs::write(&board, source).unwrap();
+        let result = handle_add_zone(
+            &json!({
+                "board": board, "net_name": "GND", "layer": "F.Cu",
+                "points": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 1.0}]
+            }),
+            &ctx_talking_to(String::new()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(text(&result).contains("3"), "{}", text(&result));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn a_live_layer_list_reports_unavailable_saved_ids_and_types_without_inventing_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let source = "(kicad_pcb (version 20240108))";
+        std::fs::write(&board, source).unwrap();
+        let server = spawn_kicad_holding_board(&board, |command| {
+            if command.type_url.ends_with("GetBoardEnabledLayers") {
+                return Some(builders::pack_any(
+                    &kiapi::board::commands::BoardEnabledLayersResponse {
+                        copper_layer_count: 2,
+                        layers: vec![
+                            kiapi::board::types::BoardLayer::BlFCu as i32,
+                            kiapi::board::types::BoardLayer::BlBCu as i32,
+                        ],
+                    },
+                    "kiapi.board.commands.BoardEnabledLayersResponse",
+                ));
+            }
+            None
+        });
+        let result = handle_get_layer_list(
+            &json!({"board": board, "board_source": "live"}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        let body: serde_json::Value = serde_json::from_str(text(&result)).unwrap();
+        assert_eq!(body["copper_layer_count"], 2);
+        assert!(body["file_backed_fields_note"]
+            .as_str()
+            .unwrap()
+            .contains("null"));
+        for layer in body["layers"].as_array().unwrap() {
+            assert!(layer["id"].is_null());
+            assert!(layer["type"].is_null());
+        }
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+
+    #[test]
+    fn graphic_origin_uses_the_first_valid_defining_point() {
+        for (source, expected) in [
+            ("(gr_line (start invalid 1) (center 2 3))", Some((2.0, 3.0))),
+            ("(gr_poly (pts (xy 4 5) (xy 8 9)))", Some((4.0, 5.0))),
+            ("(gr_poly (pts (xy invalid 5)))", None),
+            ("(gr_poly (pts))", None),
+        ] {
+            assert_eq!(block_origin(&parse_sexp(source).unwrap()), expected);
         }
     }
 }

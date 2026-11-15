@@ -5032,3 +5032,447 @@ mod issue25_batch_native_attributes_tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
     }
 }
+
+#[cfg(test)]
+mod coverage_batch_boundaries {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use crate::tools::ToolContext;
+    use std::sync::Arc;
+
+    fn context() -> Arc<ToolContext> {
+        Arc::new(ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        ))
+    }
+
+    fn body(result: &CallToolResult) -> Value {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text response");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    async fn call(tool: &str, args: &Value) -> CallToolResult {
+        let definition = tools().into_iter().find(|def| def.name == tool).unwrap();
+        (definition.handler)(args, context()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn text_validation_refuses_before_touching_the_document() {
+        let cases = [
+            json!({"text": null}),
+            json!({"x": "left"}),
+            json!({"y": null}),
+            json!({"x": 1e20}),
+            json!({"y": -1e20}),
+            json!({"size": 1e20}),
+            json!({"thickness": "thin"}),
+            json!({"thickness": 0}),
+            json!({"thickness": -0.1}),
+            json!({"thickness": 1e20}),
+            json!({"color": "red"}),
+            json!({"color": []}),
+            json!({"color": [0, 0]}),
+            json!({"color": [0, 0, 0, 1, 2]}),
+            json!({"color": ["0", 0, 0]}),
+            json!({"color": [-1, 0, 0]}),
+            json!({"color": [0, 256, 0]}),
+            json!({"color": [0, 0, 0.5]}),
+            json!({"color": [0, 0, 0, "opaque"]}),
+            json!({"color": [0, 0, 0, -0.1]}),
+            json!({"color": [0, 0, 0, 1.1]}),
+            json!({"justify": "diagonal"}),
+            json!({"justify": "top bottom"}),
+            json!({"justify": "left right"}),
+        ];
+        for patch in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("design.kicad_sch");
+            let source = crate::tools::blank_schematic_template();
+            std::fs::write(&path, &source).unwrap();
+            let mut args = json!({"schematic": path, "text": "note", "x": 10, "y": 20});
+            args.as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            let result = call("add_schematic_text", &args).await;
+            assert!(result.is_error, "accepted {patch}: {result:?}");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source, "{patch}");
+        }
+    }
+
+    #[tokio::test]
+    async fn text_effects_are_readable_at_color_and_alignment_boundaries() {
+        for (justify, expected) in [
+            ("", None),
+            (" CENTER ", None),
+            ("top", Some("top")),
+            ("right bottom", Some("right")),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("design.kicad_sch");
+            std::fs::write(&path, crate::tools::blank_schematic_template()).unwrap();
+            let result = call(
+                "add_schematic_text",
+                &json!({
+                    "schematic": path, "text": "note", "x": 10, "y": 20,
+                    "justify": justify, "color": [0, 255, 0, 0], "bold": true, "italic": true,
+                    "thickness": 0.1
+                }),
+            )
+            .await;
+            assert!(!result.is_error, "{result:?}");
+            let (_, tree) = konnect_sexp::schematic::read_schematic(&path).unwrap();
+            let text = tree.find("text").unwrap();
+            let effects = text.find("effects").unwrap();
+            assert_eq!(
+                effects
+                    .find("justify")
+                    .and_then(|node| node.get(1))
+                    .and_then(konnect_sexp::SexpNode::as_str),
+                expected
+            );
+            let font = effects.find("font").unwrap();
+            assert_eq!(font.find_f64("thickness"), Some(0.1));
+            assert_eq!(font.find("color").unwrap().get_f64(2), Some(255.0));
+            assert_eq!(font.find("color").unwrap().get_f64(4), Some(0.0));
+            assert!(font.find("bold").is_some() && font.find("italic").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_attribute_batch_refuses_all_fields_when_any_assignment_is_invalid() {
+        let invalid = [
+            json!({"fields": "not an object"}),
+            json!({"fields": {"MPN": 42}}),
+            json!({"fields": {"Reference": "U9"}}),
+            json!({"fields": {"Missing": "new"}}),
+            json!({"value": "new", "fields": {"Value": "duplicate"}}),
+        ];
+        for patch in invalid {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("design.kicad_sch");
+            let source = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+            std::fs::write(&path, source).unwrap();
+            let mut edit = json!({"reference": "U1", "dnp": true});
+            edit.as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            let result = call(
+                "batch_edit_schematic_components",
+                &json!({"schematic": path, "edits": [edit]}),
+            )
+            .await;
+            assert!(result.is_error, "{patch}: {result:?}");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_or_duplicate_native_batch_specs_leave_every_unit_untouched() {
+        for options in [
+            json!({"edits": null}),
+            json!({"edits": [], "create_missing": "yes"}),
+            json!({"edits": [{"dnp": true}]}),
+            json!({"edits": [{"reference": "U1", "dnp": true}, {"reference": "U1", "in_bom": false}]}),
+            json!({"edits": [{"reference": "U1", "dnp": true}, {"value": "missing reference"}]}),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("design.kicad_sch");
+            let source = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+            std::fs::write(&path, source).unwrap();
+            let mut args = options;
+            args["schematic"] = json!(path);
+            let result = call("batch_edit_schematic_components", &args).await;
+            assert!(result.is_error, "{args}: {result:?}");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_batch_is_a_noop_with_explicit_zero_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        let source = crate::tools::blank_schematic_template();
+        std::fs::write(&path, &source).unwrap();
+        let result = call(
+            "batch_edit_schematic_components",
+            &json!({"schematic": path, "edits": []}),
+        )
+        .await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(body(&result)["updated_count"], 0);
+        assert_eq!(body(&result)["created_unit_copies"], 0);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+    }
+}
+
+#[cfg(test)]
+mod coverage_batch_reports {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use crate::tools::ToolContext;
+    use std::sync::Arc;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn body(result: &CallToolResult) -> Value {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn pins_source() -> String {
+        let mut source = String::from(
+            r#"(kicad_sch (version 20250610) (uuid "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+          (lib_symbols (symbol "Test:P"
+            (property "Reference" "U" (at 0 0 0)) (property "Value" "P" (at 0 0 0))
+            (symbol "P_1_1"
+              (pin passive line (at 0 0 0) (length 0) (name "P") (number "1"))
+              (pin no_connect line (at 0 5 0) (length 0) (name "NC") (number "2"))
+              (pin power_in line (at 0 10 0) (length 0) (name "V") (number "3")))))"#,
+        );
+        for (reference, x, uuid) in [
+            ("U1", 10, "11111111-1111-4111-8111-111111111111"),
+            ("U2", 30, "22222222-2222-4222-8222-222222222222"),
+        ] {
+            source.push_str(&format!("(symbol (lib_id \"Test:P\") (at {x} 20 0) (unit 1) (uuid \"{uuid}\") (property \"Reference\" \"{reference}\") (property \"Value\" \"P\") (instances (project \"design\" (path \"/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\" (reference \"{reference}\") (unit 1)))))"));
+        }
+        source.push(')');
+        source
+    }
+
+    fn fixture(source: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        std::fs::write(&path, source).unwrap();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn component_connection_report_honors_reference_power_and_no_connect_filters() {
+        let source = pins_source();
+        let (_dir, path) = fixture(&source);
+        for (references, ignore_power_pins, expected) in [
+            (json!([]), false, 4),
+            (json!(["U1"]), false, 2),
+            (json!(["U1"]), true, 1),
+            (json!(["Missing"]), false, 0),
+        ] {
+            let result = handle_validate_component_connections(&json!({"schematic": path, "references": references, "ignore_power_pins": ignore_power_pins}), &context()).await.unwrap();
+            assert!(!result.is_error, "{result:?}");
+            assert_eq!(body(&result)["unconnected_count"], expected);
+        }
+        let marked = format!(
+            "{} (no_connect (at 10 20) (uuid \"33333333-3333-4333-8333-333333333333\")))",
+            &source[..source.len() - 1]
+        );
+        std::fs::write(&path, &marked).unwrap();
+        let result = handle_validate_component_connections(
+            &json!({"schematic": path, "references": ["U1"], "ignore_power_pins": true}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body(&result)["valid"], true);
+        assert_eq!(body(&result)["unconnected_count"], 0);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), marked);
+    }
+
+    #[tokio::test]
+    async fn invalid_pin_connections_report_failure_and_partial_batches_report_real_successes() {
+        for include_valid in [false, true] {
+            let source = pins_source();
+            let (_dir, path) = fixture(&source);
+            let mut connections = vec![
+                json!({}),
+                json!({"ref1": "Missing", "pin1": "1", "ref2": "U2", "pin2": "1"}),
+            ];
+            if include_valid {
+                connections.push(json!({"ref1": "U1", "pin1": "1", "ref2": "U2", "pin2": "1"}));
+            }
+            let result = handle_batch_connect_pins(
+                &json!({"schematic": path, "connections": connections}),
+                &context(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_error, !include_valid, "{result:?}");
+            let response = body(&result);
+            assert_eq!(response["connected_count"], usize::from(include_valid));
+            assert_eq!(response["errors"].as_array().unwrap().len(), 2);
+            if include_valid {
+                let (_, tree) = read_schematic(&path).unwrap();
+                assert!(!extract_wires(&tree).is_empty());
+            } else {
+                assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_reference_pin_batches_refuse_before_any_wire_or_label_is_written() {
+        let source = pins_source().replace("\"U2\"", "\"U1\"");
+        let (_dir, path) = fixture(&source);
+        let connections = handle_batch_connect_pins(&json!({"schematic": path, "connections": [{"ref1": "U1", "pin1": "1", "ref2": "U1", "pin2": "3"}]}), &context()).await.unwrap();
+        assert!(connections.is_error, "{connections:?}");
+        let labels = handle_batch_connect_to_net(&json!({"schematic": path, "net_name": "NEW", "pins": [{"reference": "U1", "pin_number": "1"}]}), &context()).await.unwrap();
+        assert!(labels.is_error, "{labels:?}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn malformed_placement_entries_keep_valid_items_and_report_each_failure() {
+        let source = pins_source();
+        let (_dir, path) = fixture(&source);
+        let result = handle_batch_place_components(
+            &json!({"schematic": path, "components": [
+                {}, {"lib_id": "Test:P", "x": 1},
+                {"lib_id": "Test:P", "reference": "U3", "x": 50.8, "y": 50.8}
+            ]}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+        assert_eq!(response["placed_count"], 1);
+        assert_eq!(response["errors"].as_array().unwrap().len(), 2);
+        let saved = cse::Schematic::load(&path).unwrap();
+        assert!(saved.symbols.by_reference("U3").is_some());
+        assert!(saved.symbols.by_reference("U1").is_some());
+        assert!(saved.symbols.by_reference("U2").is_some());
+    }
+
+    #[tokio::test]
+    async fn structural_delete_reports_bad_selectors_and_never_deletes_protected_header() {
+        let source = pins_source().replacen(
+            "(lib_symbols",
+            "(title_block (title \"Keep\") (uuid \"protected-header\")) (lib_symbols",
+            1,
+        );
+        for options in [
+            json!({"uuids": ["protected-header"]}),
+            json!({"uuids": [5]}),
+            json!({"references": [7]}),
+            json!({"uuids": []}),
+            json!({"uuids": ["missing"]}),
+        ] {
+            let (_dir, path) = fixture(&source);
+            let mut args = options;
+            args["schematic"] = json!(path);
+            let result = handle_batch_delete(&args, &context()).await.unwrap();
+            assert!(result.is_error, "{args}: {result:?}");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        }
+        let (_dir, path) = fixture(&source);
+        let result = handle_batch_delete(&json!({"schematic": path, "references": ["U1"], "uuids": ["11111111-1111-4111-8111-111111111111"]}), &context()).await.unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(body(&result)["deleted_count"], 1);
+        let (_, tree) = read_schematic(&path).unwrap();
+        assert_eq!(extract_symbol_instances(&tree).len(), 1);
+        assert!(std::fs::read_to_string(path).unwrap().contains("Keep"));
+    }
+}
+
+#[cfg(test)]
+mod coverage_bulk_move_source_boundaries {
+    use super::*;
+    use crate::tools::ToolContext;
+    use std::sync::Arc;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    const SOURCE: &str = "(kicad_sch (lib_symbols) (symbol (lib_id \"Test:R\") (at 50.8 63.5 0) (unit 1) (uuid \"11111111-1111-4111-8111-111111111111\") (property \"Reference\" \"R1\" (at 52 58 0)) (property \"Value\" \"10k\" (at 52 62 0))))";
+
+    #[tokio::test]
+    async fn a_zero_move_keeps_field_text_unchanged_and_reports_missing_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        std::fs::write(&path, SOURCE).unwrap();
+        let result = handle_bulk_move(
+            &json!({"schematic": path, "references": ["Missing", 5, "R1"], "dx": 0, "dy": 0}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert!(format!("{result:?}").contains("Missing"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), SOURCE);
+    }
+
+    #[tokio::test]
+    async fn computed_position_overflow_and_nonfinite_saved_rotation_are_no_write_refusals() {
+        for (source, dx) in [
+            (
+                SOURCE.replace("(at 50.8 63.5 0)", "(at 9000000000000 63.5 0)"),
+                9e12,
+            ),
+            (
+                SOURCE.replace("(at 50.8 63.5 0)", "(at 50.8 63.5 NaN)"),
+                1.27,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("design.kicad_sch");
+            std::fs::write(&path, &source).unwrap();
+            let result = handle_bulk_move(
+                &json!({"schematic": path, "references": ["R1"], "dx": dx, "dy": 0}),
+                &context(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{result:?}");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        }
+    }
+}
+
+#[cfg(test)]
+mod coverage_optional_property_move {
+    use super::*;
+    use crate::tools::ToolContext;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn moving_a_symbol_preserves_optional_properties_without_a_text_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        let source = "(kicad_sch (lib_symbols) (symbol (lib_id \"Test:R\") (at 50.8 63.5 0) (unit 1) (uuid \"11111111-1111-4111-8111-111111111111\") (property \"Reference\" \"R1\" (at 52 58 0)) (property \"VendorMetadata\" \"preserve exactly\")))";
+        std::fs::write(&path, source).unwrap();
+        let context = ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_bulk_move(
+            &json!({"schematic": path, "references": ["R1"], "dx": 1.27, "dy": 0}),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(
+            saved.contains("(property \"VendorMetadata\" \"preserve exactly\")"),
+            "{saved}"
+        );
+        let tree = konnect_sexp::parse_sexp(&saved).unwrap();
+        let instance = extract_symbol_instances(&tree)
+            .into_iter()
+            .find(|instance| instance.reference == "R1")
+            .unwrap();
+        assert_eq!(instance.x, 52.07);
+    }
+}

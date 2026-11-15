@@ -42,6 +42,28 @@ real-KiCad tests and platform-specific hosted checks are separate evidence;
 their absence never counts as a local pass. Coverage must be reported with
 its command and measured scope, including unavailable branch instrumentation.
 
+## v0.15.0 PCB fidelity acceptance map
+
+The milestone's implementation and its acceptance tests cover these contracts.
+Version stamping and release remain separate operations.
+
+| Issue | Contract and regression evidence |
+|---|---|
+| #14 | Actual closed-file placement compared with the live handler's captured IPC payload; chamfer geometry, named unsupported-clause refusal before mutation, and stock ESP32/NetTie preservation/refusal (`pcb_components` and `tests/fixtures/placement_fidelity`) |
+| #15 | Root-prefixed/root-relative symbol identity, ambiguous and foreign paths, unchanged footprint identity and fresh readback (`pcb_sync`, `ISSUE_15_SYNC_IDENTITY.md`) |
+| #16 | Copper zones affect only their named nets; rule areas do not count as routed copper; unavailable net evidence remains a refusal (`PCB_ZONE_NETS.md` and shared routing-snapshot tests) |
+| #17 | Shared 4/6/8-layer mirroring, native layer-to-geometry association, mirrored text and chamfer readback, and rollback/uncertain outcomes (`implementation/issue-17-inner-layer-mirroring.md`) |
+| #18 | Decimal-grid nanometre conversion, finite/range guards, and actual saved label/text coordinates without floating-point noise (`COORDINATE_PRECISION.md`, `coordinate_precision_test`) |
+| #25 | Library attributes, all placed symbol units, flag queries, BOM-excluded board placement, and strict final identity/attribute readback (`issue25` tests and `native_assembly_attributes_survive_real_kicad_bom_export`) |
+| #26 | Owned schematic fields versus board-only fields, LCSC update then noop, grouped-footprint refusal before commit, library field presentation, dashed strokes, and reset-text behavior (`pcb_sync`, `pcb_footprint_update`) |
+
+Live-handler tests above use mock IPC and saved-file observations. They do not
+claim native editor execution. The real KiCad workflow must execute the ignored
+CLI acceptance tests at the candidate head, including the native DNP/BOM and
+variant tests; a skipped CLI lookup is not execution evidence. Record the exact
+head, four normal Rust gates, measured line/branch coverage, hosted checks, and
+any remaining host-specific limits in the terminal PR.
+
 ## Measuring Coverage
 
 Workspace line and branch coverage (stable toolchain needs `RUSTC_BOOTSTRAP=1`

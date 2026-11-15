@@ -4084,3 +4084,228 @@ mod suggest_alternatives_tests {
         assert_eq!(body["error"]["field"], "value");
     }
 }
+
+#[cfg(test)]
+mod datasheet_boundary_tests {
+    use super::*;
+
+    fn symbol() -> String {
+        "(symbol (uuid \"symbol-1\") (unit 1) (property \"Reference\" \"R1\") (property \"LCSC\" \"C25804\") (property \"Datasheet\" \"~\"))".into()
+    }
+
+    fn document(symbol: &str) -> String {
+        format!("(kicad_sch (uuid \"root\") {symbol})")
+    }
+
+    #[test]
+    fn enrichment_refuses_missing_and_ambiguous_symbol_identity() {
+        assert!(validated_datasheet_symbols("").is_err());
+        let good = symbol();
+        let targets = validated_datasheet_symbols(&document(&good)).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].reference, "R1");
+        let cases = [
+            good.replace("(property \"LCSC\" \"C25804\")", "(property \"LCSC\" \"\")"),
+            good.replace("(property \"Reference\" \"R1\")", ""),
+            good.replace(
+                "(property \"Reference\" \"R1\")",
+                "(property \"Reference\" \"\")",
+            ),
+            good.replace("(uuid \"symbol-1\")", ""),
+            good.replace("(uuid \"symbol-1\")", "(uuid \" \")"),
+            good.replace("(unit 1)", "(unit 0)"),
+            good.replace("(unit 1)", "(unit invalid)"),
+            good.replace("(unit 1)", "(unit 1) (unit 2)"),
+            good.replace(
+                "(property \"Reference\" \"R1\")",
+                "(property \"Reference\" \"R1\") (property \"Reference\" \"R2\")",
+            ),
+            good.replace(
+                "(property \"LCSC\" \"C25804\")",
+                "(property \"LCSC\" \"C25804\") (property \"LCSC\" \"C1\")",
+            ),
+            good.replace(
+                "(property \"Datasheet\" \"~\")",
+                "(property \"Datasheet\" \"~\") (property \"Datasheet\" \"url\")",
+            ),
+        ];
+        for source in cases {
+            let result = validated_datasheet_symbols(&document(&source));
+            assert!(result.is_err(), "accepted {source}");
+            assert!(result.unwrap_err().into_result().is_error);
+        }
+        let default_unit =
+            validated_datasheet_symbols(&document(&good.replace("(unit 1)", ""))).unwrap();
+        assert_eq!(default_unit[0].unit, 1);
+        let without_lcsc = good.replace("(property \"LCSC\" \"C25804\")", "");
+        assert!(validated_datasheet_symbols(&document(&without_lcsc))
+            .unwrap()
+            .is_empty());
+        let no_datasheet = good.replace("(property \"Datasheet\" \"~\")", "");
+        assert!(
+            validated_datasheet_symbols(&document(&no_datasheet)).unwrap()[0]
+                .datasheet
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn enrichment_rejects_duplicate_uuids_and_reference_units_but_allows_multiple_units() {
+        let first = symbol();
+        let uuid_collision = first.replace("\"R1\"", "\"R2\"");
+        assert!(
+            validated_datasheet_symbols(&document(&format!("{first} {uuid_collision}"))).is_err()
+        );
+        let reference_collision = first.replace("symbol-1", "symbol-2");
+        assert!(
+            validated_datasheet_symbols(&document(&format!("{first} {reference_collision}")))
+                .is_err()
+        );
+        let second_unit = reference_collision.replace("(unit 1)", "(unit 2)");
+        assert_eq!(
+            validated_datasheet_symbols(&document(&format!("{first} {second_unit}")))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(validated_datasheet_symbols(&document(&format!(
+            "{first} (wire (uuid \"symbol-1\"))"
+        )))
+        .is_err());
+    }
+
+    #[test]
+    fn datasheet_readback_requires_the_planned_identity_and_url() {
+        let source = document(&symbol());
+        let target = validated_datasheet_symbols(&source).unwrap().remove(0);
+        let planned = vec![PlannedDatasheetUpdate {
+            target,
+            datasheet_url: "https://example.test/datasheet.pdf".into(),
+        }];
+        let committed = source.replace("\"~\"", "\"https://example.test/datasheet.pdf\"");
+        assert_eq!(
+            observe_datasheet_updates(&committed, &planned).unwrap()[0]["reference"],
+            "R1"
+        );
+        for bad in [
+            source,
+            committed.replace("symbol-1", "symbol-2"),
+            committed.replace("\"R1\"", "\"R2\""),
+            committed.replace("(unit 1)", "(unit 2)"),
+            committed.replace("C25804", "C1"),
+        ] {
+            assert!(observe_datasheet_updates(&bad, &planned).is_err());
+        }
+    }
+
+    #[test]
+    fn enrichment_noop_keeps_author_owned_datasheets_and_missing_targets() {
+        let source = document(&symbol());
+        let urls = HashMap::from([("C25804".into(), "https://example.test/datasheet.pdf".into())]);
+        assert!(plan_datasheet_enrichment(&source, &HashMap::new(), false)
+            .unwrap()
+            .is_none());
+        let existing = source.replace("\"~\"", "\"https://author.test/datasheet\"");
+        assert!(plan_datasheet_enrichment(&existing, &urls, false)
+            .unwrap()
+            .is_none());
+        let missing = source.replace("(property \"Datasheet\" \"~\")", "");
+        assert!(plan_datasheet_enrichment(&missing, &urls, true)
+            .unwrap()
+            .is_none());
+        let equal = source.replace("\"~\"", "\"https://example.test/datasheet.pdf\"");
+        assert!(plan_datasheet_enrichment(&equal, &urls, true)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn catalog_feed_refuses_invalid_chunk_counts_and_missing_required_schema() {
+        for source in [
+            "",
+            "-1",
+            "0",
+            "not a number",
+            "99999999999999999999999999999",
+        ] {
+            assert!(parse_jlcpcb_chunk_count(source).is_err());
+        }
+        assert_eq!(parse_jlcpcb_chunk_count(" 1\n").unwrap(), 1);
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(validate_upstream_schema(&conn).is_err());
+        conn.execute_batch("CREATE TABLE parts (\"LCSC Part\" TEXT);")
+            .unwrap();
+        let error = validate_upstream_schema(&conn).unwrap_err().to_string();
+        assert!(error.contains("Datasheet") && error.contains("Stock"));
+    }
+}
+
+#[cfg(test)]
+mod coverage_local_catalog_boundaries {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::ctx_talking_to;
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("text expected")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn local_catalog_stats_and_existing_download_preserve_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("parts.db");
+        let mut ctx = ctx_talking_to(String::new());
+        ctx.config.jlcpcb_db_path = Some(database.clone());
+        assert_eq!(
+            body(&handle_jlcpcb_stats(&json!({}), &ctx).await.unwrap())["exists"],
+            false
+        );
+        {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection.execute_batch("CREATE TABLE components (LCSC TEXT, MFR_Part TEXT, Datasheet TEXT); INSERT INTO components VALUES ('C1','P1',''),('C2','P2','https://example.test/part.pdf');").unwrap();
+        }
+        let before = std::fs::read(&database).unwrap();
+        let stats = body(&handle_jlcpcb_stats(&json!({}), &ctx).await.unwrap());
+        assert_eq!(stats["exists"], true);
+        assert_eq!(stats["part_count"], 2);
+        let download = handle_download_jlcpcb(&json!({}), &ctx).await.unwrap();
+        assert_eq!(body(&download)["status"], "already_exists");
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+        assert!(datasheet_from_catalog(&json!({}), &ctx, Some("C1"), None)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            datasheet_from_catalog(&json!({}), &ctx, None, Some("P2"))
+                .await
+                .unwrap(),
+            Some("https://example.test/part.pdf".into())
+        );
+        assert!(
+            handle_get_datasheet_url(&json!({}), &ctx)
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert_eq!(std::fs::read(database).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn datasheet_enrichment_without_placed_lcsc_targets_preserves_the_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("board.kicad_sch");
+        let source = "(kicad_sch (version 20250114) (uuid root) (lib_symbols))";
+        std::fs::write(&schematic, source).unwrap();
+        let result = handle_enrich_datasheets(
+            &json!({"schematic":schematic}),
+            &ctx_talking_to(String::new()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(body(&result)["updated"], 0);
+        assert_eq!(std::fs::read_to_string(schematic).unwrap(), source);
+    }
+}

@@ -1990,3 +1990,376 @@ mod erc_response_tests {
         assert_eq!(errors_only["warnings"], 0);
     }
 }
+
+#[cfg(test)]
+mod coverage_export_boundaries {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use std::sync::Arc;
+
+    const DRAWING: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10" viewBox="0 0 20 10"><rect x="2" y="2" width="6" height="6" fill="black"/></svg>"#;
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, ToolContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("design.kicad_sch");
+        std::fs::write(&schematic, crate::tools::blank_schematic_template()).unwrap();
+        let svg = dir.path().join("drawing.svg");
+        std::fs::write(&svg, DRAWING).unwrap();
+        let executable = cli::test_support::write_script(
+            dir.path(),
+            "export-svg",
+            &format!("#!/bin/sh\ncp \"{}\" \"$5/design.svg\"\n", svg.display()),
+            &format!(
+                "@echo off\r\ncopy /Y \"{}\" \"%~5\\design.svg\" >nul\r\n",
+                svg.display()
+            ),
+        );
+        let config = crate::tools::ServerConfig {
+            kicad_cli: executable.to_str().unwrap().to_owned(),
+            ..Default::default()
+        };
+        let context = ToolContext::new(config, Arc::new(crate::router::ToolRouter::new()));
+        (dir, schematic, svg, context)
+    }
+
+    #[tokio::test]
+    async fn rendered_dimensions_and_inline_bytes_come_from_the_written_image() {
+        use base64::Engine as _;
+        let (_dir, schematic, _svg, ctx) = fixture();
+        let output = schematic.with_file_name("images").join("preview.png");
+        let result = handle_render_png(
+            &json!({
+                "schematic": schematic, "width_px": 100, "output": output,
+                "monochrome": true, "inline": true
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let response = body(&result);
+        assert_eq!(response["width_px"], 100);
+        assert_eq!(response["height_px"], 50);
+        assert_eq!(response["monochrome"], true);
+        let bytes = std::fs::read(output).unwrap();
+        assert_eq!(response["png_bytes"], bytes.len());
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(response["png_base64"].as_str().unwrap())
+                .unwrap(),
+            bytes
+        );
+        let default = handle_render_png(&json!({"schematic": schematic, "width_px": 20}), &ctx)
+            .await
+            .unwrap();
+        assert!(!default.is_error, "{default:?}");
+        assert!(schematic.with_extension("png").is_file());
+        assert!(body(&default).get("png_base64").is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_exported_svg_is_not_reported_as_a_render() {
+        let (_dir, schematic, svg, ctx) = fixture();
+        std::fs::write(svg, "not SVG").unwrap();
+        let result = handle_render_png(&json!({"schematic": schematic, "width_px": 20}), &ctx)
+            .await
+            .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert!(!schematic.with_extension("png").exists());
+    }
+
+    #[tokio::test]
+    async fn visual_baseline_reports_equal_drift_and_stale_source_separately() {
+        let (_dir, schematic, svg, ctx) = fixture();
+        let stored = handle_baseline_set(&json!({"schematic": schematic, "width_px": 100}), &ctx)
+            .await
+            .unwrap();
+        assert!(!stored.is_error, "{stored:?}");
+        let (png, metadata) = baseline_paths(&schematic).unwrap();
+        assert_eq!(
+            body(&stored)["png_bytes"],
+            std::fs::metadata(&png).unwrap().len()
+        );
+        let same = handle_baseline_compare(&json!({"schematic": schematic}), &ctx)
+            .await
+            .unwrap();
+        let same = body(&same);
+        assert_eq!(same["status"], "PASS");
+        assert_eq!(same["changed_pixels"], 0);
+        assert_eq!(same["source_changed_since_baseline"], false);
+        assert_eq!(same["warnings"], json!([]));
+        assert!(same.get("current_png_base64").is_none());
+
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&metadata).unwrap()).unwrap();
+        meta["renderer"] = json!("old-renderer");
+        std::fs::write(&metadata, serde_json::to_vec(&meta).unwrap()).unwrap();
+        std::fs::write(
+            &schematic,
+            format!("{}\n", std::fs::read_to_string(&schematic).unwrap()),
+        )
+        .unwrap();
+        std::fs::write(&svg, DRAWING.replace("x=\"2\"", "x=\"11\"")).unwrap();
+        let drift =
+            handle_baseline_compare(&json!({"schematic": schematic, "inline_diff": true}), &ctx)
+                .await
+                .unwrap();
+        let drift = body(&drift);
+        assert_eq!(drift["status"], "DRIFT");
+        assert_eq!(drift["source_changed_since_baseline"], true);
+        assert!(drift["changed_pixels"].as_u64().unwrap() > 0);
+        assert!(drift["changed_bbox_px"].is_object());
+        assert_eq!(drift["warnings"].as_array().unwrap().len(), 1);
+        assert!(drift["current_png_base64"].is_string());
+    }
+
+    #[tokio::test]
+    async fn invalid_baseline_width_and_corrupt_image_never_report_pass() {
+        let (_dir, schematic, _svg, ctx) = fixture();
+        for width in [json!(0), json!(4097), json!(-1), json!(1.5), json!("100")] {
+            let result =
+                handle_baseline_set(&json!({"schematic": schematic, "width_px": width}), &ctx)
+                    .await
+                    .unwrap();
+            assert!(result.is_error, "{width}: {result:?}");
+        }
+        let (png, metadata) = baseline_paths(&schematic).unwrap();
+        std::fs::create_dir_all(png.parent().unwrap()).unwrap();
+        std::fs::write(&png, b"corrupt png").unwrap();
+        for width in [serde_json::Value::Null, json!("100"), json!(4294967296_u64)] {
+            std::fs::write(
+                &metadata,
+                serde_json::to_vec(&json!({"width_px": width})).unwrap(),
+            )
+            .unwrap();
+            let result = handle_baseline_compare(&json!({"schematic": schematic}), &ctx)
+                .await
+                .unwrap();
+            assert!(result.is_error, "{width}: {result:?}");
+        }
+        std::fs::write(
+            &metadata,
+            serde_json::to_vec(&json!({"width_px": 100, "renderer": konnect_render::RENDERER_ID}))
+                .unwrap(),
+        )
+        .unwrap();
+        let result = handle_baseline_compare(&json!({"schematic": schematic}), &ctx)
+            .await
+            .unwrap();
+        assert!(result.is_error, "{result:?}");
+    }
+
+    #[test]
+    fn wire_identity_and_endpoint_shapes_are_never_guessed() {
+        let cases = [
+            "(kicad_sch)",
+            "(kicad_sch (wire (uuid \"w\")))",
+            "(kicad_sch (wire (uuid \"w\") (pts (xy 0 0))))",
+            "(kicad_sch (wire (uuid \"w\") (pts (xy 0 0) (xy 1 1) (xy 2 2))))",
+            "(kicad_sch (wire (uuid \"w\") (pts (xy 0 0) (xy 1 1)) (start 0 0) (end 1 1)))",
+            "(kicad_sch (wire (uuid \"w\") (start 0 0) (start 1 1) (end 2 2)))",
+            "(kicad_sch (wire (uuid \"w\") (pts (xy bad 0) (xy 1 1))))",
+            "(kicad_sch (wire (uuid \"w\") (pts (xy 0) (xy 1 1))))",
+        ];
+        for source in cases {
+            assert!(
+                observed_wire_endpoint(source, "w", WireEndpoint::Start).is_err(),
+                "{source}"
+            );
+        }
+        let source = "(kicad_sch (wire (uuid \"w\") (start 1 2) (end 3 4)))";
+        assert_eq!(
+            observed_wire_endpoint(source, "w", WireEndpoint::Start).unwrap(),
+            (1.0, 2.0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod coverage_export_identity {
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use std::sync::Arc;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn uuidless_netlist_units_keep_their_own_positions_and_net_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        let mut source = String::from(
+            r#"(kicad_sch (lib_symbols (symbol "Test:Two"
+            (symbol "Two_1_1" (pin passive line (at 0 0 0) (length 0) (name "A") (number "1")))
+            (symbol "Two_2_1" (pin passive line (at 0 0 0) (length 0) (name "B") (number "2")))))"#,
+        );
+        for (reference, unit, x, y, net) in [
+            ("R1", 1, 10, 0, "N1"),
+            ("R1", 2, 20, 0, "N2"),
+            ("R1", 1, 30, 0, "N3"),
+            ("R1", 1, 10, 10, "N4"),
+            ("R2", 1, 40, 0, "N5"),
+        ] {
+            source.push_str(&format!("(symbol (lib_id \"Test:Two\") (at {x} {y} 0) (unit {unit}) (property \"Reference\" \"{reference}\")) (label \"{net}\" (at {x} {y} 0))"));
+        }
+        source.push(')');
+        std::fs::write(&path, source).unwrap();
+        let result = handle_export_netlist_summary(&json!({"schematic": path}), &context())
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let result = body(&result);
+        assert_eq!(result["component_count"], 5);
+        for (component, (x, y, pin, net)) in result["components"].as_array().unwrap().iter().zip([
+            (10, 0, "1", "N1"),
+            (20, 0, "2", "N2"),
+            (30, 0, "1", "N3"),
+            (10, 10, "1", "N4"),
+            (40, 0, "1", "N5"),
+        ]) {
+            assert_eq!(component["pin_count"], 1, "{component}");
+            assert_eq!(component["pins"][0]["x"].as_f64(), Some(f64::from(x)));
+            assert_eq!(component["pins"][0]["y"].as_f64(), Some(f64::from(y)));
+            assert_eq!(component["pins"][0]["number"], pin);
+            assert_eq!(component["pins"][0]["net"], net);
+        }
+    }
+
+    #[test]
+    fn erc_without_locations_or_sheet_paths_still_counts_selected_findings() {
+        let report = cli::parse_erc_json(
+            &json!({"kicad_version": "10.0.7", "sheets": [{"violations": [
+                {"severity": "error", "type": "electrical", "description": "error", "items": []},
+                {"severity": "warning", "type": "style", "description": "warning"},
+                {"severity": "info", "type": "note", "description": "info", "items": [{}]}
+            ]}]}),
+        )
+        .unwrap();
+        for (severity, count) in [("error", 1), ("warning", 2), ("info", 3)] {
+            let response = erc_response(&report, severity);
+            assert_eq!(response["total"], count);
+            assert_eq!(response["errors"], 1);
+            assert!(response["violations"][0].get("sheet").is_none());
+            assert!(response["violations"][0].get("x").is_none());
+            assert!(response["violations"][0].get("y").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn connectivity_preview_and_already_connected_tee_do_not_write() {
+        let sources = [
+            ("(kicad_sch (wire (pts (xy 0 0) (xy 10.04 0)) (uuid \"w\")) (label \"N\" (at 10 0 0)))", true, 1),
+            ("(kicad_sch (wire (pts (xy -10 0) (xy 10 0)) (uuid \"rail\")) (wire (pts (xy 0 0) (xy 0 10)) (uuid \"tap\")))", false, 0),
+            ("(kicad_sch (wire (pts (xy 0 0) (xy 10 0)) (uuid \"w\")))", false, 0),
+        ];
+        for (source, dry_run, count) in sources {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("design.kicad_sch");
+            std::fs::write(&path, source).unwrap();
+            let result = handle_fix_connectivity(
+                &json!({"schematic": path, "dry_run": dry_run}),
+                &context(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{result:?}");
+            assert_eq!(body(&result)["fixes_found"], count);
+            assert_eq!(body(&result)["applied"], false);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        }
+    }
+
+    #[tokio::test]
+    async fn reciprocal_wire_snapping_keeps_the_smaller_identity_stationary_in_either_order() {
+        let source = "(kicad_sch (wire (pts (xy 0 0) (xy 10 0)) (uuid \"wire-z\")) (wire (pts (xy 10.04 0) (xy 20 0)) (uuid \"wire-a\")))";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        std::fs::write(&path, source).unwrap();
+        let result = handle_fix_connectivity(&json!({"schematic": path}), &context())
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(body(&result)["fixes_found"], 1);
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            observed_wire_endpoint(&saved, "wire-a", WireEndpoint::Start).unwrap(),
+            (10.04, 0.0)
+        );
+        assert_eq!(
+            observed_wire_endpoint(&saved, "wire-z", WireEndpoint::End).unwrap(),
+            (10.04, 0.0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod coverage_export_generated_files {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn generated_netlist_is_read_from_the_requested_nested_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("design.kicad_sch");
+        let output = dir.path().join("exports").join("design.net");
+        std::fs::write(&schematic, crate::tools::blank_schematic_template()).unwrap();
+        let executable = cli::test_support::write_script(
+            dir.path(),
+            "netlist-writer",
+            "#!/bin/sh\nprintf '(export (version %s))' \"$7\" > \"$5\"\n",
+            "@echo off\r\n> \"%~5\" echo (export (version %~7))\r\nexit /b 0\r\n",
+        );
+        let config = crate::tools::ServerConfig {
+            kicad_cli: executable.to_str().unwrap().into(),
+            ..Default::default()
+        };
+        let context = ToolContext::new(config, Arc::new(crate::router::ToolRouter::new()));
+        let result = handle_generate_netlist(
+            &json!({"schematic": schematic, "output": output, "format": "xml"}),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let generated = parse_sexp(&std::fs::read_to_string(&output).unwrap()).unwrap();
+        assert_eq!(generated.find_str("version"), Some("kicadxml"));
+    }
+
+    #[tokio::test]
+    async fn connectivity_fix_does_not_collapse_a_short_wire_onto_its_own_other_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        let source = "(kicad_sch (wire (pts (xy 0 0) (xy 0.04 0)) (uuid \"11111111-1111-4111-8111-111111111111\")))";
+        std::fs::write(&path, source).unwrap();
+        let context = ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_fix_connectivity(
+            &json!({"schematic": path, "snap_tolerance": 0.05}),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+    }
+}

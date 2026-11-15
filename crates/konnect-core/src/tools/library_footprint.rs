@@ -1290,6 +1290,132 @@ mod issue26_tests {
     }
 
     #[test]
+    fn ownership_size_limits_refuse_without_altering_existing_board_values() {
+        let before = BTreeMap::from([
+            ("BoardOnly".into(), "keep".into()),
+            (SCHEMATIC_FIELDS.into(), " ".repeat(65_537)),
+        ]);
+        let error = schematic_properties(&before, &BTreeMap::new()).unwrap_err();
+        assert!(error.to_string().contains("too large"));
+        assert_eq!(before["BoardOnly"], "keep");
+
+        let desired = BTreeMap::from([("MPN".into(), "x".repeat(65_537))]);
+        assert!(schematic_properties(&BTreeMap::new(), &desired)
+            .unwrap_err()
+            .to_string()
+            .contains("too large"));
+        for name in ["", "Reference", "Value", "Footprint"] {
+            assert!(
+                schematic_properties(
+                    &BTreeMap::new(),
+                    &BTreeMap::from([(name.into(), "x".into())])
+                )
+                .is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn field_readback_refuses_ambiguous_names_and_native_field_collisions() {
+        use kiapi::board::types::{Field, Footprint, FootprintInstance};
+        use prost::Message;
+        let field = |name: &str| Field {
+            name: name.into(),
+            ..Default::default()
+        };
+        let pack =
+            |value: &Field| konnect_ipc::builders::pack_any(value, "kiapi.board.types.Field");
+        assert_eq!(
+            field_values(&FootprintInstance::default()).unwrap(),
+            BTreeMap::new()
+        );
+        for items in [
+            vec![pack(&field(""))],
+            vec![pack(&field("MPN")), pack(&field("MPN"))],
+        ] {
+            let instance = FootprintInstance {
+                definition: Some(Footprint {
+                    items,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(field_values(&instance)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate or unnamed"));
+        }
+        for name in ["Datasheet", "Description"] {
+            let mut instance = FootprintInstance {
+                definition: Some(Footprint {
+                    items: vec![pack(&field(name))],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            if name == "Datasheet" {
+                instance.datasheet_field = Some(field(name));
+            } else {
+                instance.description_field = Some(field(name));
+            }
+            assert!(field_values(&instance)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate footprint property"));
+        }
+        let mut instance = FootprintInstance {
+            definition: Some(Footprint {
+                items: vec![pack(&field("MPN")), pack(&field("MPN"))],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(apply_properties(&mut instance, &BTreeMap::new()).is_err());
+        let mut missing = FootprintInstance::default();
+        assert!(apply_properties(&mut missing, &BTreeMap::new()).is_err());
+        assert_eq!(
+            missing.encode_to_vec(),
+            FootprintInstance::default().encode_to_vec()
+        );
+    }
+
+    #[test]
+    fn new_properties_use_a_hidden_template_without_reusing_native_ids() {
+        use kiapi::board::types::{BoardText, Field, FieldId, Footprint, FootprintInstance};
+        use kiapi::common::types::{Kiid, Text};
+        use prost::Message;
+        let mut instance = FootprintInstance {
+            value_field: Some(Field {
+                id: Some(FieldId { id: 1 }),
+                visible: true,
+                text: Some(BoardText {
+                    id: Some(Kiid {
+                        value: "value-text".into(),
+                    }),
+                    text: Some(Text {
+                        text: "old".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            definition: Some(Footprint::default()),
+            ..Default::default()
+        };
+        let desired = BTreeMap::from([("MPN".into(), "part".into())]);
+        apply_properties(&mut instance, &desired).unwrap();
+        assert_eq!(field_values(&instance).unwrap(), desired);
+        let property =
+            Field::decode(instance.definition.unwrap().items[0].value.as_slice()).unwrap();
+        assert!(!property.visible);
+        assert_eq!(property.id, None);
+        assert_eq!(property.text.unwrap().id, None);
+        assert_eq!(instance.value_field.unwrap().id.unwrap().id, 1);
+    }
+
+    #[test]
     fn corrupt_or_colliding_ownership_is_refused() {
         for record in [
             "invalid",
@@ -1446,6 +1572,47 @@ mod refusal_tests {
 
     const FULL_PROPERTY: &str =
         "(at 1 2) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15)))";
+
+    #[test]
+    fn nonfinite_library_text_cannot_enter_a_typed_footprint() {
+        for at in ["(at NaN 2)", "(at 1 inf)", "(at 1 2 -inf)"] {
+            assert!(
+                property_field(&format!("{at} {GOOD_LAYER} {GOOD_EFFECTS}")).is_err(),
+                "{at}"
+            );
+            assert!(
+                user_text_with(at, GOOD_LAYER, GOOD_EFFECTS, "").is_err(),
+                "{at}"
+            );
+        }
+        for size in ["NaN 1", "1 inf", "0 1", "1 0", "-1 1", "1 -1"] {
+            let effects = format!("(effects (font (size {size})))");
+            assert_refused(
+                property_field(&format!("{GOOD_AT} {GOOD_LAYER} {effects}")),
+                "finite and positive",
+            );
+            assert_refused(
+                user_text_with(GOOD_AT, GOOD_LAYER, &effects, ""),
+                "finite and positive",
+            );
+        }
+        for value in ["NaN", "inf", "0", "-1"] {
+            let effects = format!("(effects (font (size 1 1) (thickness {value})))");
+            assert_refused(
+                property_field(&format!("{GOOD_AT} {GOOD_LAYER} {effects}")),
+                "finite and positive",
+            );
+            assert_refused(
+                user_text_with(GOOD_AT, GOOD_LAYER, &effects, ""),
+                "finite and positive",
+            );
+            let effects = format!("(effects (font (size 1 1) (line_spacing {value})))");
+            assert_refused(
+                property_field(&format!("{GOOD_AT} {GOOD_LAYER} {effects}")),
+                "finite and positive",
+            );
+        }
+    }
 
     #[test]
     fn attributes_read_every_supported_token_into_its_flag() {

@@ -330,3 +330,142 @@ async fn the_decoupling_audit_checks_ics_only_and_flags_an_undecoupled_power_pin
     assert_eq!(findings[0]["component"], "U1");
     assert_eq!(findings[0]["severity"], "error");
 }
+
+#[tokio::test]
+async fn decoupling_audit_excludes_each_passive_and_connector_family() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("families.kicad_sch");
+    for family in [
+        "Device:C_Small",
+        "Device:L_Small",
+        "Device:D_Small",
+        "Connector:Jack_Audio",
+        "Connector:Header_01x01",
+    ] {
+        let source = decoupling_sheet()
+            .replace("Device:R_Small", family)
+            .replace(
+                "R_Small_1_1",
+                &format!("{}_1_1", family.split(':').nth(1).unwrap()),
+            );
+        std::fs::write(&path, source).unwrap();
+        let result = audit_result_json(
+            handle_audit_decoupling_file(&json!({"schematic":path}), &test_ctx())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["total_power_pins"], 1, "{family}");
+        assert_eq!(result["findings"].as_array().unwrap().len(), 1);
+    }
+}
+
+fn reset_pin_sheet(pin_name: &str, label: bool) -> String {
+    let label = if label {
+        "(label \"RESET_NET\" (at 20 20 0))"
+    } else {
+        ""
+    };
+    format!(
+        r#"(kicad_sch (version 20250610) (generator "konnect") (uuid "11111111-1111-4111-8111-111111111111") (paper "A4")
+      (lib_symbols (symbol "Chip:Reset" (symbol "Reset_1_1" (pin input line (at 0 0 0) (length 2.54) (name "{pin_name}") (number "1")))))
+      (symbol (lib_id "Chip:Reset") (at 20 20 0) (unit 1) (uuid "22222222-2222-4222-8222-222222222222") (property "Reference" "U1") (property "Value" "Chip")) {label})"#
+    )
+}
+
+#[tokio::test]
+async fn connection_audit_warns_for_named_reset_inputs_but_not_outputs_or_unnamed_nets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reset.kicad_sch");
+    for (name, label, warnings) in [
+        ("RESET", true, 1),
+        ("NRST", true, 1),
+        ("RST", true, 1),
+        ("RESET_OUT", true, 0),
+        ("RESET", false, 0),
+    ] {
+        std::fs::write(&path, reset_pin_sheet(name, label)).unwrap();
+        let result = audit_result_json(
+            handle_audit_connections_file(&json!({"schematic":path}), &test_ctx())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            result["findings"].as_array().unwrap().len(),
+            warnings,
+            "{name}, label={label}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn power_audit_recognizes_ground_aliases_before_demanding_decoupling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aliases.kicad_sch");
+    for ground in ["GND", "VSS"] {
+        let source = format!(
+            r#"(kicad_sch (version 20250610) (generator "konnect") (uuid "11111111-1111-4111-8111-111111111111") (paper "A4")
+            (label "VCC" (at 20 20 0)) (label "{ground}" (at 20 20 0)))"#
+        );
+        std::fs::write(&path, source).unwrap();
+        let result = audit_result_json(
+            handle_audit_power_rails_file(&json!({"schematic":path}), &test_ctx())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["power_nets"].as_array().unwrap().len(), 1);
+        let errors = result["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["severity"] == "error")
+            .count();
+        assert_eq!(errors, 0, "{ground}");
+    }
+}
+
+#[tokio::test]
+async fn bom_tilde_values_are_missing_and_explicit_mpn_satisfies_ic_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bom-tilde.kicad_sch");
+    let source = reset_pin_sheet("IN",false).replace("(property \"Value\" \"Chip\")","(property \"Value\" \"~\") (property \"Footprint\" \"~\") (property \"MPN\" \"part-number\")");
+    std::fs::write(&path, source).unwrap();
+    let result = audit_result_json(
+        handle_check_bom_health_file(&json!({"schematic":path}), &test_ctx())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["missing_value"], 1);
+    assert_eq!(result["missing_footprint"], 1);
+    assert_eq!(result["missing_mpn"], 0);
+}
+
+#[tokio::test]
+async fn manufacturing_audit_reports_missing_outline_mixed_sides_and_fab_rule_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("manufacturing.kicad_pcb");
+    for fab in ["jlcpcb", "pcbway", "oshpark", "generic"] {
+        std::fs::write(&path,r#"(kicad_pcb (setup (min_trace_width 0.05))
+            (footprint "A" (layer "F.Cu")) (footprint "B" (layer "B.Cu")) (footprint "MissingLayer"))"#).unwrap();
+        let result = audit_result_json(
+            handle_audit_manufacturing(&json!({"board":path,"fab_house":fab}), &test_ctx())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["components"], json!({"front":1,"back":1}));
+        let findings = result["findings"].as_array().unwrap();
+        assert!(findings.iter().any(|finding| finding["issue"]
+            .as_str()
+            .unwrap()
+            .contains("No board outline")));
+        assert!(findings.iter().any(|finding| finding["issue"]
+            .as_str()
+            .unwrap()
+            .contains("Minimum trace width")));
+        assert!(findings.iter().any(|finding| finding["severity"] == "info"));
+    }
+}

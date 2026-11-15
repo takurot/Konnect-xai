@@ -188,3 +188,27 @@ mod tests {
         assert!(resolution.selected_path().expect("selected").is_absolute());
     }
 }
+
+#[cfg(test)]
+mod resolution_provenance_tests {
+    use super::*;
+
+    #[test]
+    fn absent_absolute_paths_are_retained_and_later_files_do_not_change_recorded_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let selected = dir.path().join("selected.toml");
+        let skipped = dir.path().join("shadowed.toml");
+        let explicit = ConfigResolution::explicit_path(&selected);
+        assert_eq!(explicit.selected_path(), Some(selected.as_path()));
+        std::fs::write(&selected, "private setting values").unwrap();
+        std::fs::write(&skipped, "other private values").unwrap();
+        let resolution = ConfigResolution::search_path(&selected, std::slice::from_ref(&skipped));
+        let captured = resolution.selected_path().unwrap().to_path_buf();
+        let shadowed = resolution.skipped_existing_paths().to_vec();
+        std::fs::remove_file(&selected).unwrap();
+        std::fs::write(&skipped, "changed after startup").unwrap();
+        assert_eq!(resolution.source(), ConfigSource::SearchPath);
+        assert_eq!(resolution.selected_path(), Some(captured.as_path()));
+        assert_eq!(resolution.skipped_existing_paths(), shadowed);
+    }
+}

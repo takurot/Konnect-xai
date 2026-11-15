@@ -3386,6 +3386,192 @@ mod chunk_tests {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn fidelity_boundary_sync_preflight_never_starts_an_unreviewed_or_missing_design() {
+        let served = ServedSync::new().await;
+        let before = std::fs::read(&served.board).unwrap();
+        let (error, body) = served
+            .call(serde_json::json!({
+                "schematic": served.schematic, "board": served.board, "dry_run": false
+            }))
+            .await;
+        assert!(error);
+        assert!(body.to_string().contains("expected_plan_revision"));
+        for (schematic, board, missing) in [
+            (
+                served._temp.path().join("missing.kicad_sch"),
+                served.board.clone(),
+                "missing.kicad_sch",
+            ),
+            (
+                served.schematic.clone(),
+                served._temp.path().join("missing.kicad_pcb"),
+                "missing.kicad_pcb",
+            ),
+        ] {
+            let (error, body) = served
+                .call(serde_json::json!({"schematic": schematic, "board": board}))
+                .await;
+            assert!(error);
+            assert!(body.to_string().contains(missing), "{body}");
+        }
+        assert!(!served.exported.exists());
+        let (error, body) = served
+            .call(serde_json::json!({
+                "schematic": served.schematic, "board": served.board
+            }))
+            .await;
+        assert!(error);
+        assert!(body.to_string().contains("netlist export failed"), "{body}");
+        assert_eq!(served.begins.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(served.sent_footprints().is_empty());
+        assert_eq!(std::fs::read(&served.board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn fidelity_boundary_exported_field_grammar_and_repeated_pad_nets_refuse_before_commit() {
+        let served = ServedSync::new().await;
+        let before = std::fs::read(&served.board).unwrap();
+        for (field, diagnostic) in [
+            (r#"(field (name "") "value")"#, "empty schematic field"),
+            (
+                r#"(field (name "Konnect:schematic_fields") "value")"#,
+                "reserved",
+            ),
+            (
+                r#"(field "wrong-order" (name "LCSC"))"#,
+                "malformed schematic field",
+            ),
+            (
+                r#"(field (name "LCSC" "extra") "value")"#,
+                "malformed schematic field",
+            ),
+            (
+                r#"(field (name "LCSC") "value" "extra")"#,
+                "malformed schematic field",
+            ),
+            (r#"(field "unnamed")"#, "no name"),
+            (r#"(field (name "LCSC") (value "nested"))"#, "invalid value"),
+        ] {
+            let netlist = exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]).replace(
+                "(value \"part\")",
+                &format!("(value \"part\") (fields {field})"),
+            );
+            let (error, body) = served.dry_run_result(&netlist).await;
+            assert!(error, "{field}: {body}");
+            assert!(body.to_string().contains(diagnostic), "{field}: {body}");
+        }
+        let netlist = exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]).replace(
+            "(nets\n",
+            "(nets\n (net (code 99) (name \"OTHER\") (node (ref \"C1\") (pin \"1\")))\n",
+        );
+        let (error, body) = served.dry_run_result(&netlist).await;
+        assert!(error);
+        assert!(
+            body.to_string().contains("appears in more than one net"),
+            "{body}"
+        );
+        assert_eq!(served.begins.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(served.sent_footprints().is_empty());
+        assert_eq!(std::fs::read(&served.board).unwrap(), before);
+    }
+
+    #[test]
+    fn fidelity_boundary_empty_exported_field_and_unwired_component_keep_their_meaning() {
+        let source = ONE_RESISTOR.replace(
+            "(value \"10k\")",
+            "(value \"10k\") (fields (field (name \"LCSC\")))",
+        );
+        let design = parse_exported_netlist(&source).unwrap();
+        assert_eq!(design.components[0].properties["LCSC"], "");
+        let source = exported_netlist(&[("C1", STOCK_0603, &[])]);
+        let nets_start = source.find("  (nets").unwrap();
+        let source = format!("{})", &source[..nets_start]);
+        let design = parse_exported_netlist(&source).unwrap();
+        assert_eq!(design.components.len(), 1);
+        assert!(design.components[0].pad_nets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fidelity_boundary_duplicate_live_kiids_are_not_a_syncable_snapshot() {
+        let served = ServedSync::new().await;
+        let before = std::fs::read(&served.board).unwrap();
+        let one = board_only_instance("same-kiid", "LOGO1");
+        let two = board_only_instance("same-kiid", "LOGO2");
+        *served.created.lock().unwrap() = vec![
+            konnect_ipc::builders::pack_any(&one, "kiapi.board.types.FootprintInstance"),
+            konnect_ipc::builders::pack_any(&two, "kiapi.board.types.FootprintInstance"),
+        ];
+        let (error, body) = served
+            .dry_run_result(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+        assert!(error);
+        assert!(
+            body.to_string().contains("duplicate footprint KIID"),
+            "{body}"
+        );
+        assert_eq!(served.begins.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&served.board).unwrap(), before);
+    }
+
+    #[test]
+    fn fidelity_boundary_readback_rejects_invented_pads_and_reports_missing_geometry() {
+        use konnect_ipc::gen::kiapi;
+        let sent = footprint_with_artwork("U1");
+        let expected = footprint_shapes(std::iter::once(&sent));
+        let native = BTreeMap::from([(
+            "U1".to_string(),
+            NativeAssemblyExpectation {
+                kiid: Some("u1-kiid".into()),
+                dnp: false,
+                assembly: AssemblyAttributes::default(),
+            },
+        )]);
+        let mut added =
+            kiapi::board::types::FootprintInstance::decode(sent.value.as_slice()).unwrap();
+        let definition = added.definition.as_mut().unwrap();
+        let extra = definition
+            .items
+            .iter()
+            .find(|child| konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad"))
+            .unwrap()
+            .clone();
+        let mut extra = kiapi::board::types::Pad::decode(extra.value.as_slice()).unwrap();
+        extra.id = Some(kiapi::common::types::Kiid {
+            value: "extra-pad-readback".into(),
+        });
+        extra.number = "99".into();
+        definition.items.push(konnect_ipc::builders::pack_any(
+            &extra,
+            "kiapi.board.types.Pad",
+        ));
+        let item = konnect_ipc::builders::pack_any(&added, "kiapi.board.types.FootprintInstance");
+        let error = verify_board_matches_what_was_sent(&[item], &expected, &native).unwrap_err();
+        assert!(error.to_string().contains("gained pads"));
+        for remove_type in [
+            "kiapi.board.types.Pad",
+            "kiapi.board.types.BoardGraphicShape",
+        ] {
+            let mut changed =
+                kiapi::board::types::FootprintInstance::decode(sent.value.as_slice()).unwrap();
+            changed
+                .definition
+                .as_mut()
+                .unwrap()
+                .items
+                .retain(|child| !konnect_ipc::builders::any_is(child, remove_type));
+            let item =
+                konnect_ipc::builders::pack_any(&changed, "kiapi.board.types.FootprintInstance");
+            let diagnostics =
+                verify_board_matches_what_was_sent(&[item], &expected, &native).unwrap();
+            assert_eq!(diagnostics.len(), 1);
+            assert!(
+                diagnostics[0].contains("U1: sent 1 pads and 6 drawings"),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
     #[test]
     fn issue26_malformed_duplicate_and_reserved_fields_refuse() {
         for fields in [
@@ -3530,6 +3716,121 @@ mod tests {
             "BOM exclusion is independent from board membership"
         );
         assert!(design.components[0].dnp);
+    }
+
+    #[test]
+    fn inconsistent_native_flags_across_units_refuse_without_changing_the_design() {
+        for attribute in ["in_bom", "on_board", "dnp", "in_pos_files"] {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("units.kicad_sch");
+            std::fs::write(
+                &file,
+                format!(
+                    r#"(kicad_sch (uuid "sheet-uuid")
+                (symbol (uuid "symbol-uuid") ({attribute} yes)
+                    (instances (project "units" (path "/" (reference "R1") (unit 1)))))
+                (symbol (uuid "second-unit") ({attribute} no)
+                    (instances (project "units" (path "/" (reference "R1") (unit 2))))))"#
+                ),
+            )
+            .unwrap();
+            let mut design = parse_exported_netlist(ONE_RESISTOR).unwrap();
+            let before = design.clone();
+            let error = apply_saved_symbol_flags(&[file], &mut design).unwrap_err();
+            assert!(
+                error.to_string().contains("multi-unit reference R1"),
+                "{error}"
+            );
+            assert_eq!(
+                design, before,
+                "{attribute} inconsistency changed the plan input"
+            );
+        }
+    }
+
+    #[test]
+    fn native_flags_ignore_incomplete_and_foreign_instances_and_default_omitted_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("defaults.kicad_sch");
+        std::fs::write(
+            &file,
+            r#"(kicad_sch (uuid "sheet-uuid")
+            (symbol (in_bom no))
+            (symbol (uuid "without-reference") (on_board no)
+                (instances (project "defaults" (path "/" (unit 1)))))
+            (symbol (uuid "symbol-uuid") (on_board no)
+                (instances (project "foreign" (path "/other-root" (reference "R1") (unit 1)))))
+            (symbol (uuid "symbol-uuid")
+                (instances (project "defaults" (path "/" (reference "R1") (unit 1))))))"#,
+        )
+        .unwrap();
+        let mut design = parse_exported_netlist(ONE_RESISTOR).unwrap();
+        apply_saved_symbol_flags(&[file], &mut design).unwrap();
+        assert_eq!(design.components.len(), 1);
+        assert!(!design.components[0].dnp);
+        assert_eq!(design.components[0].assembly, AssemblyAttributes::default());
+        assert!(design.skipped.is_empty());
+    }
+
+    #[test]
+    fn off_board_unassigned_parts_are_reported_once_and_unmatched_parts_remain() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("unassigned.kicad_sch");
+        let mut design = parse_exported_netlist(UNASSIGNED).unwrap();
+        let path = design.unassigned[0].symbol_path.clone();
+        let (_, uuid) = path.rsplit_once('/').unwrap();
+        let source = format!(
+            r#"(kicad_sch (uuid "root")
+            (symbol (uuid "{uuid}") (on_board no)
+                (instances (project "unassigned"
+                    (path "/root" (reference "R1") (unit 1))
+                    (path "/root" (reference "R1") (unit 2))))))"#
+        );
+        std::fs::write(&file, source).unwrap();
+        apply_saved_symbol_flags(std::slice::from_ref(&file), &mut design).unwrap();
+        assert!(design.unassigned.is_empty());
+        assert_eq!(design.components.len(), 2);
+        assert_eq!(design.skipped.len(), 1);
+        assert_eq!(design.skipped[0].reference, "R1");
+
+        std::fs::write(&file, "(kicad_sch (uuid root))").unwrap();
+        let mut unmatched = parse_exported_netlist(UNASSIGNED).unwrap();
+        apply_saved_symbol_flags(&[file], &mut unmatched).unwrap();
+        assert_eq!(unmatched.unassigned.len(), 1);
+        assert_eq!(unmatched.components.len(), 2);
+    }
+
+    #[test]
+    fn saved_hierarchy_refuses_cycles_missing_children_and_editor_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root.kicad_sch");
+        let sheet = |name: &str| {
+            format!(
+                r#"(kicad_sch (uuid root)
+            (sheet (at 0 0) (size 10 10) (uuid child)
+                (property "Sheetname" "Child" (at 0 0 0))
+                (property "Sheetfile" "{name}" (at 0 0 0))))"#
+            )
+        };
+        std::fs::write(&root, sheet("absent.kicad_sch")).unwrap();
+        assert!(saved_hierarchy_files(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("does not exist"));
+        std::fs::write(&root, sheet("root.kicad_sch")).unwrap();
+        assert!(saved_hierarchy_files(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("cycle"));
+        assert!(SchematicIdentity::load(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("cycle"));
+        std::fs::write(dir.path().join("~root.kicad_sch.lck"), "editor").unwrap();
+        assert!(saved_hierarchy_files(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("open in the schematic editor"));
     }
 
     #[test]
@@ -6830,6 +7131,49 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_stale_reviewed_plan_is_refused_before_any_commit() {
+        let sync = ServedSync::new().await;
+        let netlist = exported_netlist(&[("R1", STOCK_0603, &["1", "2"])]);
+        let plan = sync.dry_run(&netlist).await;
+        assert_eq!(plan["status"], "ready");
+        let (_, result) = sync
+            .call(serde_json::json!({
+                "schematic": sync.schematic, "board": sync.board,
+                "dry_run": false, "expected_plan_revision": "obsolete-revision"
+            }))
+            .await;
+        assert_eq!(result["status"], "conflict", "{result}");
+        assert!(result["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "stale_plan_revision"));
+        assert_eq!(sync.begins.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(sync.sent_footprints().is_empty());
+    }
+
+    #[tokio::test]
+    async fn applying_an_already_synchronized_plan_is_a_noop_without_another_commit() {
+        let sync = ServedSync::new().await;
+        let netlist = exported_netlist(&[("R1", STOCK_0603, &["1", "2"])]);
+        assert_eq!(sync.apply(&netlist).await["status"], "applied");
+        let before = sync.begins.load(std::sync::atomic::Ordering::SeqCst);
+        let plan = sync.dry_run(&netlist).await;
+        assert_eq!(plan["status"], "noop", "{plan}");
+        let (_, result) = sync
+            .call(serde_json::json!({
+                "schematic": sync.schematic, "board": sync.board,
+                "dry_run": false, "expected_plan_revision": plan["plan_revision"]
+            }))
+            .await;
+        assert_eq!(result["status"], "noop", "{result}");
+        assert_eq!(
+            sync.begins.load(std::sync::atomic::Ordering::SeqCst),
+            before
+        );
+    }
+
     /// A created item as the mock's board lists it back.
     fn read_back(item: &prost_types::Any, readback: Readback) -> prost_types::Any {
         match readback {
@@ -7564,5 +7908,100 @@ mod tests {
             .unwrap_err()
             .1
             .contains("drill"));
+    }
+}
+
+#[cfg(test)]
+pub(super) mod routing_snapshot_contract_tests {
+    use super::*;
+    use kiapi::common::types::KiCadObjectType as ObjectType;
+    use konnect_ipc::builders::pack_any;
+    use konnect_ipc::gen::kiapi;
+
+    pub(crate) fn server(board: &Path) -> crate::test_support::MockIpcServer {
+        super::super::pcb_board::board_mock::spawn_kicad_holding_board(board, |command| {
+            if command.type_url.ends_with("GetItems") {
+                let request =
+                    kiapi::common::commands::GetItems::decode(command.value.as_slice()).unwrap();
+                let kind = request.types.first().copied().unwrap_or_default();
+                let mut items = Vec::new();
+                for (index, net) in [Some("GND"), Some(""), None].into_iter().enumerate() {
+                    let net = net.map(|name| kiapi::board::types::Net {
+                        name: name.into(),
+                        code: Some(kiapi::board::types::NetCode { value: 1 }),
+                    });
+                    let id = Some(kiapi::common::types::Kiid {
+                        value: format!("route-{kind}-{index}"),
+                    });
+                    let item = match kind {
+                        value if value == ObjectType::KotPcbTrace as i32 => pack_any(
+                            &kiapi::board::types::Track {
+                                id,
+                                net,
+                                ..Default::default()
+                            },
+                            "kiapi.board.types.Track",
+                        ),
+                        value if value == ObjectType::KotPcbArc as i32 => pack_any(
+                            &kiapi::board::types::Arc {
+                                id,
+                                net,
+                                ..Default::default()
+                            },
+                            "kiapi.board.types.Arc",
+                        ),
+                        value if value == ObjectType::KotPcbVia as i32 => pack_any(
+                            &kiapi::board::types::Via {
+                                id,
+                                net,
+                                ..Default::default()
+                            },
+                            "kiapi.board.types.Via",
+                        ),
+                        _ => continue,
+                    };
+                    items.push(item);
+                }
+                return Some(pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items,
+                        ..Default::default()
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if command.type_url.ends_with("GetNets") {
+                return Some(pack_any(
+                    &kiapi::board::commands::NetsResponse {
+                        nets: vec![kiapi::board::types::Net {
+                            name: "GND".into(),
+                            code: Some(kiapi::board::types::NetCode { value: 1 }),
+                        }],
+                    },
+                    "kiapi.board.commands.NetsResponse",
+                ));
+            }
+            if command.type_url.ends_with("GetBoundingBox") {
+                return Some(super::super::pcb_board::board_mock::kicad_bounding_boxes(
+                    command,
+                    |_| (0.0, 0.0, 1.0, 1.0),
+                ));
+            }
+            None
+        })
+    }
+
+    #[test]
+    fn sync_counts_each_named_track_arc_and_via_but_not_unconnected_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("routing.kicad_pcb");
+        let server = server(&board);
+        let client = konnect_ipc::KiCadIpcClient::new(server.address().to_string());
+        let snapshot = snapshot_board(&client, &board).unwrap();
+        assert_eq!(
+            snapshot.state.routed_nets,
+            BTreeMap::from([("GND".into(), 3)])
+        );
     }
 }

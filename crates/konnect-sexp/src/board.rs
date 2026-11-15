@@ -2242,3 +2242,111 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod malformed_geometry_contract_tests {
+    use super::*;
+    use crate::parse_sexp;
+
+    #[test]
+    fn copper_scans_count_invalid_dimensions_instead_of_fabricating_items() {
+        for width in ["0", "-0.1", "NaN", "inf"] {
+            let board = parse_sexp(&format!(
+                "(kicad_pcb (segment (start 1 2) (end 3 4) (width {width}) (layer \"F.Cu\")))"
+            ))
+            .unwrap();
+            let scan = tracks(&board);
+            assert_eq!((scan.items.len(), scan.skipped), (0, 1), "{width}");
+        }
+        for (size, drill) in [
+            ("0", "0.3"),
+            ("-1", "0.3"),
+            ("NaN", "0.3"),
+            ("1", "0"),
+            ("1", "-0.3"),
+            ("1", "NaN"),
+        ] {
+            let board = parse_sexp(&format!("(kicad_pcb (via (at 1 2) (size {size}) (drill {drill}) (layers \"F.Cu\" \"B.Cu\")))")).unwrap();
+            let scan = vias(&board);
+            assert_eq!((scan.items.len(), scan.skipped), (0, 1));
+        }
+        let board = parse_sexp("(kicad_pcb (via (at 1 2) (size 1) (drill 0.3) (layers)))").unwrap();
+        assert_eq!(vias(&board).skipped, 1);
+    }
+
+    #[test]
+    fn zone_scans_refuse_empty_layers_and_non_enclosing_or_nonfinite_polygons() {
+        for zone in [
+            "(zone (layers) (polygon (pts (xy 0 0) (xy 1 0) (xy 0 1))))",
+            "(zone (layer \"F.Cu\") (polygon (pts (xy 0 0) (xy 1 0))))",
+            "(zone (layer \"F.Cu\") (polygon (pts (xy 0 0) (xy NaN 0) (xy 0 1))))",
+            "(zone (layer \"F.Cu\") (polygon (pts (xy 0 inf) (xy 1 0) (xy 0 1))))",
+        ] {
+            let board = parse_sexp(&format!("(kicad_pcb {zone})")).unwrap();
+            assert_eq!(zones(&board).skipped, 1, "{zone}");
+            assert_eq!(lossless_zone_outlines(&board).skipped, 1, "{zone}");
+        }
+    }
+
+    #[test]
+    fn lossless_zone_scanner_never_accepts_unknown_or_duplicate_arc_geometry() {
+        for elements in [
+            "(arc (start 0 0) (start 1 0) (end 2 0))",
+            "(arc (start 0 0 extra) (mid 1 1) (end 2 0))",
+            "(arc (start 0 0) (mid 1 1) (end 2 NaN))",
+            "(arc (start 0 0) (mid 1 1) (end 2 0) (future 1))",
+            "(xy 0 0) (xy 1 0) (future 0 1)",
+        ] {
+            let board = parse_sexp(&format!(
+                "(kicad_pcb (zone (layer \"F.Cu\") (polygon (pts {elements}))))"
+            ))
+            .unwrap();
+            let scan = lossless_zone_outlines(&board);
+            assert_eq!((scan.items.len(), scan.skipped), (0, 1), "{elements}");
+        }
+        let board = parse_sexp("(kicad_pcb (zone (layer \"F.Cu\") (polygon (pts (arc (start 0 0) (mid 1 1) (end 2 0))))))").unwrap();
+        assert_eq!(lossless_zone_outlines(&board).items[0].elements.len(), 1);
+    }
+
+    #[test]
+    fn malformed_courtyard_or_pad_geometry_invalidates_the_whole_footprint() {
+        for child in [
+            "(pad \"1\" smd rect (at 0 0) (size NaN 1))",
+            "(pad \"1\" smd rect (at 0 0) (size 1 NaN))",
+            "(pad \"1\" smd rect (at 0 0) (size 0 1))",
+            "(pad \"1\" smd rect (at 0 0) (size 1 -1))",
+            "(fp_poly (pts (xy 0 0) (xy NaN 1)) (layer \"F.CrtYd\"))",
+            "(fp_poly (pts (xy 0 0) (xy 1 NaN)) (layer \"F.CrtYd\"))",
+        ] {
+            let board = parse_sexp(&format!(
+                "(kicad_pcb (footprint \"F\" (at 1 2) (layer \"F.Cu\") {child}))"
+            ))
+            .unwrap();
+            let scan = footprint_courtyards(&board);
+            assert_eq!((scan.items.len(), scan.skipped), (0, 1), "{child}");
+        }
+        for at in ["NaN 1 0", "1 NaN 0", "1 2 NaN"] {
+            let board = parse_sexp(&format!(
+                "(kicad_pcb (footprint \"F\" (at {at}) (layer \"F.Cu\")))"
+            ))
+            .unwrap();
+            assert_eq!(footprint_courtyards(&board).skipped, 1);
+        }
+    }
+
+    #[test]
+    fn legacy_reference_and_lock_flags_survive_courtyard_observation() {
+        let board = parse_sexp("(kicad_pcb (footprint \"F\" locked (at 3 4) (layer \"B.Cu\") (fp_text user \"note\") (fp_text reference \"R7\")))").unwrap();
+        let scan = footprint_courtyards(&board);
+        assert_eq!(scan.skipped, 0);
+        assert_eq!(scan.items[0].reference.as_deref(), Some("R7"));
+        assert!(scan.items[0].locked);
+        for lock in ["(locked no)", "(locked)"] {
+            let board = parse_sexp(&format!(
+                "(kicad_pcb (footprint \"F\" {lock} (at 3 4) (layer \"F.Cu\")))"
+            ))
+            .unwrap();
+            assert!(!footprint_courtyards(&board).items[0].locked);
+        }
+    }
+}

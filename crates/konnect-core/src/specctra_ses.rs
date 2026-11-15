@@ -1014,4 +1014,463 @@ mod tests {
             .to_string();
         assert!(error.contains("exactly one path or qarc"), "{error}");
     }
+
+    #[test]
+    fn session_refusal_matrix_never_changes_the_bound_board() {
+        let (_dir, board, source, manifest) = fixture();
+        for (from, to, expected) in [
+            ("(session board", "(pcb board", "expected (session"),
+            (
+                "(was_is)",
+                "(was_is (rename old new))",
+                "unsupported SES field",
+            ),
+            ("(was_is)", "(was_is) (was_is)", "exactly one 'was_is'"),
+            ("(was_is)", "", "exactly one 'was_is'"),
+            ("(was_is)", "(was_is) stray", "unexpected SES value"),
+            ("(was_is)", "(was_is) ()", "empty list"),
+            (
+                "(resolution um 10)",
+                "(resolution mm 10)",
+                "resolution unit",
+            ),
+            (
+                "(resolution um 10)",
+                "(resolution um 0)",
+                "positive integer",
+            ),
+            (
+                "(resolution um 10)",
+                "(resolution um 1.5)",
+                "positive integer",
+            ),
+            ("(resolution um 10)", "(resolution um NaN)", "not finite"),
+            (
+                "(resolution um 10)",
+                "(resolution um invalid)",
+                "not a number",
+            ),
+            ("(resolution um 10)", "(resolution um)", "expects 2 direct"),
+            (
+                "(place R1 1000000 -500000 front 0)",
+                "(place R3 1000000 -500000 front 0)",
+                "unknown component",
+            ),
+            (
+                "(place R1 1000000 -500000 front 0)",
+                "(place R1 1000000 -500010 front 0)",
+                "changes placement",
+            ),
+            (
+                "(place R1 1000000 -500000 front 0)",
+                "(place R1 1000000 -500000 back 0)",
+                "changes placement",
+            ),
+            (
+                "(place R1 1000000 -500000 front 0)",
+                "(place R1 1000000 -500000 front 90)",
+                "changes placement",
+            ),
+            (
+                "(place R1 1000000 -500000 front 0)",
+                "(place R1 1000000.5 -500000 front 0)",
+                "whole micrometre",
+            ),
+            (
+                "(place R1 1000000 -500000 front 0)",
+                "(place R1 1e20 -500000 front 0)",
+                "coordinate range",
+            ),
+            ("(place R1 1000000 -500000 front 0)", "", "omits component"),
+            (
+                "(place R1 1000000 -500000 front 0)",
+                "(place R1 1000000 -500000 front 0) (place R1 1000000 -500000 front 0)",
+                "repeats component",
+            ),
+            (
+                "(component konnect_image_R1",
+                "(component wrong_image",
+                "image for 'R1' changed",
+            ),
+            ("(net GND\n", "(net UNKNOWN\n", "unknown net"),
+            ("(path F.Cu 2500", "(path Unknown 2500", "unknown layer"),
+            ("(path F.Cu 2500", "(path F.Cu 0", "must be positive"),
+            ("(path F.Cu 2500", "(path F.Cu NaN", "not finite"),
+            (
+                "995000 -500000 1050000 -500000 1050000 -510000",
+                "995000 -500000 995000 -500000",
+                "zero-length segment",
+            ),
+            (
+                "995000 -500000 1050000 -500000 1050000 -510000",
+                "995000 -500000 1050000",
+                "complete point pairs",
+            ),
+            (
+                "995000 -500000 1050000 -500000 1050000 -510000",
+                "995000 -500000",
+                "complete point pairs",
+            ),
+            (
+                "995000 -500000 1050000 -500000 1050000 -510000",
+                "995000 -500000 (nested 1 2) -500000",
+                "nested SES route",
+            ),
+            (
+                "995000 -500000 1050000 -500000 1050000 -510000",
+                "995000 -500000 1e20 -500000",
+                "coordinate range",
+            ),
+            (
+                "(wire (path F.Cu 2500 995000 -500000 1050000 -500000 1050000 -510000))",
+                "(wire)",
+                "exactly one path or qarc",
+            ),
+            (
+                "(via konnect_via_0001 1050000 -510000 (net GND) (type protect))",
+                "(via missing 1050000 -510000)",
+                "unknown padstack",
+            ),
+            ("(type protect)", "(type route)", "unsupported type"),
+            (
+                "(type protect)",
+                "(type protect) (type protect)",
+                "repeats 'type'",
+            ),
+            ("(attach off)", "(attach on)", "unsupported attach mode"),
+            (
+                "(circle F.Cu 6000 0 0)",
+                "(circle Missing 6000 0 0)",
+                "unexpected layer",
+            ),
+            (
+                "(circle F.Cu 6000 0 0)",
+                "(circle F.Cu 6010 0 0)",
+                "geometry differs",
+            ),
+            (
+                "(circle F.Cu 6000 0 0)",
+                "(circle F.Cu 6000 10 0)",
+                "geometry differs",
+            ),
+            (
+                "(circle F.Cu 6000 0 0)",
+                "(circle F.Cu 6000 0 10)",
+                "geometry differs",
+            ),
+            (
+                "(shape (circle B.Cu 6000 0 0))",
+                "",
+                "every expected copper layer",
+            ),
+            (
+                "(shape (circle B.Cu 6000 0 0))",
+                "(shape (circle F.Cu 6000 0 0))",
+                "repeats layer",
+            ),
+            (
+                "(padstack konnect_via_0001",
+                "(padstack unknown",
+                "unknown via padstack",
+            ),
+        ] {
+            let ses = sample_ses().replacen(from, to, 1);
+            assert_ne!(ses, sample_ses(), "ineffective fixture mutation {from}");
+            let error = format!(
+                "{:#}",
+                parse_import_plan(&board, &source, &manifest, &ses).unwrap_err()
+            );
+            assert!(error.contains(expected), "{from} -> {to}: {error}");
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn duplicated_route_primitives_are_refused_in_both_directions() {
+        let (_dir, board, source, manifest) = fixture();
+        for (primitive, expected) in [
+            (
+                "(wire (path F.Cu 2500 995000 -500000 1050000 -500000))",
+                "repeats a route segment",
+            ),
+            (
+                "(wire (path F.Cu 2500 1050000 -500000 995000 -500000))",
+                "repeats a route segment",
+            ),
+            ("(via konnect_via_0001 1050000 -510000)", "repeats a via"),
+        ] {
+            let ses = sample_ses().replace("(net GND\n", &format!("(net GND\n {primitive}\n"));
+            let error = parse_import_plan(&board, &source, &manifest, &ses).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+        let arc = "(wire (qarc F.Cu 2500 995000 -500000 1000000 -495000 1000000 -500000))";
+        let ses = sample_ses().replace("(net GND\n", &format!("(net GND\n {arc} {arc}\n"));
+        let error = parse_import_plan(&board, &source, &manifest, &ses).unwrap_err();
+        assert!(error.to_string().contains("repeats an arc"), "{error:#}");
+    }
+
+    #[test]
+    fn malformed_quarter_arcs_do_not_produce_an_approximate_plan() {
+        let (_dir, board, source, manifest) = fixture();
+        for (geometry, expected) in [
+            ("F.Cu 2500 0 0 100 100", "must contain layer"),
+            (
+                "Unknown 2500 995000 -500000 1000000 -495000 1000000 -500000",
+                "unknown layer",
+            ),
+            (
+                "F.Cu 2500 1000000 -500000 1000000 -495000 1000000 -500000",
+                "quarter-circle",
+            ),
+            (
+                "F.Cu 2500 995000 -500000 1000000 -490000 1000000 -500000",
+                "quarter-circle",
+            ),
+            (
+                "F.Cu 2500 995000 -500000 1005000 -500000 1000000 -500000",
+                "quarter-circle",
+            ),
+            (
+                "F.Cu 0 995000 -500000 1000000 -495000 1000000 -500000",
+                "must be positive",
+            ),
+        ] {
+            let ses = sample_ses().replace(
+                "(net GND\n",
+                &format!("(net GND\n (wire (qarc {geometry}))\n"),
+            );
+            let error = format!(
+                "{:#}",
+                parse_import_plan(&board, &source, &manifest, &ses).unwrap_err()
+            );
+            assert!(error.contains(expected), "{geometry}: {error}");
+        }
+    }
+
+    #[test]
+    fn manifest_refusal_matrix_preserves_identity_and_profile_contracts() {
+        use serde_json::json;
+        let (_dir, board, source, manifest) = fixture();
+        let original: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        let via_index = original["padstacks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|item| item["purpose"] == "via")
+            .unwrap();
+        let mut changes = vec![
+            ("/schema_version".to_string(), json!(2), "schema"),
+            ("/coordinate_unit".into(), json!("mm"), "coordinate system"),
+            ("/resolution".into(), json!(1), "coordinate system"),
+            (
+                "/supported_profile/copper_layers".into(),
+                json!(4),
+                "supported first routing profile",
+            ),
+            (
+                "/supported_profile/component_side".into(),
+                json!("back"),
+                "supported first routing profile",
+            ),
+            (
+                "/supported_profile/copper_zones".into(),
+                json!(true),
+                "supported first routing profile",
+            ),
+            (
+                "/supported_profile/custom_rules".into(),
+                json!(true),
+                "supported first routing profile",
+            ),
+            (
+                "/supported_profile/outline".into(),
+                json!(""),
+                "supported first routing profile",
+            ),
+            (
+                "/supported_profile/pad_shapes".into(),
+                json!([]),
+                "supported first routing profile",
+            ),
+            (
+                "/supported_profile/existing_routing".into(),
+                json!(true),
+                "locked-routing inventory",
+            ),
+            (
+                "/supported_profile/locked_track_count".into(),
+                json!(1),
+                "locked-routing inventory",
+            ),
+            (
+                "/supported_profile/locked_via_count".into(),
+                json!(1),
+                "locked-routing inventory",
+            ),
+            ("/layers/0/kicad_name".into(), json!(""), "layer mapping"),
+            ("/layers/0/dsn_name".into(), json!(""), "layer mapping"),
+            (
+                "/layers/1/dsn_name".into(),
+                original["layers"][0]["dsn_name"].clone(),
+                "layer mapping",
+            ),
+            (
+                "/layers/1/index".into(),
+                original["layers"][0]["index"].clone(),
+                "layer mapping",
+            ),
+            (
+                "/layers".into(),
+                json!([original["layers"][0]]),
+                "exactly two",
+            ),
+            ("/nets/0/name".into(), json!(""), "net name"),
+            (
+                "/nets/1/name".into(),
+                original["nets"][0]["name"].clone(),
+                "net name",
+            ),
+            ("/padstacks/0/name".into(), json!(""), "padstack name"),
+            (
+                "/padstacks/1/name".into(),
+                original["padstacks"][0]["name"].clone(),
+                "padstack name",
+            ),
+            (
+                "/components/0/reference".into(),
+                json!(""),
+                "placement metadata",
+            ),
+            (
+                "/components/1/reference".into(),
+                original["components"][0]["reference"].clone(),
+                "placement metadata",
+            ),
+            ("/components/0/kiid".into(), json!(""), "placement metadata"),
+            (
+                "/components/0/image_name".into(),
+                json!(""),
+                "placement metadata",
+            ),
+            (
+                "/components/0/side".into(),
+                json!("back"),
+                "placement metadata",
+            ),
+            (
+                "/components/0/pads/0/pad_number".into(),
+                json!(""),
+                "pin mapping",
+            ),
+            (
+                "/components/0/pads/0/dsn_pin".into(),
+                json!("R2-1"),
+                "pin mapping",
+            ),
+            (
+                "/components/0/pads/0/padstack_name".into(),
+                json!("unknown"),
+                "pin mapping",
+            ),
+            (
+                "/components/0/pads/0/net".into(),
+                json!("unknown"),
+                "pin mapping",
+            ),
+            ("/nets/0/class_name".into(), json!(""), "incomplete"),
+            ("/nets/0/pins".into(), json!([]), "incomplete"),
+        ];
+        for (field, value) in [
+            ("shape", json!("rect")),
+            ("size_y_um", json!(1)),
+            ("drill_um", json!(null)),
+        ] {
+            changes.push((
+                format!("/padstacks/{via_index}/{field}"),
+                value,
+                "supported round through via",
+            ));
+        }
+        for (pointer, value, expected) in changes {
+            let mut changed = original.clone();
+            *changed.pointer_mut(&pointer).unwrap() = value;
+            let error = format!(
+                "{:#}",
+                parse_import_plan(&board, &source, &changed.to_string(), sample_ses()).unwrap_err()
+            );
+            assert!(error.contains(expected), "{pointer}: {error}");
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+        }
+        let other = board.with_file_name("other.kicad_pcb");
+        std::fs::write(&other, &source).unwrap();
+        let error = parse_import_plan(&other, &source, &manifest, sample_ses()).unwrap_err();
+        assert!(
+            error.to_string().contains("does not match requested board"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn optional_ses_metadata_can_be_omitted_without_changing_the_routes() {
+        let (_dir, board, source, manifest) = fixture();
+        let source_ses = sample_ses()
+            .replace("(parser (host_cad KiCad) (host_version 10.0.5))", "")
+            .replace("(attach off)", "")
+            .replace(" (net GND) (type protect)", "");
+        let original = parse_import_plan(&board, &source, &manifest, sample_ses()).unwrap();
+        let without_optional = parse_import_plan(&board, &source, &manifest, &source_ses).unwrap();
+        assert_eq!(without_optional, original);
+    }
+
+    #[test]
+    fn empty_routes_incomplete_pairs_and_duplicate_via_library_are_refused() {
+        let (_dir, board, source, manifest) = fixture();
+        let wire = "(wire (path F.Cu 2500 995000 -500000 1050000 -500000 1050000 -510000))";
+        let via = "(via konnect_via_0001 1050000 -510000 (net GND) (type protect))";
+        let duplicate_library = "(padstack konnect_via_0001 (shape (circle F.Cu 6000 0 0)) (shape (circle B.Cu 6000 0 0)) (attach off))";
+        for (ses, expected) in [
+            (
+                sample_ses().replace(wire, "").replace(via, ""),
+                "no route primitives",
+            ),
+            (
+                sample_ses().replace(wire, "(wire (path F.Cu 2500 0 0 100 100 200))"),
+                "complete point pairs",
+            ),
+            (
+                sample_ses().replace("(library_out", &format!("(library_out {duplicate_library}")),
+                "repeats padstack",
+            ),
+        ] {
+            let error = parse_import_plan(&board, &source, &manifest, &ses).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+        let arc = "(wire (qarc F.Cu 2500 995000 -500000 1000000 -495000 1000000 -500000))";
+        let arc_only = sample_ses().replace(wire, arc).replace(via, "");
+        let plan = parse_import_plan(&board, &source, &manifest, &arc_only).unwrap();
+        assert!(plan.tracks.is_empty() && plan.vias.is_empty());
+        assert_eq!(plan.arcs.len(), 1);
+        let negative_via = sample_ses().replace(
+            "(via konnect_via_0001 1050000",
+            "(via konnect_via_0001 -1050000",
+        );
+        let plan = parse_import_plan(&board, &source, &manifest, &negative_via).unwrap();
+        assert_eq!(plan.vias[0].x_mm, -105.0);
+    }
+
+    #[test]
+    fn import_refuses_live_routing_that_the_manifest_cannot_preserve() {
+        let (_dir, board, source, manifest) = fixture();
+        for (routing, expected) in [
+            ("(arc)", "unsupported routed arc"),
+            ("(segment)", "track segment that is not locked"),
+            ("(via)", "via that is not locked"),
+        ] {
+            let mut snapshot = source.clone();
+            snapshot.insert_str(snapshot.rfind(')').unwrap(), routing);
+            let error = parse_import_plan(&board, &snapshot, &manifest, sample_ses()).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+        }
+    }
 }

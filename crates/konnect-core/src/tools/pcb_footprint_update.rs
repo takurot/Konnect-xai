@@ -1882,6 +1882,249 @@ mod tests {
     use prost::Message;
     use std::collections::{BTreeMap, BTreeSet};
 
+    #[test]
+    fn pcb_final_minimal_library_refresh_preserves_optional_fields_and_neutral_layer_text() {
+        let source = r#"(footprint "Socket" (layer "F.Cu")
+            (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+            (pad "2" smd rect (at 2 0) (size 1 1) (layers "F.Cu"))
+            (fp_text user "neutral note" (at 1 2) (layer "Cmts.User")
+                (effects (font (size 1 1) (thickness 0.15)))))"#;
+        let library = parse_library_footprint("Test:Socket", source).unwrap();
+        let mut current = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+        current.attributes = None;
+        let prepared = build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::from([("ROW1".into(), 11), ("COL1".into(), 12)]),
+            &BTreeSet::new(),
+            true,
+            2,
+        )
+        .unwrap();
+        let updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        assert_eq!(updated.reference_field, current.reference_field);
+        assert_eq!(updated.value_field, current.value_field);
+        assert_eq!(updated.datasheet_field, current.datasheet_field);
+        assert_eq!(updated.description_field, current.description_field);
+        let note = updated
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .find(|item| builders::any_is(item, "kiapi.board.types.BoardText"))
+            .unwrap();
+        let note = kiapi::board::types::BoardText::decode(note.value.as_slice()).unwrap();
+        assert_eq!(note.layer, builders::layer_from_name("Cmts.User") as i32);
+        assert!(!note.text.unwrap().attributes.unwrap().mirrored);
+    }
+
+    #[test]
+    fn pcb_final_unrouted_connected_pad_removal_refuses_and_readback_is_scoped_to_the_target() {
+        let source = r#"(footprint "Socket" (layer "F.Cu")
+            (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu")))"#;
+        let library = parse_library_footprint("Test:Socket", source).unwrap();
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let original = current.clone();
+        let error = build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::from([("ROW1".into(), 11), ("COL1".into(), 12)]),
+            &BTreeSet::new(),
+            false,
+            2,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("removes connected pad 2"));
+        assert_eq!(current, original);
+        let expected = instance_for_layer_readback();
+        let wanted = builders::pack_any(&expected, "kiapi.board.types.FootprintInstance");
+        let signature = footprint_layer_states(std::slice::from_ref(&wanted)).unwrap();
+        let mut other = expected.clone();
+        other.id = Some(kiapi::common::types::Kiid {
+            value: "another-footprint".into(),
+        });
+        let reference = field("Reference", "OTHER1", 0.0, 0.0, true);
+        other.reference_field = Some(reference.clone());
+        other.definition.as_mut().unwrap().reference_field = Some(reference);
+        let unrelated = builders::pack_any(&other, "kiapi.board.types.FootprintInstance");
+        verify_footprint_layer_readback(&signature, &[unrelated.clone(), wanted]).unwrap();
+        assert!(verify_footprint_layer_readback(&signature, &[unrelated]).is_err());
+    }
+
+    #[test]
+    fn pcb_fidelity3_refresh_readback_rejects_nonfinite_corner_ratios_and_keeps_offsets() {
+        let expected = instance_for_layer_readback();
+        let signature = footprint_layer_states(&[builders::pack_any(
+            &expected,
+            "kiapi.board.types.FootprintInstance",
+        )])
+        .unwrap();
+        for chamfer in [false, true] {
+            let mut observed = expected.clone();
+            let item = observed
+                .definition
+                .as_mut()
+                .unwrap()
+                .items
+                .iter_mut()
+                .find(|item| builders::any_is(item, "kiapi.board.types.Pad"))
+                .unwrap();
+            let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+            let layer = &mut pad.pad_stack.as_mut().unwrap().copper_layers[0];
+            if chamfer {
+                layer.chamfer_ratio = f64::NAN;
+            } else {
+                layer.corner_rounding_ratio = f64::NAN;
+            }
+            *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+            let error = footprint_layer_states(&[builders::pack_any(
+                &observed,
+                "kiapi.board.types.FootprintInstance",
+            )])
+            .unwrap_err();
+            assert!(error.to_string().contains("invalid corner ratio"));
+        }
+        for (offset, matches) in [(0, true), (1, false)] {
+            let mut observed = expected.clone();
+            let item = observed
+                .definition
+                .as_mut()
+                .unwrap()
+                .items
+                .iter_mut()
+                .find(|item| builders::any_is(item, "kiapi.board.types.Pad"))
+                .unwrap();
+            let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+            pad.pad_stack.as_mut().unwrap().copper_layers[0].offset =
+                Some(kiapi::common::types::Vector2 {
+                    x_nm: offset,
+                    y_nm: 0,
+                });
+            *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+            let result = verify_footprint_layer_readback(
+                &signature,
+                &[builders::pack_any(
+                    &observed,
+                    "kiapi.board.types.FootprintInstance",
+                )],
+            );
+            assert_eq!(result.is_ok(), matches, "offset={offset}");
+        }
+    }
+
+    #[test]
+    fn pcb_fidelity3_refresh_multiline_text_and_optional_fill_remain_verifiable() {
+        let mut instance = instance_for_layer_readback();
+        let text = instance
+            .reference_field
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap();
+        text.text = "first\nsecond".into();
+        text.attributes.as_mut().unwrap().multiline = true;
+        let expected = footprint_layer_states(&[builders::pack_any(
+            &instance,
+            "kiapi.board.types.FootprintInstance",
+        )])
+        .unwrap();
+        instance
+            .reference_field
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .attributes
+            .as_mut()
+            .unwrap()
+            .multiline = false;
+        assert!(verify_footprint_layer_readback(
+            &expected,
+            &[builders::pack_any(
+                &instance,
+                "kiapi.board.types.FootprintInstance"
+            )]
+        )
+        .is_err());
+        let item = instance
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .iter_mut()
+            .find(|item| builders::any_is(item, "kiapi.board.types.BoardGraphicShape"))
+            .unwrap();
+        let mut graphic =
+            kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).unwrap();
+        graphic
+            .shape
+            .as_mut()
+            .unwrap()
+            .attributes
+            .as_mut()
+            .unwrap()
+            .fill = None;
+        graphic
+            .shape
+            .as_mut()
+            .unwrap()
+            .attributes
+            .as_mut()
+            .unwrap()
+            .stroke = None;
+        *item = builders::pack_any(&graphic, "kiapi.board.types.BoardGraphicShape");
+        let packed = builders::pack_any(&instance, "kiapi.board.types.FootprintInstance");
+        let expected = footprint_layer_states(std::slice::from_ref(&packed)).unwrap();
+        verify_footprint_layer_readback(&expected, &[packed]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pcb_fidelity3_refresh_noop_and_preflight_conflict_apply_never_open_commits() {
+        let (temp, board, items) = plan_fixture();
+        let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+        let current =
+            kiapi::board::types::FootprintInstance::decode(items[2].value.as_slice()).unwrap();
+        let prepared = build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::from([("ROW1".into(), 11), ("COL1".into(), 12)]),
+            &BTreeSet::new(),
+            false,
+            2,
+        )
+        .unwrap();
+        let mock = spawn_planner_mock(&board, prepared.item, false);
+        let context = test_context(&mock.url);
+        let plan =
+            handle_update_footprints_from_library(&serde_json::json!({"board":board}), &context)
+                .await
+                .unwrap();
+        let plan = result_json(&plan);
+        assert_eq!(plan["status"], "noop", "{plan}");
+        let applied=handle_update_footprints_from_library(&serde_json::json!({"board":board,"dry_run":false,"expected_plan_revision":plan["plan_revision"]}),&context).await.unwrap();
+        assert_eq!(result_json(&applied)["status"], "noop");
+        std::fs::write(
+            temp.path().join("Test.pretty/Socket.kicad_mod"),
+            r#"(footprint "Socket" (layer "F.Cu") (zone (net 0)))"#,
+        )
+        .unwrap();
+        let applied=handle_update_footprints_from_library(&serde_json::json!({"board":board,"dry_run":false,"expected_plan_revision":"reviewed-before-library-change"}),&context).await.unwrap();
+        assert_eq!(result_json(&applied)["status"], "conflict");
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 0);
+        assert!(capture.update_batches.is_empty());
+    }
+
     /// The serialization KiCad 10 actually writes — produced by running this
     /// module's hand-written fixture through `kicad-cli fp upgrade` — parses,
     /// and the two universal flags KiCad stamps into every saved footprint
@@ -3675,6 +3918,123 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn refresh_refuses_mismatched_library_identity_and_conflicting_logical_pad_nets() {
+        let library = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
+        let nets = BTreeMap::from([("ROW1".into(), 11), ("COL1".into(), 12)]);
+        let mut current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        current
+            .definition
+            .as_mut()
+            .unwrap()
+            .id
+            .as_mut()
+            .unwrap()
+            .entry_name = "Other".into();
+        let before = current.clone();
+        let error = build_updated_instance(&current, &library, &nets, &BTreeSet::new(), false, 2)
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match"));
+        assert_eq!(current, before);
+
+        let mut current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        current
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .push(current_pad("1", "OTHER", 13));
+        let before = current.clone();
+        let error = build_updated_instance(&current, &library, &nets, &BTreeSet::new(), false, 2)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("logical pad 1 carries multiple nets"));
+        assert_eq!(current, before);
+    }
+
+    #[test]
+    fn refresh_refuses_unnamed_or_duplicated_instance_properties_without_changing_them() {
+        let library = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
+        let nets = BTreeMap::from([("ROW1".into(), 11), ("COL1".into(), 12)]);
+        for (names, expected) in [
+            (vec![""], "without a name"),
+            (
+                vec!["BoardOnly", "BoardOnly"],
+                "more than one custom property",
+            ),
+        ] {
+            let mut current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+            for name in names {
+                current
+                    .definition
+                    .as_mut()
+                    .unwrap()
+                    .items
+                    .push(builders::pack_any(
+                        &field(name, "retain", 1.0, 2.0, true),
+                        "kiapi.board.types.Field",
+                    ));
+            }
+            let before = current.clone();
+            let error =
+                build_updated_instance(&current, &library, &nets, &BTreeSet::new(), false, 2)
+                    .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+            assert_eq!(current, before);
+        }
+    }
+
+    #[test]
+    fn value_only_and_description_only_changes_are_not_noops() {
+        let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let rebuilt = build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::from([("ROW1".into(), 11), ("COL1".into(), 12)]),
+            &BTreeSet::new(),
+            false,
+            2,
+        )
+        .unwrap();
+        let baseline =
+            kiapi::board::types::FootprintInstance::decode(rebuilt.item.value.as_slice()).unwrap();
+        let mut value_change = baseline.clone();
+        apply_field_value(&mut value_change.value_field, Some("new value"));
+        assert_eq!(
+            changed_domains(&baseline, &value_change).unwrap(),
+            BTreeSet::from([ChangedDomain::Text])
+        );
+        let mut description_change = baseline.clone();
+        apply_field_value(
+            &mut description_change
+                .definition
+                .as_mut()
+                .unwrap()
+                .description_field,
+            Some("new description"),
+        );
+        assert_eq!(
+            changed_domains(&baseline, &description_change).unwrap(),
+            BTreeSet::from([ChangedDomain::Metadata])
+        );
+        let mut custom_change = baseline.clone();
+        custom_change
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .push(builders::pack_any(
+                &field("BoardOnly", "new", 0.0, 0.0, false),
+                "kiapi.board.types.Field",
+            ));
+        assert_eq!(
+            changed_domains(&baseline, &custom_change).unwrap(),
+            BTreeSet::from([ChangedDomain::Metadata])
+        );
     }
 
     #[test]
@@ -5553,5 +5913,23 @@ mod planner_refusal_tests {
         };
         assert!(text.contains("Argument 'references' is invalid"), "{text}");
         assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod routing_snapshot_contract_tests {
+    use super::*;
+
+    #[test]
+    fn refresh_protects_named_track_arc_and_via_nets_and_ignores_unconnected_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("routing.kicad_pcb");
+        let server = super::super::pcb_sync::routing_snapshot_contract_tests::server(&board);
+        let client = konnect_ipc::KiCadIpcClient::new(server.address().to_string());
+        let document = client.find_open_board(&board).unwrap();
+        assert_eq!(
+            snapshot_routed_nets(&client, document).unwrap(),
+            BTreeSet::from(["GND".into()])
+        );
     }
 }

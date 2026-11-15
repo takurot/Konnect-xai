@@ -184,3 +184,42 @@ fn dist(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
     let (dx, dy) = (ax - bx, ay - by);
     (dx * dx + dy * dy).sqrt()
 }
+
+#[cfg(test)]
+mod rectangle_selection_contract_tests {
+    use super::*;
+
+    #[test]
+    fn rectangle_selection_is_inclusive_uses_either_endpoint_and_accepts_reversed_corners() {
+        let cases = [
+            ("start-inside", (5.0, 5.0), (20.0, 5.0)),
+            ("end-inside", (20.0, 5.0), (5.0, 5.0)),
+            ("boundary", (0.0, 0.0), (-1.0, -1.0)),
+            ("left", (-2.0, 5.0), (-1.0, 5.0)),
+            ("right", (11.0, 5.0), (12.0, 5.0)),
+            ("below", (5.0, -2.0), (5.0, -1.0)),
+            ("above", (5.0, 11.0), (5.0, 12.0)),
+            ("crossing-only", (-1.0, 5.0), (11.0, 5.0)),
+        ];
+        let wires = WireCollection::new(
+            cases
+                .into_iter()
+                .map(|(name, start, end)| {
+                    let mut wire = Wire::new(start.0, start.1, end.0, end.1);
+                    wire.uuid = name.into();
+                    wire
+                })
+                .collect(),
+        );
+        let before: Vec<_> = wires.iter().map(Wire::to_sexp).collect();
+        for (a, b) in [((0.0, 0.0), (10.0, 10.0)), ((10.0, 10.0), (0.0, 0.0))] {
+            let selected: Vec<_> = wires
+                .within_rectangle(a.0, a.1, b.0, b.1)
+                .into_iter()
+                .map(|wire| wire.uuid.as_str())
+                .collect();
+            assert_eq!(selected, ["start-inside", "end-inside", "boundary"]);
+        }
+        assert_eq!(wires.iter().map(Wire::to_sexp).collect::<Vec<_>>(), before);
+    }
+}

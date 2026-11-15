@@ -1773,6 +1773,91 @@ mod review_completion_tests {
     use konnect_sexp::schematic::{format_blank_schematic, format_hierarchical_sheet};
     use tempfile::TempDir;
 
+    #[test]
+    fn audit_failures_keep_partial_and_failed_evidence_distinct() {
+        let source = Path::new("audit.kicad_sch");
+        let mut audit = AuditAggregate::new("connections");
+        let mut diagnostics = Vec::new();
+        audit.record(
+            source,
+            Err(anyhow::anyhow!("source unavailable")),
+            &mut diagnostics,
+        );
+        assert_eq!(
+            audit.summary(),
+            json!({
+                "status": "failed", "requested": 1, "completed": 0, "failed": 1, "findings": 0
+            })
+        );
+        assert_eq!(diagnostics[0]["code"], "audit_failed");
+
+        audit.record(source, Ok(CallToolResult::text("{}")), &mut diagnostics);
+        assert_eq!(diagnostics[1]["code"], "invalid_audit_result");
+        audit.record(
+            source,
+            Ok(CallToolResult::text(
+                r#"{"findings":[{"issue":"missing pull-up"}]}"#,
+            )),
+            &mut diagnostics,
+        );
+        assert_eq!(
+            audit.summary(),
+            json!({
+                "status": "partial", "requested": 3, "completed": 1, "failed": 2, "findings": 1
+            })
+        );
+        assert_eq!(audit.findings[0]["audit"], "connections");
+        assert_eq!(audit.findings[0]["source"], "audit.kicad_sch");
+        assert_eq!(diagnostics.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn manufacturing_audit_reports_outline_sides_and_fab_trace_limits() {
+        let tmp = TempDir::new().unwrap();
+        let board = tmp.path().join("dfm.kicad_pcb");
+        for (fab, width, below_limit) in [
+            ("jlcpcb", 0.126, true),
+            ("jlcpcb", 0.127, false),
+            ("pcbway", 0.1, false),
+            ("oshpark", 0.151, true),
+            ("other", 0.15, false),
+        ] {
+            let source = format!(
+                r#"(kicad_pcb
+                (setup (min_trace_width {width}))
+                (footprint "front" (layer "F.Cu"))
+                (footprint "back" (layer "B.Cu"))
+                (footprint "layerless"))"#
+            );
+            std::fs::write(&board, &source).unwrap();
+            let report = tool_json(
+                handle_audit_manufacturing(&json!({"board": board, "fab_house": fab}), &test_ctx())
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(report["components"], json!({"front": 1, "back": 1}));
+            let findings = report["findings"].as_array().unwrap();
+            let issues = findings
+                .iter()
+                .map(|f| f["issue"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert!(issues
+                .iter()
+                .any(|issue| issue.contains("No board outline")));
+            assert!(issues
+                .iter()
+                .any(|issue| issue.contains("Components on both sides")));
+            assert_eq!(
+                issues
+                    .iter()
+                    .any(|issue| issue.contains("Minimum trace width")),
+                below_limit,
+                "{report}"
+            );
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+        }
+    }
+
     fn single_unit_schematic(footprint: &str) -> String {
         format!(
             r#"(kicad_sch

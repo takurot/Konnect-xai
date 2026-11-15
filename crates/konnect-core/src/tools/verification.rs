@@ -2245,3 +2245,339 @@ mod net_identity_copy_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod palette_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn track_palette_keeps_one_netclass_sentinel_and_rejects_invalid_widths() {
+        assert_eq!(
+            parse_track_widths(&[json!(0), json!(0.2), json!(0.2), json!(0.0)]).unwrap(),
+            vec![json!(0.0), json!(0.2)]
+        );
+        for value in [json!(-0.1), json!("0.2"), json!(null), json!({})] {
+            assert!(parse_track_widths(&[value]).is_err());
+        }
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+            assert!(finite_positive(value, "track_widths").is_err());
+        }
+        assert_eq!(finite_positive(0.15, "track_widths").unwrap(), 0.15);
+    }
+
+    #[test]
+    fn via_palette_requires_numeric_positive_dimensions_and_an_annular_ring() {
+        let via = json!({"diameter":0.6,"drill":0.3});
+        assert_eq!(
+            parse_via_dimensions(&[json!({"diameter":0,"drill":0}), via.clone(), via.clone()])
+                .unwrap(),
+            vec![json!({"diameter":0.0,"drill":0.0}), via]
+        );
+        for value in [
+            json!(null),
+            json!({}),
+            json!({"diameter":"0.6","drill":0.3}),
+            json!({"diameter":0.6}),
+            json!({"diameter":0.6,"drill":"0.3"}),
+            json!({"diameter":-0.6,"drill":0.3}),
+            json!({"diameter":0.6,"drill":0}),
+            json!({"diameter":0.3,"drill":0.3}),
+            json!({"diameter":0.2,"drill":0.3}),
+        ] {
+            assert!(
+                parse_via_dimensions(std::slice::from_ref(&value)).is_err(),
+                "accepted {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn palette_defaults_do_not_treat_scalar_project_fields_as_lists() {
+        let defaults = (json!([0.0]), json!([{"diameter":0.0,"drill":0.0}]));
+        for project in [
+            json!({}),
+            json!({"board":{"design_settings":{"track_widths":7,"via_dimensions":"invalid"}}}),
+        ] {
+            assert_eq!(current_predefined_sizes(&project), defaults);
+        }
+        let explicit =
+            json!({"board":{"design_settings":{"track_widths":[0,0.2],"via_dimensions":[]}}});
+        assert_eq!(
+            current_predefined_sizes(&explicit),
+            (json!([0, 0.2]), json!([]))
+        );
+        for mut project in [
+            json!(null),
+            json!({"board":7}),
+            json!({"board":{"design_settings":[]}}),
+        ] {
+            assert!(project_design_settings_mut(&mut project).is_err());
+            assert!(project_rules_mut(&mut project).is_err());
+        }
+        let mut invalid_rules = json!({"board":{"design_settings":{"rules":false}}});
+        assert!(project_rules_mut(&mut invalid_rules).is_err());
+        let mut project = json!({});
+        project_rules_mut(&mut project)
+            .unwrap()
+            .insert("min_clearance".into(), json!(0.2));
+        assert_eq!(project_rule_value(&project, "min_clearance"), Some(0.2));
+        assert_eq!(project_rule_value(&project, "missing"), None);
+    }
+
+    #[test]
+    fn replacing_a_named_rule_ignores_parentheses_in_strings_and_comments() {
+        let rule = "(rule \"target\"\n # ignored ) (\n (condition \"A.Value == \\\"text)\\\"\")\n (constraint clearance (min 0.2mm)))";
+        let unrelated = "(rule \"other\" (constraint clearance (min 0.1mm)))";
+        let source = format!("(version 1)\n{rule}\n{unrelated}\n");
+        let replacement = layer_rule("target", "clearance", 0.3, "F.Cu");
+        let updated = upsert_named_rule(&source, "target", &replacement);
+        assert!(updated.contains(&replacement));
+        assert!(updated.contains(unrelated));
+        assert!(!updated.contains("min 0.2mm"));
+        assert_eq!(updated.matches("(rule \"target\"").count(), 1);
+        assert_eq!(
+            upsert_named_rule("", "target", &replacement),
+            format!("{replacement}\n")
+        );
+        let appended = upsert_named_rule(unrelated, "target", &replacement);
+        assert!(appended.starts_with(unrelated) && appended.contains(&replacement));
+        assert!(named_rule_range("(rule \"target\" (constraint clearance", "target").is_none());
+        assert!(named_rule_range(unrelated, "missing").is_none());
+    }
+
+    #[test]
+    fn translated_routing_preserves_numeric_net_identity_and_optional_coordinates() {
+        let map = std::collections::HashMap::from([("SIG".to_string(), "NEW".to_string())]);
+        let source = "(via (at 2.01 3 45) (size 0.6) (net \"SIG\"))";
+        let translated = translate_block(source, 1.0, -1.0, &map);
+        let root = konnect_sexp::parse_sexp(&translated).unwrap();
+        let at = root.find("at").unwrap();
+        assert_eq!(
+            (at.get_f64(1), at.get_f64(2), at.get_f64(3)),
+            (Some(3.01), Some(2.0), Some(45.0))
+        );
+        assert_eq!(
+            root.find("net")
+                .unwrap()
+                .get(1)
+                .and_then(konnect_sexp::SexpNode::as_str),
+            Some("NEW")
+        );
+        assert!(root.find("uuid").is_some());
+        let malformed = "(segment (start no 2) (end 3 4) (net 1) (uuid \"old\"))";
+        let translated = translate_block(malformed, 1.0, 2.0, &map);
+        assert!(translated.contains("(start no 2)"));
+        assert!(translated.contains("(net 1)"));
+        assert!(!translated.contains("\"old\""));
+        assert_eq!(routing_points("not sexp"), Vec::<(f64, f64)>::new());
+        assert_eq!(routing_points(malformed), vec![(3.0, 4.0)]);
+    }
+}
+
+#[cfg(test)]
+mod coverage_verification_no_write {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::ctx_talking_to;
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("text expected")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn palette_noop_and_invalid_lists_keep_project_bytes_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let project = board.with_extension("kicad_pro");
+        let original = r#"{ "board": {"design_settings": {"track_widths": [0.0,0.25], "via_dimensions": [{"diameter":0.0,"drill":0.0},{"diameter":0.6,"drill":0.3}]}} }"#;
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        std::fs::write(&project, original).unwrap();
+        let ctx = ctx_talking_to(String::new());
+        for extra in [
+            json!({"track_widths":[0,0.25]}),
+            json!({"via_dimensions":[{"diameter":0.6,"drill":0.3}]}),
+        ] {
+            let mut args = json!({"board":board});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let result = handle_set_predefined_sizes(&args, &ctx).await.unwrap();
+            assert!(!result.is_error, "{result:?}");
+            assert_eq!(body(&result)["changed"], json!([]));
+            assert_eq!(std::fs::read_to_string(&project).unwrap(), original);
+        }
+        for extra in [
+            json!({}),
+            json!({"track_widths":null,"via_dimensions":null}),
+            json!({"track_widths":1}),
+            json!({"via_dimensions":{}}),
+            json!({"via_dimensions":[{"diameter":0.6}]}),
+            json!({"track_widths":[-0.1]}),
+        ] {
+            let mut args = json!({"board":board});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(
+                handle_set_predefined_sizes(&args, &ctx)
+                    .await
+                    .unwrap()
+                    .is_error
+            );
+            assert_eq!(std::fs::read_to_string(&project).unwrap(), original);
+        }
+        assert_eq!(std::fs::read_to_string(board).unwrap(), "(kicad_pcb)");
+    }
+
+    #[tokio::test]
+    async fn absent_constraints_are_noops_and_unsafe_layer_names_create_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let rules = board.with_extension("kicad_dru");
+        let ctx = ctx_talking_to(String::new());
+        let noop = handle_set_layer_constraints(&json!({"board":board,"layer":"F.Cu"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(body(&noop)["changed"], json!([]));
+        assert!(!rules.exists());
+        for layer in ["", "F.Cu\"", "F.Cu/other", "F.Cu\n"] {
+            assert!(handle_set_layer_constraints(
+                &json!({"board":board,"layer":layer,"min_clearance":0.2}),
+                &ctx
+            )
+            .await
+            .is_err());
+            assert!(!rules.exists());
+        }
+        assert!(!board.exists());
+    }
+
+    #[tokio::test]
+    async fn routing_copy_requires_every_point_inside_the_selected_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let ctx = ctx_talking_to(String::new());
+        for points in [
+            "(start -1 1) (end 2 2)",
+            "(start 1 -1) (end 2 2)",
+            "(start 1 1) (end 11 2)",
+            "(start 1 1) (end 2 11)",
+            "",
+        ] {
+            let source = format!("(kicad_pcb (segment {points} (uuid original)))");
+            std::fs::write(&board, &source).unwrap();
+            let result = handle_copy_routing_pattern(&json!({"board":board,"src_x1":0,"src_y1":0,"src_x2":10,"src_y2":10,"dest_x":20,"dest_y":20}),&ctx).await.unwrap();
+            assert_eq!(body(&result)["copied"], 0);
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+        }
+    }
+
+    #[tokio::test]
+    async fn design_rule_noop_and_malformed_project_shapes_preserve_saved_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let project = board.with_extension("kicad_pro");
+        let ctx = ctx_talking_to(String::new());
+        for source in [
+            "[]",
+            r#"{"board":[]}"#,
+            r#"{"board":{"design_settings":[]}}"#,
+            r#"{"board":{"design_settings":{"rules":[]}}}"#,
+        ] {
+            std::fs::write(&project, source).unwrap();
+            let result =
+                handle_set_design_rules(&json!({"board":board,"min_clearance":0.2}), &ctx).await;
+            assert!(result.is_err());
+            assert_eq!(std::fs::read_to_string(&project).unwrap(), source);
+        }
+        let source = "{ \"board\": {\"design_settings\": {\"rules\":{}}} }";
+        std::fs::write(&project, source).unwrap();
+        let result = handle_set_design_rules(&json!({"board":board}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(body(&result)["changed"], json!([]));
+        assert_eq!(std::fs::read_to_string(project).unwrap(), source);
+    }
+}
+
+#[cfg(test)]
+mod coverage_final_verification_contracts {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("text expected")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn clearance_invalid_mode_and_missing_second_courtyard_never_invent_a_distance() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let ctx = ctx_talking_to(String::new());
+        let invalid = handle_check_clearance(
+            &json!({"board":board,"ref1":"C1","ref2":"R1","mode":"copper"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(invalid.is_error);
+        assert!(!board.exists());
+        let source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../konnect-sexp/tests/fixtures/ecc83-pp.kicad_pcb"),
+        )
+        .unwrap();
+        let mut changed = source.clone();
+        let (start, end) = konnect_sexp::writer::find_direct_child_blocks(&source, "kicad_pcb")
+            .into_iter()
+            .find(|(start, end)| {
+                let text = &source[*start..*end];
+                text.starts_with("(footprint")
+                    && konnect_sexp::parse_sexp(text)
+                        .ok()
+                        .is_some_and(|tree| footprint_reference(&tree) == Some("R1"))
+            })
+            .unwrap();
+        let footprint = source[start..end].replace("F.CrtYd", "F.Fab");
+        assert_ne!(footprint, &source[start..end]);
+        changed.replace_range(start..end, &footprint);
+        std::fs::write(&board, &changed).unwrap();
+        let result = handle_check_clearance(
+            &json!({"board":board,"ref1":"C1","ref2":"R1","mode":"courtyard"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let body = body(&result);
+        assert_eq!(body["available"], false);
+        assert_eq!(body["unavailable_reference"], "R1");
+        assert!(body["courtyard_clearance_mm"].is_null());
+        assert_eq!(std::fs::read_to_string(board).unwrap(), changed);
+    }
+
+    #[tokio::test]
+    async fn an_open_live_board_refuses_a_saved_palette_change_without_touching_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let project = board.with_extension("kicad_pro");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        std::fs::write(&project, "{ \"board\": {} }").unwrap();
+        let before = std::fs::read(&project).unwrap();
+        let server = spawn_kicad_holding_board(&board, |_| None);
+        let result = handle_set_predefined_sizes(
+            &json!({"board":board,"track_widths":[0.25]}),
+            &ctx_talking_to(server.address().into()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read(project).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(board).unwrap(), "(kicad_pcb)");
+    }
+}

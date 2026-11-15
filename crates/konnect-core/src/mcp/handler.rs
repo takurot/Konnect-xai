@@ -3233,3 +3233,69 @@ mod uncertain_revision_boundary_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod v015_dispatch_contract_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    #[tokio::test]
+    async fn autoload_checks_arguments_after_loading_only_the_named_toolset() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: false,
+        })
+        .await
+        .unwrap();
+        let tool = "list_schematic_components";
+        assert!(handler.ctx.router.get_tool(tool).await.is_none());
+        let (unknown, _, _) = handler
+            .dispatch_tool("not_a_registered_tool", &json!({}))
+            .await;
+        assert!(unknown.is_error);
+        assert!(handler.ctx.router.get_tool(tool).await.is_none());
+        let (missing, _, kind) = handler.dispatch_tool(tool, &json!({})).await;
+        assert!(missing.is_error);
+        assert_eq!(kind.as_deref(), Some("invalid_argument"));
+        assert!(handler.ctx.router.get_tool(tool).await.is_some());
+    }
+
+    #[test]
+    fn typed_editor_locks_keep_document_and_lock_identity_through_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("locked.kicad_sch");
+        let lock = konnect_sexp::writer::kicad_editor_lock_path(&path).unwrap();
+        std::fs::write(&lock, "owned by editor").unwrap();
+        let sexp = konnect_sexp::writer::ensure_kicad_design_document_is_closed(&path).unwrap_err();
+        let errors = [
+            anyhow::Error::new(sexp).context("saving schematic"),
+            anyhow::Error::new(konnect_schematic_editor::Error::KiCadEditorLocked {
+                path: path.clone(),
+                lock_path: lock.clone(),
+            })
+            .context("saving schematic model"),
+        ];
+        for error in errors {
+            assert_eq!(kicad_editor_locked_path(&error), Some(path.as_path()));
+            assert_eq!(kicad_editor_lock_file(&error), Some(lock.as_path()));
+            assert_eq!(kicad_board_lock_reason(&error), "kicad_lock_present");
+        }
+        let unreadable = anyhow::Error::new(konnect_sexp::SexpError::KiCadEditorLocked {
+            path,
+            lock_path: lock,
+            inspection_error: Some("permission denied".to_owned()),
+        });
+        assert_eq!(
+            kicad_board_lock_reason(&unreadable),
+            "kicad_lock_unreadable"
+        );
+        let unrelated = anyhow::anyhow!("not an editor lock");
+        assert_eq!(kicad_editor_locked_path(&unrelated), None);
+        assert_eq!(kicad_editor_lock_file(&unrelated), None);
+    }
+}

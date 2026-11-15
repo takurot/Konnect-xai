@@ -2291,3 +2291,260 @@ mod copper_layer_count_tests {
         assert_eq!(control["board_info"]["copper_layers"], 2);
     }
 }
+
+#[cfg(test)]
+mod correction_boundary_tests {
+    use super::*;
+
+    fn policy() -> serde_json::Value {
+        json!({"schema_version":1,"policy_id":"project","provenance":"test fixture",
+            "footprint_rules":[{"id":"fp","footprint_prefix":"Resistor_","rotation_degrees":90}],
+            "component_overrides":[{"id":"component","designator":"R1","offset_x_mm":0.5}]})
+    }
+
+    #[test]
+    fn correction_policy_rejects_ambiguous_identity_and_unsupported_schema() {
+        let good = policy();
+        assert!(parse_jlcpcb_correction_policy(&good.to_string(), "test").is_ok());
+        for (field, value) in [
+            ("schema_version", json!(2)),
+            ("policy_id", json!(" ")),
+            ("provenance", json!("")),
+        ] {
+            let mut bad = good.clone();
+            bad[field] = value;
+            assert!(parse_jlcpcb_correction_policy(&bad.to_string(), "test").is_err());
+        }
+        for (collection, field) in [
+            ("footprint_rules", "id"),
+            ("footprint_rules", "footprint_prefix"),
+            ("component_overrides", "id"),
+            ("component_overrides", "designator"),
+        ] {
+            let mut bad = good.clone();
+            bad[collection][0][field] = json!(" ");
+            assert!(parse_jlcpcb_correction_policy(&bad.to_string(), "test").is_err());
+        }
+        let mut duplicate_footprint = good.clone();
+        duplicate_footprint["footprint_rules"]
+            .as_array_mut()
+            .unwrap()
+            .push(good["footprint_rules"][0].clone());
+        assert!(parse_jlcpcb_correction_policy(&duplicate_footprint.to_string(), "test").is_err());
+        let mut duplicate_id = good.clone();
+        duplicate_id["component_overrides"][0]["id"] = json!("fp");
+        assert!(parse_jlcpcb_correction_policy(&duplicate_id.to_string(), "test").is_err());
+        let mut duplicate_designator = good.clone();
+        let mut second = good["component_overrides"][0].clone();
+        second["id"] = json!("second");
+        duplicate_designator["component_overrides"]
+            .as_array_mut()
+            .unwrap()
+            .push(second);
+        assert!(parse_jlcpcb_correction_policy(&duplicate_designator.to_string(), "test").is_err());
+        for (rotation, x, y) in [
+            (f64::NAN, 0.0, 0.0),
+            (0.0, f64::INFINITY, 0.0),
+            (0.0, 0.0, f64::NEG_INFINITY),
+        ] {
+            assert!(validate_finite_correction("test", "rule", rotation, x, y).is_err());
+        }
+        assert!(validate_finite_correction("test", "rule", -90.0, -0.3, 0.2).is_ok());
+    }
+
+    #[test]
+    fn project_component_override_beats_project_prefix_which_beats_builtin_prefix() {
+        let built_in = parse_jlcpcb_correction_policy(&json!({"schema_version":1,"policy_id":"builtin","provenance":"test",
+            "footprint_rules":[{"id":"builtin-rule","footprint_prefix":"Resistor_","rotation_degrees":180},
+                {"id":"capacitor","footprint_prefix":"Capacitor_","rotation_degrees":45}]}).to_string(), "test").unwrap();
+        let project = parse_jlcpcb_correction_policy(&policy().to_string(), "test").unwrap();
+        let policies = JlcpcbCorrectionPolicies {
+            built_in,
+            project: Some(project),
+        };
+        let component = policies.matching_rule("R1", "Resistor_0805").unwrap();
+        assert_eq!(
+            component.values(),
+            ("project", "component", "component_override", 0.0, 0.5, 0.0)
+        );
+        let footprint = policies.matching_rule("R2", "Resistor_0805").unwrap();
+        assert_eq!(
+            footprint.values(),
+            ("project", "fp", "footprint_rule", 90.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            policies
+                .matching_rule("C1", "Capacitor_0603")
+                .unwrap()
+                .values()
+                .0,
+            "builtin"
+        );
+        assert!(policies.matching_rule("U1", "Unknown").is_none());
+    }
+
+    #[test]
+    fn bom_designators_require_explicit_unique_components_and_matching_cpl_membership() {
+        for source in [
+            "Value\n10k\n",
+            "Reference\n",
+            "Reference\n\"\"\n",
+            "Reference\n\"R1,R1\"\n",
+            "Reference\n\"R1,\"\n",
+            "Reference\nR1-R3\n",
+        ] {
+            assert!(
+                jlcpcb_bom_designators(source).is_err(),
+                "accepted {source:?}"
+            );
+        }
+        for header in ["Reference", "Refs", "Designator"] {
+            let bom = jlcpcb_bom_designators(&format!("{header}\n\"R1, R2\"\nC1\n")).unwrap();
+            assert_eq!(bom, BTreeSet::from(["R1".into(), "R2".into(), "C1".into()]));
+            assert!(jlcpcb_designator_mismatch(&bom, &bom).is_none());
+            let mismatch =
+                jlcpcb_designator_mismatch(&BTreeSet::from(["R1".into(), "U1".into()]), &bom)
+                    .unwrap();
+            assert!(mismatch.contains("U1") && mismatch.contains("R2") && mismatch.contains("C1"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod board_evidence_contract_tests {
+    use super::*;
+
+    #[test]
+    fn numeric_net_references_count_once_and_nested_zone_arcs_are_not_tracks() {
+        let numeric = konnect_sexp::parse_sexp("(kicad_pcb (segment (net 1)) (via (net 1)) (arc (net 2)) (pad (net 0)) (zone (net 2) (polygon (pts (arc (start 0 0) (mid 1 1) (end 2 0))))))").unwrap();
+        assert_eq!(count_nets_and_tracks(&numeric), (2, 3));
+        let named = konnect_sexp::parse_sexp("(kicad_pcb (net 1 \"GND\") (segment (net 1)) (via (net \"GND\")) (footprint (pad (net \"SIG\"))) (net \"\"))").unwrap();
+        assert_eq!(count_nets_and_tracks(&named), (2, 2));
+    }
+
+    #[test]
+    fn dimension_estimation_combines_all_edge_extrema_and_ignores_non_edges() {
+        let source = "(kicad_pcb\n (gr_line (start 5 6) (end -3 -4) (layer \"Edge.Cuts\"))\n (gr_line (start 8 -8) (end -6 9) (layer \"Edge.Cuts\"))\n (gr_line (start -100 -100) (end 100 100) (layer \"F.SilkS\"))\n)";
+        assert_eq!(estimate_board_dimensions(source), (14.0, 17.0));
+        assert_eq!(estimate_board_dimensions("(kicad_pcb)"), (0.0, 0.0));
+        assert_eq!(
+            estimate_board_dimensions("(gr_line (start bad 0) (end 1 1) (layer \"Edge.Cuts\"))\n"),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            estimate_board_dimensions("(gr_line (start 1 2) (end bad 3) (layer \"Edge.Cuts\"))\n"),
+            (0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn setup_and_outline_coordinate_extraction_return_no_evidence_for_bad_fields() {
+        assert_eq!(
+            find_setup_value("(setup (min_trace_width 0.127))", "min_trace_width"),
+            Some(0.127)
+        );
+        for source in [
+            "(setup)",
+            "(setup (min_trace_width nope))",
+            "(setup (min_trace_width 0.127",
+        ] {
+            assert_eq!(find_setup_value(source, "min_trace_width"), None);
+        }
+        assert_eq!(extract_coord("(start 2.01 -3.5)", "start", 1), Some(-3.5));
+        assert_eq!(extract_coord("(start 2.01)", "start", 2), None);
+        assert_eq!(extract_coord("(start nope 1)", "start", 0), None);
+        assert_eq!(extract_coord("(end 2 3)", "start", 0), None);
+    }
+}
+
+#[cfg(test)]
+mod package_preflight_contract_tests {
+    use super::*;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+    fn body(result: CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            other => panic!("expected JSON, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_package_options_are_named_before_ipc_or_output_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let output = dir.path().join("output");
+        let corrections = dir.path().join("corrections.json");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        for (extra, field) in [
+            (json!({"gerber_layers":"F.Cu"}), "gerber_layers"),
+            (json!({"gerber_layers":[7]}), "gerber_layers[0]"),
+            (json!({"position_side":"left"}), "position_side"),
+            (json!({"position_units":"cm"}), "position_units"),
+            (json!({"position_units":"in"}), "position_units"),
+            (
+                json!({"include_assembly":false,"jlcpcb_cpl_corrections_path":corrections}),
+                "jlcpcb_cpl_corrections_path",
+            ),
+            (
+                json!({"fab_house":"pcbway","jlcpcb_cpl_corrections_path":corrections}),
+                "jlcpcb_cpl_corrections_path",
+            ),
+        ] {
+            let mut args = json!({"board":board,"output_dir":output});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let result = handle_export_manufacturing_package(&args, &context())
+                .await
+                .unwrap();
+            assert!(result.is_error);
+            let result = body(result);
+            assert_eq!(result["error"]["kind"], "invalid_argument");
+            assert_eq!(result["error"]["field"], field);
+            assert!(!output.exists());
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), "(kicad_pcb)");
+        }
+    }
+
+    #[tokio::test]
+    async fn pcbway_multilayer_quote_reports_the_requested_and_saved_layer_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb (layers (0 \"F.Cu\" signal) (31 \"B.Cu\" signal)))",
+        )
+        .unwrap();
+        for (layers, price) in [(2, "$5.00"), (8, "$25.00")] {
+            let result = body(
+                handle_estimate_cost(
+                    &json!({"board":board,"fab_house":"pcbway","layers":layers}),
+                    &context(),
+                )
+                .await
+                .unwrap(),
+            );
+            assert_eq!(result["board"]["copper_layers"], layers);
+            assert_eq!(result["board"]["board_copper_layers"], 2);
+            assert_eq!(result["cost_estimate"]["pcb_fabrication"], price);
+            assert_eq!(
+                result["warnings"].as_array().unwrap().len(),
+                usize::from(layers != 2)
+            );
+        }
+    }
+}

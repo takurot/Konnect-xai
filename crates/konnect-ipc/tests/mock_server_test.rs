@@ -3526,3 +3526,1542 @@ fn issue26_placement_checks_field_presentation_and_stroke_readback() {
         }
     }
 }
+
+mod v015_client_contract_tests {
+    use super::*;
+    use kiapi::board::{commands as bc, types as bt};
+    use kiapi::common::{commands as cc, types as ct};
+
+    fn reply_to(command: &'static str, payload: prost_types::Any) -> MockKicad {
+        spawn_mock(move |request| {
+            let message = request.message.unwrap();
+            assert!(message.type_url.ends_with(command), "{}", message.type_url);
+            Some(reply_with(payload.clone()))
+        })
+    }
+
+    #[test]
+    fn empty_or_duplicate_local_requests_never_reach_kicad() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let mock = spawn_mock(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(ok_response())
+        });
+        let client = KiCadIpcClient::new(&mock.url);
+        let document = doc_for("test.kicad_pcb");
+        assert!(client
+            .create_items_in_returning(document.clone(), vec![])
+            .unwrap()
+            .is_empty());
+        client.update_items_in(document.clone(), vec![]).unwrap();
+        client.delete_items_in(document.clone(), vec![]).unwrap();
+        assert!(client
+            .get_item_boxes_in(document.clone(), &[])
+            .unwrap()
+            .is_empty());
+        assert!(client
+            .delete_items_in(document.clone(), vec!["same".into(), "same".into()])
+            .is_err());
+        assert!(client
+            .get_item_boxes_in(document, &["same".into(), "same".into()])
+            .is_err());
+        client
+            .verify_footprint_presentation_in(
+                doc_for("test.kicad_pcb"),
+                &konnect_ipc::FootprintPresentation::default(),
+            )
+            .unwrap();
+        for (operation, ids) in [
+            (IpcSelectionMutation::Add, vec![]),
+            (IpcSelectionMutation::Remove, vec![]),
+            (IpcSelectionMutation::Add, vec![String::new()]),
+        ] {
+            let error = client
+                .mutate_selection(&navigation_board_target(), operation, &ids)
+                .unwrap_err();
+            assert_eq!(
+                IpcSelectionMutationError::from_error(&error).unwrap().kind,
+                IpcSelectionMutationErrorKind::InvalidRequest
+            );
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn bounding_boxes_require_complete_unique_identity_and_valid_dimensions() {
+        let valid = ct::Box2 {
+            position: Some(ct::Vector2 { x_nm: 10, y_nm: 20 }),
+            size: Some(ct::Vector2 { x_nm: 30, y_nm: 40 }),
+        };
+        let cases = [
+            (vec!["one"], vec![], "incomplete"),
+            (vec!["other"], vec![valid], "unexpected"),
+            (
+                vec!["one"],
+                vec![ct::Box2 {
+                    size: None,
+                    ..valid
+                }],
+                "missing size",
+            ),
+            (
+                vec!["one"],
+                vec![ct::Box2 {
+                    position: None,
+                    ..valid
+                }],
+                "invalid native",
+            ),
+            (
+                vec!["one"],
+                vec![ct::Box2 {
+                    size: Some(ct::Vector2 { x_nm: -1, y_nm: 40 }),
+                    ..valid
+                }],
+                "invalid native",
+            ),
+            (
+                vec!["one"],
+                vec![ct::Box2 {
+                    size: Some(ct::Vector2 { x_nm: 30, y_nm: -1 }),
+                    ..valid
+                }],
+                "invalid native",
+            ),
+            (vec!["one", "one"], vec![valid, valid], "duplicate native"),
+        ];
+        for (ids, boxes, reason) in cases {
+            let requested = if ids.len() == 2 {
+                vec!["one".into(), "two".into()]
+            } else {
+                vec!["one".into()]
+            };
+            let response = cc::GetBoundingBoxResponse {
+                items: ids
+                    .into_iter()
+                    .map(|value| ct::Kiid {
+                        value: value.into(),
+                    })
+                    .collect(),
+                boxes,
+            };
+            let mock = reply_to(
+                "GetBoundingBox",
+                builders::pack_any(&response, "kiapi.common.commands.GetBoundingBoxResponse"),
+            );
+            let error = KiCadIpcClient::new(&mock.url)
+                .get_item_boxes_in(doc_for("test.kicad_pcb"), &requested)
+                .unwrap_err();
+            assert!(error.to_string().contains(reason), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn creation_default_status_and_result_counts_do_not_invent_success() {
+        let mock = spawn_mock_creating(vec![cc::ItemCreationResult {
+            status: None,
+            item: Some(any_item()),
+        }]);
+        let created = KiCadIpcClient::new(&mock.url)
+            .create_items_in_returning(doc_for("test.kicad_pcb"), vec![any_item()])
+            .unwrap();
+        assert_eq!(created, vec![any_item()]);
+        let mock = spawn_mock_creating(vec![cc::ItemCreationResult {
+            status: None,
+            item: None,
+        }]);
+        let error = KiCadIpcClient::new(&mock.url)
+            .create_items_in_returning(doc_for("test.kicad_pcb"), vec![any_item()])
+            .unwrap_err();
+        assert!(error.to_string().contains("no error message"));
+        let mock = spawn_mock_creating(vec![creation_result(cc::ItemStatusCode::IscOk, "")]);
+        let error = KiCadIpcClient::new(&mock.url)
+            .create_items_in_returning(doc_for("test.kicad_pcb"), vec![any_item(), any_item()])
+            .unwrap_err();
+        assert!(error.to_string().contains("created 1 of 2 requested"));
+    }
+
+    #[test]
+    fn update_results_without_success_status_are_refused() {
+        for (status, reason) in [
+            (None, "without item status"),
+            (
+                Some(cc::ItemStatus {
+                    code: cc::ItemStatusCode::IscInvalidData as i32,
+                    error_message: "not editable".into(),
+                }),
+                "not editable",
+            ),
+            (Some(cc::ItemStatus::default()), "ISC_UNKNOWN"),
+        ] {
+            let response = cc::UpdateItemsResponse {
+                status: ct::ItemRequestStatus::IrsOk as i32,
+                updated_items: vec![cc::ItemUpdateResult { status, item: None }],
+                ..Default::default()
+            };
+            let mock = reply_to(
+                "UpdateItems",
+                builders::pack_any(&response, "kiapi.common.commands.UpdateItemsResponse"),
+            );
+            let error = KiCadIpcClient::new(&mock.url)
+                .update_items_in(doc_for("test.kicad_pcb"), vec![any_item()])
+                .unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+    }
+
+    #[test]
+    fn deletion_results_must_account_for_each_requested_identifier() {
+        for (ids, reason) in [
+            (vec![Some("one"), Some("extra")], "unexpected item"),
+            (vec![Some("one"), Some("one")], "unexpected item"),
+            (vec![Some("one"), None], "without an item identifier"),
+            (vec![Some("one")], "1 deletion results for 2"),
+        ] {
+            let response = cc::DeleteItemsResponse {
+                status: ct::ItemRequestStatus::IrsOk as i32,
+                deleted_items: ids
+                    .into_iter()
+                    .map(|id| cc::ItemDeletionResult {
+                        id: id.map(|value| ct::Kiid {
+                            value: value.into(),
+                        }),
+                        status: cc::ItemDeletionStatus::IdsOk as i32,
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let mock = reply_to(
+                "DeleteItems",
+                builders::pack_any(&response, "kiapi.common.commands.DeleteItemsResponse"),
+            );
+            let error = KiCadIpcClient::new(&mock.url)
+                .delete_items_in(doc_for("test.kicad_pcb"), vec!["one".into(), "two".into()])
+                .unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+    }
+
+    #[test]
+    fn route_filters_keep_only_matching_straight_tracks_and_preserve_defaults() {
+        let track = |id: &str, net: &str, layer| {
+            builders::pack_any(
+                &bt::Track {
+                    id: Some(ct::Kiid { value: id.into() }),
+                    net: Some(bt::Net {
+                        name: net.into(),
+                        ..Default::default()
+                    }),
+                    layer,
+                    ..Default::default()
+                },
+                "kiapi.board.types.Track",
+            )
+        };
+        let mock = spawn_kicad_holding_items(vec![
+            track("front", "GND", bt::BoardLayer::BlFCu as i32),
+            track("back", "GND", bt::BoardLayer::BlBCu as i32),
+            track("signal", "SIG", bt::BoardLayer::BlFCu as i32),
+            builders::pack_any(&bt::Via::default(), "kiapi.board.types.Via"),
+            prost_types::Any {
+                type_url: "kiapi.board.types.Track".into(),
+                value: vec![0xff],
+            },
+        ]);
+        let client = KiCadIpcClient::new(&mock.url);
+        let filtered = client
+            .get_tracks_in(doc_for("test.kicad_pcb"), Some("GND"), Some("F.Cu"))
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].uuid, "front");
+        assert_eq!(filtered[0].width, 0.25);
+        assert_eq!(filtered[0].start.x, 0.0);
+        assert_eq!(filtered[0].end.y, 0.0);
+        assert_eq!(
+            client
+                .get_tracks_in(doc_for("test.kicad_pcb"), Some("missing"), None)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn duplicate_footprint_references_are_not_pad_identity() {
+        let item = footprint_with_pads("U1", vec![]);
+        let mock = spawn_kicad_holding_items(vec![any_item(), item.clone(), item]);
+        let error = KiCadIpcClient::new(&mock.url)
+            .get_footprint_pads_in(doc_for("test.kicad_pcb"), "U1")
+            .unwrap_err();
+        assert!(error.to_string().contains("appears more than once"));
+    }
+
+    #[test]
+    fn missing_nets_and_empty_snapshots_are_distinct_observations() {
+        let mock = spawn_mock(|request| {
+            let message = request.message.unwrap();
+            if message.type_url.ends_with("GetNets") {
+                return Some(ok_response());
+            }
+            panic!("empty net set must not trigger a netclass request");
+        });
+        let client = KiCadIpcClient::new(&mock.url);
+        assert!(client
+            .get_nets_in(doc_for("test.kicad_pcb"))
+            .unwrap()
+            .is_empty());
+        assert!(client
+            .get_effective_routing_rules_in(doc_for("test.kicad_pcb"))
+            .unwrap()
+            .is_empty());
+        let mock = reply_to(
+            "SaveDocumentToString",
+            builders::pack_any(
+                &cc::SavedDocumentResponse::default(),
+                "kiapi.common.commands.SavedDocumentResponse",
+            ),
+        );
+        assert!(KiCadIpcClient::new(&mock.url)
+            .save_document_to_string_in(doc_for("test.kicad_pcb"))
+            .unwrap_err()
+            .to_string()
+            .contains("empty PCB snapshot"));
+        let mock = reply_to(
+            "BeginCommit",
+            builders::pack_any(
+                &cc::BeginCommitResponse {
+                    id: Some(ct::Kiid {
+                        value: String::new(),
+                    }),
+                },
+                "kiapi.common.commands.BeginCommitResponse",
+            ),
+        );
+        assert!(KiCadIpcClient::new(&mock.url)
+            .begin_commit()
+            .unwrap_err()
+            .to_string()
+            .contains("empty commit identifier"));
+    }
+
+    #[test]
+    fn effective_rules_keep_missing_or_invalid_dimensions_unknown() {
+        for mode in 0..3 {
+            let mock = spawn_mock(move |request| {
+                let message = request.message.unwrap();
+                let response = if message.type_url.ends_with("GetNets") {
+                    builders::pack_any(
+                        &bc::NetsResponse {
+                            nets: vec![bt::Net {
+                                name: "SIG".into(),
+                                code: None,
+                            }],
+                        },
+                        "kiapi.board.commands.NetsResponse",
+                    )
+                } else {
+                    assert!(message.type_url.ends_with("GetNetClassForNets"));
+                    let class = kiapi::common::project::NetClass {
+                        constituents: vec!["Power".into(), "Fast".into()],
+                        board: if mode == 0 {
+                            None
+                        } else {
+                            Some(kiapi::common::project::NetClassBoardSettings {
+                                track_width: Some(ct::Distance { value_nm: 0 }),
+                                clearance: Some(ct::Distance {
+                                    value_nm: if mode == 1 { 0 } else { -1 },
+                                }),
+                                via_stack: Some(bt::PadStack {
+                                    copper_layers: vec![bt::PadStackLayer {
+                                        size: Some(ct::Vector2 { x_nm: 0, y_nm: 0 }),
+                                        ..Default::default()
+                                    }],
+                                    drill: Some(bt::DrillProperties {
+                                        diameter: Some(ct::Vector2 { x_nm: -1, y_nm: -1 }),
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            })
+                        },
+                        ..Default::default()
+                    };
+                    builders::pack_any(
+                        &bc::NetClassForNetsResponse {
+                            classes: [("SIG".into(), class)].into_iter().collect(),
+                        },
+                        "kiapi.board.commands.NetClassForNetsResponse",
+                    )
+                };
+                Some(reply_with(response))
+            });
+            let rules = KiCadIpcClient::new(&mock.url)
+                .get_effective_routing_rules_in(doc_for("test.kicad_pcb"))
+                .unwrap();
+            let rule = &rules["SIG"];
+            assert_eq!(rule.class_name, "Power+Fast");
+            assert_eq!(rule.track_width_mm, None);
+            assert_eq!(rule.via_diameter_mm, None);
+            assert_eq!(rule.via_drill_mm, None);
+            assert_eq!(rule.clearance_mm, if mode == 1 { Some(0.0) } else { None });
+        }
+    }
+    #[test]
+    fn identical_model_replacement_is_a_readback_derived_noop() {
+        use konnect_ipc::{IpcFootprint3DModelEdit, IpcFootprint3DModelEditOutcome};
+        let footprint = model_footprint();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let mock = spawn_mock(move |request| {
+            let message = request.message.unwrap();
+            observed.lock().unwrap().push(message.type_url.clone());
+            assert!(message.type_url.ends_with("GetItems"));
+            Some(reply_with(builders::pack_any(
+                &cc::GetItemsResponse {
+                    status: ct::ItemRequestStatus::IrsOk as i32,
+                    items: vec![builders::pack_any(
+                        &footprint,
+                        "kiapi.board.types.FootprintInstance",
+                    )],
+                    ..Default::default()
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            )))
+        });
+        let client = KiCadIpcClient::new(&mock.url);
+        let before = client
+            .footprint_3d_model_snapshot_in(doc_for("test.kicad_pcb"), "U1")
+            .unwrap();
+        let result = client
+            .edit_footprint_3d_models_in(
+                doc_for("test.kicad_pcb"),
+                "U1",
+                before.clone(),
+                IpcFootprint3DModelEdit::Replace {
+                    index: 0,
+                    model: before.models[0].clone(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            result,
+            IpcFootprint3DModelEditOutcome::Applied { changed: false, .. }
+        ));
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "no commit or mutation is needed"
+        );
+    }
+
+    fn model_footprint() -> bt::FootprintInstance {
+        let packed = footprint_with_pads("U1", vec![]);
+        let mut footprint = bt::FootprintInstance::decode(packed.value.as_slice()).unwrap();
+        footprint.id = Some(ct::Kiid {
+            value: "footprint-one".into(),
+        });
+        footprint
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .push(builders::pack_any(
+                &bt::Footprint3DModel {
+                    filename: "part.step".into(),
+                    scale: Some(ct::Vector3D {
+                        x_nm: 1.0,
+                        y_nm: 1.0,
+                        z_nm: 1.0,
+                    }),
+                    rotation: Some(ct::Vector3D::default()),
+                    offset: Some(ct::Vector3D::default()),
+                    visible: true,
+                    opacity: 1.0,
+                },
+                "kiapi.board.types.Footprint3DModel",
+            ));
+        footprint
+    }
+
+    #[test]
+    fn model_edit_outcomes_follow_fresh_identity_and_content_not_update_status() {
+        use konnect_ipc::{IpcFootprint3DModelEdit, IpcFootprint3DModelEditOutcome};
+        for mode in 0..6 {
+            let initial = model_footprint();
+            let state = Arc::new(Mutex::new((initial, false)));
+            let held = state.clone();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let observed = calls.clone();
+            let mock = spawn_mock(move |request| {
+                let message = request.message.unwrap();
+                observed.lock().unwrap().push(message.type_url.clone());
+                let mut state = held.lock().unwrap();
+                if message.type_url.ends_with("GetItems") {
+                    if mode == 5 && state.1 {
+                        let mut response = ok_response();
+                        response.status.as_mut().unwrap().status =
+                            kiapi::common::ApiStatusCode::AsBadRequest as i32;
+                        return Some(response);
+                    }
+                    return Some(reply_with(builders::pack_any(
+                        &cc::GetItemsResponse {
+                            status: ct::ItemRequestStatus::IrsOk as i32,
+                            items: vec![builders::pack_any(
+                                &state.0,
+                                "kiapi.board.types.FootprintInstance",
+                            )],
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    )));
+                }
+                if message.type_url.ends_with("BeginCommit") {
+                    return Some(reply_with(builders::pack_any(
+                        &cc::BeginCommitResponse {
+                            id: Some(ct::Kiid {
+                                value: "edit".into(),
+                            }),
+                        },
+                        "kiapi.common.commands.BeginCommitResponse",
+                    )));
+                }
+                if message.type_url.ends_with("EndCommit") {
+                    return Some(reply_with(builders::pack_any(
+                        &cc::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    )));
+                }
+                assert!(
+                    message.type_url.ends_with("UpdateItems"),
+                    "{}",
+                    message.type_url
+                );
+                let update = cc::UpdateItems::decode(message.value.as_slice()).unwrap();
+                state.1 = true;
+                if matches!(mode, 1 | 2 | 4 | 5) {
+                    state.0 =
+                        bt::FootprintInstance::decode(update.items[0].value.as_slice()).unwrap();
+                }
+                if mode == 1 {
+                    state.0.id = Some(ct::Kiid {
+                        value: "different-footprint".into(),
+                    });
+                }
+                if mode == 4 {
+                    let model = state
+                        .0
+                        .definition
+                        .as_mut()
+                        .unwrap()
+                        .items
+                        .iter_mut()
+                        .find(|item| builders::any_is(item, "kiapi.board.types.Footprint3DModel"))
+                        .unwrap();
+                    let mut changed = bt::Footprint3DModel::decode(model.value.as_slice()).unwrap();
+                    changed.filename = "unexpected.step".into();
+                    *model = builders::pack_any(&changed, "kiapi.board.types.Footprint3DModel");
+                }
+                if matches!(mode, 2..=4) {
+                    let mut response = ok_response();
+                    response.status.as_mut().unwrap().status =
+                        kiapi::common::ApiStatusCode::AsBadRequest as i32;
+                    response.status.as_mut().unwrap().error_message = "rejected update".into();
+                    return Some(response);
+                }
+                Some(reply_with(builders::pack_any(
+                    &cc::UpdateItemsResponse {
+                        status: ct::ItemRequestStatus::IrsOk as i32,
+                        updated_items: vec![cc::ItemUpdateResult {
+                            status: Some(cc::ItemStatus {
+                                code: cc::ItemStatusCode::IscOk as i32,
+                                error_message: String::new(),
+                            }),
+                            item: None,
+                        }],
+                        ..Default::default()
+                    },
+                    "kiapi.common.commands.UpdateItemsResponse",
+                )))
+            });
+            let client = KiCadIpcClient::new(&mock.url);
+            let before = client
+                .footprint_3d_model_snapshot_in(doc_for("test.kicad_pcb"), "U1")
+                .unwrap();
+            let mut model = before.models[0].clone();
+            model.offset_mm.x = 3.0;
+            let result = client.edit_footprint_3d_models_in(
+                doc_for("test.kicad_pcb"),
+                "U1",
+                before,
+                IpcFootprint3DModelEdit::Replace { index: 0, model },
+            );
+            match mode {
+                2 => assert!(matches!(
+                    result.unwrap(),
+                    IpcFootprint3DModelEditOutcome::Applied { changed: true, .. }
+                )),
+                3 => assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("fresh readback confirmed")),
+                _ => assert!(matches!(
+                    result.unwrap(),
+                    IpcFootprint3DModelEditOutcome::Uncertain { .. }
+                )),
+            }
+            assert!(!calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.ends_with("SaveDocument")));
+        }
+    }
+}
+
+mod v015_footprint_edit_contract_tests {
+    use super::*;
+    use kiapi::board::types as bt;
+    use kiapi::common::{commands as cc, types as ct};
+
+    #[derive(Default)]
+    struct HeldBoard {
+        items: Vec<prost_types::Any>,
+        updates: Vec<Vec<prost_types::Any>>,
+        commands: Vec<String>,
+        commit_actions: Vec<i32>,
+    }
+
+    fn footprint(reference: &str, children: Vec<prost_types::Any>) -> bt::FootprintInstance {
+        let packed = footprint_with_pads(reference, vec![]);
+        let mut footprint = bt::FootprintInstance::decode(packed.value.as_slice()).unwrap();
+        footprint.id = Some(ct::Kiid {
+            value: format!("{reference}-id"),
+        });
+        footprint.definition.as_mut().unwrap().items = children;
+        footprint
+    }
+
+    fn packed(footprint: &bt::FootprintInstance) -> prost_types::Any {
+        builders::pack_any(footprint, "kiapi.board.types.FootprintInstance")
+    }
+
+    fn spawn_board(items: Vec<prost_types::Any>) -> (MockKicad, Arc<Mutex<HeldBoard>>) {
+        let held = Arc::new(Mutex::new(HeldBoard {
+            items,
+            ..Default::default()
+        }));
+        let state = held.clone();
+        let mock = spawn_mock(move |request| {
+            let message = request.message.unwrap();
+            let mut state = state.lock().unwrap();
+            state.commands.push(message.type_url.clone());
+            let body = match builders::any_type_name(&message) {
+                "kiapi.common.commands.GetOpenDocuments" => return Some(open_board_response()),
+                "kiapi.common.commands.GetItems" => builders::pack_any(
+                    &cc::GetItemsResponse {
+                        status: ct::ItemRequestStatus::IrsOk as i32,
+                        items: state.items.clone(),
+                        ..Default::default()
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ),
+                "kiapi.common.commands.BeginCommit" => builders::pack_any(
+                    &cc::BeginCommitResponse {
+                        id: Some(ct::Kiid {
+                            value: "edit".into(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                ),
+                "kiapi.common.commands.EndCommit" => {
+                    let command = cc::EndCommit::decode(message.value.as_slice()).unwrap();
+                    state.commit_actions.push(command.action);
+                    builders::pack_any(
+                        &cc::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    )
+                }
+                "kiapi.common.commands.UpdateItems" => {
+                    let update = cc::UpdateItems::decode(message.value.as_slice()).unwrap();
+                    state.updates.push(update.items.clone());
+                    for item in &update.items {
+                        let updated = bt::FootprintInstance::decode(item.value.as_slice()).unwrap();
+                        let existing = state
+                            .items
+                            .iter_mut()
+                            .find(|existing| {
+                                builders::any_is(existing, "kiapi.board.types.FootprintInstance")
+                                    && bt::FootprintInstance::decode(existing.value.as_slice())
+                                        .is_ok_and(|fp| fp.id == updated.id)
+                            })
+                            .expect("updated footprint already belongs to the board");
+                        *existing = item.clone();
+                    }
+                    builders::pack_any(
+                        &cc::UpdateItemsResponse {
+                            status: ct::ItemRequestStatus::IrsOk as i32,
+                            updated_items: update
+                                .items
+                                .into_iter()
+                                .map(|item| cc::ItemUpdateResult {
+                                    status: Some(cc::ItemStatus {
+                                        code: cc::ItemStatusCode::IscOk as i32,
+                                        error_message: String::new(),
+                                    }),
+                                    item: Some(item),
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.UpdateItemsResponse",
+                    )
+                }
+                other => panic!("unexpected board command {other}"),
+            };
+            Some(reply_with(body))
+        });
+        (mock, held)
+    }
+
+    fn polygon(id: &str, outlines: usize, holes: usize) -> bt::BoardGraphicShape {
+        let outline = ct::PolyLine {
+            closed: true,
+            nodes: [(100.0, 99.0), (101.0, 99.0), (101.0, 98.0)]
+                .into_iter()
+                .map(|(x, y)| ct::PolyLineNode {
+                    geometry: Some(ct::poly_line_node::Geometry::Point(
+                        builders::vec2(x, y).unwrap(),
+                    )),
+                })
+                .collect(),
+        };
+        bt::BoardGraphicShape {
+            id: Some(ct::Kiid { value: id.into() }),
+            layer: bt::BoardLayer::BlFSilkS as i32,
+            shape: Some(ct::GraphicShape {
+                geometry: Some(ct::graphic_shape::Geometry::Polygon(ct::PolySet {
+                    polygons: (0..outlines)
+                        .map(|_| ct::PolygonWithHoles {
+                            outline: Some(outline.clone()),
+                            holes: vec![outline.clone(); holes],
+                        })
+                        .collect(),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn footprint_graphic_observation_marks_only_unambiguous_simple_polygons_editable() {
+        let mut children = Vec::new();
+        for shape in [
+            polygon("simple", 1, 0),
+            polygon("holed", 1, 1),
+            polygon("multiple", 2, 0),
+            polygon("", 1, 0),
+        ] {
+            children.push(builders::pack_any(
+                &shape,
+                "kiapi.board.types.BoardGraphicShape",
+            ));
+        }
+        children.extend([
+            builders::pack_any(
+                &builders::board_segment("F.SilkS", 0.1, 100.0, 99.0, 101.0, 99.0).unwrap(),
+                "kiapi.board.types.BoardGraphicShape",
+            ),
+            builders::pack_any(
+                &bt::BoardGraphicShape::default(),
+                "kiapi.board.types.BoardGraphicShape",
+            ),
+            prost_types::Any {
+                type_url: "kiapi.board.types.BoardGraphicShape".into(),
+                value: vec![0xff],
+            },
+            any_item(),
+        ]);
+        let mut fp = footprint("U1", children);
+        fp.orientation = Some(ct::Angle {
+            value_degrees: 90.0,
+        });
+        let (mock, held) = spawn_board(vec![packed(&footprint("U2", vec![])), packed(&fp)]);
+        let graphics = KiCadIpcClient::new(&mock.url)
+            .list_footprint_graphics("U1")
+            .unwrap();
+        assert_eq!(graphics.len(), 5);
+        assert!(graphics[0].editable);
+        assert_eq!(graphics[0].uuid, "simple");
+        assert_eq!(
+            (graphics[0].points[0].x, graphics[0].points[0].y),
+            (1.0, 0.0)
+        );
+        assert!(graphics[1..].iter().all(|graphic| !graphic.editable));
+        assert_eq!((graphics[1].outlines, graphics[1].holes), (1, 1));
+        assert_eq!(graphics[2].outlines, 2);
+        assert_eq!(graphics[4].kind, "segment");
+        assert!(held.lock().unwrap().updates.is_empty());
+
+        let mut missing = footprint("U1", vec![]);
+        missing.definition = None;
+        let (mock, _) = spawn_board(vec![packed(&missing)]);
+        assert!(KiCadIpcClient::new(&mock.url)
+            .list_footprint_graphics("U1")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn polygon_edit_writes_board_coordinates_only_for_the_named_child() {
+        let mut fp = footprint(
+            "U1",
+            vec![
+                builders::pack_any(
+                    &polygon("other", 1, 0),
+                    "kiapi.board.types.BoardGraphicShape",
+                ),
+                prost_types::Any {
+                    type_url: "kiapi.board.types.BoardGraphicShape".into(),
+                    value: vec![0xff],
+                },
+                builders::pack_any(
+                    &polygon("target", 1, 0),
+                    "kiapi.board.types.BoardGraphicShape",
+                ),
+            ],
+        );
+        fp.orientation = Some(ct::Angle {
+            value_degrees: 90.0,
+        });
+        let untouched = fp.definition.as_ref().unwrap().items[0].clone();
+        let (mock, held) = spawn_board(vec![packed(&fp)]);
+        let result = KiCadIpcClient::new(&mock.url)
+            .set_footprint_graphic_points("U1", "target", &[(2.0, 0.0), (2.0, 1.0), (3.0, 1.0)])
+            .unwrap();
+        assert_eq!(result, "polygon");
+        let held = held.lock().unwrap();
+        assert_eq!(held.updates.len(), 1);
+        let updated = bt::FootprintInstance::decode(held.updates[0][0].value.as_slice()).unwrap();
+        let children = updated.definition.unwrap().items;
+        assert_eq!(children[0], untouched);
+        let target = bt::BoardGraphicShape::decode(children[2].value.as_slice()).unwrap();
+        let ct::graphic_shape::Geometry::Polygon(polyset) = target.shape.unwrap().geometry.unwrap()
+        else {
+            panic!("polygon")
+        };
+        let points = &polyset.polygons[0].outline.as_ref().unwrap().nodes;
+        assert_eq!(
+            points[0].geometry,
+            Some(ct::poly_line_node::Geometry::Point(
+                builders::vec2(100.0, 98.0).unwrap()
+            ))
+        );
+        assert_eq!(
+            points[2].geometry,
+            Some(ct::poly_line_node::Geometry::Point(
+                builders::vec2(101.0, 97.0).unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn unsupported_polygon_edits_refuse_before_update_items() {
+        for (shape, uuid, points) in [
+            (
+                polygon("target", 1, 1),
+                "target",
+                vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+            ),
+            (
+                polygon("target", 2, 0),
+                "target",
+                vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+            ),
+            (
+                polygon("target", 1, 0),
+                "target",
+                vec![(0.0, 0.0), (1.0, 0.0)],
+            ),
+            (
+                polygon("target", 1, 0),
+                "missing",
+                vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+            ),
+        ] {
+            let fp = footprint(
+                "U1",
+                vec![builders::pack_any(
+                    &shape,
+                    "kiapi.board.types.BoardGraphicShape",
+                )],
+            );
+            let before = packed(&fp);
+            let (mock, held) = spawn_board(vec![before.clone()]);
+            assert!(KiCadIpcClient::new(&mock.url)
+                .set_footprint_graphic_points("U1", uuid, &points)
+                .is_err());
+            let held = held.lock().unwrap();
+            assert!(held.updates.is_empty());
+            assert_eq!(held.items, vec![before]);
+        }
+    }
+
+    fn value_field(value: &str) -> bt::Field {
+        bt::Field {
+            name: "Value".into(),
+            text: Some(bt::BoardText {
+                text: Some(ct::Text {
+                    text: value.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn value_edit_updates_both_copies_only_on_the_requested_footprint() {
+        for definition_copy in [false, true] {
+            let mut fp = footprint("U1", vec![]);
+            fp.value_field = Some(value_field("old"));
+            if definition_copy {
+                fp.definition.as_mut().unwrap().value_field = Some(value_field("old"));
+            }
+            let other = packed(&footprint("U2", vec![]));
+            let malformed = prost_types::Any {
+                type_url: "kiapi.board.types.FootprintInstance".into(),
+                value: vec![0xff],
+            };
+            let (mock, held) = spawn_board(vec![malformed, other.clone(), packed(&fp)]);
+            KiCadIpcClient::new(&mock.url)
+                .set_footprint_value("U1", "new")
+                .unwrap();
+            let held = held.lock().unwrap();
+            assert_eq!(held.updates.len(), 1);
+            let fp = bt::FootprintInstance::decode(held.updates[0][0].value.as_slice()).unwrap();
+            assert_eq!(fp.id.unwrap().value, "U1-id");
+            assert_eq!(
+                fp.value_field.unwrap().text.unwrap().text.unwrap().text,
+                "new"
+            );
+            if definition_copy {
+                assert_eq!(
+                    fp.definition
+                        .unwrap()
+                        .value_field
+                        .unwrap()
+                        .text
+                        .unwrap()
+                        .text
+                        .unwrap()
+                        .text,
+                    "new"
+                );
+            }
+            assert!(held.items.contains(&other));
+        }
+        for reference in ["U1", "missing"] {
+            let (mock, held) = spawn_board(vec![packed(&footprint("U1", vec![]))]);
+            assert!(KiCadIpcClient::new(&mock.url)
+                .set_footprint_value(reference, "new")
+                .is_err());
+            assert!(held.lock().unwrap().updates.is_empty());
+        }
+    }
+
+    #[test]
+    fn placement_batches_validate_identity_and_report_observed_positions() {
+        use konnect_ipc::IpcFootprintPlacement;
+        let requested = IpcFootprintPlacement {
+            reference: "U1".into(),
+            x: 100.0,
+            y: 100.0,
+            rotation: 0.0,
+        };
+        let (mock, held) = spawn_board(vec![]);
+        let client = KiCadIpcClient::new(&mock.url);
+        assert!(client.set_footprint_placements(&[]).unwrap().is_empty());
+        assert!(client
+            .set_footprint_placements(&[requested.clone(), requested.clone()])
+            .is_err());
+        assert!(held.lock().unwrap().commands.is_empty());
+        for delta in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)] {
+            let mut target = requested.clone();
+            target.x += delta.0;
+            target.y += delta.1;
+            let other = packed(&footprint("U2", vec![]));
+            let (mock, held) = spawn_board(vec![
+                any_item(),
+                other.clone(),
+                packed(&footprint("U1", vec![])),
+            ]);
+            let observed = KiCadIpcClient::new(&mock.url)
+                .set_footprint_placements(&[target.clone()])
+                .unwrap();
+            assert_eq!(
+                (observed[0].x, observed[0].y, observed[0].rotation),
+                (target.x, target.y, target.rotation)
+            );
+            let held = held.lock().unwrap();
+            assert_eq!(held.updates.len(), 1);
+            assert!(held.items.contains(&other));
+            assert_eq!(held.updates[0].len(), 1);
+        }
+        for (items, requests) in [
+            (
+                vec![
+                    packed(&footprint("U1", vec![])),
+                    packed(&footprint("U1", vec![])),
+                ],
+                vec![requested.clone()],
+            ),
+            (vec![], vec![requested.clone()]),
+            (
+                vec![],
+                vec![
+                    requested.clone(),
+                    IpcFootprintPlacement {
+                        reference: "U2".into(),
+                        ..requested
+                    },
+                ],
+            ),
+        ] {
+            let (mock, held) = spawn_board(items);
+            assert!(KiCadIpcClient::new(&mock.url)
+                .set_footprint_placements(&requests)
+                .is_err());
+            let held = held.lock().unwrap();
+            assert!(held.updates.is_empty());
+            assert!(held
+                .commands
+                .iter()
+                .any(|command| command.ends_with("EndCommit")));
+            assert_eq!(held.commit_actions, vec![cc::CommitAction::CmaDrop as i32]);
+        }
+    }
+    #[test]
+    fn board_graphics_keep_text_box_and_dimension_origins_distinct() {
+        let items = vec![
+            builders::pack_any(
+                &bt::BoardText {
+                    id: Some(ct::Kiid {
+                        value: "text".into(),
+                    }),
+                    text: Some(ct::Text {
+                        position: Some(builders::vec2(2.0, 3.0).unwrap()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "kiapi.board.types.BoardText",
+            ),
+            builders::pack_any(
+                &bt::BoardTextBox {
+                    id: Some(ct::Kiid {
+                        value: "box".into(),
+                    }),
+                    textbox: Some(ct::TextBox {
+                        top_left: Some(builders::vec2(4.0, 5.0).unwrap()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "kiapi.board.types.BoardTextBox",
+            ),
+            builders::pack_any(
+                &bt::Dimension {
+                    id: Some(ct::Kiid {
+                        value: "dimension".into(),
+                    }),
+                    text: Some(ct::Text {
+                        position: Some(builders::vec2(6.0, 7.0).unwrap()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "kiapi.board.types.Dimension",
+            ),
+            prost_types::Any {
+                type_url: "kiapi.board.types.BoardText".into(),
+                value: vec![0xff],
+            },
+            any_item(),
+        ];
+        let (mock, held) = spawn_board(items);
+        let graphics = KiCadIpcClient::new(&mock.url)
+            .get_board_graphics_in(doc_for("test.kicad_pcb"))
+            .unwrap();
+        assert_eq!(graphics.len(), 3);
+        for (graphic, (id, kind, x, y)) in graphics.iter().zip([
+            ("text", "text", 2.0, 3.0),
+            ("box", "textbox", 4.0, 5.0),
+            ("dimension", "dimension", 6.0, 7.0),
+        ]) {
+            assert_eq!((graphic.uuid.as_str(), graphic.kind.as_str()), (id, kind));
+            let position = graphic.origin.as_ref().unwrap();
+            assert_eq!((position.x, position.y), (x, y));
+        }
+        assert!(held.lock().unwrap().updates.is_empty());
+    }
+
+    #[test]
+    fn fanout_resolves_only_named_nets_and_creates_one_undo_group() {
+        let created = Arc::new(Mutex::new(Vec::new()));
+        let captured = created.clone();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let mock = spawn_mock(move |request| {
+            let message = request.message.unwrap();
+            observed.lock().unwrap().push(message.type_url.clone());
+            let body = match builders::any_type_name(&message) {
+                "kiapi.common.commands.GetOpenDocuments" => return Some(open_board_response()),
+                "kiapi.board.commands.GetNets" => builders::pack_any(
+                    &kiapi::board::commands::NetsResponse {
+                        nets: vec![bt::Net {
+                            name: "GND".into(),
+                            code: Some(bt::NetCode { value: 7 }),
+                        }],
+                    },
+                    "kiapi.board.commands.NetsResponse",
+                ),
+                "kiapi.common.commands.BeginCommit" => builders::pack_any(
+                    &cc::BeginCommitResponse {
+                        id: Some(ct::Kiid {
+                            value: "fanout".into(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                ),
+                "kiapi.common.commands.EndCommit" => {
+                    let command = cc::EndCommit::decode(message.value.as_slice()).unwrap();
+                    assert_eq!(command.action, cc::CommitAction::CmaCommit as i32);
+                    builders::pack_any(
+                        &cc::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    )
+                }
+                "kiapi.common.commands.CreateItems" => {
+                    let command = cc::CreateItems::decode(message.value.as_slice()).unwrap();
+                    *captured.lock().unwrap() = command.items.clone();
+                    builders::pack_any(
+                        &cc::CreateItemsResponse {
+                            status: ct::ItemRequestStatus::IrsOk as i32,
+                            created_items: command
+                                .items
+                                .into_iter()
+                                .map(|item| cc::ItemCreationResult {
+                                    status: Some(cc::ItemStatus {
+                                        code: cc::ItemStatusCode::IscOk as i32,
+                                        error_message: String::new(),
+                                    }),
+                                    item: Some(item),
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.CreateItemsResponse",
+                    )
+                }
+                other => panic!("unexpected fanout command {other}"),
+            };
+            Some(reply_with(body))
+        });
+        let count = KiCadIpcClient::new(&mock.url)
+            .apply_fanout(
+                &[
+                    ("".into(), 0.0, 0.0, 1.0, 1.0),
+                    ("GND".into(), 2.0, 2.0, 3.0, 3.0),
+                ],
+                &[("".into(), 1.0, 1.0), ("GND".into(), 3.0, 3.0)],
+                "F.Cu",
+                0.25,
+                0.3,
+                0.6,
+            )
+            .unwrap();
+        assert_eq!(count, 4);
+        let created = created.lock().unwrap();
+        for index in 0..2 {
+            let track = bt::Track::decode(created[index].value.as_slice()).unwrap();
+            let net = track.net.unwrap();
+            assert_eq!(net.code.unwrap().value, if index == 0 { 0 } else { 7 });
+            assert_eq!(net.name, if index == 0 { "" } else { "GND" });
+            let via = bt::Via::decode(created[index + 2].value.as_slice()).unwrap();
+            assert_eq!(
+                via.net.unwrap().code.unwrap().value,
+                if index == 0 { 0 } else { 7 }
+            );
+        }
+        let calls = calls.lock().unwrap();
+        for command in ["BeginCommit", "CreateItems", "EndCommit"] {
+            assert_eq!(
+                calls.iter().filter(|call| call.ends_with(command)).count(),
+                1
+            );
+        }
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.ends_with("GetNets"))
+                .count(),
+            2
+        );
+    }
+    #[test]
+    fn public_footprint_builder_preserves_oval_drills_and_optional_field_angles() {
+        use konnect_ipc::{IpcFieldPlacement, IpcPadDefinition};
+        let build = |pads: &[IpcPadDefinition], fields: &IpcFieldPlacement, angle| {
+            KiCadIpcClient::build_footprint_item(
+                "Test:Part",
+                "U1",
+                "value",
+                pads,
+                &[],
+                fields,
+                0.0,
+                0.0,
+                angle,
+                "B.Cu",
+            )
+        };
+        let pad = IpcPadDefinition {
+            number: "1".into(),
+            pad_type: "thru_hole".into(),
+            shape: "oval".into(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            size_x: 1.0,
+            size_y: 1.5,
+            drill_x: Some(0.3),
+            drill_y: Some(0.5),
+            drill_oval: true,
+            layers: vec!["*.Cu".into(), "*.Mask".into()],
+            roundrect_ratio: 0.0,
+            chamfer_ratio: 0.0,
+            chamfered_corners: None,
+        };
+        for attributes in [
+            None,
+            Some(ct::TextAttributes {
+                angle: Some(ct::Angle {
+                    value_degrees: 170.0,
+                }),
+                keep_upright: false,
+                ..Default::default()
+            }),
+        ] {
+            let mut field = value_field("custom");
+            field.name = "MPN".into();
+            let text = field.text.as_mut().unwrap().text.as_mut().unwrap();
+            text.position = Some(ct::Vector2::default());
+            text.attributes = attributes.clone();
+            let fields = IpcFieldPlacement {
+                fields: vec![field],
+                ..Default::default()
+            };
+            let item = build(std::slice::from_ref(&pad), &fields, 90.0).unwrap();
+            let fp = bt::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            assert_eq!(
+                fp.reference_field.unwrap().text.unwrap().layer,
+                bt::BoardLayer::BlBSilkS as i32
+            );
+            let children = fp.definition.unwrap().items;
+            let native_pad = bt::Pad::decode(
+                children
+                    .iter()
+                    .find(|item| builders::any_is(item, "kiapi.board.types.Pad"))
+                    .unwrap()
+                    .value
+                    .as_slice(),
+            )
+            .unwrap();
+            let drill = native_pad.pad_stack.unwrap().drill.unwrap();
+            assert_eq!(drill.shape, bt::DrillShape::DsOblong as i32);
+            assert_eq!(drill.diameter, Some(builders::vec2(0.3, 0.5).unwrap()));
+            let native_field = bt::Field::decode(
+                children
+                    .iter()
+                    .find(|item| builders::any_is(item, "kiapi.board.types.Field"))
+                    .unwrap()
+                    .value
+                    .as_slice(),
+            )
+            .unwrap();
+            let observed = native_field.text.unwrap().text.unwrap().attributes;
+            if attributes.is_some() {
+                assert_eq!(observed.unwrap().angle.unwrap().value_degrees, 260.0);
+            } else {
+                assert_eq!(observed, None);
+            }
+        }
+        assert!(build(&[], &IpcFieldPlacement::default(), f64::NAN).is_err());
+        // Keep degree-to-radian conversion finite so the derived-angle guards run.
+        let huge_rotation = f64::MAX / 4.0;
+        let fields = IpcFieldPlacement {
+            reference_at: Some((0.0, 0.0, f64::MAX)),
+            ..Default::default()
+        };
+        assert!(build(&[], &fields, huge_rotation)
+            .unwrap_err()
+            .to_string()
+            .contains("rotation must be finite"));
+        let mut overflow_pad = pad;
+        overflow_pad.rotation = f64::MAX;
+        assert!(build(
+            &[overflow_pad],
+            &IpcFieldPlacement::default(),
+            huge_rotation
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("rotation must be finite"));
+        let mut field = value_field("custom");
+        field.name = "MPN".into();
+        let text = field.text.as_mut().unwrap().text.as_mut().unwrap();
+        text.position = Some(ct::Vector2::default());
+        text.attributes = Some(ct::TextAttributes {
+            angle: Some(ct::Angle {
+                value_degrees: f64::MAX,
+            }),
+            ..Default::default()
+        });
+        assert!(build(
+            &[],
+            &IpcFieldPlacement {
+                fields: vec![field],
+                ..Default::default()
+            },
+            huge_rotation
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("rotation must be finite"));
+    }
+
+    #[test]
+    fn component_lookups_skip_unreadable_items_and_never_mutate_an_unrelated_reference() {
+        let malformed = prost_types::Any {
+            type_url: "kiapi.board.types.FootprintInstance".into(),
+            value: vec![0xff],
+        };
+        let other = packed(&footprint("U2", vec![]));
+        let (mock, held) = spawn_board(vec![malformed, other.clone()]);
+        let client = KiCadIpcClient::new(&mock.url);
+        assert!(client.get_footprint("missing").unwrap().is_none());
+        assert!(client.move_footprint("missing", 1.0, 2.0).is_err());
+        assert!(client.rotate_footprint("missing", 90.0).is_err());
+        assert!(client.list_footprint_graphics("missing").is_err());
+        let held = held.lock().unwrap();
+        assert!(held.updates.is_empty());
+        assert!(held.items.contains(&other));
+    }
+
+    #[test]
+    fn commit_failures_distinguish_known_rejection_from_unknown_mutation() {
+        for mode in 0..4 {
+            let actions = Arc::new(Mutex::new(Vec::new()));
+            let observed = actions.clone();
+            let mock = spawn_mock(move |request| {
+                let message = request.message.unwrap();
+                if message.type_url.ends_with("BeginCommit") {
+                    return Some(reply_with(builders::pack_any(
+                        &cc::BeginCommitResponse {
+                            id: Some(ct::Kiid {
+                                value: "batch".into(),
+                            }),
+                        },
+                        "kiapi.common.commands.BeginCommitResponse",
+                    )));
+                }
+                let mut response = ok_response();
+                if message.type_url.ends_with("RunAction") {
+                    if mode == 3 {
+                        response.status = None;
+                    } else if mode == 2 {
+                        response.status.as_mut().unwrap().status =
+                            kiapi::common::ApiStatusCode::AsBadRequest as i32;
+                    }
+                    return Some(response);
+                }
+                assert!(message.type_url.ends_with("EndCommit"));
+                let command = cc::EndCommit::decode(message.value.as_slice()).unwrap();
+                observed.lock().unwrap().push(command.action);
+                if command.action == cc::CommitAction::CmaCommit as i32 || matches!(mode, 1 | 2) {
+                    response.status.as_mut().unwrap().status =
+                        kiapi::common::ApiStatusCode::AsBadRequest as i32;
+                    response.status.as_mut().unwrap().error_message = "commit refused".into();
+                } else {
+                    response.message = Some(builders::pack_any(
+                        &cc::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    ));
+                }
+                Some(response)
+            });
+            let error = KiCadIpcClient::new(&mock.url)
+                .run_commit("test", |client| client.run_action("test.action"))
+                .unwrap_err();
+            if mode == 0 {
+                assert!(error.to_string().contains("changes dropped"));
+                assert!(!matches!(
+                    konnect_ipc::IpcFailure::from_error(error),
+                    konnect_ipc::IpcFailure::Uncertain(_)
+                ));
+            } else {
+                assert!(matches!(
+                    konnect_ipc::IpcFailure::from_error(error),
+                    konnect_ipc::IpcFailure::Uncertain(_)
+                ));
+            }
+            let expected = match mode {
+                0 | 1 => vec![
+                    cc::CommitAction::CmaCommit as i32,
+                    cc::CommitAction::CmaDrop as i32,
+                ],
+                2 => vec![cc::CommitAction::CmaDrop as i32],
+                _ => vec![],
+            };
+            assert_eq!(
+                *actions.lock().unwrap(),
+                expected,
+                "unknown operation must not trigger a blind drop"
+            );
+        }
+    }
+
+    #[test]
+    fn flip_rejections_and_fresh_identity_mismatch_never_report_a_successful_flip() {
+        for mode in 0..3 {
+            let mut fp = footprint("U1", vec![]);
+            fp.layer = bt::BoardLayer::BlFCu as i32;
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let observed = calls.clone();
+            let flipped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let state = flipped.clone();
+            let mock = spawn_mock(move |request| {
+                let message = request.message.unwrap();
+                observed.lock().unwrap().push(message.type_url.clone());
+                let body = match builders::any_type_name(&message) {
+                    "kiapi.common.commands.GetOpenDocuments" => return Some(open_board_response()),
+                    "kiapi.common.commands.GetItems" => {
+                        let mut observed = fp.clone();
+                        if mode == 1 && state.load(std::sync::atomic::Ordering::SeqCst) {
+                            observed.id = Some(ct::Kiid {
+                                value: "replacement".into(),
+                            });
+                            observed.layer = bt::BoardLayer::BlBCu as i32;
+                        }
+                        builders::pack_any(
+                            &cc::GetItemsResponse {
+                                status: ct::ItemRequestStatus::IrsOk as i32,
+                                items: vec![packed(&observed)],
+                                ..Default::default()
+                            },
+                            "kiapi.common.commands.GetItemsResponse",
+                        )
+                    }
+                    "kiapi.common.commands.BeginCommit" => builders::pack_any(
+                        &cc::BeginCommitResponse {
+                            id: Some(ct::Kiid {
+                                value: "flip".into(),
+                            }),
+                        },
+                        "kiapi.common.commands.BeginCommitResponse",
+                    ),
+                    "kiapi.common.commands.EndCommit" => builders::pack_any(
+                        &cc::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    ),
+                    "kiapi.board.commands.FlipItems" => {
+                        if mode == 0 {
+                            let mut response = ok_response();
+                            response.status.as_mut().unwrap().status =
+                                kiapi::common::ApiStatusCode::AsBadRequest as i32;
+                            return Some(response);
+                        }
+                        state.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let mut receipt = fp.clone();
+                        receipt.layer = bt::BoardLayer::BlBCu as i32;
+                        builders::pack_any(
+                            &kiapi::board::commands::FlipItemsResponse {
+                                status: ct::ItemRequestStatus::IrsOk as i32,
+                                flipped_items: vec![kiapi::board::commands::ItemFlipResult {
+                                    status: Some(cc::ItemStatus {
+                                        code: cc::ItemStatusCode::IscOk as i32,
+                                        error_message: String::new(),
+                                    }),
+                                    item: Some(if mode == 2 {
+                                        any_item()
+                                    } else {
+                                        packed(&receipt)
+                                    }),
+                                }],
+                                ..Default::default()
+                            },
+                            "kiapi.board.commands.FlipItemsResponse",
+                        )
+                    }
+                    other => panic!("unexpected flip command {other}"),
+                };
+                Some(reply_with(body))
+            });
+            let result = KiCadIpcClient::new(&mock.url).flip_footprint("U1", "B.Cu");
+            if mode == 1 {
+                let konnect_ipc::IpcFlipOutcome::Uncertain { reason, .. } = result.unwrap() else {
+                    panic!("identity mismatch is uncertain")
+                };
+                assert!(reason.contains("KIID"));
+            } else {
+                assert!(result.is_err());
+            }
+            assert!(
+                !calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|command| command.ends_with("GetVersion")),
+                "ordinary refusals are not an unsupported KiCad version"
+            );
+        }
+    }
+
+    #[test]
+    fn nonpolygon_edit_refusal_preserves_the_child_and_unknown_geometry_is_not_an_origin() {
+        let mut segment = builders::board_segment("F.SilkS", 0.1, 0.0, 0.0, 1.0, 1.0).unwrap();
+        segment.id = Some(ct::Kiid {
+            value: "line".into(),
+        });
+        let before = packed(&footprint(
+            "U1",
+            vec![builders::pack_any(
+                &segment,
+                "kiapi.board.types.BoardGraphicShape",
+            )],
+        ));
+        let (mock, held) = spawn_board(vec![before.clone()]);
+        assert!(KiCadIpcClient::new(&mock.url)
+            .set_footprint_graphic_points("U1", "line", &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)])
+            .is_err());
+        let held = held.lock().unwrap();
+        assert!(held.updates.is_empty());
+        assert_eq!(held.items, vec![before]);
+        drop(held);
+        let shape = builders::pack_any(
+            &bt::BoardGraphicShape::default(),
+            "kiapi.board.types.BoardGraphicShape",
+        );
+        let (mock, _) = spawn_board(vec![shape]);
+        let observed = KiCadIpcClient::new(&mock.url)
+            .get_board_graphics_in(doc_for("test.kicad_pcb"))
+            .unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].kind, "shape");
+        assert!(observed[0].origin.is_none());
+    }
+}

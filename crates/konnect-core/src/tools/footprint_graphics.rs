@@ -1001,6 +1001,175 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
+    #[tokio::test]
+    async fn fidelity_boundary_graphic_geometry_refusals_preserve_the_library_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Fixture.kicad_mod");
+        std::fs::write(&path, OLD_FOOTPRINT).unwrap();
+        let a = json!({"x": 0.0, "y": 0.0});
+        let b = json!({"x": 1.0, "y": 1.0});
+        let c = json!({"x": 2.0, "y": 0.0});
+        for (graphic, diagnostic) in [
+            (
+                json!({"type":"arc", "start": a, "mid": a, "end": c, "stroke_width_mm":0.1}),
+                "distinct",
+            ),
+            (
+                json!({"type":"arc", "start": a, "mid": b, "end": b, "stroke_width_mm":0.1}),
+                "distinct",
+            ),
+            (
+                json!({"type":"arc", "start": a, "mid": b, "end": a, "stroke_width_mm":0.1}),
+                "distinct",
+            ),
+            (
+                json!({"type":"line", "start": a, "end": b, "stroke_width_mm":-0.1}),
+                "non-negative",
+            ),
+            (
+                json!({"type":"line", "start": a, "end": b, "stroke_width_mm":0.0}),
+                "positive stroke",
+            ),
+            (
+                json!({"type":"rect", "start": a, "end": c, "stroke_width_mm":0.1, "fill":"none"}),
+                "height",
+            ),
+            (
+                json!({"type":"circle", "center": a, "radius_mm":-1.0, "stroke_width_mm":0.1, "fill":"solid"}),
+                "positive",
+            ),
+            (
+                json!({"type":"poly", "points":[a, b, a, b], "stroke_width_mm":0.1, "fill":"none"}),
+                "distinct points",
+            ),
+        ] {
+            let result = handle_set_footprint_graphics(
+                &json!({
+                    "footprint_path": path, "selector":{"layer":"B.CrtYd"},
+                    "mode":"replace", "graphics":[graphic],
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{graphic}");
+            assert!(
+                result_body(&result).to_string().contains(diagnostic),
+                "{graphic}: {:?}",
+                result.content
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD_FOOTPRINT);
+        }
+    }
+
+    #[test]
+    fn fidelity_boundary_graphic_inspection_rejects_invalid_saved_geometry() {
+        for (block, diagnostic) in [
+            (
+                r#"(fp_line (start 0 0) (end 1 1) (layer "F.Fab") (stroke (width -0.1)))"#,
+                "non-negative",
+            ),
+            (
+                r#"(fp_line (start 0 0) (end 1 1) (layer "F.Fab") (stroke (width inf)))"#,
+                "finite",
+            ),
+            (
+                r#"(fp_line (start inf 0) (end 1 1) (layer "F.Fab") (stroke (width 0.1)))"#,
+                "finite",
+            ),
+            (
+                r#"(fp_line (start 0 inf) (end 1 1) (layer "F.Fab") (stroke (width 0.1)))"#,
+                "finite",
+            ),
+            (
+                r#"(fp_rect (start 0 0) (end 1 1) (layer "F.Fab") (stroke (width 0.1)) (fill unsupported))"#,
+                "fill",
+            ),
+            (
+                r#"(fp_poly (pts (xy 0 0) (xy 1 inf) (xy 2 0)) (layer "F.Fab") (stroke (width 0.1)) (fill yes))"#,
+                "finite",
+            ),
+        ] {
+            let error = inspect_graphics(&format!(r#"(footprint "F" {block})"#), None).unwrap_err();
+            assert!(error.to_string().contains(diagnostic), "{block}: {error}");
+        }
+        assert!(inspect_graphics("(kicad_pcb)", None).is_err());
+    }
+
+    #[tokio::test]
+    async fn fidelity_boundary_graphic_handler_requires_explicit_selector_and_nonempty_replacement()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Fixture.kicad_mod");
+        std::fs::write(&path, OLD_FOOTPRINT).unwrap();
+        for args in [
+            json!({"selector":{"layer":"F.Fab"}, "mode":"delete"}),
+            json!({"footprint_path":path, "mode":"delete"}),
+            json!({"footprint_path":path, "selector":{"layer":null}, "mode":"delete"}),
+            json!({"footprint_path":path, "selector":{"layer":"F.Fab"}, "mode":"append", "graphics":[]}),
+            json!({"footprint_path":path, "selector":{"layer":"F.Fab"}, "mode":"replace", "graphics":[]}),
+        ] {
+            let result = handle_set_footprint_graphics(&args, &test_ctx())
+                .await
+                .unwrap();
+            assert!(result.is_error, "{args}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD_FOOTPRINT);
+        }
+        let result = handle_set_footprint_graphics(&json!({
+            "footprint_path":path, "selector":{"layer":"B.CrtYd"}, "mode":"delete", "graphics":[]
+        }), &test_ctx()).await.unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = result_body(&result);
+        assert_eq!(body["matched_count"], 2);
+        assert_eq!(body["added_count"], 0);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("KEEP ON B.CrtYd"));
+        assert!(written.contains("F.SilkS"));
+        assert!(written.contains("KEEP.step"));
+    }
+
+    #[tokio::test]
+    async fn fidelity_boundary_graphic_append_preserves_grouped_selected_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Fixture.kicad_mod");
+        let grouped = OLD_FOOTPRINT.replacen(
+            "  (model",
+            r#"  (group "keep" (members "20000000-0000-4000-8000-000000000001"))
+  (model"#,
+            1,
+        );
+        std::fs::write(&path, &grouped).unwrap();
+        let result = handle_set_footprint_graphics(
+            &json!({
+                "footprint_path":path, "selector":{"layer":"B.CrtYd"}, "mode":"append",
+                "graphics":[{"type":"circle", "center":{"x":4.0,"y":5.0}, "radius_mm":1.0,
+                    "stroke_width_mm":0.0, "fill":"solid"}]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = result_body(&result);
+        assert_eq!(body["matched_count"], 2);
+        assert_eq!(body["added_count"], 1);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains(r#"(group "keep" (members "20000000-0000-4000-8000-000000000001"))"#)
+        );
+        let graphics = inspect_graphics(&written, Some("B.CrtYd")).unwrap();
+        assert_eq!(graphics.len(), 3);
+        assert_eq!(
+            graphics
+                .iter()
+                .filter(
+                    |item| item.item_id.as_deref() == Some("20000000-0000-4000-8000-000000000001")
+                )
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn graphic_serializers_escape_layer_strings() {
         let start = Point { x: 0., y: 0. };

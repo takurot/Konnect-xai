@@ -2231,3 +2231,295 @@ mod project_name_encoding_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod rename_boundary_tests {
+    use super::*;
+
+    fn fixture(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let pro = dir.join("old.kicad_pro");
+        std::fs::write(&pro, r#"{"meta":{"filename":"old.kicad_pro"}}"#).unwrap();
+        std::fs::write(dir.join("old.kicad_sch"), "(kicad_sch (project \"old\"))").unwrap();
+        std::fs::create_dir(dir.join("old-backups")).unwrap();
+        std::fs::write(dir.join("old-backups/marker"), "historic backup").unwrap();
+        pro
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            other => panic!("expected JSON, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_refusals_and_same_name_never_move_existing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pro = fixture(tmp.path());
+        let before = std::fs::read(&pro).unwrap();
+        let same = rename_project_with(&json!({"project":pro,"new_name":"old"}), || {})
+            .await
+            .unwrap();
+        assert_eq!(body(&same)["renamed"], false);
+        for new_name in ["nested/new", "nested\\new"] {
+            let result = rename_project_with(&json!({"project":pro,"new_name":new_name}), || {})
+                .await
+                .unwrap();
+            assert!(result.is_error);
+        }
+        let missing_name = rename_project_with(&json!({"project":pro}), || {})
+            .await
+            .unwrap();
+        assert!(missing_name.is_error);
+        let missing_file = rename_project_with(
+            &json!({"project":tmp.path().join("absent.kicad_pro"),"new_name":"new"}),
+            || {},
+        )
+        .await
+        .unwrap();
+        assert!(missing_file.is_error);
+        std::fs::write(tmp.path().join("new.kicad_sch"), "other project").unwrap();
+        let collision = rename_project_with(&json!({"project":pro,"new_name":"new"}), || {})
+            .await
+            .unwrap();
+        assert!(collision.is_error);
+        assert_eq!(std::fs::read(&pro).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("new.kicad_sch")).unwrap(),
+            "other project"
+        );
+        assert!(tmp.path().join("old-backups/marker").exists());
+    }
+
+    #[tokio::test]
+    async fn rename_moves_backups_and_matching_directory_only_after_content_rewrites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("old");
+        let pro = fixture(&old);
+        let result = rename_project_with(
+            &json!({"project":pro,"new_name":"new","rename_directory":true}),
+            || {},
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let new = tmp.path().join("new");
+        assert!(!old.exists());
+        assert_eq!(
+            std::fs::read_to_string(new.join("new-backups/marker")).unwrap(),
+            "historic backup"
+        );
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(new.join("new.kicad_pro")).unwrap())
+                .unwrap();
+        assert_eq!(settings["meta"]["filename"], "new.kicad_pro");
+        assert!(std::fs::read_to_string(new.join("new.kicad_sch"))
+            .unwrap()
+            .contains("(project \"new\")"));
+        assert_eq!(body(&result)["directory"], new.display().to_string());
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_backup_and_directory_moves_without_performing_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("old");
+        let pro = fixture(&old);
+        let before = std::fs::read(&pro).unwrap();
+        let result = rename_project_with(
+            &json!({"project":pro,"new_name":"new","rename_directory":true,"dry_run":true}),
+            || {},
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        let result = body(&result);
+        assert_eq!(result["backups_folder"], "new-backups");
+        assert_eq!(
+            result["directory"],
+            tmp.path().join("new").display().to_string()
+        );
+        assert_eq!(std::fs::read(pro).unwrap(), before);
+        assert!(old.join("old-backups/marker").exists());
+        assert!(!tmp.path().join("new").exists());
+    }
+
+    #[tokio::test]
+    async fn existing_backup_and_directory_targets_preserve_both_owners() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("old");
+        let pro = fixture(&old);
+        std::fs::create_dir(old.join("new-backups")).unwrap();
+        std::fs::write(old.join("new-backups/marker"), "external backup").unwrap();
+        std::fs::create_dir(tmp.path().join("new")).unwrap();
+        let result = rename_project_with(
+            &json!({"project":pro,"new_name":"new","rename_directory":true}),
+            || {},
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        assert!(body(&result)["directory"].is_null());
+        assert!(old.join("new.kicad_pro").exists());
+        assert_eq!(
+            std::fs::read_to_string(old.join("old-backups/marker")).unwrap(),
+            "historic backup"
+        );
+        assert_eq!(
+            std::fs::read_to_string(old.join("new-backups/marker")).unwrap(),
+            "external backup"
+        );
+    }
+
+    #[test]
+    fn rewriting_annotation_keys_handles_tabs_and_unquoted_names_without_touching_values() {
+        for source in [
+            "(kicad_sch (project old (path \"/\")))",
+            "(kicad_sch (project\t\"old\" (path \"/\")))",
+        ] {
+            let (updated, count) = rewrite_project_references(source, "old", "new", true);
+            assert_eq!(count, 1);
+            assert_eq!(
+                konnect_sexp::parse_sexp(&updated)
+                    .unwrap()
+                    .find("project")
+                    .unwrap()
+                    .get(1)
+                    .and_then(konnect_sexp::SexpNode::as_str),
+                Some("new")
+            );
+        }
+        for source in [
+            "(kicad_sch (project \"other\"))",
+            "(kicad_sch (project \"old\"",
+            "(kicad_sch (property \"Value\" \"old\"))",
+        ] {
+            assert_eq!(
+                rewrite_project_references(source, "old", "new", true),
+                (source.to_string(), 0)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod coverage_project_observation {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("text expected")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn open_project_reports_requested_identity_separately_from_ipc_availability() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let other = dir.path().join("other.kicad_pcb");
+        std::fs::write(&board, "saved board bytes").unwrap();
+        std::fs::write(&other, "other saved bytes").unwrap();
+        let server = spawn_kicad_holding_board(&board, |_| None);
+        let ctx = ctx_talking_to(server.address().into());
+        for (args, expected) in [
+            (json!({}), None),
+            (
+                json!({"path":board.with_extension("kicad_pro")}),
+                Some(true),
+            ),
+            (json!({"path":other}), Some(false)),
+        ] {
+            let result = handle_open_project(&args, &ctx).await.unwrap();
+            assert!(!result.is_error);
+            let body = body(&result);
+            assert_eq!(body["ipc_available"], true);
+            assert_eq!(body["open_board_count"], 1);
+            assert_eq!(body["requested_open"], json!(expected));
+            if expected == Some(false) {
+                assert!(body["requested_check_error"].is_string());
+            }
+        }
+        let offline = handle_open_project(&json!({"path":board}), &ctx_talking_to(String::new()))
+            .await
+            .unwrap();
+        let offline = body(&offline);
+        assert_eq!(offline["ipc_available"], false);
+        assert!(offline["requested_open"].is_null());
+        assert_eq!(offline["requested_board"], board.to_str().unwrap());
+        assert_eq!(std::fs::read_to_string(board).unwrap(), "saved board bytes");
+        assert_eq!(std::fs::read_to_string(other).unwrap(), "other saved bytes");
+    }
+
+    #[tokio::test]
+    async fn open_project_keeps_document_inventory_failure_visible_after_a_successful_ping() {
+        use konnect_ipc::gen::kiapi;
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "saved").unwrap();
+        let server =
+            crate::test_support::MockIpcServer::spawn("project-inventory-refusal", |request| {
+                let inventory = request
+                    .message
+                    .unwrap()
+                    .type_url
+                    .ends_with("GetOpenDocuments");
+                kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: if inventory {
+                            kiapi::common::ApiStatusCode::AsBadRequest
+                        } else {
+                            kiapi::common::ApiStatusCode::AsOk
+                        } as i32,
+                        error_message: if inventory {
+                            "inventory unavailable".into()
+                        } else {
+                            String::new()
+                        },
+                    }),
+                    header: None,
+                    message: None,
+                }
+            });
+        let result = handle_open_project(
+            &json!({"path":board}),
+            &ctx_talking_to(server.address().into()),
+        )
+        .await
+        .unwrap();
+        let result = body(&result);
+        assert_eq!(result["ipc_available"], true);
+        assert_eq!(result["open_board_count"], 0);
+        assert!(result["open_boards_error"]
+            .as_str()
+            .unwrap()
+            .contains("inventory unavailable"));
+        assert_eq!(result["requested_open"], false);
+        assert!(result["requested_check_error"].is_string());
+        assert_eq!(std::fs::read_to_string(board).unwrap(), "saved");
+    }
+
+    #[test]
+    fn project_name_rewrite_preserves_escaped_names_and_unrelated_values() {
+        for old in ["old \\\"quoted", "old\\path", "old\tname"] {
+            let source = format!(
+                "(kicad_sch (project {} (path root)) (property Value {}))",
+                konnect_sexp::quoted(old),
+                konnect_sexp::quoted(old)
+            );
+            let (rewritten, hits) = rewrite_project_references(&source, old, "new", true);
+            assert_eq!(hits, 1);
+            let tree = konnect_sexp::parse_sexp(&rewritten).unwrap();
+            assert_eq!(tree.find_str("project"), Some("new"));
+            assert_eq!(
+                tree.find("property").unwrap().get(2).unwrap().as_str(),
+                Some(old)
+            );
+        }
+        for malformed in ["(project old", "(project other)"] {
+            let (rewritten, hits) = rewrite_project_references(malformed, "old", "new", true);
+            assert_eq!((rewritten, hits), (malformed.to_string(), 0));
+        }
+    }
+}
