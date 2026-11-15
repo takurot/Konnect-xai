@@ -4020,6 +4020,10 @@ fn build_rect_unit(
 type SymbolRect = Option<(f64, f64, f64, f64)>;
 
 #[cfg(test)]
+#[path = "library_path_tests.rs"]
+mod library_path_tests;
+
+#[cfg(test)]
 mod omitted_rect_pin_tests {
     use super::*;
     use crate::mcp::handler::McpHandler;
