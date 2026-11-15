@@ -3643,7 +3643,7 @@ mod coverage_legacy_net_no_write {
     async fn adding_an_existing_legacy_net_preserves_its_id_and_all_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("board.kicad_pcb");
-        let source = "(kicad_pcb (version 20240108) (net invalid X) (net 7 GND))";
+        let source = "(kicad_pcb (version 20240108) (net invalid \"X\") (net 7 \"GND\"))";
         std::fs::write(&board, source).unwrap();
         let result = handle_add_net(
             &json!({"board":board,"net_name":"GND"}),
