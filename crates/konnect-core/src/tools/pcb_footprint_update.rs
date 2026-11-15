@@ -3678,6 +3678,123 @@ mod tests {
     }
 
     #[test]
+    fn refresh_refuses_mismatched_library_identity_and_conflicting_logical_pad_nets() {
+        let library = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
+        let nets = BTreeMap::from([("ROW1".into(), 11), ("COL1".into(), 12)]);
+        let mut current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        current
+            .definition
+            .as_mut()
+            .unwrap()
+            .id
+            .as_mut()
+            .unwrap()
+            .entry_name = "Other".into();
+        let before = current.clone();
+        let error = build_updated_instance(&current, &library, &nets, &BTreeSet::new(), false, 2)
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match"));
+        assert_eq!(current, before);
+
+        let mut current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        current
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .push(current_pad("1", "OTHER", 13));
+        let before = current.clone();
+        let error = build_updated_instance(&current, &library, &nets, &BTreeSet::new(), false, 2)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("logical pad 1 carries multiple nets"));
+        assert_eq!(current, before);
+    }
+
+    #[test]
+    fn refresh_refuses_unnamed_or_duplicated_instance_properties_without_changing_them() {
+        let library = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
+        let nets = BTreeMap::from([("ROW1".into(), 11), ("COL1".into(), 12)]);
+        for (names, expected) in [
+            (vec![""], "without a name"),
+            (
+                vec!["BoardOnly", "BoardOnly"],
+                "more than one custom property",
+            ),
+        ] {
+            let mut current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+            for name in names {
+                current
+                    .definition
+                    .as_mut()
+                    .unwrap()
+                    .items
+                    .push(builders::pack_any(
+                        &field(name, "retain", 1.0, 2.0, true),
+                        "kiapi.board.types.Field",
+                    ));
+            }
+            let before = current.clone();
+            let error =
+                build_updated_instance(&current, &library, &nets, &BTreeSet::new(), false, 2)
+                    .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+            assert_eq!(current, before);
+        }
+    }
+
+    #[test]
+    fn value_only_and_description_only_changes_are_not_noops() {
+        let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let rebuilt = build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::from([("ROW1".into(), 11), ("COL1".into(), 12)]),
+            &BTreeSet::new(),
+            false,
+            2,
+        )
+        .unwrap();
+        let baseline =
+            kiapi::board::types::FootprintInstance::decode(rebuilt.item.value.as_slice()).unwrap();
+        let mut value_change = baseline.clone();
+        apply_field_value(&mut value_change.value_field, Some("new value"));
+        assert_eq!(
+            changed_domains(&baseline, &value_change).unwrap(),
+            BTreeSet::from([ChangedDomain::Text])
+        );
+        let mut description_change = baseline.clone();
+        apply_field_value(
+            &mut description_change
+                .definition
+                .as_mut()
+                .unwrap()
+                .description_field,
+            Some("new description"),
+        );
+        assert_eq!(
+            changed_domains(&baseline, &description_change).unwrap(),
+            BTreeSet::from([ChangedDomain::Metadata])
+        );
+        let mut custom_change = baseline.clone();
+        custom_change
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .push(builders::pack_any(
+                &field("BoardOnly", "new", 0.0, 0.0, false),
+                "kiapi.board.types.Field",
+            ));
+        assert_eq!(
+            changed_domains(&baseline, &custom_change).unwrap(),
+            BTreeSet::from([ChangedDomain::Metadata])
+        );
+    }
+
+    #[test]
     fn kicad_roundtrip_defaults_do_not_create_false_pad_or_graphic_changes() {
         let library = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
         let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
