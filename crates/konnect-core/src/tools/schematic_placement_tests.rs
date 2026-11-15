@@ -1115,6 +1115,7 @@ fn native_placement_readback_refuses_wrong_document_and_missing_evidence() {
         let uuid = schematic.symbols.get(0).unwrap().uuid.clone();
         let symbol = schematic.symbols.get(0).unwrap();
         let fields = sch_components::PlacementFields {
+            attributes: symbol.attributes(),
             value: symbol.value_str().unwrap_or_default().to_string(),
             footprint: symbol.footprint().unwrap_or_default().to_string(),
         };
@@ -1181,6 +1182,7 @@ fn native_placement_readback_requires_requested_values() {
         let context = sheet_instance_context(&child, &mut schematic).unwrap();
         let symbol = schematic.symbols.get(0).unwrap();
         let fields = sch_components::PlacementFields {
+            attributes: symbol.attributes(),
             value: if mismatch == "Value" {
                 "wrong-value".to_string()
             } else {
