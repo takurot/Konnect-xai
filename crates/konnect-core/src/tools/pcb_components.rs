@@ -4159,7 +4159,7 @@ mod tests {
                 "R1",
                 "1",
                 SAVED_BOARD_WITH_R1.replace("(at -0.9 0 105)", "(at -0.9 invalid 105)"),
-                "no readable position",
+                "has an invalid position",
             ),
         ] {
             std::fs::write(&board, &source).unwrap();
