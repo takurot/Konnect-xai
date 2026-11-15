@@ -1825,3 +1825,105 @@ mod pin_label_rotation_tests {
         assert_eq!(horizontal_label_rotation(-180.0), 180.0);
     }
 }
+
+#[cfg(test)]
+mod geometry_boundary_contract_tests {
+    use super::*;
+    use crate::parse_sexp;
+
+    #[test]
+    fn malformed_drawings_do_not_create_phantom_symbol_bounds() {
+        for shape in [
+            "(circle (radius 2))",
+            "(circle (center 1 2))",
+            "(circle (center invalid 2) (radius 1))",
+            "(arc (start 1 2) (end 3 4))",
+            "(polyline (pts (xy 1) (xy no 2)))",
+            "(rectangle (start NaN 1) (end 1 inf))",
+        ] {
+            let symbol = parse_sexp(&format!("(symbol \"S\" {shape})")).unwrap();
+            assert!(
+                symbol_local_bounds_for_unit(&symbol, 1).is_none(),
+                "{shape}"
+            );
+        }
+        let symbol =
+            parse_sexp("(symbol \"S\" (polyline (pts (xy NaN 2) (xy 1 NaN) (xy 3 4) (xy -1 2))))")
+                .unwrap();
+        assert_eq!(
+            symbol_local_bounds_for_unit(&symbol, 1),
+            Some(SymbolBounds {
+                min_x: -1.0,
+                min_y: 2.0,
+                max_x: 3.0,
+                max_y: 4.0
+            })
+        );
+    }
+
+    #[test]
+    fn arc_bounds_handle_collinearity_and_clockwise_extrema() {
+        let collinear = parse_sexp("(symbol \"S\" (arc (start 0 0) (mid 1 0) (end 2 0)))").unwrap();
+        let bounds = symbol_local_bounds_for_unit(&collinear, 1).unwrap();
+        assert_eq!(
+            (bounds.min_x, bounds.max_x, bounds.min_y, bounds.max_y),
+            (0.0, 2.0, 0.0, 0.0)
+        );
+        for points in [
+            "(start -1 0) (mid 0 1) (end 1 0)",
+            "(start 1 0) (mid 0 1) (end -1 0)",
+        ] {
+            let symbol = parse_sexp(&format!("(symbol \"S\" (arc {points}))")).unwrap();
+            let bounds = symbol_local_bounds_for_unit(&symbol, 1).unwrap();
+            assert!((bounds.min_x + 1.0).abs() < 1e-9);
+            assert!((bounds.max_x - 1.0).abs() < 1e-9);
+            assert!((bounds.max_y - 1.0).abs() < 1e-9);
+            assert!(bounds.min_y.abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn symbol_instance_mirrors_and_private_properties_remain_distinct() {
+        for (mirror, x, y) in [
+            ("x", true, false),
+            ("y", false, true),
+            ("xy", true, true),
+            ("none", false, false),
+        ] {
+            let tree = parse_sexp(&format!(
+                "(kicad_sch (symbol (lib_id \"L:S\") (at 1 2 90) (mirror {mirror})
+                (property private \"Reference\" \"U1\") (property private \"Value\" \"V\")
+                (property private \"Footprint\" \"L:F\")))"
+            ))
+            .unwrap();
+            let symbols = extract_symbol_instances(&tree);
+            assert_eq!(symbols.len(), 1);
+            assert_eq!((symbols[0].mirror_x, symbols[0].mirror_y), (x, y));
+            assert_eq!(
+                (
+                    &*symbols[0].reference,
+                    &*symbols[0].value,
+                    &*symbols[0].footprint
+                ),
+                ("U1", "V", "L:F")
+            );
+        }
+    }
+
+    #[test]
+    fn t_junctions_deduplicate_intersections_without_marking_shared_endpoints() {
+        let tree = parse_sexp(
+            "(kicad_sch
+            (wire (pts (xy 0 0) (xy 10 0)))
+            (wire (pts (xy 5 0) (xy 5 5)))
+            (wire (pts (xy 5 0) (xy 5 -5)))
+            (wire (pts (xy 10 0) (xy 12 0))))",
+        )
+        .unwrap();
+        assert_eq!(
+            find_t_junctions(&extract_wires(&tree), 0.001),
+            vec![(5.0, 0.0)]
+        );
+        assert!(find_t_junctions(&[], 0.001).is_empty());
+    }
+}

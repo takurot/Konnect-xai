@@ -1520,3 +1520,103 @@ mod fabrication_option_tests {
         assert_eq!(error["error"]["field"], "layers[1]");
     }
 }
+
+#[cfg(test)]
+mod export_boundary_contract_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    #[test]
+    fn position_options_refuse_the_incompatible_field_and_layer_lists_require_strings() {
+        for (format, side, units, field) in [
+            ("pdf", "both", "mm", "format"),
+            ("csv", "left", "mm", "side"),
+            ("csv", "both", "cm", "units"),
+            ("gerber", "both", "mm", "side"),
+        ] {
+            assert_eq!(
+                validate_position_values(format, side, units).unwrap_err().0,
+                field
+            );
+        }
+        for (format, side, units) in [
+            ("csv", "front", "mm"),
+            ("csv", "back", "in"),
+            ("csv", "both", "mm"),
+            ("gerber", "front", "mm"),
+            ("gerber", "back", "mm"),
+        ] {
+            assert!(validate_position_values(format, side, units).is_ok());
+        }
+        assert!(optional_string_array(&json!({}), "layers")
+            .unwrap()
+            .is_empty());
+        assert!(optional_string_array(&json!({"layers":"F.Cu"}), "layers").is_err());
+        assert!(optional_string_array(&json!({"layers":["F.Cu",null]}), "layers").is_err());
+        assert!(standard_gerber_layers("(kicad_pcb (layers (44 \"Edge.Cuts\" user)))").is_ok());
+        assert!(standard_gerber_layers("(kicad_pcb (layers (49 \"F.Fab\" user)))").is_err());
+    }
+
+    #[tokio::test]
+    async fn specctra_preflight_refuses_invalid_identity_and_mode_without_creating_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let output = dir.path().join("output.dsn");
+        let manifest = dir.path().join("output.json");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        let good = json!({"board":board,"output":output,"manifest_output_path":manifest});
+        for (field, value) in [
+            ("board", json!(dir.path().join("board.kicad_sch"))),
+            ("output", json!(dir.path().join("output.txt"))),
+            ("manifest_output_path", json!(output)),
+            ("native_bridge_mode", json!("auto")),
+        ] {
+            let mut args = good.clone();
+            args[field] = value;
+            let result = handle_export_specctra_dsn(&args, &context()).await.unwrap();
+            assert!(result.is_error, "accepted {args}");
+            assert!(!output.exists() && !manifest.exists());
+        }
+        std::fs::write(board.with_extension("kicad_dru"), "(version 1)").unwrap();
+        let result = handle_export_specctra_dsn(&good, &context()).await.unwrap();
+        assert!(result.is_error);
+        assert!(!output.exists() && !manifest.exists());
+        assert_eq!(std::fs::read_to_string(board).unwrap(), "(kicad_pcb)");
+    }
+
+    #[test]
+    fn complete_export_pair_is_create_only_and_preserves_existing_dsn() {
+        let dir = tempfile::tempdir().unwrap();
+        let dsn = dir.path().join("dsn/board.dsn");
+        let manifest = dir.path().join("manifest/board.json");
+        write_specctra_export_pair(&dsn, "(pcb board)", &manifest, "{\"snapshot\":1}").unwrap();
+        assert_eq!(std::fs::read_to_string(&dsn).unwrap(), "(pcb board)");
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            "{\"snapshot\":1}"
+        );
+        assert!(write_specctra_export_pair(&dsn, "replacement", &manifest, "replacement").is_err());
+        assert_eq!(std::fs::read_to_string(dsn).unwrap(), "(pcb board)");
+        assert_eq!(
+            std::fs::read_to_string(manifest).unwrap(),
+            "{\"snapshot\":1}"
+        );
+    }
+}

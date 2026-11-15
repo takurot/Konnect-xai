@@ -2171,3 +2171,86 @@ mod committed_readback_tests {
         assert!(verify_cas_readback(&path, "committed", Ok("committed".into())).is_ok());
     }
 }
+
+#[cfg(test)]
+mod file_boundary_contract_tests {
+    use super::*;
+
+    #[test]
+    fn block_scanners_handle_incomplete_roots_and_crlf_indentation_without_consuming_neighbors() {
+        assert!(find_direct_child_blocks("no root", "kicad_sch").is_empty());
+        assert!(find_direct_child_blocks("(kicad_sch (wire)", "kicad_sch").is_empty());
+        assert!(find_balanced_block("plain text", 0).is_none());
+        assert!(find_balanced_block("(unterminated", 0).is_none());
+        let source = "first\r\n \t(wire (property \"quoted\" \"(wire) \\\"text\\\"\"))\r\nlast";
+        let start = source.find("(wire").unwrap();
+        let (a, b) = find_block_with_leading_whitespace(source, start).unwrap();
+        assert_eq!(&source[..a], "first");
+        assert_eq!(&source[b..], "\r\nlast");
+        assert_eq!(find_block_starts(source, "wire"), vec![start]);
+        let first = "(wire)";
+        assert_eq!(
+            find_block_with_leading_whitespace(first, 0),
+            Some((0, first.len()))
+        );
+    }
+
+    #[test]
+    fn transaction_update_and_noop_return_receipts_but_refusal_preserves_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "before").unwrap();
+        let receipt =
+            transact_atomic(&path, |current| Ok((current.to_string(), "unchanged"))).unwrap();
+        assert_eq!(receipt, "unchanged");
+        assert_eq!(read_consistent(&path).unwrap(), "before");
+        let receipt = transact_atomic(&path, |_| Ok(("after".into(), 7))).unwrap();
+        assert_eq!(receipt, 7);
+        assert_eq!(read_consistent(&path).unwrap(), "after");
+        let refused = transact_atomic::<()>(&path, |_| {
+            Err(SexpError::InvalidValue("test refusal".into()))
+        });
+        assert!(refused.is_err());
+        assert_eq!(read_consistent(&path).unwrap(), "after");
+    }
+
+    #[test]
+    fn scratch_lock_entries_refuse_directories_and_do_not_change_ordinary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("document.lock");
+        std::fs::create_dir(&lock).unwrap();
+        assert!(open_lock_file(&lock).is_err());
+        assert!(lock.is_dir());
+        let file = dir.path().join("regular.lock");
+        std::fs::write(&file, "owner").unwrap();
+        drop(open_lock_file(&file).unwrap());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "owner");
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(state.join("locks"), "external").unwrap();
+        assert!(document_lock_path_in(&state, &dir.path().join("board.kicad_pcb")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(state.join("locks")).unwrap(),
+            "external"
+        );
+    }
+
+    #[test]
+    fn editor_lock_identity_accepts_document_extensions_case_insensitively_only() {
+        let dir = tempfile::tempdir().unwrap();
+        for ext in ["KICAD_SCH", "KiCad_Pcb", "KICAD_PRO"] {
+            let path = dir.path().join(format!("new.{ext}"));
+            assert_eq!(
+                kicad_editor_lock_path(&path),
+                Some(
+                    dir.path()
+                        .canonicalize()
+                        .unwrap()
+                        .join(format!("~new.{ext}.lck"))
+                )
+            );
+        }
+        assert!(kicad_editor_lock_path(&dir.path().join("notes.txt")).is_none());
+        assert!(kicad_editor_lock_path(&dir.path().join("board.kicad_mod")).is_none());
+    }
+}
