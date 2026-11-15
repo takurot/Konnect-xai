@@ -5693,3 +5693,30 @@ mod coverage_sheet_precommit_identity {
         }
     }
 }
+
+#[cfg(test)]
+mod coverage_legacy_uuid_insertion_boundary {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn a_uuidless_parent_with_inline_metadata_refuses_before_creating_its_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.kicad_sch");
+        let source = "(kicad_sch\n  (version 20250610) (lib_symbols)\n)\n";
+        std::fs::write(&path, source).unwrap();
+        let context = ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let error = handle_add_hierarchical_sheet(
+            &json!({"schematic": path, "sheet_name": "Child", "sheet_file": "child.kicad_sch"}),
+            &context,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("not line-oriented"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        assert!(!dir.path().join("child.kicad_sch").exists());
+    }
+}

@@ -5439,3 +5439,40 @@ mod coverage_bulk_move_source_boundaries {
         }
     }
 }
+
+#[cfg(test)]
+mod coverage_optional_property_move {
+    use super::*;
+    use crate::tools::ToolContext;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn moving_a_symbol_preserves_optional_properties_without_a_text_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.kicad_sch");
+        let source = "(kicad_sch (lib_symbols) (symbol (lib_id \"Test:R\") (at 50.8 63.5 0) (unit 1) (uuid \"11111111-1111-4111-8111-111111111111\") (property \"Reference\" \"R1\" (at 52 58 0)) (property \"VendorMetadata\" \"preserve exactly\")))";
+        std::fs::write(&path, source).unwrap();
+        let context = ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_bulk_move(
+            &json!({"schematic": path, "references": ["R1"], "dx": 1.27, "dy": 0}),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(
+            saved.contains("(property \"VendorMetadata\" \"preserve exactly\")"),
+            "{saved}"
+        );
+        let tree = konnect_sexp::parse_sexp(&saved).unwrap();
+        let instance = extract_symbol_instances(&tree)
+            .into_iter()
+            .find(|instance| instance.reference == "R1")
+            .unwrap();
+        assert_eq!(instance.x, 52.07);
+    }
+}

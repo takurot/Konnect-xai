@@ -5261,3 +5261,34 @@ mod coverage_marker_pair_identity {
         ));
     }
 }
+
+#[cfg(test)]
+mod coverage_exact_wire_identity {
+    use super::*;
+
+    #[test]
+    fn complete_endpoint_pairs_outrank_decoys_in_either_direction_and_refuse_near_misses() {
+        let candidates = [
+            ((1, 9), (3, 4)),
+            ((1, 2), (9, 4)),
+            ((1, 2), (3, 9)),
+            ((3, 9), (1, 2)),
+            ((3, 4), (9, 2)),
+            ((3, 4), (1, 9)),
+        ];
+        let mut source = String::from("(kicad_sch\n");
+        for (index, ((x1, y1), (x2, y2))) in candidates.into_iter().enumerate() {
+            source.push_str(&format!(
+                "  (wire (pts (xy {x1} {y1}) (xy {x2} {y2})) (uuid \"decoy-{index}\"))\n"
+            ));
+        }
+        source.push_str("  (wire (pts (xy 3 4) (xy 1 2)) (uuid \"selected\"))\n)");
+        let (start, end) = find_wire_block_by_endpoints(&source, 1.0, 2.0, 3.0, 4.0).unwrap();
+        assert!(source[start..end].contains("(uuid \"selected\")"));
+        assert_eq!(
+            find_wire_block_by_endpoints(&source, 3.0, 4.0, 1.0, 2.0),
+            Some((start, end))
+        );
+        assert!(find_wire_block_by_endpoints(&source, 1.0, 2.0, 3.0, 4.00001).is_none());
+    }
+}

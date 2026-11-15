@@ -10353,7 +10353,9 @@ mod coverage_component_observation_contracts {
             .unwrap();
         let mut source = original.to_owned();
         source.insert_str(end - 1, " (symbol \"Test:Single\" (property \"Reference\" \"U\" (at 0 0 0)) (symbol \"Single_1_1\"))");
-        let (_dir, path) = fixture(&source);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ecc83-pp.kicad_sch");
+        std::fs::write(&path, &source).unwrap();
         let result = handle_replace_component(
             &json!({"schematic": path, "reference": "U1", "new_lib_id": "Test:Single"}),
             &context(),
@@ -10361,6 +10363,11 @@ mod coverage_component_observation_contracts {
         .await
         .unwrap();
         assert!(result.is_error, "{result:?}");
+        let diagnostic = format!("{result:?}");
+        assert!(
+            diagnostic.contains("placed unit") && diagnostic.contains("does not exist"),
+            "{diagnostic}"
+        );
         assert_eq!(std::fs::read_to_string(path).unwrap(), source);
     }
 
@@ -10469,5 +10476,38 @@ mod coverage_component_observation_contracts {
                 Some("stale_target")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn field_local_partial_edit_reports_the_refused_field_and_only_the_committed_change() {
+        let original = source();
+        let (_dir, path) = fixture(&original);
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path, "reference": "R1", "value": "20k",
+                "fields": {"Reference": "R9"}
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        let response = body(&result);
+        let errors = response["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].as_str().unwrap().contains("Reference"));
+        let changes = response["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].as_str().unwrap().starts_with("Value"));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let target = component_target_from_source(&path, &saved, "R1").unwrap();
+        assert_eq!(
+            target.units[0].fields.get("Value").map(String::as_str),
+            Some("20k")
+        );
+        assert_eq!(
+            target.units[0].fields.get("Reference").map(String::as_str),
+            Some("R1")
+        );
+        assert!(!saved.contains("R9"));
     }
 }
