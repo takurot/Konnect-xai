@@ -4064,6 +4064,123 @@ async fn handle_get_board_2d_view(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn fidelity_boundary_component_identifiers_and_empty_batches_refuse_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let board = fallback_fixture(directory.path());
+        let before = std::fs::read(&board).unwrap();
+        let (server, mutations) = placement_refusal_server(&board, vec![]);
+        let ctx = ctx_talking_to(server.address().to_string());
+        for footprint in [":Missing", "Fixture:", "NoSeparator"] {
+            let result = handle_place_component(
+                &json!({
+                    "board":board, "footprint":footprint, "reference":"U1", "x":0.0, "y":0.0
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error);
+            assert!(result_text(&result).contains("Library:Footprint"));
+        }
+        let result =
+            handle_set_component_placements(&json!({"board":board, "placements":[]}), &ctx)
+                .await
+                .unwrap();
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("at least one placement"));
+        assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn fidelity_boundary_reference_replacement_decodes_existing_and_new_escaped_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = library_footprint().replace(r#""REF**""#, r#""old\"reference\\tail""#);
+        let board = placement_fidelity_fixture(directory.path(), "Fixture:F", &source);
+        let reference = r#"R"\1"#;
+        let result = handle_place_component(
+            &json!({
+                "board":board, "footprint":"Fixture:F", "reference":reference, "x":10.0, "y":20.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+        assert_eq!(parsed(&result)["source"], "file");
+        let written = std::fs::read_to_string(&board).unwrap();
+        let tree = konnect_sexp::parse_sexp(&written).unwrap();
+        assert_eq!(
+            footprint_reference(tree.find("footprint").unwrap()).as_deref(),
+            Some(reference)
+        );
+    }
+
+    #[tokio::test]
+    async fn fidelity_boundary_array_rejects_a_lossy_stock_footprint_before_any_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let source =
+            include_str!("../../tests/fixtures/placement_fidelity/ESP32-WROOM-32.kicad_mod");
+        let board =
+            placement_fidelity_fixture(directory.path(), "RF_Module:ESP32-WROOM-32", source);
+        let before = std::fs::read(&board).unwrap();
+        let (server, mutations) = placement_refusal_server(&board, vec![]);
+        let result = handle_place_array(
+            &json!({
+                "board":board, "footprint":"RF_Module:ESP32-WROOM-32", "start_x":10.0,
+                "start_y":20.0, "count_x":2, "spacing_x":1.0
+            }),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let text = result_text(&result);
+        assert!(text.contains("RF_Module:ESP32-WROOM-32"));
+        assert!(text.contains("property"));
+        assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn fidelity_boundary_pad_lookup_never_returns_a_different_or_unreadable_pad() {
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("pads.kicad_pcb");
+        for (reference, number, source, diagnostic) in [
+            (
+                "R1",
+                "404",
+                SAVED_BOARD_WITH_R1.to_string(),
+                "Pad '404' not found",
+            ),
+            ("missing", "1", SAVED_BOARD_WITH_R1.to_string(), "not found"),
+            (
+                "R1",
+                "1",
+                SAVED_BOARD_WITH_R1.replace("(at -0.9 0 105)", "(at -0.9 invalid 105)"),
+                "no readable position",
+            ),
+        ] {
+            std::fs::write(&board, &source).unwrap();
+            let result = handle_get_pad_position(
+                &json!({
+                    "board":board, "reference":reference, "pad_number":number
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error);
+            assert!(
+                result_text(&result).contains(diagnostic),
+                "{}",
+                result_text(&result)
+            );
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+        }
+    }
+
     #[test]
     fn coordinate_review_closed_placement_refuses_overflow_without_writing() {
         let directory = tempfile::tempdir().unwrap();

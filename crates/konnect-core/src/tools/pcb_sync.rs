@@ -3386,6 +3386,192 @@ mod chunk_tests {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn fidelity_boundary_sync_preflight_never_starts_an_unreviewed_or_missing_design() {
+        let served = ServedSync::new().await;
+        let before = std::fs::read(&served.board).unwrap();
+        let (error, body) = served
+            .call(serde_json::json!({
+                "schematic": served.schematic, "board": served.board, "dry_run": false
+            }))
+            .await;
+        assert!(error);
+        assert!(body.to_string().contains("expected_plan_revision"));
+        for (schematic, board, missing) in [
+            (
+                served._temp.path().join("missing.kicad_sch"),
+                served.board.clone(),
+                "missing.kicad_sch",
+            ),
+            (
+                served.schematic.clone(),
+                served._temp.path().join("missing.kicad_pcb"),
+                "missing.kicad_pcb",
+            ),
+        ] {
+            let (error, body) = served
+                .call(serde_json::json!({"schematic": schematic, "board": board}))
+                .await;
+            assert!(error);
+            assert!(body.to_string().contains(missing), "{body}");
+        }
+        assert!(!served.exported.exists());
+        let (error, body) = served
+            .call(serde_json::json!({
+                "schematic": served.schematic, "board": served.board
+            }))
+            .await;
+        assert!(error);
+        assert!(body.to_string().contains("netlist export failed"), "{body}");
+        assert_eq!(served.begins.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(served.sent_footprints().is_empty());
+        assert_eq!(std::fs::read(&served.board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn fidelity_boundary_exported_field_grammar_and_repeated_pad_nets_refuse_before_commit() {
+        let served = ServedSync::new().await;
+        let before = std::fs::read(&served.board).unwrap();
+        for (field, diagnostic) in [
+            (r#"(field (name "") "value")"#, "empty schematic field"),
+            (
+                r#"(field (name "Konnect:schematic_fields") "value")"#,
+                "reserved",
+            ),
+            (
+                r#"(field "wrong-order" (name "LCSC"))"#,
+                "malformed schematic field",
+            ),
+            (
+                r#"(field (name "LCSC" "extra") "value")"#,
+                "malformed schematic field",
+            ),
+            (
+                r#"(field (name "LCSC") "value" "extra")"#,
+                "malformed schematic field",
+            ),
+            (r#"(field "unnamed")"#, "no name"),
+            (r#"(field (name "LCSC") (value "nested"))"#, "invalid value"),
+        ] {
+            let netlist = exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]).replace(
+                "(value \"part\")",
+                &format!("(value \"part\") (fields {field})"),
+            );
+            let (error, body) = served.dry_run_result(&netlist).await;
+            assert!(error, "{field}: {body}");
+            assert!(body.to_string().contains(diagnostic), "{field}: {body}");
+        }
+        let netlist = exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]).replace(
+            "(nets\n",
+            "(nets\n (net (code 99) (name \"OTHER\") (node (ref \"C1\") (pin \"1\")))\n",
+        );
+        let (error, body) = served.dry_run_result(&netlist).await;
+        assert!(error);
+        assert!(
+            body.to_string().contains("appears in more than one net"),
+            "{body}"
+        );
+        assert_eq!(served.begins.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(served.sent_footprints().is_empty());
+        assert_eq!(std::fs::read(&served.board).unwrap(), before);
+    }
+
+    #[test]
+    fn fidelity_boundary_empty_exported_field_and_unwired_component_keep_their_meaning() {
+        let source = ONE_RESISTOR.replace(
+            "(value \"10k\")",
+            "(value \"10k\") (fields (field (name \"LCSC\")))",
+        );
+        let design = parse_exported_netlist(&source).unwrap();
+        assert_eq!(design.components[0].properties["LCSC"], "");
+        let source = exported_netlist(&[("C1", STOCK_0603, &[])]);
+        let nets_start = source.find("  (nets").unwrap();
+        let source = format!("{})", &source[..nets_start]);
+        let design = parse_exported_netlist(&source).unwrap();
+        assert_eq!(design.components.len(), 1);
+        assert!(design.components[0].pad_nets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fidelity_boundary_duplicate_live_kiids_are_not_a_syncable_snapshot() {
+        let served = ServedSync::new().await;
+        let before = std::fs::read(&served.board).unwrap();
+        let one = board_only_instance("same-kiid", "LOGO1");
+        let two = board_only_instance("same-kiid", "LOGO2");
+        *served.created.lock().unwrap() = vec![
+            konnect_ipc::builders::pack_any(&one, "kiapi.board.types.FootprintInstance"),
+            konnect_ipc::builders::pack_any(&two, "kiapi.board.types.FootprintInstance"),
+        ];
+        let (error, body) = served
+            .dry_run_result(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+        assert!(error);
+        assert!(
+            body.to_string().contains("duplicate footprint KIID"),
+            "{body}"
+        );
+        assert_eq!(served.begins.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&served.board).unwrap(), before);
+    }
+
+    #[test]
+    fn fidelity_boundary_readback_rejects_invented_pads_and_reports_missing_geometry() {
+        use konnect_ipc::gen::kiapi;
+        let sent = footprint_with_artwork("U1");
+        let expected = footprint_shapes(std::iter::once(&sent));
+        let native = BTreeMap::from([(
+            "U1".to_string(),
+            NativeAssemblyExpectation {
+                kiid: Some("u1-kiid".into()),
+                dnp: false,
+                assembly: AssemblyAttributes::default(),
+            },
+        )]);
+        let mut added =
+            kiapi::board::types::FootprintInstance::decode(sent.value.as_slice()).unwrap();
+        let definition = added.definition.as_mut().unwrap();
+        let extra = definition
+            .items
+            .iter()
+            .find(|child| konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad"))
+            .unwrap()
+            .clone();
+        let mut extra = kiapi::board::types::Pad::decode(extra.value.as_slice()).unwrap();
+        extra.id = Some(kiapi::common::types::Kiid {
+            value: "extra-pad-readback".into(),
+        });
+        extra.number = "99".into();
+        definition.items.push(konnect_ipc::builders::pack_any(
+            &extra,
+            "kiapi.board.types.Pad",
+        ));
+        let item = konnect_ipc::builders::pack_any(&added, "kiapi.board.types.FootprintInstance");
+        let error = verify_board_matches_what_was_sent(&[item], &expected, &native).unwrap_err();
+        assert!(error.to_string().contains("gained pads"));
+        for remove_type in [
+            "kiapi.board.types.Pad",
+            "kiapi.board.types.BoardGraphicShape",
+        ] {
+            let mut changed =
+                kiapi::board::types::FootprintInstance::decode(sent.value.as_slice()).unwrap();
+            changed
+                .definition
+                .as_mut()
+                .unwrap()
+                .items
+                .retain(|child| !konnect_ipc::builders::any_is(child, remove_type));
+            let item =
+                konnect_ipc::builders::pack_any(&changed, "kiapi.board.types.FootprintInstance");
+            let diagnostics =
+                verify_board_matches_what_was_sent(&[item], &expected, &native).unwrap();
+            assert_eq!(diagnostics.len(), 1);
+            assert!(
+                diagnostics[0].contains("U1: sent 1 pads and 6 drawings"),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
     #[test]
     fn issue26_malformed_duplicate_and_reserved_fields_refuse() {
         for fields in [
