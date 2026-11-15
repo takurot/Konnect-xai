@@ -2501,3 +2501,83 @@ mod coverage_verification_no_write {
         assert_eq!(std::fs::read_to_string(project).unwrap(), source);
     }
 }
+
+#[cfg(test)]
+mod coverage_final_verification_contracts {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("text expected")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn clearance_invalid_mode_and_missing_second_courtyard_never_invent_a_distance() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let ctx = ctx_talking_to(String::new());
+        let invalid = handle_check_clearance(
+            &json!({"board":board,"ref1":"C1","ref2":"R1","mode":"copper"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(invalid.is_error);
+        assert!(!board.exists());
+        let source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../konnect-sexp/tests/fixtures/ecc83-pp.kicad_pcb"),
+        )
+        .unwrap();
+        let mut changed = source.clone();
+        let (start, end) = konnect_sexp::writer::find_direct_child_blocks(&source, "kicad_pcb")
+            .into_iter()
+            .find(|(start, end)| {
+                let text = &source[*start..*end];
+                text.starts_with("(footprint")
+                    && konnect_sexp::parse_sexp(text)
+                        .ok()
+                        .is_some_and(|tree| footprint_reference(&tree) == Some("R1"))
+            })
+            .unwrap();
+        let footprint = source[start..end].replace("F.CrtYd", "F.Fab");
+        assert_ne!(footprint, &source[start..end]);
+        changed.replace_range(start..end, &footprint);
+        std::fs::write(&board, &changed).unwrap();
+        let result = handle_check_clearance(
+            &json!({"board":board,"ref1":"C1","ref2":"R1","mode":"courtyard"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let body = body(&result);
+        assert_eq!(body["available"], false);
+        assert_eq!(body["unavailable_reference"], "R1");
+        assert!(body["courtyard_clearance_mm"].is_null());
+        assert_eq!(std::fs::read_to_string(board).unwrap(), changed);
+    }
+
+    #[tokio::test]
+    async fn an_open_live_board_refuses_a_saved_palette_change_without_touching_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let project = board.with_extension("kicad_pro");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        std::fs::write(&project, "{ \"board\": {} }").unwrap();
+        let before = std::fs::read(&project).unwrap();
+        let server = spawn_kicad_holding_board(&board, |_| None);
+        let result = handle_set_predefined_sizes(
+            &json!({"board":board,"track_widths":[0.25]}),
+            &ctx_talking_to(server.address().into()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read(project).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(board).unwrap(), "(kicad_pcb)");
+    }
+}

@@ -2233,4 +2233,67 @@ mod tests {
             assert!(error.contains(expected), "{error}");
         }
     }
+
+    #[test]
+    fn native_adoption_refuses_duplicate_and_empty_identity_collections() {
+        let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        let native = include_str!("../tests/fixtures/specctra_two_resistors.native-kicad-10.dsn");
+        let place = "(place R1 100000 -50000 front 0 (PN 10k))";
+        let net = "(net GND\n      (pins R1-2 R2-1)\n    )";
+        let class = "(class kicad_default GND VCC\n      (circuit\n        (use_via \"Via[0-1]_600:300_um\")\n      )\n      (rule\n        (width 200)\n        (clearance 200)\n      )\n    )";
+        let layer =
+            "(layer B.Cu\n      (type signal)\n      (property\n        (index 1)\n      )\n    )";
+        for (from, to, expected) in [
+            ("(image Resistor_SMD:R_0402\n", "(image Resistor_SMD:R_0402)\n    (image Resistor_SMD:R_0402\n".to_string(), "repeats image"),
+            ("(shape (rect F.Cu -300 -250 300 250))", "".into(), "empty or duplicate padstack"),
+            ("(library\n", "(library\n    (padstack Rect[T]Pad_600.000000x500.000000_um (shape (rect F.Cu -300 -250 300 250)))\n".into(), "empty or duplicate padstack"),
+            (place, format!("{place} {place}"), "repeats component"),
+            ("(pins R1-2 R2-1)", "(pins)".into(), "empty or duplicate net"),
+            (net, format!("{net} {net}"), "empty or duplicate net"),
+            ("(class kicad_default GND VCC", "(class kicad_default".into(), "invalid or duplicate class"),
+            (class, format!("{class} {class}"), "invalid or duplicate class"),
+            (layer, "".into(), "changed the copper-layer count"),
+            (class, "".into(), "changed the routing-class count"),
+            (place, "".into(), "changed the component count"),
+            ("1 -500 0)", "1 -500.5 0)".into(), "not a supported integer"),
+            ("1 -500 0)", "1 -1e30 0)".into(), "not a supported integer"),
+            ("1 -500 0)", "1 1e30 0)".into(), "not a supported integer"),
+        ] {
+            let changed = native.replace(from,&to);
+            assert_ne!(changed,native,"ineffective pinned fixture mutation: {from}");
+            let baseline = export_dsn(Path::new("board.kicad_pcb"),source,&native_fixture_rules()).unwrap();
+            let error = format!("{:#}",adopt_native_dsn(baseline,changed).unwrap_err());
+            assert!(error.contains(expected),"{from} -> {to}: {error}");
+        }
+    }
+
+    #[test]
+    fn export_resolves_legacy_aliases_and_refuses_routing_outside_effective_rules() {
+        for pad in [
+            COVERAGE_ROUTING_PAD.replace("(net \"GND\")", "(net 7)"),
+            COVERAGE_ROUTING_PAD.replace("(net \"GND\")", "(net 7 \"GND\")"),
+        ] {
+            let source = coverage_routing_board(&pad, "", r#"(net 7 "GND")"#);
+            let exported = export_dsn(Path::new("board.kicad_pcb"), &source, &rules()).unwrap();
+            let manifest: serde_json::Value = serde_json::from_str(&exported.manifest).unwrap();
+            assert_eq!(manifest["nets"][0]["name"], "GND");
+            assert_eq!(manifest["components"][0]["pads"][0]["net"], "GND");
+        }
+        let zero_offset = COVERAGE_ROUTING_PAD.replace("(size 2 2)", "(size 2 2) (offset 0 0)");
+        assert!(export_dsn(
+            Path::new("board.kicad_pcb"),
+            &coverage_routing_board(&zero_offset, "", ""),
+            &rules()
+        )
+        .is_ok());
+        for (routing,expected) in [
+            ("(segment (locked yes) (start 1 1) (end 2 2) (width 0.25) (layer F.Cu) (net OTHER))","unknown routing net"),
+            ("(via (locked yes) (at 5 5) (layers F.Cu B.Cu) (net GND) (size 0.8) (drill 0.3))","effective via rule"),
+            ("(via (locked yes) (at 5 5) (layers F.Cu B.Cu) (net GND) (size 0.6) (drill 0.2))","effective via rule"),
+        ] {
+            let source = coverage_routing_board(COVERAGE_ROUTING_PAD,"",routing);
+            let error = format!("{:#}",export_dsn(Path::new("board.kicad_pcb"),&source,&rules()).unwrap_err());
+            assert!(error.contains(expected),"{routing}: {error}");
+        }
+    }
 }

@@ -1545,4 +1545,36 @@ cat >/dev/null"#;
             1
         );
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn requests_refuse_an_expired_deadline_and_bound_router_error_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = scripted_client(
+            &dir.path().join("deadline.log"),
+            &[json!({"id":2,"result":{}}).to_string()],
+        )
+        .await;
+        let error = client
+            .request("probe", json!({}), Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        client.close().await;
+        let reply =
+            json!({"id":2,"result":{"isError":true,"message":"x".repeat(3000)}}).to_string();
+        let mut client = scripted_client(&dir.path().join("error.log"), &[reply]).await;
+        let error = client
+            .call_tool("route", json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        client.close().await;
+        assert!(error.contains("returned an error"));
+        assert!(
+            error.chars().count() < 2200,
+            "router error escaped the bounded diagnostic"
+        );
+        assert!(error.ends_with("..."));
+    }
 }
