@@ -10411,3 +10411,136 @@ mod overwrite_argument_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod v015_library_readback_tests {
+    use super::*;
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(
+            Default::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn text(result: &CallToolResult) -> &str {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text response")
+        };
+        text
+    }
+
+    #[tokio::test]
+    async fn appending_a_symbol_preserves_existing_symbols_and_updates_library_metadata() {
+        for (metadata, expected_generator) in [
+            ("(generator \"legacy\")", Some("10.0")),
+            (
+                "(generator \"legacy\") (generator_version \"9.0\")",
+                Some("9.0"),
+            ),
+            ("", None),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("Parts.kicad_sym");
+            let original_symbol = "(symbol \"Existing\" (property \"Value\" \"keep me\"))";
+            std::fs::write(
+                &path,
+                format!("(kicad_symbol_lib (version 20240108) {metadata} {original_symbol})"),
+            )
+            .unwrap();
+            let result = handle_create_symbol(
+                &json!({
+                    "library_path": path, "name":"Added", "reference_prefix":"U",
+                    "show_pin_names":false, "show_pin_numbers":false,
+                    "pins":[{"number":"1","name":"IN","type":"input"}]
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{}", text(&result));
+            let source = std::fs::read_to_string(&path).unwrap();
+            assert!(source.contains(original_symbol));
+            let parsed = parse_sexp(&source).unwrap();
+            assert_eq!(parsed.find("version").unwrap().get_f64(1), Some(20251024.0));
+            assert_eq!(parsed.find_str("generator_version"), expected_generator);
+            assert!(parsed.find_all("generator_version").len() <= 1);
+            let symbols = parsed.find_all("symbol");
+            assert_eq!(symbols.len(), 2);
+            let added = symbols
+                .into_iter()
+                .find(|symbol| symbol.get(1).and_then(SexpNode::as_str) == Some("Added"))
+                .unwrap();
+            assert_eq!(added.find_str("pin_numbers"), Some("hide"));
+            assert_eq!(
+                added.find("pin_names").unwrap().find_str("hide"),
+                Some("yes")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn glyph_fallback_reports_output_and_unsupported_pin_mismatches() {
+        for (extra_pins, reason) in [
+            (json!([]), "exactly 1 output pin but 0"),
+            (
+                json!([{"number":"3","type":"output"},{"number":"4","type":"output"}]),
+                "exactly 1 output pin but 2",
+            ),
+            (
+                json!([{"number":"3","type":"output"},{"number":"4","type":"passive"}]),
+                "only supports input/output/power pins",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("Gate.kicad_sym");
+            let mut pins = vec![
+                json!({"number":"1","name":"A","type":"input"}),
+                json!({"number":"2","name":"B","type":"input"}),
+            ];
+            pins.extend(extra_pins.as_array().unwrap().iter().cloned());
+            let result = handle_create_symbol(&json!({
+                "library_path":path,"name":"Gate","reference_prefix":"U","glyph":"and","pins":pins
+            }), &ctx()).await.unwrap();
+            assert!(!result.is_error, "{}", text(&result));
+            let response: serde_json::Value = serde_json::from_str(text(&result)).unwrap();
+            assert_eq!(response["units"][0]["body"], "rectangle");
+            assert!(response["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str().unwrap().contains(reason)));
+            let source = std::fs::read_to_string(&path).unwrap();
+            let root = parse_sexp(&source).unwrap();
+            assert_eq!(
+                descendants_with_head(root.find("symbol").unwrap(), "pin").len(),
+                pins.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn footprint_pad_inspection_refuses_unreadable_positions_without_rewriting_the_file() {
+        for (position, reason) in [
+            ("", "no readable"),
+            ("(at broken 1)", "invalid"),
+            ("(at 1 broken)", "invalid"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("Part.kicad_mod");
+            let source = format!(
+                "(footprint \"Part\" (pad \"1\" smd rect {position} (size 1 1) (layers \"F.Cu\")))"
+            );
+            std::fs::write(&path, &source).unwrap();
+            let result = handle_get_footprint_info(
+                &json!({"footprint_path":path,"include_pads":true}),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error);
+            assert!(text(&result).contains(reason), "{}", text(&result));
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        }
+    }
+}

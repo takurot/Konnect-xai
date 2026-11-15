@@ -587,4 +587,328 @@ mod tests {
         transform_footprint_children(&mut fp, &xf).unwrap();
         assert_eq!(fp.definition.unwrap().items[0].value, original);
     }
+
+    #[test]
+    fn zone_outlines_holes_and_filled_arcs_move_with_the_footprint() {
+        use common::poly_line_node::Geometry;
+        let point = |x, y| common::Vector2 { x_nm: x, y_nm: y };
+        let outline = common::PolyLine {
+            closed: true,
+            nodes: vec![common::PolyLineNode {
+                geometry: Some(Geometry::Point(point(10, 20))),
+            }],
+        };
+        let hole = common::PolyLine {
+            closed: true,
+            nodes: vec![common::PolyLineNode {
+                geometry: Some(Geometry::Arc(common::ArcStartMidEnd {
+                    start: Some(point(1, 2)),
+                    mid: Some(point(3, 4)),
+                    end: Some(point(5, 6)),
+                })),
+            }],
+        };
+        let shapes = common::PolySet {
+            polygons: vec![common::PolygonWithHoles {
+                outline: Some(outline),
+                holes: vec![hole],
+            }],
+        };
+        let zone = board::Zone {
+            outline: Some(shapes.clone()),
+            filled: true,
+            filled_polygons: vec![board::ZoneFilledPolygons {
+                layer: board::BoardLayer::BlFCu as i32,
+                shapes: Some(shapes),
+            }],
+            ..Default::default()
+        };
+        let mut fp = instance_with(vec![builders::pack_any(&zone, "kiapi.board.types.Zone")]);
+        let anchor = fp.position;
+        transform_footprint_children(
+            &mut fp,
+            &Xform::Translate {
+                dx_nm: 100,
+                dy_nm: -50,
+            },
+        )
+        .unwrap();
+        assert_eq!(fp.position, anchor);
+        let zone = board::Zone::decode(fp.definition.unwrap().items[0].value.as_slice()).unwrap();
+        assert!(zone.filled);
+        for shapes in [
+            zone.outline.unwrap(),
+            zone.filled_polygons[0].shapes.clone().unwrap(),
+        ] {
+            let polygon = &shapes.polygons[0];
+            assert_eq!(
+                polygon.outline.as_ref().unwrap().nodes[0].geometry,
+                Some(Geometry::Point(point(110, -30)))
+            );
+            assert_eq!(
+                polygon.holes[0].nodes[0].geometry,
+                Some(Geometry::Arc(common::ArcStartMidEnd {
+                    start: Some(point(101, -48)),
+                    mid: Some(point(103, -46)),
+                    end: Some(point(105, -44)),
+                }))
+            );
+            assert!(polygon.holes[0].closed);
+        }
+    }
+
+    #[test]
+    fn each_dimension_style_keeps_its_endpoints_attached_on_rotation() {
+        use board::dimension::DimensionStyle;
+        let start = Some(common::Vector2 { x_nm: 10, y_nm: 20 });
+        let end = Some(common::Vector2 { x_nm: 30, y_nm: 40 });
+        let styles = [
+            DimensionStyle::Aligned(board::AlignedDimensionAttributes {
+                start,
+                end,
+                ..Default::default()
+            }),
+            DimensionStyle::Orthogonal(board::OrthogonalDimensionAttributes {
+                start,
+                end,
+                ..Default::default()
+            }),
+            DimensionStyle::Radial(board::RadialDimensionAttributes {
+                center: start,
+                radius_point: end,
+                ..Default::default()
+            }),
+            DimensionStyle::Leader(board::LeaderDimensionAttributes {
+                start,
+                end,
+                ..Default::default()
+            }),
+            DimensionStyle::Center(board::CenterDimensionAttributes { center: start, end }),
+        ];
+        for style in styles {
+            let dimension = board::Dimension {
+                dimension_style: Some(style),
+                text: Some(common::Text {
+                    text: "measured".into(),
+                    position: start,
+                    attributes: Some(common::TextAttributes::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut fp = instance_with(vec![builders::pack_any(
+                &dimension,
+                "kiapi.board.types.Dimension",
+            )]);
+            transform_footprint_children(
+                &mut fp,
+                &Xform::Rotate {
+                    cx_nm: 0,
+                    cy_nm: 0,
+                    delta_deg: 90.0,
+                },
+            )
+            .unwrap();
+            let dimension =
+                board::Dimension::decode(fp.definition.unwrap().items[0].value.as_slice()).unwrap();
+            let endpoints = match dimension.dimension_style.unwrap() {
+                DimensionStyle::Aligned(v) => (v.start, v.end),
+                DimensionStyle::Orthogonal(v) => (v.start, v.end),
+                DimensionStyle::Radial(v) => (v.center, v.radius_point),
+                DimensionStyle::Leader(v) => (v.start, v.end),
+                DimensionStyle::Center(v) => (v.center, v.end),
+            };
+            assert_eq!(
+                endpoints,
+                (
+                    Some(common::Vector2 {
+                        x_nm: 20,
+                        y_nm: -10
+                    }),
+                    Some(common::Vector2 {
+                        x_nm: 40,
+                        y_nm: -30
+                    }),
+                )
+            );
+            let text = dimension.text.unwrap();
+            assert_eq!(text.text, "measured");
+            assert_eq!(text.position, endpoints.0);
+            assert_eq!(text.attributes.unwrap().angle.unwrap().value_degrees, 90.0);
+        }
+    }
+
+    #[test]
+    fn textbox_and_custom_field_follow_cardinal_rotation() {
+        let position = Some(common::Vector2 { x_nm: 10, y_nm: 20 });
+        let textbox = board::BoardTextBox {
+            textbox: Some(common::TextBox {
+                top_left: position,
+                bottom_right: Some(common::Vector2 { x_nm: 30, y_nm: 40 }),
+                attributes: Some(common::TextAttributes::default()),
+                text: "assembly".into(),
+            }),
+            ..Default::default()
+        };
+        let field = board::Field {
+            name: "MPN".into(),
+            text: Some(board::BoardText {
+                text: Some(common::Text {
+                    text: "part".into(),
+                    position,
+                    attributes: Some(common::TextAttributes::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut fp = instance_with(vec![
+            builders::pack_any(&textbox, "kiapi.board.types.BoardTextBox"),
+            builders::pack_any(&field, "kiapi.board.types.Field"),
+        ]);
+        transform_footprint_children(
+            &mut fp,
+            &Xform::Rotate {
+                cx_nm: 0,
+                cy_nm: 0,
+                delta_deg: -90.0,
+            },
+        )
+        .unwrap();
+        let items = fp.definition.unwrap().items;
+        let textbox = board::BoardTextBox::decode(items[0].value.as_slice())
+            .unwrap()
+            .textbox
+            .unwrap();
+        assert_eq!(
+            textbox.top_left,
+            Some(common::Vector2 {
+                x_nm: -20,
+                y_nm: 10
+            })
+        );
+        assert_eq!(
+            textbox.bottom_right,
+            Some(common::Vector2 {
+                x_nm: -40,
+                y_nm: 30
+            })
+        );
+        assert_eq!(
+            textbox.attributes.unwrap().angle.unwrap().value_degrees,
+            -90.0
+        );
+        let field = board::Field::decode(items[1].value.as_slice()).unwrap();
+        assert_eq!(field.name, "MPN");
+        let text = field.text.unwrap().text.unwrap();
+        assert_eq!(text.text, "part");
+        assert_eq!(
+            text.position,
+            Some(common::Vector2 {
+                x_nm: -20,
+                y_nm: 10
+            })
+        );
+    }
+
+    #[test]
+    fn lossy_rotations_and_malformed_typed_children_are_refused() {
+        let mut rectangle =
+            builders::board_rectangle("F.Fab", 0.1, 0.0, 0.0, 1.0, 1.0, false).unwrap();
+        if let Some(common::graphic_shape::Geometry::Rectangle(rect)) =
+            rectangle.shape.as_mut().unwrap().geometry.as_mut()
+        {
+            rect.corner_radius = Some(common::Distance { value_nm: 100 });
+        }
+        let noncardinal = Xform::Rotate {
+            cx_nm: 0,
+            cy_nm: 0,
+            delta_deg: 45.0,
+        };
+        for (item, reason) in [
+            (
+                builders::pack_any(&rectangle, "kiapi.board.types.BoardGraphicShape"),
+                "rounded-rectangle",
+            ),
+            (
+                builders::pack_any(
+                    &board::BoardTextBox::default(),
+                    "kiapi.board.types.BoardTextBox",
+                ),
+                "textbox",
+            ),
+        ] {
+            let mut fp = instance_with(vec![item]);
+            let before = fp.definition.clone();
+            let error = transform_footprint_children(&mut fp, &noncardinal).unwrap_err();
+            assert!(error.to_string().contains(reason));
+            assert_eq!(fp.definition, before, "refused child must remain unchanged");
+        }
+        for kind in [
+            "Pad",
+            "BoardText",
+            "BoardTextBox",
+            "Field",
+            "BoardGraphicShape",
+            "Zone",
+            "Dimension",
+        ] {
+            let mut fp = instance_with(vec![prost_types::Any {
+                type_url: format!("type.googleapis.com/kiapi.board.types.{kind}"),
+                value: vec![0xff],
+            }]);
+            assert!(
+                transform_footprint_children(&mut fp, &Xform::Translate { dx_nm: 1, dy_nm: 2 })
+                    .is_err(),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_optional_child_geometry_does_not_create_new_objects() {
+        let items = vec![
+            builders::pack_any(&board::Pad::default(), "kiapi.board.types.Pad"),
+            builders::pack_any(&board::BoardText::default(), "kiapi.board.types.BoardText"),
+            builders::pack_any(
+                &board::BoardTextBox::default(),
+                "kiapi.board.types.BoardTextBox",
+            ),
+            builders::pack_any(&board::Field::default(), "kiapi.board.types.Field"),
+            builders::pack_any(
+                &board::BoardGraphicShape::default(),
+                "kiapi.board.types.BoardGraphicShape",
+            ),
+            builders::pack_any(&board::Zone::default(), "kiapi.board.types.Zone"),
+            builders::pack_any(&board::Dimension::default(), "kiapi.board.types.Dimension"),
+            builders::pack_any(&board::Group::default(), "kiapi.board.types.Group"),
+        ];
+        let mut fp = board::FootprintInstance {
+            definition: Some(board::Footprint {
+                items: items.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        transform_footprint_children(
+            &mut fp,
+            &Xform::Translate {
+                dx_nm: 10,
+                dy_nm: 20,
+            },
+        )
+        .unwrap();
+        assert_eq!(fp.definition.unwrap().items, items);
+        let mut no_definition = board::FootprintInstance::default();
+        transform_footprint_children(
+            &mut no_definition,
+            &Xform::Translate {
+                dx_nm: 10,
+                dy_nm: 20,
+            },
+        )
+        .unwrap();
+        assert_eq!(no_definition, board::FootprintInstance::default());
+    }
 }
