@@ -1401,3 +1401,759 @@ mod issue26_tests {
         assert!(fields.iter().any(|field| field.name == "KiLib_Generator"));
     }
 }
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    fn root(source: &str) -> SexpNode {
+        konnect_sexp::parse_sexp(source).unwrap()
+    }
+
+    fn assert_refused<T>(result: Result<T>, needle: &str) {
+        let text = match result {
+            Ok(_) => panic!("expected a refusal containing '{needle}', got success"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(text.contains(needle), "'{text}' should contain '{needle}'");
+    }
+
+    fn children_of(body: &str) -> Result<()> {
+        validate_supported_children(&root(&format!("(footprint \"X\" {body})")))
+    }
+
+    const GOOD_AT: &str = "(at 0 0)";
+    const GOOD_LAYER: &str = "(layer \"F.Fab\")";
+    const GOOD_EFFECTS: &str = "(effects (font (size 1 1) (thickness 0.15)))";
+
+    fn user_text(clauses: &str) -> Result<()> {
+        children_of(&format!("(fp_text user \"T\" {clauses})"))
+    }
+
+    fn user_text_with(at: &str, layer: &str, effects: &str, extra: &str) -> Result<()> {
+        user_text(&format!("{at} {layer} {effects} {extra}"))
+    }
+
+    fn pad(body: &str) -> Result<()> {
+        children_of(&format!("(pad \"1\" {body})"))
+    }
+
+    fn property_field(extra: &str) -> Result<Vec<kiapi::board::types::Field>> {
+        fields(&root(&format!(
+            "(footprint \"X\" (property \"LCSC\" \"C1\" {extra}))"
+        )))
+    }
+
+    const FULL_PROPERTY: &str =
+        "(at 1 2) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15)))";
+
+    #[test]
+    fn attributes_read_every_supported_token_into_its_flag() {
+        let parsed = attributes(&root(
+            "(footprint \"X\" (attr through_hole board_only exclude_from_pos_files \
+             exclude_from_bom allow_missing_courtyard dnp allow_soldermask_bridges))",
+        ))
+        .unwrap();
+        assert_eq!(
+            parsed.mounting_style,
+            kiapi::board::types::FootprintMountingStyle::FmsThroughHole as i32
+        );
+        assert!(parsed.not_in_schematic);
+        assert!(parsed.exclude_from_position_files);
+        assert!(parsed.exclude_from_bill_of_materials);
+        assert!(parsed.exempt_from_courtyard_requirement);
+        assert!(parsed.do_not_populate);
+        assert!(parsed.allow_soldermask_bridges);
+    }
+
+    #[test]
+    fn a_footprint_without_attr_gets_the_unspecified_default() {
+        let parsed = attributes(&root("(footprint \"X\")")).unwrap();
+        assert_eq!(parsed, kiapi::board::types::FootprintAttributes::default());
+    }
+
+    #[test]
+    fn attributes_refuse_unknown_tokens_and_non_atoms() {
+        assert_refused(
+            attributes(&root("(footprint \"X\" (attr smd quantum))")),
+            "footprint attribute 'quantum' is not supported",
+        );
+        assert_refused(
+            attributes(&root("(footprint \"X\" (attr (smd)))")),
+            "non-atom",
+        );
+    }
+
+    #[test]
+    fn description_and_keywords_default_to_empty_when_absent() {
+        let text = description_and_keywords(&root("(footprint \"X\")"));
+        assert_eq!(text.description, "");
+        assert_eq!(text.keywords, "");
+    }
+
+    #[test]
+    fn models_carry_explicit_transforms_and_refuse_malformed_clauses() {
+        let parsed = models(&root(
+            "(footprint \"X\" (model \"m.step\" (offset (xyz 1 2 3)) (scale (xyz 4 5 6)) \
+             (rotate (xyz 7 8 9)) (opacity 0.5)))",
+        ))
+        .unwrap();
+        let model = &parsed[0];
+        let triple = |v: &Option<kiapi::common::types::Vector3D>| {
+            let v = v.as_ref().unwrap();
+            (v.x_nm, v.y_nm, v.z_nm)
+        };
+        assert_eq!(triple(&model.offset), (1.0, 2.0, 3.0));
+        assert_eq!(triple(&model.scale), (4.0, 5.0, 6.0));
+        assert_eq!(triple(&model.rotation), (7.0, 8.0, 9.0));
+        assert_eq!(model.opacity, 0.5);
+
+        let refuse = |body: &str, needle: &str| {
+            assert_refused(
+                models(&root(&format!(
+                    "(footprint \"X\" (model \"m.step\" {body}))"
+                ))),
+                needle,
+            )
+        };
+        refuse("(shadow yes)", "3D model clause 'shadow' is not supported");
+        refuse("surprise", "unsupported atom");
+        refuse("(offset)", "offset is missing xyz");
+        refuse("(offset (xyz 1 2))", "offset.z is invalid");
+        refuse("(offset (xyz 1 two 3))", "offset.y is invalid");
+        refuse("(scale (xyz x 2 3))", "scale.x is invalid");
+        assert_refused(
+            models(&root("(footprint \"X\" (model))")),
+            "missing its filename",
+        );
+    }
+
+    #[test]
+    fn unsupported_footprint_children_are_refused_by_name() {
+        assert_refused(
+            children_of("(zone (net 1))"),
+            "footprint child 'zone' is not supported",
+        );
+        assert!(children_of("(embedded_fonts no) (duplicate_pad_numbers_are_jumpers no)").is_ok());
+        assert_refused(
+            children_of("(embedded_fonts yes)"),
+            "'embedded_fonts yes' is not supported",
+        );
+        assert_refused(
+            children_of("(duplicate_pad_numbers_are_jumpers)"),
+            "'duplicate_pad_numbers_are_jumpers ' is not supported",
+        );
+        assert!(children_of("bare_atom (version 20240108)").is_ok());
+    }
+
+    #[test]
+    fn fp_text_kinds_other_than_reference_value_user_are_refused() {
+        assert!(children_of("(fp_text reference \"R**\")").is_ok());
+        assert!(children_of("(fp_text value \"V\")").is_ok());
+        assert_refused(
+            children_of("(fp_text barcode \"V\")"),
+            "fp_text kind 'barcode' is not supported",
+        );
+        assert_refused(children_of("(fp_text)"), "missing its kind");
+    }
+
+    #[test]
+    fn a_complete_user_text_is_accepted_with_either_identifier_style() {
+        assert!(user_text_with(GOOD_AT, GOOD_LAYER, GOOD_EFFECTS, "(uuid \"abc\")").is_ok());
+        assert!(
+            user_text_with("(at 1 2 90)", GOOD_LAYER, GOOD_EFFECTS, "(tstamp \"abc\")").is_ok()
+        );
+    }
+
+    #[test]
+    fn user_text_refuses_missing_required_clauses() {
+        assert_refused(
+            children_of("(fp_text user)"),
+            "fp_text user is missing its text",
+        );
+        assert_refused(
+            user_text(&format!("{GOOD_LAYER} {GOOD_EFFECTS}")),
+            "missing its 'at' clause",
+        );
+        assert_refused(
+            user_text(&format!("{GOOD_AT} {GOOD_EFFECTS}")),
+            "missing its 'layer' clause",
+        );
+        assert_refused(
+            user_text(&format!("{GOOD_AT} {GOOD_LAYER}")),
+            "missing its 'effects' clause",
+        );
+    }
+
+    #[test]
+    fn user_text_refuses_duplicates_and_unknown_clauses() {
+        assert_refused(
+            user_text_with(GOOD_AT, GOOD_LAYER, GOOD_EFFECTS, "(at 1 1)"),
+            "duplicate 'at'",
+        );
+        assert_refused(
+            user_text_with(GOOD_AT, GOOD_LAYER, GOOD_EFFECTS, "(layer \"B.Fab\")"),
+            "duplicate 'layer'",
+        );
+        assert_refused(
+            user_text_with(GOOD_AT, GOOD_LAYER, GOOD_EFFECTS, GOOD_EFFECTS),
+            "duplicate 'effects'",
+        );
+        assert_refused(
+            user_text_with(
+                GOOD_AT,
+                GOOD_LAYER,
+                GOOD_EFFECTS,
+                "(uuid \"a\") (tstamp \"b\")",
+            ),
+            "multiple identifier clauses ('uuid' and 'tstamp')",
+        );
+        assert_refused(
+            user_text_with(GOOD_AT, GOOD_LAYER, GOOD_EFFECTS, "(render_cache 1)"),
+            "clause 'render_cache' is not supported losslessly",
+        );
+        assert_refused(
+            user_text_with(GOOD_AT, GOOD_LAYER, GOOD_EFFECTS, "stray"),
+            "unsupported atom",
+        );
+    }
+
+    #[test]
+    fn user_text_refuses_malformed_position_layer_and_identifier() {
+        assert_refused(
+            user_text_with("(at 1)", GOOD_LAYER, GOOD_EFFECTS, ""),
+            "'at' must contain x, y",
+        );
+        assert_refused(
+            user_text_with("(at 1 2 3 4)", GOOD_LAYER, GOOD_EFFECTS, ""),
+            "'at' must contain x, y",
+        );
+        assert_refused(
+            user_text_with("(at 1 up)", GOOD_LAYER, GOOD_EFFECTS, ""),
+            "'at' value 2 is invalid",
+        );
+        assert_refused(
+            user_text_with(GOOD_AT, "(layer)", GOOD_EFFECTS, ""),
+            "must name exactly one layer",
+        );
+        assert_refused(
+            user_text_with(GOOD_AT, "(layer \"\")", GOOD_EFFECTS, ""),
+            "must name exactly one layer",
+        );
+        assert_refused(
+            user_text_with(GOOD_AT, "(layer \"F.Fab\" \"B.Fab\")", GOOD_EFFECTS, ""),
+            "must name exactly one layer",
+        );
+        assert_refused(
+            user_text_with(GOOD_AT, GOOD_LAYER, GOOD_EFFECTS, "(uuid)"),
+            "'uuid' must contain exactly one identifier",
+        );
+        assert_refused(
+            user_text_with(GOOD_AT, GOOD_LAYER, GOOD_EFFECTS, "(tstamp \"\")"),
+            "'tstamp' must contain exactly one identifier",
+        );
+    }
+
+    fn effects(body: &str) -> Result<()> {
+        user_text_with(GOOD_AT, GOOD_LAYER, &format!("(effects {body})"), "")
+    }
+
+    #[test]
+    fn user_text_effects_refuse_anything_the_rebuild_cannot_reproduce() {
+        assert_refused(effects(""), "missing the font clause");
+        assert_refused(
+            effects("(justify left) (font (size 1 1) (thickness 0.1))"),
+            "effects clause 'justify' is not supported losslessly",
+        );
+        assert_refused(
+            effects("hide (font (size 1 1) (thickness 0.1))"),
+            "effects contain an unsupported atom",
+        );
+        assert_refused(
+            effects("(font (size 1 1) (thickness 0.1)) (font (size 1 1) (thickness 0.1))"),
+            "duplicate font clauses",
+        );
+    }
+
+    #[test]
+    fn user_text_font_refuses_bad_sizes_and_thicknesses() {
+        let font = |body: &str| effects(&format!("(font {body})"));
+        assert!(font("(size 1.5 1.5) (thickness 0.2)").is_ok());
+        assert_refused(font("(thickness 0.1)"), "missing its size");
+        assert_refused(font("(size 1 1)"), "missing its thickness");
+        assert_refused(
+            font("(size 1 1) (size 1 1) (thickness 0.1)"),
+            "duplicate font size",
+        );
+        assert_refused(
+            font("(size 1) (thickness 0.1)"),
+            "must contain width and height",
+        );
+        assert_refused(font("(size a 1) (thickness 0.1)"), "font width is invalid");
+        assert_refused(font("(size 1 b) (thickness 0.1)"), "font height is invalid");
+        assert_refused(
+            font("(size 0 0) (thickness 0.1)"),
+            "size must be finite and positive",
+        );
+        assert_refused(
+            font("(size -1 -1) (thickness 0.1)"),
+            "size must be finite and positive",
+        );
+        assert_refused(
+            font("(size 1 2) (thickness 0.1)"),
+            "non-square font size is not supported",
+        );
+        assert_refused(
+            font("(size 1 1) (thickness 0.1) (thickness 0.1)"),
+            "duplicate font thickness",
+        );
+        assert_refused(
+            font("(size 1 1) (thickness 0.1 0.2)"),
+            "thickness must contain exactly one value",
+        );
+        assert_refused(
+            font("(size 1 1) (thickness x)"),
+            "font thickness is invalid",
+        );
+        assert_refused(
+            font("(size 1 1) (thickness 0)"),
+            "thickness must be finite and positive",
+        );
+        assert_refused(
+            font("(size 1 1) (thickness 0.1) (bold yes)"),
+            "font clause 'bold' is not supported losslessly",
+        );
+        assert_refused(
+            font("(size 1 1) (thickness 0.1) italic"),
+            "font contains an unsupported atom",
+        );
+    }
+
+    #[test]
+    fn graphics_accept_their_own_clauses_and_refuse_foreign_ones() {
+        assert!(children_of(
+            "(fp_line (start 0 0) (end 1 1) (stroke (width 0.1) (type dash_dot)) \
+             (layer \"F.SilkS\") (uuid \"a\"))"
+        )
+        .is_ok());
+        assert!(children_of("(fp_rect (start 0 0) (end 1 1) (fill yes))").is_ok());
+        assert!(children_of("(fp_circle (center 0 0) (end 1 0) (fill none))").is_ok());
+        assert!(children_of("(fp_arc (start 0 0) (mid 1 1) (end 2 0))").is_ok());
+        assert!(children_of("(fp_poly (pts (xy 0 0) (xy 1 0) (xy 1 1)) (fill no))").is_ok());
+        assert_refused(
+            children_of("(fp_line (start 0 0) (end 1 1) (fill solid))"),
+            "fp_line clause 'fill' is not supported",
+        );
+        assert_refused(
+            children_of("(fp_rect (start 0 0) (mid 1 1))"),
+            "fp_rect clause 'mid' is not supported",
+        );
+        assert_refused(
+            children_of("(fp_line (start 0 0) (end 1 1) solid)"),
+            "fp_line contains an unsupported atom",
+        );
+    }
+
+    #[test]
+    fn graphic_strokes_and_fills_refuse_lossy_values() {
+        assert_refused(
+            children_of("(fp_line (stroke (width 0.1) (type wavy)))"),
+            "stroke type 'wavy' is not supported losslessly",
+        );
+        assert_refused(
+            children_of("(fp_line (stroke (type)))"),
+            "graphic stroke type is missing",
+        );
+        assert_refused(
+            children_of("(fp_line (stroke (color 1 2 3 1)))"),
+            "stroke clause 'color' is not supported losslessly",
+        );
+        assert_refused(
+            children_of("(fp_line (stroke solid))"),
+            "stroke contains an unsupported atom",
+        );
+        assert_refused(
+            children_of("(fp_rect (fill hatch))"),
+            "graphic fill 'hatch' is not supported losslessly",
+        );
+        assert_refused(children_of("(fp_rect (fill))"), "graphic fill is missing");
+        assert_refused(
+            children_of("(fp_poly (pts (xy 0 0) (arc (start 0 0) (mid 1 1) (end 2 0))))"),
+            "fp_poly contains a non-xy point",
+        );
+    }
+
+    #[test]
+    fn pads_accept_supported_shapes_and_refuse_the_rest() {
+        for shape in ["circle", "rect", "oval", "roundrect", "chamfered_rect"] {
+            assert!(
+                pad(&format!(
+                    "smd {shape} (at 0 0) (size 1 1) (layers \"F.Cu\")"
+                ))
+                .is_ok(),
+                "{shape}"
+            );
+        }
+        assert_refused(
+            pad("smd trapezoid (at 0 0)"),
+            "pad shape 'trapezoid' is not supported",
+        );
+        assert_refused(pad("smd"), "missing its shape");
+        assert_refused(
+            pad("smd rect (at 0 0) (solder_mask_margin 0.1)"),
+            "pad clause 'solder_mask_margin' is not supported",
+        );
+    }
+
+    #[test]
+    fn pads_that_remove_unused_layers_or_nest_drills_are_refused() {
+        assert!(pad("thru_hole circle (remove_unused_layers no)").is_ok());
+        assert_refused(
+            pad("thru_hole circle (remove_unused_layers yes)"),
+            "remove_unused_layers yes' is not supported",
+        );
+        assert_refused(
+            pad("thru_hole circle (remove_unused_layers)"),
+            "remove_unused_layers yes' is not supported",
+        );
+        assert!(pad("thru_hole circle (drill 0.8)").is_ok());
+        assert!(pad("thru_hole oval (drill oval 0.8 1.2)").is_ok());
+        assert_refused(
+            pad("thru_hole circle (drill (offset 0.1 0))"),
+            "nested drill clauses are not supported",
+        );
+        assert!(pad("smd rect stray_atom (at 0 0)").is_ok());
+    }
+
+    #[test]
+    fn property_without_name_or_value_is_refused() {
+        assert_refused(
+            fields(&root("(footprint \"X\" (property))")),
+            "property is missing its name",
+        );
+        assert_refused(
+            fields(&root("(footprint \"X\" (property \"LCSC\"))")),
+            "property 'LCSC' is missing its value",
+        );
+    }
+
+    #[test]
+    fn a_complete_custom_property_becomes_a_typed_field() {
+        let parsed = property_field(&format!(
+            "{FULL_PROPERTY} (hide yes) (knockout yes) (uuid \"u\")"
+        ))
+        .unwrap();
+        let field = &parsed[0];
+        assert!(!field.visible);
+        assert!(field.text.as_ref().unwrap().knockout);
+        assert_eq!(field.text.as_ref().unwrap().id, None);
+    }
+
+    #[test]
+    fn a_custom_property_must_carry_position_layer_and_effects() {
+        assert_refused(
+            property_field("(layer \"F.Fab\") (effects (font (size 1 1)))"),
+            "missing its 'at' clause",
+        );
+        assert_refused(
+            property_field("(at 1 2) (effects (font (size 1 1)))"),
+            "missing its 'layer' clause",
+        );
+        assert_refused(
+            property_field("(at 1 2) (layer \"F.Fab\")"),
+            "missing its 'effects' clause",
+        );
+    }
+
+    #[test]
+    fn mandatory_properties_fall_back_to_kicad_defaults() {
+        let parsed = fields(&root("(footprint \"X\" (property \"Value\" \"10k\"))")).unwrap();
+        let text = parsed[0].text.as_ref().unwrap();
+        assert_eq!(text.layer, kiapi::board::types::BoardLayer::BlFFab as i32);
+        let inner = text.text.as_ref().unwrap();
+        let attributes = inner.attributes.as_ref().unwrap();
+        assert_eq!(attributes.size.as_ref().unwrap().x_nm, 1_000_000);
+        assert_eq!(attributes.stroke_width.as_ref().unwrap().value_nm, 150_000);
+        assert!(attributes.visible);
+        assert_eq!(inner.position.as_ref().unwrap().x_nm, 0);
+    }
+
+    #[test]
+    fn property_position_and_layer_clauses_are_validated() {
+        let with = |clause: &str| property_field(&format!("{clause} (effects (font (size 1 1)))"));
+        assert_refused(
+            property_field(&format!("{FULL_PROPERTY} (at 3 4)")),
+            "duplicate 'at'",
+        );
+        assert_refused(with("(at 1)"), "'at' must contain x, y");
+        assert_refused(with("(at x 2)"), "invalid X position");
+        assert_refused(with("(at 1 y)"), "invalid Y position");
+        assert_refused(
+            with("(at 1e300 2) (layer \"F.Fab\")"),
+            "outside the nanometre range",
+        );
+        assert_refused(
+            property_field(&format!("{FULL_PROPERTY} (layer \"B.Fab\")")),
+            "duplicate 'layer'",
+        );
+        assert_refused(with("(at 1 2) (layer)"), "has no layer name");
+        assert_refused(with("(at 1 2) (layer \"\")"), "has no layer name");
+        assert_refused(
+            with("(at 1 2) (layer \"F.Fab\" \"B.Fab\")"),
+            "must name exactly one layer",
+        );
+        assert_refused(
+            with("(at 1 2) (layer \"Nowhere.Cu\")"),
+            "has an unsupported layer",
+        );
+    }
+
+    #[test]
+    fn property_flags_identifiers_and_unknown_clauses_are_validated() {
+        let extra = |clause: &str| property_field(&format!("{FULL_PROPERTY} {clause}"));
+        assert_refused(extra("(hide yes) (hide no)"), "duplicate 'hide'");
+        assert_refused(extra("(hide maybe)"), "'hide' must be yes or no");
+        assert_refused(
+            extra("(hide)"),
+            "'hide' must contain exactly one yes/no value",
+        );
+        assert_refused(
+            extra("(knockout yes) (knockout yes)"),
+            "duplicate 'knockout'",
+        );
+        assert_refused(
+            extra("(knockout no no)"),
+            "'knockout' must contain exactly one",
+        );
+        assert_refused(
+            extra("(uuid \"a\") (tstamp \"b\")"),
+            "multiple identifier clauses ('uuid' and 'tstamp')",
+        );
+        assert_refused(
+            extra("(uuid)"),
+            "'uuid' must contain exactly one identifier",
+        );
+        assert_refused(extra("(effects (font (size 1 1)))"), "duplicate 'effects'");
+        assert_refused(
+            extra("(unlocked yes)"),
+            "clause 'unlocked' is not supported losslessly",
+        );
+        assert_refused(extra("hide"), "contains an unsupported atom");
+    }
+
+    fn effects_property(body: &str) -> Result<Vec<kiapi::board::types::Field>> {
+        property_field(&format!("(at 1 2) (layer \"F.Fab\") (effects {body})"))
+    }
+
+    fn text_attributes(
+        fields: &[kiapi::board::types::Field],
+    ) -> kiapi::common::types::TextAttributes {
+        fields[0]
+            .text
+            .as_ref()
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap()
+            .attributes
+            .clone()
+            .unwrap()
+    }
+
+    #[test]
+    fn property_effects_carry_justification_and_font_options() {
+        let parsed = effects_property(
+            "(font (face \"Arial\") (size 2 3) (thickness 0.3) (bold yes) (italic no) \
+             (line_spacing 1.5)) (justify left bottom mirror)",
+        )
+        .unwrap();
+        let attributes = text_attributes(&parsed);
+        assert_eq!(attributes.font_name, "Arial");
+        assert_eq!(
+            attributes.horizontal_alignment,
+            kiapi::common::types::HorizontalAlignment::HaLeft as i32
+        );
+        assert_eq!(
+            attributes.vertical_alignment,
+            kiapi::common::types::VerticalAlignment::VaBottom as i32
+        );
+        assert!(attributes.mirrored);
+        assert!(attributes.bold);
+        assert!(!attributes.italic);
+        assert_eq!(attributes.line_spacing, 1.5);
+        assert_eq!(attributes.size.as_ref().unwrap().y_nm, 3_000_000);
+        assert_eq!(attributes.stroke_width.as_ref().unwrap().value_nm, 300_000);
+
+        let right_top = effects_property("(font (size 1 1)) (justify right top)").unwrap();
+        let attributes = text_attributes(&right_top);
+        assert_eq!(
+            attributes.horizontal_alignment,
+            kiapi::common::types::HorizontalAlignment::HaRight as i32
+        );
+        assert_eq!(
+            attributes.vertical_alignment,
+            kiapi::common::types::VerticalAlignment::VaTop as i32
+        );
+        assert_eq!(attributes.stroke_width.as_ref().unwrap().value_nm, 150_000);
+    }
+
+    #[test]
+    fn property_justification_conflicts_are_refused() {
+        let justify =
+            |words: &str| effects_property(&format!("(font (size 1 1)) (justify {words})"));
+        assert_refused(
+            justify("left right"),
+            "conflicting horizontal justification",
+        );
+        assert_refused(justify("left left"), "conflicting horizontal justification");
+        assert_refused(justify("top bottom"), "conflicting vertical justification");
+        assert_refused(justify("mirror mirror"), "repeats mirrored justification");
+        assert_refused(
+            justify("diagonal"),
+            "justification 'diagonal' is not supported",
+        );
+        assert_refused(justify("(left)"), "justify contains a non-atom");
+    }
+
+    #[test]
+    fn property_effects_refuse_malformed_structure() {
+        assert_refused(
+            effects_property("(justify left)"),
+            "missing the font clause",
+        );
+        assert_refused(
+            effects_property("(font (size 1 1)) (font (size 1 1))"),
+            "duplicate font clauses",
+        );
+        assert_refused(
+            effects_property("(font (size 1 1)) hide"),
+            "effects contain an unsupported atom",
+        );
+        assert_refused(
+            effects_property("(font (size 1 1)) (href \"x\")"),
+            "effects clause 'href' is not supported losslessly",
+        );
+    }
+
+    #[test]
+    fn property_font_refuses_malformed_clauses() {
+        let font = |body: &str| effects_property(&format!("(font {body})"));
+        assert_refused(font("(thickness 0.1)"), "font is missing its size");
+        assert_refused(font("(size 1 1) hide"), "font contains an unsupported atom");
+        assert_refused(font("(size 1 1) (face)"), "font face is invalid");
+        assert_refused(
+            font("(size 1 1) (face \"A\") (face \"B\")"),
+            "duplicate font face",
+        );
+        assert_refused(font("(size 1 1) (size 2 2)"), "duplicate font size");
+        assert_refused(font("(size 1)"), "must contain width and height");
+        assert_refused(font("(size w 1)"), "font width is invalid");
+        assert_refused(font("(size 1 h)"), "font height is invalid");
+        assert_refused(font("(size 0 1)"), "size must be finite and positive");
+        assert_refused(
+            font("(size 1 1) (thickness 0.1) (thickness 0.2)"),
+            "duplicate font thickness",
+        );
+        assert_refused(
+            font("(size 1 1) (thickness t)"),
+            "font thickness is invalid",
+        );
+        assert_refused(
+            font("(size 1 1) (thickness -1)"),
+            "thickness must be finite and positive",
+        );
+        assert_refused(
+            font("(size 1 1) (thickness 1 2)"),
+            "thickness must be finite and positive",
+        );
+        assert_refused(
+            font("(size 1 1) (bold yes) (bold no)"),
+            "duplicate font 'bold'",
+        );
+        assert_refused(font("(size 1 1) (bold maybe)"), "must be yes or no");
+        assert_refused(
+            font("(size 1 1) (italic yes) (italic yes)"),
+            "duplicate font 'italic'",
+        );
+        assert_refused(
+            font("(size 1 1) (line_spacing 1) (line_spacing 2)"),
+            "duplicate font 'line_spacing'",
+        );
+        assert_refused(
+            font("(size 1 1) (line_spacing s)"),
+            "line spacing is invalid",
+        );
+        assert_refused(
+            font("(size 1 1) (line_spacing 0)"),
+            "line spacing must be finite and positive",
+        );
+        assert_refused(
+            font("(size 1 1) (line_spacing 1 2)"),
+            "line spacing must be finite and positive",
+        );
+        assert_refused(
+            font("(size 1 1) (underline yes)"),
+            "font clause 'underline' is not supported losslessly",
+        );
+        assert_refused(
+            font("(size 1e300 1) (thickness 0.1)"),
+            "font size is outside the nanometre range",
+        );
+    }
+
+    #[test]
+    fn reserved_and_repeated_property_names_are_refused() {
+        assert_refused(
+            fields(&root(&format!(
+                "(footprint \"X\" (property \"{SCHEMATIC_FIELDS}\" \"v\" {FULL_PROPERTY}))"
+            ))),
+            "reserved for schematic ownership",
+        );
+        assert_refused(
+            fields(&root(&format!(
+                "(footprint \"X\" (property \"A\" \"1\" {FULL_PROPERTY}) \
+                 (property \"A\" \"2\" {FULL_PROPERTY}))"
+            ))),
+            "appears more than once",
+        );
+    }
+
+    #[test]
+    fn legacy_fp_text_reference_and_value_become_fields_and_user_text_is_skipped() {
+        let parsed = fields(&root(
+            "(footprint \"X\" (fp_text reference \"R**\" (at 0 -2) (layer \"F.SilkS\") \
+             (effects (font (size 1 1) (thickness 0.15)))) \
+             (fp_text value \"10k\" hide (at 0 2) (layer \"F.Fab\") \
+             (effects (font (size 1 1) (thickness 0.15)))) \
+             (fp_text user \"note\" (at 0 0) (layer \"F.Fab\")))",
+        ))
+        .unwrap();
+        assert_eq!(parsed.len(), 2);
+        let reference = parsed.iter().find(|f| f.name == "Reference").unwrap();
+        assert!(reference.visible);
+        assert_eq!(
+            reference.text.as_ref().unwrap().text.as_ref().unwrap().text,
+            "R**"
+        );
+        let value = parsed.iter().find(|f| f.name == "Value").unwrap();
+        assert!(!value.visible, "a bare `hide` atom hides the legacy text");
+    }
+
+    #[test]
+    fn a_legacy_text_that_duplicates_a_property_is_refused() {
+        assert_refused(
+            fields(&root(&format!(
+                "(footprint \"X\" (property \"Value\" \"1\" {FULL_PROPERTY}) \
+                 (fp_text value \"2\" (at 0 0) (layer \"F.Fab\") \
+                 (effects (font (size 1 1) (thickness 0.15)))))"
+            ))),
+            "'Value' appears more than once",
+        );
+        assert_refused(
+            fields(&root(
+                "(footprint \"X\" (fp_text reference \"A\") (fp_text reference \"B\"))",
+            )),
+            "'Reference' appears more than once",
+        );
+    }
+}
