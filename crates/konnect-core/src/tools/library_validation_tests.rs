@@ -165,7 +165,7 @@ fn malformed_graphics_are_refused_naming_the_primitive() {
         ),
     ];
     for (graphic, needle) in cases {
-        let error = validate_graphics(&[graphic.clone()]).unwrap_err();
+        let error = validate_graphics(std::slice::from_ref(&graphic)).unwrap_err();
         assert!(error.contains(needle), "{graphic}: {error}");
     }
 }
