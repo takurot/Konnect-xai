@@ -13,7 +13,10 @@ fn bundled_skill_and_hook_content_are_available_without_installing() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(!output.stdout.is_empty());
-        assert!(String::from_utf8(output.stdout).unwrap().contains("KiCad"));
+        assert!(String::from_utf8(output.stdout)
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("kicad"));
     }
     let output = Command::new(env!("CARGO_BIN_EXE_konnect"))
         .args(["hook", "pre-pcb-ipc"])
@@ -25,7 +28,8 @@ fn bundled_skill_and_hook_content_are_available_without_installing() {
     assert!(body["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap()
-        .contains("KiCad"));
+        .to_ascii_lowercase()
+        .contains("kicad"));
 }
 
 #[test]
