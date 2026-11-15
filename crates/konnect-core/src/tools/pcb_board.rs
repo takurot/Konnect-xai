@@ -4230,13 +4230,17 @@ mod delete_graphics_tests {
         let (_dir, board) = board_file();
         let deleted = Arc::new(Mutex::new(Vec::new()));
         let server = spawn_kicad_with_shapes(&board, vec![("", "Edge.Cuts")], deleted.clone());
-        let (body, error) = delete_graphics(
+        let result = handle_delete_graphics(
+            &json!({"board":board,"layer":"Edge.Cuts","dry_run":false}),
             &ctx_talking_to(server.address().to_string()),
-            json!({"board":board,"layer":"Edge.Cuts","dry_run":false}),
         )
-        .await;
-        assert!(error, "{body}");
-        assert!(body.to_string().contains("no identifier"), "{body}");
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text: body } = &result.content[0] else {
+            panic!("expected text refusal");
+        };
+        assert!(body.contains("no identifier"), "{body}");
         assert!(deleted.lock().unwrap().is_empty());
         assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
     }
