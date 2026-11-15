@@ -1203,6 +1203,70 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn guidance_record_requires_matching_install_key_and_known_state() {
+        let temp = TempDir::new().unwrap();
+        let record = temp.path().join("state.json");
+        let key = serde_json::json!({"marker": {"version": "1.0", "legacy": false}});
+        assert_eq!(recorded_state(&record, &key), None);
+        for contents in [
+            "not-json".to_owned(),
+            "{}".to_owned(),
+            serde_json::json!({"key": key, "state": "invented"}).to_string(),
+            serde_json::json!({"key": {"marker": null}, "state": "current"}).to_string(),
+        ] {
+            fs::write(&record, contents).unwrap();
+            assert_eq!(recorded_state(&record, &key), None);
+        }
+        for state in [
+            GuidanceState::NotInstalled,
+            GuidanceState::Current,
+            GuidanceState::OutOfSync,
+        ] {
+            record_state(&record, &key, state).unwrap();
+            assert_eq!(recorded_state(&record, &key), Some(state.as_str()));
+        }
+    }
+
+    #[test]
+    fn uninstall_preserves_unrecognized_hook_values_and_refuses_unparseable_settings() {
+        let temp = TempDir::new().unwrap();
+        let settings = temp.path().join("settings.json");
+        remove_hooks_from_settings(&settings, "konnect-test").unwrap();
+        assert!(!settings.exists());
+        for value in [
+            serde_json::json!({"hooks": "third-party"}),
+            serde_json::json!({"hooks": {"PreToolUse": "third-party"}}),
+            serde_json::json!({"hooks": {"PreToolUse": [{"hooks": false}, {"other": "preserved"}]}}),
+        ] {
+            fs::write(&settings, value.to_string()).unwrap();
+            remove_hooks_from_settings(&settings, "konnect-test").unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&fs::read(&settings).unwrap()).unwrap(),
+                value
+            );
+        }
+        fs::write(&settings, "{ invalid settings").unwrap();
+        assert!(remove_hooks_from_settings(&settings, "konnect-test").is_err());
+        assert_eq!(fs::read_to_string(settings).unwrap(), "{ invalid settings");
+    }
+
+    #[test]
+    fn guidance_marker_only_accepts_bounded_plain_version_tokens() {
+        for invalid in [
+            String::new(),
+            "1".repeat(65),
+            "1.0\nINSTRUCTIONS".to_owned(),
+            "1.0/next".to_owned(),
+            "１.０".to_owned(),
+        ] {
+            assert!(!is_plain_version(&invalid));
+        }
+        for valid in ["1".repeat(64), "1.2.3-rc.1+build".to_owned()] {
+            assert!(is_plain_version(&valid));
+        }
+    }
+
     fn test_paths(temp: &TempDir) -> InstallPaths {
         InstallPaths {
             home: temp.path().to_path_buf(),
