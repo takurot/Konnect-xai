@@ -1009,7 +1009,18 @@ pub(crate) mod mode_probe {
     pub(crate) fn run_under_umask(probe: &str, umask: &str) -> tempfile::TempDir {
         let executable = std::env::current_exe().expect("test binary path");
         let directory = tempfile::tempdir().expect("temporary directory");
-        let output = std::process::Command::new("sh")
+        // Under a restrictive umask the child's coverage profile would be
+        // written with mode 000, and `llvm-profdata merge` then crashes on it.
+        // The child's profile goes to a scratch directory that is dropped here.
+        let profile_scratch = tempfile::tempdir().expect("profile scratch directory");
+        let mut command = std::process::Command::new("sh");
+        if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+            command.env(
+                "LLVM_PROFILE_FILE",
+                profile_scratch.path().join("probe-%p.profraw"),
+            );
+        }
+        let output = command
             .arg("-c")
             .arg(format!(
                 "umask {umask}; exec \"$0\" --exact --ignored {probe}"

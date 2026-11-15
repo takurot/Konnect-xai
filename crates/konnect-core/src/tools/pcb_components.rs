@@ -4498,9 +4498,113 @@ mod tests {
         assert!(!corners.top_right && !corners.bottom_left);
     }
 
+    /// The pad block a library footprint carries is what file placement keeps
+    /// verbatim. Each supported pad must reach the live payload with the same
+    /// number, position, size and chamfer geometry, so the two paths agree.
+    #[test]
+    fn live_payload_pads_match_the_library_pads_that_file_placement_keeps() {
+        use konnect_ipc::gen::kiapi::board::types::{FootprintInstance, Pad};
+        let source = r#"(footprint "F" (layer "F.Cu")
+            (pad "1" smd rect (at -1.5 0.25) (size 0.9 1.1) (layers "F.Cu" "F.Mask"))
+            (pad "2" smd chamfered_rect (at 1.5 -0.25) (size 2 1)
+                (layers "F.Cu") (chamfer_ratio 0.2) (chamfer top_left bottom_right))
+            (pad "3" smd roundrect (at 0 3) (size 1 1) (layers "F.Cu") (roundrect_rratio 0.25)))"#;
+        let library = konnect_sexp::parse_sexp(source).unwrap();
+        let pads = extract_pad_definitions(source).unwrap();
+        let item = KiCadIpcClient::build_footprint_item(
+            "L:F",
+            "U1",
+            "F",
+            &pads,
+            &[],
+            &Default::default(),
+            0.0,
+            0.0,
+            0.0,
+            "F.Cu",
+        )
+        .unwrap();
+        let footprint = FootprintInstance::decode(item.value.as_slice()).unwrap();
+        let live: Vec<Pad> = footprint
+            .definition
+            .unwrap()
+            .items
+            .iter()
+            .filter(|child| konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad"))
+            .map(|child| Pad::decode(child.value.as_slice()).unwrap())
+            .collect();
+        let library_pads = library.find_all("pad");
+        assert_eq!(live.len(), library_pads.len());
+        let nm = |mm: f64| (mm * 1_000_000.0).round() as i64;
+        for (pad, live) in library_pads.iter().zip(&live) {
+            let number = pad.get(1).and_then(konnect_sexp::SexpNode::as_str).unwrap();
+            assert_eq!(live.number, number);
+            let at = pad.find("at").unwrap();
+            let position = live.position.as_ref().unwrap();
+            assert_eq!(
+                (position.x_nm, position.y_nm),
+                (nm(at.get_f64(1).unwrap()), nm(at.get_f64(2).unwrap())),
+                "pad {number} position"
+            );
+            let size = pad.find("size").unwrap();
+            let copper = &live.pad_stack.as_ref().unwrap().copper_layers[0];
+            let live_size = copper.size.as_ref().unwrap();
+            assert_eq!(
+                (live_size.x_nm, live_size.y_nm),
+                (nm(size.get_f64(1).unwrap()), nm(size.get_f64(2).unwrap())),
+                "pad {number} size"
+            );
+            assert_eq!(
+                copper.chamfer_ratio,
+                pad.find_f64("chamfer_ratio").unwrap_or(0.0),
+                "pad {number} chamfer ratio"
+            );
+            let corners = copper.chamfered_corners.unwrap_or_default();
+            let expected = |name: &str| {
+                pad.find("chamfer")
+                    .and_then(konnect_sexp::SexpNode::children)
+                    .is_some_and(|c| c.iter().any(|n| n.as_str() == Some(name)))
+            };
+            assert_eq!(
+                (
+                    corners.top_left,
+                    corners.top_right,
+                    corners.bottom_left,
+                    corners.bottom_right
+                ),
+                (
+                    expected("top_left"),
+                    expected("top_right"),
+                    expected("bottom_left"),
+                    expected("bottom_right")
+                ),
+                "pad {number} chamfered corners"
+            );
+        }
+    }
+
+    /// Custom pads (real KiCad 10 library fixtures) carry primitives the typed
+    /// live payload cannot express. Live placement must refuse them rather
+    /// than place a degraded plain pad.
+    #[test]
+    fn live_pad_extraction_refuses_real_custom_pad_footprints() {
+        for source in [
+            include_str!("../../tests/fixtures/custom_pads_vqfn20_kicad10.kicad_mod"),
+            include_str!("../../tests/fixtures/custom_pads_texas_rje0020a_kicad10.kicad_mod"),
+        ] {
+            let error = extract_pad_definitions(source).unwrap_err().to_string();
+            assert!(error.contains("'custom'"), "{error}");
+        }
+    }
+
     fn unsupported_placement_cases() -> Vec<(&'static str, String)> {
         [
             ("footprint", "(zone (net 0))"),
+            (
+                "footprint",
+                "(zone (net 0) (net_name \"\") (layers \"F&B.Cu\") (hatch edge 0.5) (keepout (tracks not_allowed) (vias not_allowed) (pads allowed) (copperpour not_allowed) (footprints allowed)) (polygon (pts (xy -9 -9) (xy 9 -9) (xy 9 -6) (xy -9 -6))))",
+            ),
+            ("footprint", "(net_tie_pad_groups \"1, 2\")"),
             ("footprint", "(solder_mask_margin 0.1)"),
             ("footprint", "(solder_paste_margin 0.1)"),
             ("footprint", "(solder_paste_ratio 0.1)"),
