@@ -673,3 +673,62 @@ mod uncertain_error_mapping_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod spatial_selection_contract_tests {
+    use super::*;
+
+    #[test]
+    fn spatial_queries_include_boundaries_for_every_element_kind_and_preserve_the_model() {
+        let mut schematic =
+            Schematic::from_source("unused.kicad_sch", "(kicad_sch (uuid root))").unwrap();
+        for (x, y) in [
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (-2.0, 0.0),
+            (2.0, 0.0),
+            (0.0, -2.0),
+            (0.0, 2.0),
+        ] {
+            schematic.symbols.push(Symbol::new("Test:Part", x, y));
+            schematic.wires.push(Wire::new(x - 0.25, y, x + 0.25, y));
+            schematic.labels.push(Label::new("LOCAL", x, y));
+            schematic
+                .global_labels
+                .push(GlobalLabel::new("GLOBAL", "input", x, y));
+            schematic.junctions.push(Junction::new(x, y));
+            schematic.texts.push(Text::new("text", x, y));
+        }
+        let before = schematic.to_source();
+        for selected in [
+            schematic.within_circle(0.0, 0.0, 1.0),
+            schematic.within_rectangle(1.0, 1.0, -1.0, -1.0),
+        ] {
+            let mut kinds = std::collections::BTreeMap::new();
+            for element in selected {
+                assert!([(0.0, 0.0), (1.0, 0.0)].contains(&element.position()));
+                let kind = match element {
+                    LocatedElement::Symbol(_) => "symbol",
+                    LocatedElement::Wire(_) => "wire",
+                    LocatedElement::Label(_) => "label",
+                    LocatedElement::GlobalLabel(_) => "global_label",
+                    LocatedElement::Junction(_) => "junction",
+                    LocatedElement::Text(_) => "text",
+                };
+                *kinds.entry(kind).or_insert(0) += 1;
+            }
+            assert_eq!(
+                kinds,
+                std::collections::BTreeMap::from([
+                    ("symbol", 2),
+                    ("wire", 2),
+                    ("label", 2),
+                    ("global_label", 2),
+                    ("junction", 2),
+                    ("text", 2),
+                ])
+            );
+        }
+        assert_eq!(schematic.to_source(), before);
+    }
+}
