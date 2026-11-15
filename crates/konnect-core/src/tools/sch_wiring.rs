@@ -5090,10 +5090,17 @@ mod coverage_wiring_safety_paths {
     }
 
     #[tokio::test]
-    async fn coordinate_connection_refuses_joining_named_nets_until_explicitly_allowed() {
+    async fn coordinate_connection_refuses_an_unselected_middle_net_until_explicitly_allowed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("design.kicad_sch");
-        let source = "(kicad_sch (label \"LEFT\" (at 0 0 0)) (label \"RIGHT\" (at 10 0 0)))";
+        let source = r#"(kicad_sch (version 20250610) (generator "eeschema")
+            (uuid "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee") (paper "A4")
+            (label "LEFT" (at 0 0 0) (effects (font (size 1.27 1.27)))
+                (uuid "11111111-1111-4111-8111-111111111111"))
+            (label "RIGHT" (at 10 0 0) (effects (font (size 1.27 1.27)))
+                (uuid "22222222-2222-4222-8222-222222222222"))
+            (label "MIDDLE" (at 5 0 0) (effects (font (size 1.27 1.27)))
+                (uuid "33333333-3333-4333-8333-333333333333")))"#;
         std::fs::write(&path, source).unwrap();
         let mut args = json!({"schematic": path, "x1": 0, "y1": 0, "x2": 10, "y2": 0});
         let result = handle_add_schematic_connection(&args, &context())
