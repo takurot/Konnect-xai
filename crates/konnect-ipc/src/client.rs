@@ -7564,3 +7564,486 @@ mod issue26_tests {
         assert_eq!(custom.text.unwrap().text.unwrap().text, "fixture");
     }
 }
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+    use kiapi::common::types::graphic_shape::Geometry;
+    use kiapi::common::types::Vector2;
+
+    fn v(x: i64, y: i64) -> Option<Vector2> {
+        Some(Vector2 { x_nm: x, y_nm: y })
+    }
+
+    fn mm(point: &Option<IpcVector2>) -> (f64, f64) {
+        let point = point.as_ref().expect("a point");
+        (point.x, point.y)
+    }
+
+    #[test]
+    fn pad_vocabulary_maps_known_values_and_hides_unknown_ones() {
+        use kiapi::board::types::{DrillShape, PadStackShape, PadType};
+        assert_eq!(
+            pad_type_name(PadType::PtPth as i32).as_deref(),
+            Some("thru_hole")
+        );
+        assert_eq!(pad_type_name(PadType::PtSmd as i32).as_deref(), Some("smd"));
+        assert_eq!(
+            pad_type_name(PadType::PtEdgeConnector as i32).as_deref(),
+            Some("edge_connector")
+        );
+        assert_eq!(
+            pad_type_name(PadType::PtNpth as i32).as_deref(),
+            Some("np_thru_hole")
+        );
+        assert_eq!(pad_type_name(PadType::PtUnknown as i32), None);
+        assert_eq!(pad_type_name(9999), None);
+
+        let shapes = [
+            (PadStackShape::PssCircle, "circle"),
+            (PadStackShape::PssRectangle, "rect"),
+            (PadStackShape::PssOval, "oval"),
+            (PadStackShape::PssTrapezoid, "trapezoid"),
+            (PadStackShape::PssRoundrect, "roundrect"),
+            (PadStackShape::PssChamferedrect, "chamfered_rect"),
+            (PadStackShape::PssCustom, "custom"),
+        ];
+        for (shape, name) in shapes {
+            assert_eq!(pad_shape_name(shape as i32).as_deref(), Some(name));
+        }
+        assert_eq!(pad_shape_name(PadStackShape::PssUnknown as i32), None);
+        assert_eq!(pad_shape_name(9999), None);
+
+        assert_eq!(
+            drill_shape_name(DrillShape::DsCircle as i32).as_deref(),
+            Some("circle")
+        );
+        assert_eq!(
+            drill_shape_name(DrillShape::DsOblong as i32).as_deref(),
+            Some("oval")
+        );
+        assert_eq!(drill_shape_name(DrillShape::DsUndefined as i32), None);
+        assert_eq!(drill_shape_name(9999), None);
+    }
+
+    #[test]
+    fn a_pad_without_a_stack_reports_no_geometry() {
+        let geometry = pad_geometry(&kiapi::board::types::Pad::default());
+        assert!(geometry.rotation_deg.is_none() && geometry.shape.is_none());
+        assert!(geometry.size.is_none() && geometry.drill.is_none());
+        assert!(geometry.copper_layers.is_empty());
+    }
+
+    #[test]
+    fn a_pad_stack_reports_layer_geometry_drill_and_omits_zero_defaults() {
+        use kiapi::board::types::{
+            ChamferedRectCorners, DrillProperties, DrillShape, PadStack, PadStackLayer,
+            PadStackShape,
+        };
+        let pad = kiapi::board::types::Pad {
+            pad_stack: Some(PadStack {
+                copper_layers: vec![
+                    PadStackLayer {
+                        layer: kiapi::board::types::BoardLayer::BlFCu as i32,
+                        shape: PadStackShape::PssChamferedrect as i32,
+                        size: v(1_500_000, 1_000_000),
+                        offset: v(100_000, 0),
+                        corner_rounding_ratio: 0.25,
+                        chamfer_ratio: 0.5,
+                        chamfered_corners: Some(ChamferedRectCorners {
+                            top_left: true,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    PadStackLayer::default(),
+                ],
+                drill: Some(DrillProperties {
+                    shape: DrillShape::DsOblong as i32,
+                    diameter: v(800_000, 1_200_000),
+                    start_layer: kiapi::board::types::BoardLayer::BlFCu as i32,
+                    end_layer: 0,
+                    ..Default::default()
+                }),
+                angle: Some(kiapi::common::types::Angle {
+                    value_degrees: 90.0,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let geometry = pad_geometry(&pad);
+
+        assert_eq!(geometry.rotation_deg, Some(90.0));
+        assert_eq!(geometry.shape.as_deref(), Some("chamfered_rect"));
+        assert_eq!(mm(&geometry.size), (1.5, 1.0));
+        let first = &geometry.copper_layers[0];
+        assert_eq!(first.layer, "F.Cu");
+        assert_eq!(mm(&first.offset), (0.1, 0.0));
+        assert_eq!(first.corner_rounding_ratio, Some(0.25));
+        assert_eq!(first.chamfer_ratio, Some(0.5));
+        assert!(first.chamfered_corners.as_ref().unwrap().top_left);
+        let second = &geometry.copper_layers[1];
+        assert_eq!(second.corner_rounding_ratio, None);
+        assert_eq!(second.chamfer_ratio, None);
+        assert!(second.chamfered_corners.is_none() && second.size.is_none());
+        let drill = geometry.drill.unwrap();
+        assert_eq!(drill.shape.as_deref(), Some("oval"));
+        assert_eq!(drill.start_layer.as_deref(), Some("F.Cu"));
+        assert_eq!(drill.end_layer, None);
+    }
+
+    #[test]
+    fn item_request_status_other_than_ok_is_an_error_naming_the_operation() {
+        use kiapi::common::types::ItemRequestStatus;
+        assert!(ensure_item_request_ok(ItemRequestStatus::IrsOk as i32, "x").is_ok());
+        let error = ensure_item_request_ok(ItemRequestStatus::IrsFieldMaskInvalid as i32, "update")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "KiCad update request failed with IRS_FIELD_MASK_INVALID"
+        );
+        let error = ensure_item_request_ok(12345, "read")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "KiCad read request failed with IRS_UNKNOWN");
+    }
+
+    #[test]
+    fn decode_as_trusts_the_type_url_not_the_bytes() {
+        let text = kiapi::board::types::BoardText::default();
+        let packed = pack_any(&text, "kiapi.board.types.BoardText");
+        assert!(decode_as::<kiapi::board::types::BoardText>(&packed, "BoardText").is_some());
+        assert!(
+            decode_as::<kiapi::board::types::BoardGraphicShape>(&packed, "BoardGraphicShape")
+                .is_none(),
+            "a BoardText body must not decode as a graphic shape"
+        );
+        let corrupt = prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.BoardText".into(),
+            value: vec![0xff, 0xff, 0xff],
+        };
+        assert!(decode_as::<kiapi::board::types::BoardText>(&corrupt, "BoardText").is_none());
+    }
+
+    #[test]
+    fn kiid_value_is_empty_for_an_item_without_an_id() {
+        assert_eq!(kiid_value(None), "");
+        assert_eq!(
+            kiid_value(Some(kiapi::common::types::Kiid {
+                value: "abc".into()
+            })),
+            "abc"
+        );
+    }
+
+    #[test]
+    fn unpack_required_names_the_command_when_the_payload_is_missing() {
+        let error = unpack_required::<kiapi::common::commands::Ping>(None, "Ping")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "KiCad returned no Ping response payload");
+    }
+
+    fn shape(geometry: Geometry) -> kiapi::common::types::GraphicShape {
+        kiapi::common::types::GraphicShape {
+            attributes: None,
+            geometry: Some(geometry),
+        }
+    }
+
+    fn polygon_with_node(node: Option<kiapi::common::types::poly_line_node::Geometry>) -> Geometry {
+        use kiapi::common::types::{PolyLine, PolyLineNode, PolySet, PolygonWithHoles};
+        Geometry::Polygon(PolySet {
+            polygons: vec![PolygonWithHoles {
+                outline: Some(PolyLine {
+                    nodes: vec![PolyLineNode { geometry: node }],
+                    closed: true,
+                }),
+                holes: vec![],
+            }],
+        })
+    }
+
+    #[test]
+    fn every_graphic_kind_reports_its_name_and_first_point() {
+        use kiapi::common::types::{
+            poly_line_node, GraphicArcAttributes, GraphicBezierAttributes, GraphicCircleAttributes,
+            GraphicRectangleAttributes, GraphicSegmentAttributes,
+        };
+        let first = v(1_000_000, 2_000_000);
+        let cases: Vec<(Geometry, &str)> = vec![
+            (
+                Geometry::Segment(GraphicSegmentAttributes {
+                    start: first,
+                    end: None,
+                }),
+                "line",
+            ),
+            (
+                Geometry::Rectangle(GraphicRectangleAttributes {
+                    top_left: first,
+                    ..Default::default()
+                }),
+                "rect",
+            ),
+            (
+                Geometry::Arc(GraphicArcAttributes {
+                    start: first,
+                    ..Default::default()
+                }),
+                "arc",
+            ),
+            (
+                Geometry::Circle(GraphicCircleAttributes {
+                    center: first,
+                    ..Default::default()
+                }),
+                "circle",
+            ),
+            (
+                Geometry::Bezier(GraphicBezierAttributes {
+                    start: first,
+                    ..Default::default()
+                }),
+                "curve",
+            ),
+            (
+                polygon_with_node(Some(poly_line_node::Geometry::Point(first.unwrap()))),
+                "poly",
+            ),
+        ];
+        for (geometry, name) in cases {
+            let (kind, origin) = shape_kind_and_origin(Some(&shape(geometry)));
+            assert_eq!(kind, name);
+            assert_eq!(origin, Some(IpcVector2 { x: 1.0, y: 2.0 }), "{name}");
+        }
+        assert_eq!(shape_kind_and_origin(None), ("shape", None));
+        assert_eq!(
+            shape_kind_and_origin(Some(&kiapi::common::types::GraphicShape::default())),
+            ("shape", None)
+        );
+    }
+
+    #[test]
+    fn polygon_origin_is_absent_for_empty_or_pointless_outlines() {
+        use kiapi::common::types::{poly_line_node, PolySet};
+        let no_polygons = Geometry::Polygon(PolySet { polygons: vec![] });
+        assert_eq!(
+            shape_kind_and_origin(Some(&shape(no_polygons))),
+            ("poly", None)
+        );
+        assert_eq!(
+            shape_kind_and_origin(Some(&shape(polygon_with_node(None)))),
+            ("poly", None)
+        );
+        let arc_node = polygon_with_node(Some(poly_line_node::Geometry::Arc(
+            kiapi::common::types::ArcStartMidEnd {
+                start: v(3_000_000, 0),
+                mid: None,
+                end: None,
+            },
+        )));
+        let (_, origin) = shape_kind_and_origin(Some(&shape(arc_node)));
+        assert_eq!(origin, Some(IpcVector2 { x: 3.0, y: 0.0 }));
+    }
+
+    #[test]
+    fn geometry_points_skip_absent_vertices_instead_of_inventing_the_origin() {
+        use kiapi::common::types::{
+            GraphicArcAttributes, GraphicBezierAttributes, GraphicCircleAttributes,
+            GraphicRectangleAttributes, GraphicSegmentAttributes,
+        };
+        assert_eq!(
+            geometry_points(&Geometry::Segment(GraphicSegmentAttributes {
+                start: v(1, 2),
+                end: None
+            })),
+            vec![(1, 2)]
+        );
+        assert_eq!(
+            geometry_points(&Geometry::Rectangle(GraphicRectangleAttributes {
+                top_left: v(1, 2),
+                bottom_right: v(3, 4),
+                ..Default::default()
+            })),
+            vec![(1, 2), (3, 4)]
+        );
+        assert_eq!(
+            geometry_points(&Geometry::Arc(GraphicArcAttributes {
+                start: v(1, 1),
+                mid: v(2, 2),
+                end: v(3, 3),
+            })),
+            vec![(1, 1), (2, 2), (3, 3)]
+        );
+        assert_eq!(
+            geometry_points(&Geometry::Circle(GraphicCircleAttributes {
+                center: v(5, 5),
+                radius_point: v(6, 5),
+            })),
+            vec![(5, 5), (6, 5)]
+        );
+        assert_eq!(
+            geometry_points(&Geometry::Bezier(GraphicBezierAttributes {
+                start: v(1, 1),
+                control1: v(2, 2),
+                control2: None,
+                end: v(4, 4),
+            })),
+            vec![(1, 1), (2, 2), (4, 4)]
+        );
+        assert!(
+            geometry_points(&Geometry::Polygon(kiapi::common::types::PolySet {
+                polygons: vec![]
+            }))
+            .is_empty()
+        );
+        assert_eq!(
+            geometry_points(&polygon_with_node(None)),
+            Vec::<(i64, i64)>::new()
+        );
+    }
+
+    #[test]
+    fn rotation_helpers_follow_kicads_conventions() {
+        for cardinal in [0.0, 90.0, 180.0, 270.0, -90.0, 450.0] {
+            assert!(is_cardinal_rotation(cardinal), "{cardinal}");
+        }
+        for oblique in [45.0, 37.0, 89.0, -10.0] {
+            assert!(!is_cardinal_rotation(oblique), "{oblique}");
+        }
+        assert_eq!(readable_text_angle(0.0), 0.0);
+        assert_eq!(readable_text_angle(90.0), 90.0);
+        assert_eq!(readable_text_angle(180.0), 0.0);
+        assert_eq!(readable_text_angle(270.0), 90.0);
+        assert_eq!(readable_text_angle(271.0), 271.0);
+        assert_eq!(readable_text_angle(-90.0), 90.0);
+    }
+
+    fn graphic_style(item: &prost_types::Any) -> (kiapi::board::types::BoardGraphicShape, i32) {
+        let decoded =
+            kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).unwrap();
+        let style = decoded
+            .shape
+            .as_ref()
+            .and_then(|s| s.attributes.as_ref())
+            .and_then(|a| a.stroke.as_ref())
+            .map(|s| s.style)
+            .unwrap();
+        (decoded, style)
+    }
+
+    #[test]
+    fn library_graphics_become_board_items_in_the_placed_frame() {
+        use kiapi::common::types::StrokeLineStyle as Style;
+        let line = IpcGraphicDefinition::Line {
+            start: (0.0, 0.0),
+            end: (1.0, 0.0),
+            layer: "F.SilkS".into(),
+            width: 0.12,
+            style: Style::SlsDash,
+        };
+        let item = build_graphic_child(&line, 10.0, 20.0, 90.0).unwrap();
+        assert!(item.type_url.ends_with("BoardGraphicShape"));
+        let (decoded, style) = graphic_style(&item);
+        assert_eq!(style, Style::SlsDash as i32);
+        assert_eq!(
+            geometry_points(decoded.shape.as_ref().unwrap().geometry.as_ref().unwrap()),
+            vec![(10_000_000, 20_000_000), (10_000_000, 19_000_000)],
+            "a 90 degree placement rotates the segment about its anchor"
+        );
+
+        let circle = IpcGraphicDefinition::Circle {
+            center: (1.0, 0.0),
+            end: (1.0, 2.0),
+            layer: "F.Fab".into(),
+            width: 0.1,
+            style: Style::SlsSolid,
+            filled: true,
+        };
+        let item = build_graphic_child(&circle, 0.0, 0.0, 37.0).unwrap();
+        let (decoded, _) = graphic_style(&item);
+        let points = geometry_points(decoded.shape.unwrap().geometry.as_ref().unwrap());
+        let (center, rim) = (points[0], points[1]);
+        let radius = (((rim.0 - center.0).pow(2) + (rim.1 - center.1).pow(2)) as f64).sqrt();
+        assert!(
+            (radius - 2_000_000.0).abs() < 2.0,
+            "the radius survives any rotation, got {radius}"
+        );
+
+        let arc = IpcGraphicDefinition::Arc {
+            start: (1.0, 0.0),
+            mid: (0.0, 1.0),
+            end: (-1.0, 0.0),
+            layer: "F.SilkS".into(),
+            width: 0.1,
+            style: Style::SlsDot,
+        };
+        let item = build_graphic_child(&arc, 5.0, 5.0, 0.0).unwrap();
+        let (decoded, style) = graphic_style(&item);
+        assert_eq!(style, Style::SlsDot as i32);
+        assert_eq!(
+            geometry_points(decoded.shape.unwrap().geometry.as_ref().unwrap()).len(),
+            3
+        );
+
+        let poly = IpcGraphicDefinition::Poly {
+            points: vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+            layer: "F.CrtYd".into(),
+            width: 0.05,
+            style: Style::SlsDefault,
+            filled: false,
+        };
+        let item = build_graphic_child(&poly, 0.0, 0.0, 0.0).unwrap();
+        let (decoded, _) = graphic_style(&item);
+        assert_eq!(
+            geometry_points(decoded.shape.unwrap().geometry.as_ref().unwrap()).len(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_rectangle_stays_a_rectangle_at_right_angles_and_becomes_a_polygon_otherwise() {
+        use kiapi::common::types::StrokeLineStyle as Style;
+        let rect = IpcGraphicDefinition::Rect {
+            start: (0.0, 0.0),
+            end: (2.0, 1.0),
+            layer: "F.CrtYd".into(),
+            width: 0.05,
+            style: Style::SlsSolid,
+            filled: false,
+        };
+        let cardinal = build_graphic_child(&rect, 0.0, 0.0, 90.0).unwrap();
+        let (decoded, _) = graphic_style(&cardinal);
+        assert!(matches!(
+            decoded.shape.unwrap().geometry,
+            Some(Geometry::Rectangle(_))
+        ));
+
+        let oblique = build_graphic_child(&rect, 0.0, 0.0, 30.0).unwrap();
+        let (decoded, _) = graphic_style(&oblique);
+        let geometry = decoded.shape.unwrap().geometry.unwrap();
+        assert!(matches!(geometry, Geometry::Polygon(_)));
+        assert_eq!(geometry_points(&geometry).len(), 4);
+    }
+
+    #[test]
+    fn library_text_is_rotated_with_the_footprint_and_kept_readable() {
+        let text = IpcGraphicDefinition::Text {
+            text: "REF".into(),
+            position: (0.0, -1.0),
+            rotation: 0.0,
+            layer: "F.SilkS".into(),
+            size: 1.0,
+            stroke_width_mm: 0.15,
+        };
+        let item = build_graphic_child(&text, 0.0, 0.0, 180.0).unwrap();
+        assert!(item.type_url.ends_with("BoardText"));
+        let decoded = kiapi::board::types::BoardText::decode(item.value.as_slice()).unwrap();
+        let attributes = decoded.text.unwrap().attributes.unwrap();
+        assert_eq!(attributes.angle.unwrap().value_degrees, 0.0);
+    }
+}
