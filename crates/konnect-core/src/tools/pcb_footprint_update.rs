@@ -1891,6 +1891,178 @@ mod tests {
     /// assumptions about the format (see the fixtures-from-KiCad rule in
     /// CONTRIBUTING).
     #[test]
+    fn pcb_fidelity3_refresh_readback_rejects_nonfinite_corner_ratios_and_keeps_offsets() {
+        let expected = instance_for_layer_readback();
+        let signature = footprint_layer_states(&[builders::pack_any(
+            &expected,
+            "kiapi.board.types.FootprintInstance",
+        )])
+        .unwrap();
+        for chamfer in [false, true] {
+            let mut observed = expected.clone();
+            let item = observed
+                .definition
+                .as_mut()
+                .unwrap()
+                .items
+                .iter_mut()
+                .find(|item| builders::any_is(item, "kiapi.board.types.Pad"))
+                .unwrap();
+            let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+            let layer = &mut pad.pad_stack.as_mut().unwrap().copper_layers[0];
+            if chamfer {
+                layer.chamfer_ratio = f64::NAN;
+            } else {
+                layer.corner_rounding_ratio = f64::NAN;
+            }
+            *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+            let error = footprint_layer_states(&[builders::pack_any(
+                &observed,
+                "kiapi.board.types.FootprintInstance",
+            )])
+            .unwrap_err();
+            assert!(error.to_string().contains("invalid corner ratio"));
+        }
+        for (offset, matches) in [(0, true), (1, false)] {
+            let mut observed = expected.clone();
+            let item = observed
+                .definition
+                .as_mut()
+                .unwrap()
+                .items
+                .iter_mut()
+                .find(|item| builders::any_is(item, "kiapi.board.types.Pad"))
+                .unwrap();
+            let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+            pad.pad_stack.as_mut().unwrap().copper_layers[0].offset =
+                Some(kiapi::common::types::Vector2 {
+                    x_nm: offset,
+                    y_nm: 0,
+                });
+            *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+            let result = verify_footprint_layer_readback(
+                &signature,
+                &[builders::pack_any(
+                    &observed,
+                    "kiapi.board.types.FootprintInstance",
+                )],
+            );
+            assert_eq!(result.is_ok(), matches, "offset={offset}");
+        }
+    }
+
+    #[test]
+    fn pcb_fidelity3_refresh_multiline_text_and_optional_fill_remain_verifiable() {
+        let mut instance = instance_for_layer_readback();
+        let text = instance
+            .reference_field
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap();
+        text.text = "first\nsecond".into();
+        text.attributes.as_mut().unwrap().multiline = true;
+        let expected = footprint_layer_states(&[builders::pack_any(
+            &instance,
+            "kiapi.board.types.FootprintInstance",
+        )])
+        .unwrap();
+        instance
+            .reference_field
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .attributes
+            .as_mut()
+            .unwrap()
+            .multiline = false;
+        assert!(verify_footprint_layer_readback(
+            &expected,
+            &[builders::pack_any(
+                &instance,
+                "kiapi.board.types.FootprintInstance"
+            )]
+        )
+        .is_err());
+        let item = instance
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .iter_mut()
+            .find(|item| builders::any_is(item, "kiapi.board.types.BoardGraphicShape"))
+            .unwrap();
+        let mut graphic =
+            kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).unwrap();
+        graphic
+            .shape
+            .as_mut()
+            .unwrap()
+            .attributes
+            .as_mut()
+            .unwrap()
+            .fill = None;
+        graphic
+            .shape
+            .as_mut()
+            .unwrap()
+            .attributes
+            .as_mut()
+            .unwrap()
+            .stroke = None;
+        *item = builders::pack_any(&graphic, "kiapi.board.types.BoardGraphicShape");
+        let packed = builders::pack_any(&instance, "kiapi.board.types.FootprintInstance");
+        let expected = footprint_layer_states(std::slice::from_ref(&packed)).unwrap();
+        verify_footprint_layer_readback(&expected, &[packed]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pcb_fidelity3_refresh_noop_and_preflight_conflict_apply_never_open_commits() {
+        let (temp, board, items) = plan_fixture();
+        let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+        let current =
+            kiapi::board::types::FootprintInstance::decode(items[2].value.as_slice()).unwrap();
+        let prepared = build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::from([("ROW1".into(), 11), ("COL1".into(), 12)]),
+            &BTreeSet::new(),
+            false,
+            2,
+        )
+        .unwrap();
+        let mock = spawn_planner_mock(&board, prepared.item, false);
+        let context = test_context(&mock.url);
+        let plan =
+            handle_update_footprints_from_library(&serde_json::json!({"board":board}), &context)
+                .await
+                .unwrap();
+        let plan = result_json(&plan);
+        assert_eq!(plan["status"], "noop", "{plan}");
+        let applied=handle_update_footprints_from_library(&serde_json::json!({"board":board,"dry_run":false,"expected_plan_revision":plan["plan_revision"]}),&context).await.unwrap();
+        assert_eq!(result_json(&applied)["status"], "noop");
+        std::fs::write(
+            temp.path().join("Test.pretty/Socket.kicad_mod"),
+            r#"(footprint "Socket" (layer "F.Cu") (zone (net 0)))"#,
+        )
+        .unwrap();
+        let applied=handle_update_footprints_from_library(&serde_json::json!({"board":board,"dry_run":false,"expected_plan_revision":"reviewed-before-library-change"}),&context).await.unwrap();
+        assert_eq!(result_json(&applied)["status"], "conflict");
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 0);
+        assert!(capture.update_batches.is_empty());
+    }
+
+    #[test]
     fn a_footprint_kicad_saved_is_accepted_not_refused() {
         let source = KICAD_LIBRARY_FOOTPRINT;
         let library = parse_library_footprint("Konnect:Socket", source)

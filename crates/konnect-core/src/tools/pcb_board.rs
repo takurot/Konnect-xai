@@ -4226,6 +4226,22 @@ mod delete_graphics_tests {
     }
 
     #[tokio::test]
+    async fn pcb_fidelity3_anonymous_live_graphics_are_never_sent_to_delete_items() {
+        let (_dir, board) = board_file();
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        let server = spawn_kicad_with_shapes(&board, vec![("", "Edge.Cuts")], deleted.clone());
+        let (body, error) = delete_graphics(
+            &ctx_talking_to(server.address().to_string()),
+            json!({"board":board,"layer":"Edge.Cuts","dry_run":false}),
+        )
+        .await;
+        assert!(error, "{body}");
+        assert!(body.to_string().contains("no identifier"), "{body}");
+        assert!(deleted.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
+    }
+
+    #[tokio::test]
     async fn clearing_edge_cuts_leaves_the_rest_of_the_board() {
         let (_dir, board) = board_file();
 
@@ -6027,6 +6043,99 @@ mod board_boundary_contract_tests {
             panic!("text response required");
         };
         text
+    }
+
+    #[tokio::test]
+    async fn pcb_fidelity3_noncanonical_layer_names_refuse_without_changing_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let source = "(kicad_pcb (layers (0 \"F.Cu\" signal) (31 \"B.Cu\" signal)))";
+        std::fs::write(&board, source).unwrap();
+        let result = handle_add_layer(
+            &json!({"board":board,"layer_name":"Custom.Cu","layer_type":"signal"}),
+            &ctx_talking_to(String::new()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(text(&result).contains("not a KiCAD layer name"));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn pcb_fidelity3_live_outline_replacement_refuses_a_nonsegment_outline_before_mutation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let source = "(kicad_pcb (version 20240108))";
+        std::fs::write(&board, source).unwrap();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let observed = writes.clone();
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                let shape =
+                    builders::board_rectangle("Edge.Cuts", 0.05, 0.0, 0.0, 10.0, 10.0, false)
+                        .unwrap();
+                Some(builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: vec![builders::pack_any(
+                            &shape,
+                            "kiapi.board.types.BoardGraphicShape",
+                        )],
+                        ..Default::default()
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ))
+            } else {
+                observed.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+        });
+        let result = handle_set_board_size(
+            &json!({"board":board,"width":20.0,"height":30.0}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(text(&result).contains("rectangle"));
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn pcb_fidelity3_project_mounting_hole_library_preserves_its_fields_and_geometry() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
+        let pretty = dir.path().join("MountingHole.pretty");
+        std::fs::create_dir(&pretty).unwrap();
+        // A project library fixture, with a marker proving that exact source was used.
+        let library = r#"(footprint "MountingHole_3.2mm_M3" (layer "F.Cu")
+            (property "Reference" "REF**" (at 0 -3) (layer "F.SilkS"))
+            (property "Value" "MountingHole" (at 0 3) (layer "F.Fab"))
+            (property "ProjectMarker" "preserve me" (at 1 2) (layer "Cmts.User"))
+            (fp_circle (center 0 0) (end 2 0) (stroke (width 0.1) (type solid)) (fill none) (layer "F.CrtYd"))
+            (pad "" np_thru_hole circle (at 0 0) (size 3.2 3.2) (drill 3.2) (layers "*.Cu" "*.Mask")))"#;
+        std::fs::write(pretty.join("MountingHole_3.2mm_M3.kicad_mod"), library).unwrap();
+        std::fs::write(dir.path().join("fp-lib-table"),"(fp_lib_table\n (lib (name \"MountingHole\") (type \"KiCad\") (uri \"${KIPRJMOD}/MountingHole.pretty\") (options \"\") (descr \"\")))").unwrap();
+        let result = handle_add_mounting_hole(
+            &json!({"board":board,"x":5.0,"y":6.0,"reference":"H1"}),
+            &ctx_talking_to(String::new()),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text(&result));
+        let body: serde_json::Value = serde_json::from_str(text(&result)).unwrap();
+        assert_eq!(body["geometry"], "library");
+        let saved = std::fs::read_to_string(&board).unwrap();
+        assert!(saved.contains("preserve me"));
+        assert!(saved.contains("(fp_circle"));
+        assert!(saved.contains("(drill 3.2)"));
     }
 
     #[test]

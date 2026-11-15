@@ -4181,6 +4181,296 @@ mod tests {
         }
     }
 
+    struct PcbFidelity3State {
+        items: Vec<prost_types::Any>,
+        writes: Vec<String>,
+    }
+
+    fn pcb_fidelity3_live_components(
+        board: &Path,
+        initial: Vec<prost_types::Any>,
+    ) -> (
+        crate::test_support::MockIpcServer,
+        std::sync::Arc<std::sync::Mutex<PcbFidelity3State>>,
+    ) {
+        use konnect_ipc::gen::kiapi;
+        use std::sync::{Arc, Mutex};
+        let state = Arc::new(Mutex::new(PcbFidelity3State {
+            items: initial,
+            writes: Vec::new(),
+        }));
+        let capture = state.clone();
+        let server =
+            crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(board, move |command| {
+                let mut state = capture.lock().unwrap();
+                if command.type_url.ends_with("GetItems") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items: state.items.clone(),
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ))
+                } else if command.type_url.ends_with("CreateItems") {
+                    state.writes.push("create".into());
+                    let request =
+                        kiapi::common::commands::CreateItems::decode(command.value.as_slice())
+                            .unwrap();
+                    let created_items = request
+                        .items
+                        .iter()
+                        .cloned()
+                        .map(|item| kiapi::common::commands::ItemCreationResult {
+                            status: Some(kiapi::common::commands::ItemStatus {
+                                code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                error_message: String::new(),
+                            }),
+                            item: Some(item),
+                        })
+                        .collect();
+                    state.items.extend(request.items);
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::CreateItemsResponse {
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            created_items,
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.CreateItemsResponse",
+                    ))
+                } else if command.type_url.ends_with("UpdateItems") {
+                    state.writes.push("update".into());
+                    let request =
+                        kiapi::common::commands::UpdateItems::decode(command.value.as_slice())
+                            .unwrap();
+                    let updated_items = request
+                        .items
+                        .iter()
+                        .cloned()
+                        .map(|item| {
+                            let instance = kiapi::board::types::FootprintInstance::decode(
+                                item.value.as_slice(),
+                            )
+                            .unwrap();
+                            state.items.retain(|existing| {
+                                kiapi::board::types::FootprintInstance::decode(
+                                    existing.value.as_slice(),
+                                )
+                                .unwrap()
+                                .id != instance.id
+                            });
+                            state.items.push(item.clone());
+                            kiapi::common::commands::ItemUpdateResult {
+                                status: Some(kiapi::common::commands::ItemStatus {
+                                    code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                    error_message: String::new(),
+                                }),
+                                item: Some(item),
+                            }
+                        })
+                        .collect();
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::UpdateItemsResponse {
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            updated_items,
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.UpdateItemsResponse",
+                    ))
+                } else if command.type_url.ends_with("BeginCommit") {
+                    state.writes.push("begin".into());
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::BeginCommitResponse {
+                            id: Some(kiapi::common::types::Kiid {
+                                value: "component-edit".into(),
+                            }),
+                        },
+                        "kiapi.common.commands.BeginCommitResponse",
+                    ))
+                } else if command.type_url.ends_with("EndCommit") {
+                    state.writes.push("end".into());
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    ))
+                } else {
+                    None
+                }
+            });
+        (server, state)
+    }
+
+    #[tokio::test]
+    async fn pcb_fidelity3_duplicate_preserves_source_value_rotation_and_reads_back_the_new_part() {
+        use konnect_ipc::gen::kiapi;
+        let directory = tempfile::tempdir().unwrap();
+        let board = fallback_fixture(directory.path());
+        let before = std::fs::read(&board).unwrap();
+        let item = KiCadIpcClient::build_footprint_item(
+            "Resistor_SMD:R_0805_2012Metric",
+            "R1",
+            "custom source value",
+            &extract_pad_definitions(&library_footprint()).unwrap(),
+            &[],
+            &Default::default(),
+            10.0,
+            20.0,
+            30.0,
+            "F.Cu",
+        )
+        .unwrap();
+        let (server, state) = pcb_fidelity3_live_components(&board, vec![item]);
+        let ctx = ctx_talking_to(server.address().to_string());
+        let result = handle_duplicate_component(
+            &json!({"board":board, "reference":"R1", "new_reference":"R2", "x":40.0,"y":50.0}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+        let result = parsed(&result);
+        assert_eq!(result["new_reference"], "R2");
+        assert_eq!(result["x"], 40.0);
+        assert_eq!(result["y"], 50.0);
+        let state = state.lock().unwrap();
+        assert_eq!(state.writes, ["create"]);
+        let duplicate = state
+            .items
+            .iter()
+            .map(|item| {
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap()
+            })
+            .find(|fp| footprint_instance_reference(fp) == "R2")
+            .unwrap();
+        assert_eq!(duplicate.orientation.unwrap().value_degrees, 30.0);
+        assert_eq!(
+            duplicate
+                .value_field
+                .unwrap()
+                .text
+                .unwrap()
+                .text
+                .unwrap()
+                .text,
+            "custom source value"
+        );
+        assert_eq!(std::fs::read(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn pcb_fidelity3_duplicate_refuses_backside_missing_and_lossy_sources_before_creation() {
+        use konnect_ipc::gen::kiapi;
+        for (layer, library_id, source, diagnostic) in [
+            ("B.Cu", "Fixture:F", library_footprint(), "back-side"),
+            ("F.Cu", "Missing:F", library_footprint(), "Missing"),
+            (
+                "F.Cu",
+                "Fixture:F",
+                include_str!(
+                    "../../tests/fixtures/placement_fidelity/NetTie-2_SMD_Pad0.5mm.kicad_mod"
+                )
+                .to_string(),
+                "net_tie_pad_groups",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let board = placement_fidelity_fixture(directory.path(), "Fixture:F", &source);
+            let before = std::fs::read(&board).unwrap();
+            let mut original = kiapi::board::types::FootprintInstance::decode(
+                live_footprint("R1", vec![]).value.as_slice(),
+            )
+            .unwrap();
+            let (library, name) = library_id.split_once(':').unwrap();
+            original.definition.as_mut().unwrap().id =
+                Some(kiapi::common::types::LibraryIdentifier {
+                    library_nickname: library.into(),
+                    entry_name: name.into(),
+                });
+            original.layer = konnect_ipc::builders::layer_from_name(layer) as i32;
+            let original =
+                konnect_ipc::builders::pack_any(&original, "kiapi.board.types.FootprintInstance");
+            let (server, mutations) = placement_refusal_server(&board, vec![original]);
+            let result = handle_duplicate_component(
+                &json!({"board":board, "reference":"R1", "new_reference":"R2", "x":10.0,"y":20.0}),
+                &ctx_talking_to(server.address().to_string()),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error);
+            assert!(
+                result_text(&result).contains(diagnostic),
+                "{}",
+                result_text(&result)
+            );
+            assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(std::fs::read(&board).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn pcb_fidelity3_edit_and_align_use_the_live_values_and_one_commit_per_alignment() {
+        let directory = tempfile::tempdir().unwrap();
+        let board = fallback_fixture(directory.path());
+        let item = KiCadIpcClient::build_footprint_item(
+            "Resistor_SMD:R_0805_2012Metric",
+            "R1",
+            "before",
+            &[],
+            &[],
+            &Default::default(),
+            10.0,
+            20.0,
+            0.0,
+            "F.Cu",
+        )
+        .unwrap();
+        let (server, state) = pcb_fidelity3_live_components(&board, vec![item]);
+        let ctx = ctx_talking_to(server.address().to_string());
+        let result = handle_edit_component(
+            &json!({"board":board,"reference":"R1","value":"after"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+        assert_eq!(parsed(&result)["value"], "after");
+        let result = handle_edit_component(&json!({"board":board,"reference":"R1"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(parsed(&result)["value"], "after");
+        for (axis, value, expected) in [("x", 40.0, (40.0, 20.0)), ("y", 50.0, (40.0, 50.0))] {
+            let result = handle_align_components(
+                &json!({"board":board,"references":["R1"],"axis":axis,"value":value}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{}", result_text(&result));
+            let body = parsed(&result);
+            assert_eq!(body["aligned_count"], 1);
+            assert_eq!(body["components"][0]["x"], expected.0);
+            assert_eq!(body["components"][0]["y"], expected.1);
+        }
+        assert_eq!(
+            state.lock().unwrap().writes,
+            ["update", "begin", "update", "end", "begin", "update", "end"]
+        );
+        for overrides in [
+            json!({"references":[]}),
+            json!({"references":[2]}),
+            json!({"axis":"z"}),
+        ] {
+            let before = state.lock().unwrap().writes.clone();
+            let mut args = json!({"board":board,"references":["R1"],"axis":"x","value":30.0});
+            args.as_object_mut()
+                .unwrap()
+                .extend(overrides.as_object().unwrap().clone());
+            let result = handle_align_components(&args, &ctx).await.unwrap();
+            assert!(result.is_error);
+            assert_eq!(state.lock().unwrap().writes, before);
+        }
+    }
+
     #[test]
     fn coordinate_review_closed_placement_refuses_overflow_without_writing() {
         let directory = tempfile::tempdir().unwrap();
