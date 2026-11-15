@@ -3818,8 +3818,8 @@ mod v015_client_contract_tests {
         let mock = reply_to(
             "SaveDocumentToString",
             builders::pack_any(
-                &cc::SaveDocumentToStringResponse::default(),
-                "kiapi.common.commands.SaveDocumentToStringResponse",
+                &cc::SavedDocumentResponse::default(),
+                "kiapi.common.commands.SavedDocumentResponse",
             ),
         );
         assert!(KiCadIpcClient::new(&mock.url)
