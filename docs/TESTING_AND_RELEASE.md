@@ -145,6 +145,9 @@ test passes only when the exact pre-import IPC snapshot returns.
 
 ## CI And Live Validation
 
+For the CLI and live-GUI evaluation checklist, commands, acceptance criteria,
+and evidence template, see the [KiCad E2E runbook](KICAD_E2E_RUNBOOK.md).
+
 `.github/workflows/ci.yml` covers the Rust workspace, formatting, clippy,
 documentation tests, viewer, plugin, Nix, and PCM validation. The real-KiCad
 workflow remains separate because it installs KiCad and is not an ordinary
