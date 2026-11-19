@@ -108,8 +108,7 @@ fn compute_watch_dirs(entries: &[SheetEntry]) -> HashSet<PathBuf> {
 /// wastes a full parallel re-render *and* can eat the debounce window right
 /// before a genuine save, silently dropping the real change.
 fn is_relevant_sch_change(path: &Path) -> bool {
-    let is_sch = path.extension().map(|e| e == "kicad_sch").unwrap_or(false);
-    if !is_sch {
+    if !is_schematic_path(path) {
         return false;
     }
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -449,10 +448,18 @@ struct SheetsUpdated {
     active_file: String,
 }
 
+fn is_schematic_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("kicad_sch"))
+}
+
 fn open_schematic_path(path: &str) -> Result<PathBuf, String> {
     let root = PathBuf::from(path);
-    if !root.exists() {
-        return Err(format!("File not found: {}", path));
+    if !is_schematic_path(&root) {
+        return Err("Expected a .kicad_sch file".into());
+    }
+    if !root.is_file() {
+        return Err(format!("Schematic file not found: {}", path));
     }
     Ok(root)
 }

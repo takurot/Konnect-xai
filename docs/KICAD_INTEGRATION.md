@@ -231,3 +231,25 @@ separate executable IPC integration that is the forward path. The standalone vie
 The PCM assembly scripts in `packaging/build-pcm.ps1` and `build-pcm.sh` stage
 only metadata, plugin files, icons, and binaries. Repository developer
 documentation under `docs/` is intentionally not part of the install zip.
+
+### Schematic Viewer acceptance
+
+The viewer passes each `kicad-cli` export to the browser image decoder and
+displays the result as an SVG image. The app CSP permits local scripts and
+styles, SVG data images, and Tauri IPC endpoints. Startup and drop requests require a
+schematic file with the `.kicad_sch` extension.
+
+On Windows, macOS, and Linux, launch a packaged viewer with a disposable copy
+of a hierarchical KiCad project. Check that the root sheet renders, a child
+sheet can be selected, and a saved change to the child updates the displayed
+image. Switch the theme, pan and zoom, use **Fit** and **Refresh**, and confirm
+**Open in KiCAD** opens the project. Record the KiCad and viewer versions with
+the result on each OS.
+
+To verify that SVG load handlers stay inert, use a debug build of the viewer.
+In its developer console, pass an SVG with a green rectangle and an `onload`
+handler that changes the rectangle to red to `setSvg`. The displayed rectangle
+must stay green in the light theme. Inspect `#schematic-image` and confirm that
+it is an HTML image and that the sheet's SVG elements are absent from the
+viewer document. The Rust viewer tests also validate the static CSP and reject
+schematic-only startup paths.

@@ -8,6 +8,9 @@
   },
   "app": {
     "withGlobalTauri": true,
+    "security": {
+      "csp": "default-src 'none'; script-src 'self'; style-src 'self'; img-src data:; connect-src ipc: http://ipc.localhost; base-uri 'none'; object-src 'none'; frame-src 'none'; form-action 'none'"
+    },
     "windows": [
       {
         "title": "Schematic Viewer — Konnect",
