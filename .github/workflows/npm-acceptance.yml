@@ -17,7 +17,29 @@ permissions:
   contents: read
 
 jobs:
+  version:
+    name: Resolve one public version for all platforms
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - id: resolve
+        name: Resolve and validate the exact version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          ver="$REQUESTED_VERSION"
+          if [ -z "$ver" ]; then
+            ver="$(npm view @konnect-xai/konnect@latest version --registry=https://registry.npmjs.org)"
+          fi
+          node -e "require('./npm/scripts/version').assertVersion(process.argv[1])" "$ver"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
   registry:
+    needs: version
     name: npm registry MCP (${{ matrix.platform }}-${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
@@ -47,11 +69,5 @@ jobs:
       - name: Install exact public package and verify MCP
         shell: bash
         env:
-          REQUESTED_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          ver="$REQUESTED_VERSION"
-          if [ -z "$ver" ]; then
-            ver="$(npm view @konnect-xai/konnect@latest version --registry=https://registry.npmjs.org)"
-          fi
-          node npm/scripts/smoke.js "$ver" --published
+          KONNECT_NPM_VERSION: ${{ needs.version.outputs.version }}
+        run: node npm/scripts/smoke.js "$KONNECT_NPM_VERSION" --published

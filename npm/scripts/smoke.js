@@ -9,6 +9,7 @@ const { platformKey, packageFor, binaryFile } = require('../konnect/lib/platform
 const { assertVersion } = require('./version');
 
 const HANDSHAKE_TIMEOUT_MS = 60000;
+const PROTOCOL_VERSION = '2025-06-18';
 
 function npm(args, options) {
   if (process.platform === 'win32') {
@@ -23,9 +24,9 @@ function pack(dir, dest, env) {
   return path.join(dest, out.trim().split('\n').pop());
 }
 
-function handshake(command, args = [], { cwd, env } = {}) {
+function handshake(command, args = [], { cwd, env, version } = {}) {
   const requests = [
-    ['initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'npm-smoke', version: '0' } }],
+    ['initialize', { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'npm-smoke', version: '0' } }],
     ['tools/list', {}],
     ['tools/call', { name: 'get_installation_info', arguments: {} }],
   ];
@@ -72,8 +73,14 @@ function handshake(command, args = [], { cwd, env } = {}) {
         if (error || !result || typeof result !== 'object' || Array.isArray(result)) {
           throw new Error(`${method}: ${error?.message ?? 'missing result object'}`);
         }
+        if (method === 'initialize') {
+          if (result.protocolVersion !== PROTOCOL_VERSION || result.serverInfo?.name !== 'konnect'
+              || result.serverInfo.version !== version) {
+            throw new Error('initialize did not negotiate the expected protocol, server name and version');
+          }
+          send({ method: 'notifications/initialized', params: {} });
+        }
         results.push(result);
-        if (results.length === 1) send({ method: 'notifications/initialized', params: {} });
         if (results.length === requests.length) child.stdin.end();
         else request();
       } catch (error) {
@@ -115,10 +122,7 @@ async function smoke({ version, npmDir }) {
     const expected = path.join(modules, packageFor(key), 'bin', binaryFile(process.platform));
     const reported = execFileSync(process.execPath, [launcher, '--version'], { cwd: project, env, encoding: 'utf8', timeout: 60000 }).trim();
     if (reported !== `konnect ${version}`) throw new Error(`binary reports "${reported}", expected "konnect ${version}"`);
-    const [initialized, listed, installation] = await handshake(process.execPath, [launcher], { cwd: project, env });
-    if (initialized.serverInfo?.name !== 'konnect' || initialized.serverInfo.version !== version) {
-      throw new Error('initialize server name or version did not match the package');
-    }
+    const [, listed, installation] = await handshake(process.execPath, [launcher], { cwd: project, env, version });
     if (!Array.isArray(listed.tools) || !listed.tools.some((tool) => tool.name === 'get_installation_info')) {
       throw new Error('tools/list omitted get_installation_info');
     }
