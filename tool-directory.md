@@ -376,8 +376,8 @@ and Windows servers do not.
 | Tool | Description |
 |------|-------------|
 | `download_jlcpcb_database` | Download or update the local JLCPCB parts database cache (SQLite). |
-| `search_jlcpcb_parts` | Search the local JLCPCB database by keyword, value, or category. The query is split on whitespace; a part matches only if every word appears, in any order, in its LCSC number, MPN, package, manufacturer or description (case-insensitive, `%` and `_` literal). |
-| `get_jlcpcb_part` | Retrieve full details for a single JLCPCB part by LCSC part number. |
+| `search_jlcpcb_parts` | Search every query word across the catalog. Electrical values match whole normalized tokens (for example, `4k7` matches `4.7kΩ`), while other words and the category filter use literal substring matching. The response lists categories for the returned page. Price, stock and text fields can be `null` when unavailable. |
+| `get_jlcpcb_part` | Retrieve part details by LCSC number. Price, stock and text fields can be `null` when unavailable. Catalogs built before the nullable stock schema report ambiguous zero stock as `null`. Refresh the catalog to recover known zero stock counts. |
 | `suggest_jlcpcb_alternatives` | Suggest JLCPCB-stocked parts with the same value in the package a KiCad footprint maps to. Excludes parts below a stock floor and ranks Basic, then Preferred, then Extended parts, then known price and stock; the response states the LCSC package names matched, the ranking and what was excluded. |
 | `get_jlcpcb_database_stats` | Statistics about the local JLCPCB cache: part count, last updated, file size. |
 | `enrich_datasheets` | Fetch and cache datasheet URLs for all components in a schematic (LCSC API). |
@@ -476,7 +476,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 |------|-------------|
 | `export_manufacturing_package` | Generate Gerbers, drill, fab-house BOM, and pick-and-place. JLCPCB assembly requires the exact board open with IPC enabled: native pad-box midpoints and board exports share a stable live snapshot, then versioned CPL corrections apply. Geometry and correction evidence remain separate; Component Placements preview is required. |
 | `validate_for_manufacturing` | Board pre-flight before ordering: checks outline, design rules, footprints, routing evidence, and complete DRC results. |
-| `estimate_cost` | Estimate total manufacturing cost from board dimensions, layers, and footprint count, with an itemized breakdown. |
+| `estimate_cost` | Estimate fabrication and assembly. JLCPCB pricing uses local catalog unit prices for LCSC IDs from saved PCB fields or UUID-linked root schematic components, reports fallback references and counts known Extended feeder fees once per part number. The model assumes a board up to 100 × 100 mm and excludes quantity discounts, attrition and shipping. |
 
 ---
 

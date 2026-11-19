@@ -44,7 +44,7 @@ struct ExportedDesign {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct SchematicIdentity {
+pub(super) struct SchematicIdentity {
     root_prefix: String,
     sheet_paths: BTreeSet<String>,
 }
@@ -91,7 +91,7 @@ impl SchematicIdentity {
         })
     }
 
-    fn matching_path<'a>(&self, path: &'a str) -> Result<&'a str> {
+    pub(super) fn matching_path<'a>(&self, path: &'a str) -> Result<&'a str> {
         let normalized = path
             .strip_prefix(&self.root_prefix)
             .filter(|suffix| suffix.starts_with('/'))
@@ -161,13 +161,13 @@ struct AssemblyAttributes {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DesignComponent {
-    properties: BTreeMap<String, String>,
-    reference: String,
-    value: String,
-    footprint_id: String,
-    symbol_path: String,
-    dnp: bool,
+pub(super) struct DesignComponent {
+    pub(super) properties: BTreeMap<String, String>,
+    pub(super) reference: String,
+    pub(super) value: String,
+    pub(super) footprint_id: String,
+    pub(super) symbol_path: String,
+    pub(super) dnp: bool,
     assembly: AssemblyAttributes,
     pad_nets: BTreeMap<String, String>,
 }
@@ -1265,6 +1265,15 @@ fn refresh_revision_with_staging(plan: &mut SyncPlan) {
     hasher.update(plan.plan_revision.as_bytes());
     hasher.update(serde_json::to_vec(&plan.changes).expect("planned changes serialize"));
     plan.plan_revision = format!("{:x}", hasher.finalize());
+}
+
+pub(super) fn linked_netlist_components(
+    schematic: &Path,
+    netlist: &str,
+) -> Result<(SchematicIdentity, Vec<DesignComponent>)> {
+    let identity = SchematicIdentity::load(schematic)?;
+    let design = parse_exported_netlist(netlist)?;
+    Ok((identity, design.components))
 }
 
 fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {

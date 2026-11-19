@@ -9,11 +9,11 @@ use crate::tools::{get_path, ToolContext, ToolDef};
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info};
 
-use super::{cli, jlcpcb_midpoints, pcb_export};
+use super::{cli, integration, jlcpcb_midpoints, pcb_export, pcb_sync};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -102,8 +102,7 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "estimate_cost",
             "Estimate the total manufacturing cost for PCB fabrication and assembly at a given fab house. \
-             Counts components from board footprints and returns an itemized rough estimate: \
-             PCB, components, assembly, and total.",
+             Returns an itemized estimate for the board. JLCPCB component pricing uses local catalog prices for known LCSC IDs and reports fallback averages for the others.",
             json!({
                 "type": "object",
                 "properties": {
@@ -116,8 +115,10 @@ pub fn tools() -> Vec<ToolDef> {
                     "quantity": {
                         "type": "integer",
                         "description": "Number of boards to manufacture",
+                        "minimum": 1,
                         "default": 5
                     },
+                    "schematic": { "type": "string", "description": "Optional root schematic for LCSC fields. Defaults to a same-stem .kicad_sch next to the board." },
                     "layers": {
                         "type": "integer",
                         "description": "Copper layer count to quote at (2, 4, 6). Defaults to the count the board file declares; when given and different, the response reports both under board.copper_layers / board.board_copper_layers and warns."
@@ -958,11 +959,6 @@ fn jlcpcb_bom_designators(source: &str) -> anyhow::Result<BTreeSet<String>> {
             .filter(|value| !value.is_empty())
             .context("JLCPCB BOM contains an empty designator group")?;
         for designator in group.split(',').map(str::trim) {
-            if designator.contains('-') {
-                bail!(
-                    "JLCPCB BOM contains compressed designator range '{designator}'; pass an empty KiCad reference-range delimiter"
-                );
-            }
             if designator.is_empty() || !designators.insert(designator.to_string()) {
                 bail!("JLCPCB BOM contains an empty or duplicate designator '{designator}'");
             }
@@ -1169,13 +1165,184 @@ async fn handle_validate_for_manufacturing(
     ))
 }
 
+const JLCPCB_EXTENDED_FEE_USD: f64 = 3.0;
+const JLCPCB_FALLBACK_UNIT_USD: f64 = 0.05;
+
+#[derive(Default, Serialize)]
+struct JlcpcbPricing {
+    priced_from_catalog: Vec<String>,
+    fallback_average: Vec<String>,
+    extended_part_ids: BTreeSet<String>,
+    unknown_feeder_fee_refs: Vec<String>,
+    extended_feeder_fee_usd: f64,
+    #[serde(skip)]
+    order_parts_cost_usd: f64,
+}
+
+fn jlcpcb_component_pricing(
+    db_path: &Path,
+    parts: &BTreeMap<String, Option<String>>,
+    quantity: u64,
+) -> anyhow::Result<JlcpcbPricing> {
+    use rusqlite::OptionalExtension;
+
+    let conn = if parts.values().any(Option::is_some) && db_path.try_exists()? {
+        Some(integration::open_jlcpcb_catalog(db_path)?)
+    } else {
+        None
+    };
+    let mut lookup = conn
+        .as_ref()
+        .map(|conn| {
+            conn.prepare("SELECT Price, Library_Type FROM components WHERE LCSC = ?1 LIMIT 1")
+        })
+        .transpose()?;
+    let mut catalog = BTreeMap::new();
+    for id in parts.values().flatten().collect::<BTreeSet<_>>() {
+        let row = match &mut lookup {
+            Some(lookup) => lookup
+                .query_row([id], |row| {
+                    Ok((
+                        integration::catalog_price(row, 0),
+                        row.get::<_, String>(1).ok(),
+                    ))
+                })
+                .optional()?,
+            None => None,
+        };
+        if let Some(row) = row {
+            catalog.insert(id, row);
+        }
+    }
+    let pricing = price_parts(parts, &catalog, quantity);
+    anyhow::ensure!(
+        pricing.order_parts_cost_usd.is_finite(),
+        "catalog prices overflow the order total"
+    );
+    Ok(pricing)
+}
+
+fn price_parts(
+    parts: &BTreeMap<String, Option<String>>,
+    catalog: &BTreeMap<&String, (Option<f64>, Option<String>)>,
+    quantity: u64,
+) -> JlcpcbPricing {
+    let mut result = JlcpcbPricing::default();
+    let mut per_board = 0.0;
+    for (reference, id) in parts {
+        let entry = id.as_ref().and_then(|id| catalog.get(id));
+        if let Some(price) = entry.and_then(|(price, _)| *price) {
+            result.priced_from_catalog.push(reference.clone());
+            per_board += price;
+        } else {
+            result.fallback_average.push(reference.clone());
+            per_board += JLCPCB_FALLBACK_UNIT_USD;
+        }
+        match entry.and_then(|(_, kind)| kind.as_deref()).map(str::trim) {
+            Some(kind) if kind.eq_ignore_ascii_case("extended") => {
+                result.extended_part_ids.extend(id.clone());
+            }
+            Some(kind)
+                if [
+                    "Basic",
+                    "Preferred",
+                    "Extended (Preferred)",
+                    "Extended (Promotional)",
+                ]
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(kind)) => {}
+            _ => result.unknown_feeder_fee_refs.push(reference.clone()),
+        }
+    }
+    result.order_parts_cost_usd = per_board * quantity as f64;
+    result.extended_feeder_fee_usd =
+        result.extended_part_ids.len() as f64 * JLCPCB_EXTENDED_FEE_USD;
+    result
+}
+
+fn lcsc_part_id(id: &str) -> Option<String> {
+    let id = id.trim().to_ascii_uppercase();
+    let valid = id.strip_prefix('C').is_some_and(|numeric| {
+        !numeric.is_empty() && numeric.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    valid.then_some(id)
+}
+
+async fn schematic_lcsc_ids(
+    cli_path: &str,
+    schematic: &Path,
+    footprints: &BTreeMap<String, &konnect_sexp::SexpNode>,
+) -> anyhow::Result<(BTreeMap<String, String>, Vec<String>)> {
+    let temp = tempfile::tempdir()?;
+    let netlist = temp.path().join("components.net");
+    cli::export_netlist(cli_path, schematic, &netlist, "kicadsexpr").await?;
+    let source = tokio::fs::read_to_string(&netlist).await?;
+    linked_component_catalog_ids(schematic, &source, footprints)
+}
+
+fn linked_component_catalog_ids(
+    schematic: &Path,
+    netlist: &str,
+    footprints: &BTreeMap<String, &konnect_sexp::SexpNode>,
+) -> anyhow::Result<(BTreeMap<String, String>, Vec<String>)> {
+    let (identity, components) = pcb_sync::linked_netlist_components(schematic, netlist)?;
+    let mut prices = BTreeMap::new();
+    let mut unmatched = footprints.keys().cloned().collect::<BTreeSet<_>>();
+    for component in components {
+        let Some(footprint) = footprints.get(&component.reference) else {
+            continue;
+        };
+        let board_path = footprint
+            .find_str("path")
+            .and_then(|path| identity.matching_path(path).ok());
+        let board_value = footprint
+            .find_all("property")
+            .into_iter()
+            .find(|property| {
+                property.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("Value")
+            })
+            .and_then(|property| property.get(2))
+            .and_then(konnect_sexp::SexpNode::as_str);
+        let component_path = identity.matching_path(&component.symbol_path)?;
+        if board_path != Some(component_path)
+            || footprint.get(1).and_then(konnect_sexp::SexpNode::as_str)
+                != Some(&component.footprint_id)
+            || board_value != Some(component.value.as_str())
+            || component.dnp
+        {
+            continue;
+        }
+        unmatched.remove(&component.reference);
+        let ids = ["LCSC", "LCSC Part #"]
+            .into_iter()
+            .filter_map(|name| component.properties.get(name))
+            .filter_map(|value| lcsc_part_id(value))
+            .collect::<BTreeSet<_>>();
+        if ids.len() == 1 {
+            prices.extend(ids.into_iter().map(|id| (component.reference.clone(), id)));
+        }
+    }
+    Ok((prices, unmatched.into_iter().collect()))
+}
+
 async fn handle_estimate_cost(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let fab_house = args["fab_house"].as_str().unwrap_or("jlcpcb");
-    let quantity = args["quantity"].as_u64().unwrap_or(5) as usize;
+    let quantity = match args.get("quantity") {
+        Some(value) => match value.as_u64() {
+            Some(quantity) if quantity > 0 => quantity,
+            _ => {
+                return Ok(invalid_manufacturing_argument(
+                    "quantity",
+                    "must be a positive integer",
+                ))
+            }
+        },
+        None => 5,
+    };
 
     info!(
         board = %board.display(),
@@ -1188,7 +1355,7 @@ async fn handle_estimate_cost(
     let tree = konnect_sexp::parser::parse_sexp(&content)?;
 
     // Count components
-    let fps = tree.find_all("footprint");
+    let fps = konnect_sexp::board::footprints(&tree);
     let component_count = fps.len();
 
     // The board's own copper count comes from its `(layers …)` table, through
@@ -1217,9 +1384,94 @@ async fn handle_estimate_cost(
     // Estimate board dimensions from Edge.Cuts
     let (width_mm, height_mm) = estimate_board_dimensions(&content);
 
+    let assembly_footprints: Vec<_> = fps
+        .into_iter()
+        .filter(|footprint| {
+            !footprint
+                .find("attr")
+                .and_then(konnect_sexp::SexpNode::children)
+                .into_iter()
+                .flatten()
+                .filter_map(konnect_sexp::SexpNode::as_str)
+                .any(|attribute| matches!(attribute, "dnp" | "exclude_from_bom"))
+        })
+        .collect();
+    let assembly_count = assembly_footprints.len();
+    let mut pricing = None;
+    if fab_house == "jlcpcb" {
+        let mut parts = BTreeMap::new();
+        let mut schematic_candidates = BTreeMap::new();
+        for (index, footprint) in assembly_footprints.iter().enumerate() {
+            let reference = konnect_sexp::board::footprint_reference(footprint)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("<footprint {}>", index + 1));
+            let ids = footprint
+                .find_all("property")
+                .into_iter()
+                .filter(|property| {
+                    matches!(
+                        property.get(1).and_then(konnect_sexp::SexpNode::as_str),
+                        Some("LCSC" | "LCSC Part #")
+                    )
+                })
+                .filter_map(|property| property.get(2).and_then(konnect_sexp::SexpNode::as_str))
+                .filter_map(lcsc_part_id)
+                .collect::<BTreeSet<_>>();
+            if ids.is_empty() {
+                schematic_candidates.insert(reference.clone(), *footprint);
+            }
+            let id = if ids.len() == 1 {
+                ids.into_iter().next()
+            } else {
+                None
+            };
+            if parts.insert(reference.clone(), id).is_some() {
+                return Ok(invalid_manufacturing_argument(
+                    "board",
+                    format!("duplicate assembly reference '{reference}'"),
+                ));
+            }
+        }
+        let explicit_schematic = args.get("schematic").is_some();
+        let schematic = if explicit_schematic {
+            get_path(args, "schematic")?
+        } else {
+            board.with_extension("kicad_sch")
+        };
+        if !schematic_candidates.is_empty() && (explicit_schematic || schematic.try_exists()?) {
+            match schematic_lcsc_ids(&ctx.config.kicad_cli, &schematic, &schematic_candidates).await {
+                Ok((schematic_parts, unmatched)) => {
+                    parts.extend(schematic_parts.into_iter().map(|(reference, id)| (reference, Some(id))));
+                    if !unmatched.is_empty() {
+                        warnings.push(format!("Schematic/PCB identity or population did not match for [{}]; these references use the fallback average", unmatched.join(", ")));
+                    }
+                }
+                Err(error) => warnings.push(format!("Could not read schematic LCSC fields ({error:#}); unpriced references use the fallback average")),
+            }
+        }
+        let db_path = integration::resolve_db_path(&json!({}), ctx);
+        let (estimate, warning) = super::blocking_work::spawn_tracked_blocking(move || {
+            match jlcpcb_component_pricing(&db_path, &parts, quantity) {
+                Ok(pricing) => (pricing, None),
+                Err(error) => (price_parts(&parts, &BTreeMap::new(), quantity), Some(format!(
+                    "Could not read local JLCPCB catalog ({error:#}); all references use the fallback average"
+                ))),
+            }
+        }).await?;
+        warnings.extend(warning);
+        pricing = Some(estimate);
+    }
+    let fabrication_scope = if width_mm == 0.0 || height_mm == 0.0 {
+        "board_size_unknown"
+    } else if width_mm > 100.0 || height_mm > 100.0 {
+        "board_exceeds_model"
+    } else {
+        "within_model_dimensions"
+    };
+
     // Rough cost estimation based on fab house pricing models
-    let (pcb_cost, assembly_cost, component_est) = match fab_house {
-        "jlcpcb" => {
+    let (pcb_cost, assembly_cost, component_est) = match (fab_house, &pricing) {
+        ("jlcpcb", Some(pricing)) => {
             let pcb = match copper_layers {
                 // JLCPCB prices single-sided boards on the two-layer scale.
                 1 | 2 => 2.0 + (quantity as f64 - 5.0).max(0.0) * 0.40,
@@ -1227,19 +1479,22 @@ async fn handle_estimate_cost(
                 6 => 15.0 + (quantity as f64 - 5.0).max(0.0) * 3.00,
                 _ => 30.0 + (quantity as f64 - 5.0).max(0.0) * 5.00,
             };
-            let smt_setup = if component_count > 0 { 8.0 } else { 0.0 };
-            let smt_per_board = component_count as f64 * 0.003 * quantity as f64;
-            let comp_est = component_count as f64 * 0.05; // rough avg per component
-            (pcb, smt_setup + smt_per_board, comp_est * quantity as f64)
+            let smt_setup = if assembly_count > 0 { 8.0 } else { 0.0 };
+            let smt_per_board = assembly_count as f64 * 0.003 * quantity as f64;
+            (
+                pcb,
+                smt_setup + smt_per_board + pricing.extended_feeder_fee_usd,
+                pricing.order_parts_cost_usd,
+            )
         }
-        "pcbway" => {
+        ("pcbway", _) => {
             let pcb = match copper_layers {
                 1 | 2 => 5.0 + (quantity as f64 - 5.0).max(0.0) * 0.50,
                 4 => 12.0 + (quantity as f64 - 5.0).max(0.0) * 2.00,
                 _ => 25.0 + (quantity as f64 - 5.0).max(0.0) * 4.00,
             };
-            let smt = component_count as f64 * 0.005 * quantity as f64;
-            let comp_est = component_count as f64 * 0.08 * quantity as f64;
+            let smt = assembly_count as f64 * 0.005 * quantity as f64;
+            let comp_est = assembly_count as f64 * 0.08 * quantity as f64;
             (pcb, smt, comp_est)
         }
         _ => {
@@ -1269,9 +1524,12 @@ async fn handle_estimate_cost(
                 // declares. They differ only when the caller passed `layers`.
                 "copper_layers": copper_layers,
                 "board_copper_layers": board_copper_layers,
-                "component_count": component_count
+                "component_count": component_count,
+                "assembly_component_count": assembly_count
             },
             "warnings": warnings,
+            "fabrication_scope": fabrication_scope,
+            "component_pricing": pricing,
             "cost_estimate": {
                 "pcb_fabrication": format!("${:.2}", pcb_cost),
                 "smt_assembly": format!("${:.2}", assembly_cost),
@@ -1280,8 +1538,8 @@ async fn handle_estimate_cost(
                 "per_board": format!("${:.2}", total / quantity as f64)
             },
             "notes": [
-                "Estimates are approximate — actual cost depends on board size, finish, and specific components",
-                "Component costs are rough averages — use generate_bom with supply chain data for accurate pricing",
+                "Fabrication prices assume a board up to 100 × 100 mm. If the board exceeds that size or its size is unknown, the fabrication amount remains a small-board baseline.",
+                "The saved PCB determines the assembly population. JLCPCB estimates use local catalog unit prices multiplied by order quantity, without quantity discounts, attrition, or shipping. Each known Extended part number adds an estimated $3 for Economic assembly. Inspect individual prices with `get_jlcpcb_part`.",
                 format!("Based on {} quantity from {}", quantity, fab_house.to_uppercase())
             ],
             "disclaimer": "BETA: Cost estimates are indicative only. Always confirm with the fab house's online quoting tool."
@@ -1317,6 +1575,49 @@ mod package_export_option_tests {
             json!(["front", "back", "both"])
         );
         assert_eq!(properties["jlcpcb_cpl_corrections_path"]["type"], "string");
+    }
+
+    #[test]
+    fn issue6_schematic_lcsc_requires_same_symbol_and_footprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("board.kicad_sch");
+        std::fs::write(
+            &schematic,
+            r#"(kicad_sch (version 20250114) (generator "eeschema")
+            (uuid "654ed724-a3d8-41bf-ae77-122d5b63d566") (lib_symbols))"#,
+        )
+        .unwrap();
+        let exported = |stamp: &str, extra: &str| {
+            format!(
+                r#"(export (components (comp (ref "U1") (value "MCU") (footprint "Pkg")
+                (fields (field (name "LCSC") "C123")) (sheetpath (tstamps "/"))
+                (tstamps "{stamp}") {extra})))"#
+            )
+        };
+        let board = konnect_sexp::parse_sexp(
+            r#"(kicad_pcb (footprint "Pkg"
+            (property "Reference" "U1") (property "Value" "MCU") (path "/symbol-1")))"#,
+        )
+        .unwrap();
+        let footprints = BTreeMap::from([("U1".to_string(), board.find("footprint").unwrap())]);
+        let (matched, unmatched) =
+            linked_component_catalog_ids(&schematic, &exported("symbol-1", ""), &footprints)
+                .unwrap();
+        assert_eq!(
+            matched,
+            BTreeMap::from([("U1".to_string(), "C123".to_string())])
+        );
+        assert!(unmatched.is_empty());
+        for invalid in [
+            exported("other", ""),
+            exported("symbol-1", "(property (name dnp))"),
+            exported("symbol-1", "").replace("(value \"MCU\")", "(value \"OLD\")"),
+        ] {
+            let (matched, unmatched) =
+                linked_component_catalog_ids(&schematic, &invalid, &footprints).unwrap();
+            assert!(matched.is_empty());
+            assert_eq!(unmatched, ["U1"]);
+        }
     }
 
     #[tokio::test]
@@ -1364,9 +1665,14 @@ mod package_export_option_tests {
         );
         assert_eq!(body["component_pricing"]["extended_feeder_fee_usd"], 3.0);
         let notes = body["notes"].as_array().unwrap();
-        assert!(notes
+        let mentions = notes
             .iter()
-            .all(|note| !note.as_str().unwrap().contains("generate_bom")));
+            .flat_map(|note| note.as_str().unwrap().split('`').skip(1).step_by(2))
+            .collect::<Vec<_>>();
+        assert_eq!(mentions, ["get_jlcpcb_part"]);
+        for tool in mentions {
+            assert!(ctx.router.find_toolset_for_tool(tool).is_some(), "{tool}");
+        }
     }
 
     #[tokio::test]
@@ -1745,10 +2051,10 @@ mod jlcpcb_assembly_tests {
     #[test]
     fn compressed_ranges_and_cross_file_mismatches_fail_closed() {
         let ranged = "Designator,Comment\nC1-C3,100nF\n";
-        assert!(jlcpcb_bom_designators(ranged)
-            .unwrap_err()
-            .to_string()
-            .contains("compressed designator range"));
+        let ranged_refs = jlcpcb_bom_designators(ranged).unwrap();
+        let enumerated = BTreeSet::from(["C1".into(), "C2".into(), "C3".into()]);
+        let mismatch = jlcpcb_designator_mismatch(&enumerated, &ranged_refs).unwrap();
+        assert!(mismatch.contains("missing from CPL [C1-C3]"));
 
         let cpl = ["C1", "C2", "U1"].into_iter().map(str::to_string).collect();
         let bom = ["C1", "C2", "R1"].into_iter().map(str::to_string).collect();
@@ -1797,10 +2103,9 @@ mod jlcpcb_assembly_tests {
             .await
             .unwrap();
         let ranged_source = tokio::fs::read_to_string(&ranged).await.unwrap();
-        let ranged_refs = jlcpcb_bom_designators(&ranged_source).unwrap_err();
-        assert!(ranged_refs
-            .to_string()
-            .contains("compressed designator range"));
+        let enumerated_refs = jlcpcb_bom_designators(&source).unwrap();
+        let ranged_refs = jlcpcb_bom_designators(&ranged_source).unwrap();
+        assert!(jlcpcb_designator_mismatch(&enumerated_refs, &ranged_refs).is_some());
     }
 
     /// The KiCad ECC83 demo contains board footprints excluded from both the
@@ -2452,7 +2757,6 @@ mod correction_boundary_tests {
             "Reference\n\"\"\n",
             "Reference\n\"R1,R1\"\n",
             "Reference\n\"R1,\"\n",
-            "Reference\nR1-R3\n",
         ] {
             assert!(
                 jlcpcb_bom_designators(source).is_err(),
