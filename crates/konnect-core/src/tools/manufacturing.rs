@@ -1382,7 +1382,7 @@ async fn handle_estimate_cost(
     }
 
     // Estimate board dimensions from Edge.Cuts
-    let (width_mm, height_mm) = estimate_board_dimensions(&content);
+    let (width_mm, height_mm) = estimate_board_dimensions(&tree);
 
     let assembly_footprints: Vec<_> = fps
         .into_iter()
@@ -1625,6 +1625,24 @@ mod package_export_option_tests {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("board.kicad_pcb");
         std::fs::write(&board, r#"(kicad_pcb (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+            (gr_line
+                (start 106 102)
+                (end 126 102)
+                (stroke (width 0.05) (type solid))
+                (layer "Edge.Cuts"))
+            (gr_line
+                (start 126 102)
+                (end 126 122)
+                (layer "Edge.Cuts"))
+            (gr_line
+                (start 126 122)
+                (end 106 122)
+                (layer "Edge.Cuts"))
+            (gr_line
+                (start 106 122)
+                (end 106 102)
+                (stroke (width 0.05) (type solid))
+                (layer "Edge.Cuts"))
             (footprint "Pkg" (property "Reference" "U1") (property "LCSC" "C100"))
             (footprint "Pkg" (property "Reference" "U2") (property "LCSC" "C100"))
             (footprint "Pkg" (property "Reference" "R1") (property "LCSC" "C101"))
@@ -1653,6 +1671,9 @@ mod package_export_option_tests {
                 .await
                 .unwrap(),
         );
+        assert_eq!(body["board"]["width_mm"], 20.0);
+        assert_eq!(body["board"]["height_mm"], 20.0);
+        assert_eq!(body["fabrication_scope"], "within_model_dimensions");
         assert_eq!(body["cost_estimate"]["components_estimate"], "$56.45");
         assert_eq!(
             body["component_pricing"]["priced_from_catalog"],
@@ -2287,74 +2308,11 @@ fn find_setup_value(content: &str, key: &str) -> Option<f64> {
     after[..end].trim().parse().ok()
 }
 
-fn estimate_board_dimensions(content: &str) -> (f64, f64) {
-    let mut min_x = f64::MAX;
-    let mut max_x = f64::MIN;
-    let mut min_y = f64::MAX;
-    let mut max_y = f64::MIN;
-    let mut found = false;
-
-    // Scan gr_line on Edge.Cuts for board outline coordinates
-    let mut pos = 0;
-    while let Some(line_pos) = content[pos..].find("(gr_line") {
-        let abs = pos + line_pos;
-        let block_end = content[abs..].find(")\n").unwrap_or(300) + abs;
-        let block = &content[abs..block_end.min(content.len())];
-
-        if block.contains("Edge.Cuts") {
-            // Extract start and end coordinates
-            if let (Some(sx), Some(sy)) = (
-                extract_coord(block, "start", 0),
-                extract_coord(block, "start", 1),
-            ) {
-                if sx < min_x {
-                    min_x = sx;
-                }
-                if sx > max_x {
-                    max_x = sx;
-                }
-                if sy < min_y {
-                    min_y = sy;
-                }
-                if sy > max_y {
-                    max_y = sy;
-                }
-                found = true;
-            }
-            if let (Some(ex), Some(ey)) = (
-                extract_coord(block, "end", 0),
-                extract_coord(block, "end", 1),
-            ) {
-                if ex < min_x {
-                    min_x = ex;
-                }
-                if ex > max_x {
-                    max_x = ex;
-                }
-                if ey < min_y {
-                    min_y = ey;
-                }
-                if ey > max_y {
-                    max_y = ey;
-                }
-            }
-        }
-        pos = abs + 1;
-    }
-
-    if found {
-        ((max_x - min_x).abs(), (max_y - min_y).abs())
-    } else {
-        (0.0, 0.0) // Unknown
-    }
-}
-
-fn extract_coord(block: &str, keyword: &str, index: usize) -> Option<f64> {
-    let pat = format!("({} ", keyword);
-    let pos = block.find(&pat)? + pat.len();
-    let rest = &block[pos..];
-    let parts: Vec<&str> = rest.split([' ', ')']).collect();
-    parts.get(index)?.parse().ok()
+fn estimate_board_dimensions(tree: &konnect_sexp::SexpNode) -> (f64, f64) {
+    konnect_sexp::board::board_outline_bbox(tree)
+        .map(|(min_x, min_y, max_x, max_y)| (max_x - min_x, max_y - min_y))
+        .filter(|(width, height)| width.is_finite() && height.is_finite())
+        .unwrap_or((0.0, 0.0))
 }
 
 #[cfg(test)]
@@ -2862,21 +2820,31 @@ mod board_evidence_contract_tests {
 
     #[test]
     fn dimension_estimation_combines_all_edge_extrema_and_ignores_non_edges() {
-        let source = "(kicad_pcb\n (gr_line (start 5 6) (end -3 -4) (layer \"Edge.Cuts\"))\n (gr_line (start 8 -8) (end -6 9) (layer \"Edge.Cuts\"))\n (gr_line (start -100 -100) (end 100 100) (layer \"F.SilkS\"))\n)";
-        assert_eq!(estimate_board_dimensions(source), (14.0, 17.0));
-        assert_eq!(estimate_board_dimensions("(kicad_pcb)"), (0.0, 0.0));
+        let dimensions = |source| {
+            let tree = konnect_sexp::parse_sexp(source).unwrap();
+            estimate_board_dimensions(&tree)
+        };
+        let source = r#"(kicad_pcb
+            (gr_line (start 5 6) (end -3 -4) (layer "Edge.Cuts"))
+            (gr_line (start 8 -8) (end -6 9) (layer "Edge.Cuts"))
+            (gr_line (start -100 -100) (end 100 100) (layer "F.SilkS")))"#;
+        assert_eq!(dimensions(source), (14.0, 17.0));
         assert_eq!(
-            estimate_board_dimensions("(gr_line (start bad 0) (end 1 1) (layer \"Edge.Cuts\"))\n"),
-            (0.0, 0.0)
+            dimensions(r#"(kicad_pcb (gr_rect (start 0 0) (end 100 20) (layer "Edge.Cuts")))"#),
+            (100.0, 20.0)
         );
-        assert_eq!(
-            estimate_board_dimensions("(gr_line (start 1 2) (end bad 3) (layer \"Edge.Cuts\"))\n"),
-            (0.0, 0.0)
-        );
+        for source in [
+            "(kicad_pcb)",
+            r#"(kicad_pcb (gr_line (start bad 0) (end 1 1) (layer "Edge.Cuts")))"#,
+            r#"(kicad_pcb (gr_line (start 1 2) (end bad 3) (layer "Edge.Cuts")))"#,
+            r#"(kicad_pcb (gr_rect (start -1e308 0) (end 1e308 20) (layer "Edge.Cuts")))"#,
+        ] {
+            assert_eq!(dimensions(source), (0.0, 0.0), "{source}");
+        }
     }
 
     #[test]
-    fn setup_and_outline_coordinate_extraction_return_no_evidence_for_bad_fields() {
+    fn setup_value_extraction_returns_no_evidence_for_bad_fields() {
         assert_eq!(
             find_setup_value("(setup (min_trace_width 0.127))", "min_trace_width"),
             Some(0.127)
@@ -2888,10 +2856,6 @@ mod board_evidence_contract_tests {
         ] {
             assert_eq!(find_setup_value(source, "min_trace_width"), None);
         }
-        assert_eq!(extract_coord("(start 2.01 -3.5)", "start", 1), Some(-3.5));
-        assert_eq!(extract_coord("(start 2.01)", "start", 2), None);
-        assert_eq!(extract_coord("(start nope 1)", "start", 0), None);
-        assert_eq!(extract_coord("(end 2 3)", "start", 0), None);
     }
 }
 
