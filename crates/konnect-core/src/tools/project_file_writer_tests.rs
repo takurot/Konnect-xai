@@ -1,4 +1,4 @@
-//! The three `.kicad_pro` writers while KiCad holds the board (#791).
+//! Served `.kicad_pro` writer contracts, including the KiCad ownership guard (#791).
 //!
 //! Saving the board in KiCad rewrites the project file from KiCad's own copy.
 //! So `set_design_rules`, `create_netclass` and `assign_net_to_class` must not
@@ -261,9 +261,17 @@ async fn design_rules_accept_fab_minima_and_refuse_out_of_range_batches() {
     });
     let result = call(&handler, "set_design_rules", &fixture.board, &arguments).await;
     assert!(!result.is_error, "{}", text_of(&result));
+    let set_body: Value = serde_json::from_str(text_of(&result)).unwrap();
+    let persisted = std::fs::read(&fixture.project_file).unwrap();
+    let repeated = call(&handler, "set_design_rules", &fixture.board, &arguments).await;
+    assert!(!repeated.is_error, "{}", text_of(&repeated));
+    let repeated_body: Value = serde_json::from_str(text_of(&repeated)).unwrap();
+    assert_eq!(repeated_body["changed"], json!([]));
+    assert_eq!(std::fs::read(&fixture.project_file).unwrap(), persisted);
     let result = call(&handler, "get_design_rules", &fixture.board, &json!({})).await;
     assert!(!result.is_error, "{}", text_of(&result));
     let body: Value = serde_json::from_str(text_of(&result)).unwrap();
+    assert_eq!(set_body["rules"], body["rules"]);
     for (field, value) in arguments.as_object().unwrap() {
         assert_eq!(&body["rules"][field], value, "{field}");
     }
@@ -360,6 +368,16 @@ async fn delete_netclass_preserves_surviving_matches_and_default_fallback() {
     assert!(text_of(&result).contains("currently holds this board open"));
     assert_eq!(std::fs::read(&fixture.project_file).unwrap(), before);
     drop(locked);
+
+    let lock = fixture
+        .project_file
+        .with_file_name("~placement_fixture.kicad_pro.lck");
+    std::fs::write(&lock, r#"{"username":"test","hostname":"test-host"}"#).unwrap();
+    let result = call(&handler, "delete_netclass", &fixture.board, &args).await;
+    assert!(result.is_error, "{}", text_of(&result));
+    assert!(text_of(&result).contains(".kicad_pro.lck"));
+    assert_eq!(std::fs::read(&fixture.project_file).unwrap(), before);
+    std::fs::remove_file(lock).unwrap();
 
     let result = call(&handler, "delete_netclass", &fixture.board, &args).await;
     assert!(!result.is_error, "{}", text_of(&result));

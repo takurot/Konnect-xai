@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **228 registered tools** + **7 always-visible meta-tools** = **235 total**
+- **229 registered tools** + **7 always-visible meta-tools** = **236 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -279,7 +279,7 @@ and Windows servers do not.
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
 
-### `pcb_routing` · 15 tools
+### `pcb_routing` · 16 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
@@ -296,7 +296,8 @@ and Windows servers do not.
 | `query_traces` | List trace segments on the board, optionally filtered by net and/or layer. |
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |
 | `modify_trace` | Modify a trace segment by deleting and re-adding it with new parameters. |
-| `create_netclass` | Create or update a netclass in the project's `net_settings` (the sibling `.kicad_pro`, where KiCad keeps netclasses since v7). Never touches the board file. An update changes only the settings named; use `get_netclasses` to look, since naming an unknown class here creates it. |
+| `create_netclass` | Create or update a netclass in the sibling `.kicad_pro`, including differential pair width and gaps. Updates change only the settings named. |
+| `delete_netclass` | Delete a non-Default class and remove its saved memberships from the sibling `.kicad_pro`. Surviving memberships and priorities are preserved, with Default filling unspecified settings. |
 | `get_netclasses` | Read every netclass with its settings, its `netclass_patterns` and the board nets those patterns match. Mixed-source: definitions and patterns come from the `.kicad_pro`, the board nets from a live KiCad where one holds the board and from the saved board file otherwise (`board_source` selects that), and `sources` names each. KiCad need not be running. Reports `Default` (marked) and any pattern naming a class that does not exist. |
 | `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
@@ -400,7 +401,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | Tool | Description |
 |------|-------------|
 | `run_drc` | Run KiCad's complete configured DRC ruleset — schematic parity included when the board's project has a root schematic to compare against, reported as unchecked (`null`, with a diagnostic quoting KiCad) when KiCad says it could not fetch one — and return structured violation results. Each violation item names what owns it — `owner.kind` `board` or `footprint` (with the reference), plus `item_kind`, `layer`, and `ownership_status` — so an `Edge.Cuts` hit on a footprint's own cutout is distinguishable from one on the board outline. |
-| `set_design_rules` | Set board-level design rules (clearance, trace width, via size) in the sibling `.kicad_pro` project file. The board file is not modified. |
+| `set_design_rules` | Validate and set board-wide fabrication minima in the sibling `.kicad_pro`, including edge, annular, hole and silkscreen constraints. See [KiCad design rules](docs/KICAD_DESIGN_RULES.md). |
 | `get_design_rules` | Return the current design rule constraints from the sibling `.kicad_pro` project file. |
 | `set_predefined_sizes` | Write the PCB editor Pre-defined Sizes list (track widths and via pad/drill pairs) into the sibling `.kicad_pro`. These fill the Track/Via dropdowns; they are not DRC limits. |
 | `get_predefined_sizes` | Return the Pre-defined Sizes list from the sibling `.kicad_pro`, including the 0 / 0,0 netclass sentinel. |

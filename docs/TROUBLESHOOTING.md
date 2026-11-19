@@ -525,7 +525,7 @@ callable tools, the fix is to make the *first* listing complete:
 
 in a server configuration passed with `--config <path>` or discovered at a
 trusted location. Every toolset is then loaded at startup, so `tools/list`
-carries all 235 tools from the first call.
+carries all 236 tools from the first call.
 
 It is off by default because it costs what the router exists to save: roughly
 25K tokens per listing instead of ~2K. Turn it on only if your client needs it.
