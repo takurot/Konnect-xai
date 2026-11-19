@@ -135,7 +135,7 @@ package name, for example `"args": ["-y", "@konnect-xai/konnect", "--config", "/
 Do not install with `--omit=optional` or `--no-optional`: the binary lives in
 the optional platform package. KiCad itself is still installed separately.
 
-Linux x64 and arm64 packages from v0.15.0 target glibc 2.35 or newer, with
+Linux x64 and arm64 packages from v0.16.0 target glibc 2.35 or newer, with
 Ubuntu 22.04 and Debian 12 checked before publication. Alpine and other musl
 systems are unsupported by these binaries. The older v0.13.1 and v0.14.0
 Linux x64 binaries require glibc 2.43. The Linux x64 PCM viewer also needs
@@ -144,7 +144,7 @@ the distribution's GTK 3 and WebKitGTK 4.1 runtimes
 
 ### From the KiCAD Plugin Manager (recommended)
 
-1. Download the package for your OS from [Releases](https://github.com/mixelpixx/Konnect/releases):
+1. Download the package for your OS from [Releases](https://github.com/takurot/Konnect-xai/releases):
    `konnect-pcm-v<version>-windows.zip`, `-macos.zip`, or `-linux.zip`. Each
    bundles that platform's server binary — the macOS package is a universal
    build, so one download covers Apple Silicon and Intel. (The `konnect-pcm-*`
@@ -244,7 +244,7 @@ it is not silently guessed from a directory name.
 
 ### macOS
 
-The [Releases](https://github.com/mixelpixx/Konnect/releases) page ships
+The [Releases](https://github.com/takurot/Konnect-xai/releases) page ships
 standalone server binaries for both Apple Silicon (`aarch64-apple-darwin`) and
 Intel (`x86_64-apple-darwin`). They are not yet code-signed, so if you download
 one through a browser, clear the quarantine flag before first launch:
