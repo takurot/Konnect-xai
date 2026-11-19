@@ -2497,6 +2497,25 @@ mod netclass_tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn malformed_differential_fields_leave_the_project_unchanged() {
+        let (_dir, board) = fixture(true);
+        let project = board.with_extension("kicad_pro");
+        let before = std::fs::read(&project).unwrap();
+        for value in [json!("wide"), json!(-0.01), json!(2147.483648)] {
+            let result = create(
+                &board,
+                json!({"name":"Pair","trace_width":0.3,"diff_pair_via_gap":value}),
+            )
+            .await;
+            assert!(result.is_error, "{}", text_of(&result));
+            let body: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+            assert_eq!(body["error"]["kind"], "invalid_argument");
+            assert_eq!(body["error"]["field"], "diff_pair_via_gap");
+            assert_eq!(std::fs::read(&project).unwrap(), before);
+        }
+    }
+
     /// The board file is data KiCad refuses if a netclass node lands in it;
     /// the class must go into the project file and the board must not change
     /// by a single byte.

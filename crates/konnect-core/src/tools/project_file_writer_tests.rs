@@ -356,7 +356,10 @@ async fn delete_netclass_preserves_surviving_matches_and_default_fallback() {
             {"netclass":"Remove","pattern":"SIG"},
             {"netclass":"Other","pattern":"VCC"}
         ],
-        "netclass_assignments":{"SIG":["Remove","Other"],"ONLY":["Remove"],"OLD":"Remove"}
+        "netclass_assignments":{
+            "SIG":["Remove","Other"],"ONLY":["Remove"],"OLD":"Remove",
+            "UNCHANGED":["Other"],"OLD_UNCHANGED":"Other"
+        }
     });
     std::fs::write(&fixture.project_file, serde_json::to_vec(&saved).unwrap()).unwrap();
     let handler = handler_talking_to("").await;
@@ -410,7 +413,74 @@ async fn delete_netclass_preserves_surviving_matches_and_default_fallback() {
     );
     assert_eq!(
         net_settings["netclass_assignments"],
-        json!({"SIG":["Other"]})
+        json!({"SIG":["Other"],"UNCHANGED":["Other"],"OLD_UNCHANGED":"Other"})
     );
     assert_eq!(std::fs::read(&fixture.board).unwrap(), board_before);
+}
+
+#[tokio::test]
+async fn deleting_an_unknown_netclass_never_materializes_project_settings() {
+    let fixture = project();
+    let handler = handler_talking_to("").await;
+    for source in [
+        r#"{"board":{"design_settings":{}}}"#,
+        r#"{"net_settings":{"meta":{"version":5}}}"#,
+        r#"{"net_settings":{"classes":[{"name":"Power"}]}}"#,
+    ] {
+        std::fs::write(&fixture.project_file, source).unwrap();
+        let result = call(
+            &handler,
+            "delete_netclass",
+            &fixture.board,
+            &json!({"name":"Missing"}),
+        )
+        .await;
+        assert!(result.is_error, "{}", text_of(&result));
+        let error: Value = serde_json::from_str(text_of(&result)).unwrap();
+        assert_eq!(error["error"]["kind"], "invalid_argument");
+        assert!(text_of(&result).contains("netclass 'Missing' does not exist"));
+        assert_eq!(
+            std::fs::read_to_string(&fixture.project_file).unwrap(),
+            source
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_the_last_explicit_netclass_keeps_kicads_seeded_default() {
+    let fixture = project();
+    std::fs::write(
+        &fixture.project_file,
+        r#"{"net_settings":{"classes":[{"name":"Power","priority":2}],"netclass_assignments":null}}"#,
+    )
+    .unwrap();
+    let handler = handler_talking_to("").await;
+    let result = call(
+        &handler,
+        "delete_netclass",
+        &fixture.board,
+        &json!({"name":"Power"}),
+    )
+    .await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    let report: Value = serde_json::from_str(text_of(&result)).unwrap();
+    assert_eq!(report["removed_patterns"], 0);
+    assert_eq!(report["removed_label_assignments"], 0);
+    assert_eq!(report["backfilled_default_fields"], json!([]));
+    let committed = std::fs::read(&fixture.project_file).unwrap();
+    let project: Value = serde_json::from_slice(&committed).unwrap();
+    assert_eq!(project["net_settings"]["classes"], json!([]));
+    assert!(project["net_settings"].get("netclass_patterns").is_none());
+    assert!(project["net_settings"]["netclass_assignments"].is_null());
+
+    let assignment = call(
+        &handler,
+        "assign_net_to_class",
+        &fixture.board,
+        &json!({"net_name":"VCC","netclass":"Power"}),
+    )
+    .await;
+    assert!(assignment.is_error, "{}", text_of(&assignment));
+    assert!(text_of(&assignment).contains("available: (none)"));
+    assert_eq!(std::fs::read(&fixture.project_file).unwrap(), committed);
 }

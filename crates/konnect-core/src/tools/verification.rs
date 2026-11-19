@@ -2531,6 +2531,26 @@ mod coverage_verification_no_write {
     }
 
     #[tokio::test]
+    async fn design_rule_wrong_type_does_not_apply_a_valid_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let project = board.with_extension("kicad_pro");
+        let source = "{ \"board\": {\"design_settings\": {\"rules\":{}}} }";
+        std::fs::write(&project, source).unwrap();
+        let result = handle_set_design_rules(
+            &json!({"board":board,"min_clearance":0.1,"min_via_annular_width":"narrow"}),
+            &ctx_talking_to(String::new()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let error = body(&result);
+        assert_eq!(error["error"]["kind"], "invalid_argument");
+        assert_eq!(error["error"]["field"], "min_via_annular_width");
+        assert_eq!(std::fs::read_to_string(&project).unwrap(), source);
+    }
+
+    #[tokio::test]
     async fn design_rule_noop_and_malformed_project_shapes_preserve_saved_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("board.kicad_pcb");
