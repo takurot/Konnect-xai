@@ -266,7 +266,7 @@ pub fn tools() -> Vec<ToolDef> {
             "delete_netclass",
             "Delete a named non-Default netclass from the sibling .kicad_pro. Remove its project \
              pattern and saved label assignments. Remaining classes and their priority are preserved, \
-             with Default filling settings they do not supply. Does not edit schematic labels or \
+             with KiCad's normal fallback rules. Does not edit schematic labels or \
              the PCB. Refuses while KiCad holds the board or project lock.",
             json!({
                 "type": "object",
@@ -292,7 +292,8 @@ pub fn tools() -> Vec<ToolDef> {
              property from the highest-priority class that sets it (lower number = \
              higher priority) and falls back to Default. Settings are reported \
              resolved, with 'inherits' naming the ones a class takes from the \
-             Default rather than setting itself; 'missing_fields' on the \
+             Default rather than setting itself. KiCad 10 leaves an omitted differential pair \
+             via gap unset on named classes. 'missing_fields' on the \
              Default names settings nothing can resolve. 'orphan_patterns' \
              lists patterns naming a class that does not exist; \
              'unmatched_patterns' lists patterns whose class exists but which \
@@ -1692,8 +1693,8 @@ fn wildcard_matches(pattern: &str, name: &str) -> bool {
 const MAX_NETCLASS_MM: f64 = i32::MAX as f64 / 1_000_000.0;
 
 /// KiCad key, tool argument, and creation default for a named class.
-/// Differential fields are absent unless explicitly set, so a named class
-/// keeps inheriting them from Default.
+/// Differential fields are absent unless explicitly set. KiCad inherits width
+/// and gap, but does not inherit the via gap for named classes.
 const NETCLASS_FIELDS: [(&str, &str, Option<f64>); 7] = [
     ("clearance", "clearance", Some(0.2)),
     ("track_width", "trace_width", Some(0.25)),
@@ -1838,7 +1839,9 @@ async fn handle_get_netclasses(
             let own = class.get(key).filter(|v| !v.is_null());
             entry[api] = match own {
                 Some(value) => value.clone(),
-                None if !is_default => {
+                // KiCad 10 NET_SETTINGS::addMissingDefaults deliberately leaves
+                // the via gap unset in an aggregate named class.
+                None if !is_default && key != "diff_pair_via_gap" => {
                     let inherited = effective_default[key].clone();
                     if !inherited.is_null() {
                         inherits.push(api);

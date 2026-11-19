@@ -297,7 +297,7 @@ and Windows servers do not.
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |
 | `modify_trace` | Modify a trace segment by deleting and re-adding it with new parameters. |
 | `create_netclass` | Create or update a netclass in the sibling `.kicad_pro`, including differential pair width and gaps. Updates change only the settings named. |
-| `delete_netclass` | Delete a non-Default class and remove its saved memberships from the sibling `.kicad_pro`. Surviving memberships and priorities are preserved, with Default filling unspecified settings. |
+| `delete_netclass` | Delete a non-Default class and remove its saved memberships from the sibling `.kicad_pro`. Surviving memberships and priorities are preserved. Nets with no surviving match fall back to Default. |
 | `get_netclasses` | Read every netclass with its settings, its `netclass_patterns` and the board nets those patterns match. Mixed-source: definitions and patterns come from the `.kicad_pro`, the board nets from a live KiCad where one holds the board and from the saved board file otherwise (`board_source` selects that), and `sources` names each. KiCad need not be running. Reports `Default` (marked) and any pattern naming a class that does not exist. |
 | `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |

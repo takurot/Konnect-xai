@@ -285,7 +285,7 @@ async fn differential_netclass_fields_roundtrip_and_inherit() {
         &handler,
         "create_netclass",
         &fixture.board,
-        &json!({"name":"Default","diff_pair_via_gap":0.65}),
+        &json!({"name":"Default","diff_pair_gap":0.14,"diff_pair_via_gap":0.65}),
     )
     .await;
     assert!(!result.is_error, "{}", text_of(&result));
@@ -293,7 +293,7 @@ async fn differential_netclass_fields_roundtrip_and_inherit() {
         &handler,
         "create_netclass",
         &fixture.board,
-        &json!({"name":"Pair","diff_pair_width":0.18,"diff_pair_gap":0.14}),
+        &json!({"name":"Pair","diff_pair_width":0.18}),
     )
     .await;
     assert!(!result.is_error, "{}", text_of(&result));
@@ -314,8 +314,8 @@ async fn differential_netclass_fields_roundtrip_and_inherit() {
         .unwrap();
     assert_eq!(pair["diff_pair_width"], 0.18);
     assert_eq!(pair["diff_pair_gap"], 0.14);
-    assert_eq!(pair["diff_pair_via_gap"], 0.65);
-    assert_eq!(pair["inherits"], json!(["diff_pair_via_gap"]));
+    assert_eq!(pair["diff_pair_via_gap"], Value::Null);
+    assert_eq!(pair["inherits"], json!(["diff_pair_gap"]));
     let written: Value =
         serde_json::from_slice(&std::fs::read(&fixture.project_file).unwrap()).unwrap();
     let stored_pair = written["net_settings"]["classes"]
@@ -325,6 +325,18 @@ async fn differential_netclass_fields_roundtrip_and_inherit() {
         .find(|class| class["name"] == "Pair")
         .unwrap();
     assert!(stored_pair.get("diff_pair_via_gap").is_none());
+
+    let result = call(
+        &handler,
+        "create_netclass",
+        &fixture.board,
+        &json!({"name":"Pair","diff_pair_via_gap":0.62}),
+    )
+    .await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    let body: Value = serde_json::from_str(text_of(&result)).unwrap();
+    assert_eq!(body["diff_pair_via_gap"], 0.62);
+    assert_eq!(body["diff_pair_width"], 0.18);
 }
 
 #[tokio::test]

@@ -32,14 +32,15 @@ for the specific fabrication service used for the board.
 
 `create_netclass` accepts `diff_pair_width`, `diff_pair_gap` and
 `diff_pair_via_gap` in mm. Omitting one when updating a class preserves its
-current value. A new named class that omits one inherits it. `get_netclasses`
-reports differential pair values with the other class settings and identifies
-inherited values.
+current value. Named classes inherit omitted trace widths and gaps from
+`Default`. KiCad 10 leaves an omitted via gap unset on named classes.
+`get_netclasses` reports the unset value as `null` and identifies the values
+that inherit.
 
 `delete_netclass` refuses to remove `Default`. It removes patterns and saved
 label assignments to the deleted class and preserves other assignments and
-class priorities. A net with surviving matches uses those classes and falls
-back to `Default` for their unspecified properties. A net with no surviving
+class priorities. A net with surviving matches uses those classes and keeps
+KiCad's normal fallback rules. A net with no surviving
 matches falls back to `Default` for all properties. The tool backfills missing
 fields in an explicit incomplete `Default` so affected nets retain a complete
 fallback. This edits project settings only. If a schematic netclass label
