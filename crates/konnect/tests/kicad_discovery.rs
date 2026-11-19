@@ -43,7 +43,7 @@ fn nightly_cli_selects_global_tables_and_path_variables() {
     let cli = tmp.path().join("fixture-kicad-cli");
     fs::write(
         &cli,
-        "#!/bin/sh\n[ \"$1\" = --version ] && echo 10.99.0-127-gabcd\n",
+        "#!/bin/sh\n[ \"$1\" = --version ] || exit 1\n: > \"$0.probed\"\necho 10.99.0-127-gabcd\n",
     )
     .unwrap();
     fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
@@ -93,14 +93,29 @@ fn nightly_cli_selects_global_tables_and_path_variables() {
         1,
         json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"discovery-test","version":"1"}}),
     );
-    let search = request(
+    let listing = request(
         "tools/call",
         2,
+        json!({"name":"list_library_footprints","arguments":{"library_path":parts}}),
+    );
+    assert_ne!(listing["isError"], true, "{listing}");
+    assert!(
+        !cli.with_extension("probed").exists(),
+        "a directory-only listing must not run KiCad"
+    );
+
+    let search = request(
+        "tools/call",
+        3,
         json!({"name":"search_footprints","arguments":{"query":"Nightly"}}),
+    );
+    assert!(
+        cli.with_extension("probed").is_file(),
+        "search must probe the configured CLI"
     );
     let registration = request(
         "tools/call",
-        3,
+        4,
         json!({"name":"register_footprint_library","arguments":{
             "library_path":parts,"nickname":"NewFixture","scope":"global"
         }}),

@@ -2128,7 +2128,18 @@ fn freerouting_search_roots_from(
     env: &std::collections::HashMap<std::ffi::OsString, std::ffi::OsString>,
     working_directory: &Path,
 ) -> Vec<FreeroutingSearchRoot> {
-    let var = |name: &str| env.get(std::ffi::OsStr::new(name));
+    let var = |name: &str| {
+        let name = std::ffi::OsStr::new(name);
+        env.get(name).or_else(|| {
+            if cfg!(windows) {
+                env.iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value)
+            } else {
+                None
+            }
+        })
+    };
     let mut roots: Vec<FreeroutingSearchRoot> = Vec::new();
     let mut push = |location: FreeroutingLocation, path: PathBuf| {
         let path = if path.is_absolute() {
@@ -2743,7 +2754,7 @@ mod freerouting_tests {
         let observed = |location| {
             roots
                 .iter()
-                .filter(|root| root.location == location)
+                .filter(move |root| root.location == location)
                 .map(|root| &root.path)
         };
         assert_eq!(
@@ -2774,6 +2785,27 @@ mod freerouting_tests {
             position(plugin_path("home/.local/share/kicad", "11.0"))
                 < position(plugin_path("documents", "10.99"))
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_discovery_matches_environment_names_case_insensitively() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bin");
+        let third_party = temp.path().join("third-party");
+        let env = HashMap::from([
+            ("Path".into(), std::env::join_paths([&path]).unwrap()),
+            (
+                "kicad11_3rd_party".into(),
+                third_party.clone().into_os_string(),
+            ),
+        ]);
+        let roots = freerouting_search_roots_from(&env, temp.path());
+        assert!(roots
+            .iter()
+            .any(|root| root.path == path && root.location == FreeroutingLocation::PathDirectory));
+        assert!(roots.iter().any(|root| root.path == third_party
+            && root.location == FreeroutingLocation::KicadThirdPartyVariable));
     }
 
     /// Every searched location is reported as an absolute path. A relative value

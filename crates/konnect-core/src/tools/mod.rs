@@ -84,6 +84,7 @@ pub struct ToolDef {
     /// The schema shown to clients is therefore the schema the server enforces.
     pub input_validator: Arc<jsonschema::Validator>,
     pub handler: ToolHandlerFn,
+    pub(crate) uses_kicad_config: bool,
     /// How the tool interacts with a board held by KiCad. Client guidance can
     /// derive warnings from this runtime contract instead of maintaining a
     /// second list of tool names.
@@ -124,8 +125,15 @@ impl ToolDef {
             input_schema,
             input_validator,
             handler,
+            uses_kicad_config: false,
             board_access: BoardAccess::None,
         }
+    }
+
+    /// This tool resolves registered KiCad libraries or edits their tables.
+    pub(crate) fn with_kicad_config(mut self) -> Self {
+        self.uses_kicad_config = true;
+        self
     }
 
     pub fn with_board_access(mut self, board_access: BoardAccess) -> Self {

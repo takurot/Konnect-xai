@@ -394,18 +394,21 @@ impl McpHandler {
             if let Err(error) = tool_def.input_validator.validate(args) {
                 return schema_argument_error(&error);
             }
-            let config_dir = self
-                .ctx
-                .kicad_config_dir
-                .get_or_init(|| {
-                    crate::kicad_install::resolve_config_dir(&self.ctx.config.kicad_cli)
-                })
-                .await;
-            let result = crate::kicad_install::REQUEST_CONFIG_DIR
-                .scope(config_dir.clone(), async {
-                    (tool_def.handler)(args, self.ctx.clone()).await
-                })
-                .await;
+            let call = async { (tool_def.handler)(args, self.ctx.clone()).await };
+            let result = if tool_def.uses_kicad_config {
+                let dir = self
+                    .ctx
+                    .kicad_config_dir
+                    .get_or_init(|| {
+                        crate::kicad_install::resolve_config_dir(&self.ctx.config.kicad_cli)
+                    })
+                    .await;
+                crate::kicad_install::REQUEST_CONFIG_DIR
+                    .scope(dir.clone(), call)
+                    .await
+            } else {
+                call.await
+            };
             return match result {
                 Ok(result) => {
                     let status = call_status(&result);

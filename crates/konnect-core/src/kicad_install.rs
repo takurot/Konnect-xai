@@ -90,6 +90,11 @@ pub(crate) fn versioned_environment(
     let mut matches: Vec<_> = env
         .into_iter()
         .filter_map(|(key, value)| {
+            let key = if cfg!(windows) {
+                key.to_ascii_uppercase()
+            } else {
+                key
+            };
             let (major, found_suffix) = key.to_str()?.strip_prefix("KICAD")?.split_once('_')?;
             if found_suffix != suffix {
                 return None;

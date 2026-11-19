@@ -203,6 +203,7 @@ pub(crate) fn tool() -> ToolDef {
         }),
         |args, ctx| async move { handle_update_footprints_from_library(args, ctx).await }
     )
+    .with_kicad_config()
     .with_board_access(crate::tools::BoardAccess::LiveOnly)
 }
 
