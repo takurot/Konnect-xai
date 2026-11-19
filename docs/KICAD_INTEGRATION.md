@@ -252,4 +252,4 @@ handler that changes the rectangle to red to `setSvg`. The displayed rectangle
 must stay green in the light theme. Inspect `#schematic-image` and confirm that
 it is an HTML image and that the sheet's SVG elements are absent from the
 viewer document. The Rust viewer tests also validate the static CSP and reject
-schematic-only startup paths.
+non-schematic startup paths.
