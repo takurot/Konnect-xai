@@ -323,7 +323,7 @@ and Windows servers do not.
 | Tool | Description |
 |------|-------------|
 | `export_gerber` | Export Gerber production files for all copper/mask layers using kicad-cli. |
-| `export_pdf` | Export PCB layers to one PDF, optionally in black and white. Omitted or empty `layers` selects F.Cu, F.Paste, F.SilkS, F.Mask, and Edge.Cuts. The response includes `layers_used`. |
+| `export_pdf` | Export PCB layers to one PDF, optionally in black and white. Accepts canonical layer names and saved-board aliases. Omitted or empty `layers` selects F.Cu, F.Paste, F.SilkS, F.Mask, and Edge.Cuts. The response includes `layers_used`. |
 | `export_svg` | Export PCB layers to one SVG, optionally in black and white. Uses the same front-view defaults as `export_pdf` and returns `layers_used`. |
 | `export_3d` | Export the PCB as a 3D model using kicad-cli, with explicit control over unspecified footprint models. |
 | `export_bom` | Generate KiCad 10's CSV Bill of Materials from schematic fields. |

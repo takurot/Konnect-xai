@@ -597,6 +597,34 @@ fn export_staging_dir(destination: &Path) -> Result<Arc<ExportStaging>> {
         .context("failed to create an export staging directory")
 }
 
+fn ensure_export_destination_is_not_design_file(destination: &Path) -> Result<()> {
+    let canonical = destination.canonicalize().ok();
+    let reserved = [Some(destination), canonical.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+        .any(|name| {
+            let name = name.trim_end_matches([' ', '.']).to_ascii_lowercase();
+            matches!(name.as_str(), "fp-lib-table" | "sym-lib-table")
+                || Path::new(&name)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        ext.starts_with("kicad_")
+                            || matches!(
+                                ext,
+                                "sch" | "brd" | "pro" | "lib" | "mod" | "dcm" | "pretty"
+                            )
+                    })
+        });
+    anyhow::ensure!(
+        !reserved,
+        "export destination {} is reserved for a KiCad design or library",
+        destination.display()
+    );
+    Ok(())
+}
+
 /// Publish a verified artifact without letting a stale destination stand in
 /// for output from the current command. The staging directory is a sibling of
 /// the destination, so every rename remains on the same filesystem.
@@ -1496,37 +1524,7 @@ pub(crate) async fn export_named_schematic_svg(
     let root_name = output
         .file_name()
         .context("root SVG output has no file name")?;
-    let staging = export_staging_dir(output)?;
-    let (root, staged) = stage_schematic_svg(cli, schematic, options, &staging).await?;
-
-    let children = staged
-        .iter()
-        .filter(|path| **path != root)
-        .map(|path| {
-            let name = path.file_name().expect("staged child has a basename");
-            (path, output.with_file_name(name))
-        })
-        .collect::<Vec<_>>();
-
-    for (source, destination) in &children {
-        verify_nonempty_file(source, "schematic SVG").await?;
-        anyhow::ensure!(
-            !destination
-                .file_name()
-                .unwrap()
-                .eq_ignore_ascii_case(root_name),
-            "schematic SVG root output {} conflicts with a child sheet",
-            output.display()
-        );
-        match tokio::fs::symlink_metadata(destination).await {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            Err(error) => return Err(error).context("could not inspect child SVG destination"),
-            Ok(_) => anyhow::bail!(
-                "child SVG output {} already exists; choose a directory without conflicting child names",
-                destination.display()
-            ),
-        }
-    }
+    ensure_export_destination_is_not_design_file(output)?;
     let root_exists = match tokio::fs::symlink_metadata(output).await {
         Ok(metadata) => {
             anyhow::ensure!(
@@ -1539,6 +1537,46 @@ pub(crate) async fn export_named_schematic_svg(
         Err(error) => return Err(error).context("could not inspect root SVG destination"),
     };
 
+    let staging = export_staging_dir(output)?;
+    let (root, staged) = stage_schematic_svg(cli, schematic, options, &staging).await?;
+
+    let children = staged
+        .iter()
+        .filter(|path| **path != root)
+        .map(|path| {
+            let name = path.file_name().expect("staged child has a basename");
+            (path, output.with_file_name(name))
+        })
+        .collect::<Vec<_>>();
+
+    // Reserve filenames in an empty directory on the destination filesystem
+    // so case- or normalization-equivalent root/child names fail before any
+    // publication, using that filesystem's own filename comparison.
+    let names = staging.path().join(".names");
+    tokio::fs::create_dir(&names).await?;
+    tokio::fs::File::create_new(names.join(root_name)).await?;
+    for (source, destination) in &children {
+        verify_nonempty_file(source, "schematic SVG").await?;
+        let name = destination
+            .file_name()
+            .expect("child output has a basename");
+        tokio::fs::File::create_new(names.join(name))
+            .await
+            .with_context(|| {
+                format!(
+                    "cannot reserve schematic child filename {}",
+                    destination.display()
+                )
+            })?;
+        match tokio::fs::symlink_metadata(destination).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error).context("could not inspect child SVG destination"),
+            Ok(_) => anyhow::bail!(
+                "child SVG output {} already exists; choose a directory without conflicting child names",
+                destination.display()
+            ),
+        }
+    }
     let mut outputs = vec![output.to_path_buf()];
     for (source, destination) in children {
         konnect_sexp::rename_noreplace(source, &destination).with_context(|| {
@@ -1960,6 +1998,7 @@ async fn export_single_pcb_plot(
     layers: &[&str],
     black_and_white: bool,
 ) -> Result<()> {
+    ensure_export_destination_is_not_design_file(output)?;
     anyhow::ensure!(
         !output
             .canonicalize()
@@ -2129,6 +2168,7 @@ pub(crate) async fn export_native_netlist(
     output: &Path,
     schematic: bool,
 ) -> Result<()> {
+    ensure_export_destination_is_not_design_file(output)?;
     let staging = export_staging_dir(output)?;
     let staged = staging.path().join(
         output

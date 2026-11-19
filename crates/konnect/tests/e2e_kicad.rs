@@ -312,8 +312,12 @@ fn default_front_view_pcb_exports_through_mcp() {
         .join("../konnect-core/tests/fixtures/drc_ownership_j1.kicad_pcb");
     let dir = tempfile::tempdir().unwrap();
     let board = dir.path().join("source.kicad_pcb");
-    std::fs::copy(fixture, &board).unwrap();
-    let original_board = std::fs::read(&board).unwrap();
+    let original_board = std::fs::read_to_string(fixture)
+        .unwrap()
+        .replace(r#""F.Silkscreen""#, r#""Front legend custom""#);
+    std::fs::write(&board, &original_board).unwrap();
+    let library = dir.path().join("sibling.kicad_mod");
+    std::fs::write(&library, r#"(footprint "existing")"#).unwrap();
     let mut mcp = Mcp::spawn(&cli);
     mcp.load("pcb_export");
     for (tool, name, magic) in [
@@ -334,8 +338,32 @@ fn default_front_view_pcb_exports_through_mcp() {
             json!({"name":tool,"arguments":{"board":board,"output":board}}),
         );
         assert_eq!(refused["result"]["isError"], true, "{refused}");
-        assert_eq!(std::fs::read(&board).unwrap(), original_board);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), original_board);
+
+        for args in [
+            json!({"board":board,"output":library}),
+            json!({"board":board,"output":output,"layers":["F.Cu", "not-a-layer"]}),
+        ] {
+            let refused = mcp.request("tools/call", json!({"name":tool,"arguments":args}));
+            assert_eq!(refused["result"]["isError"], true, "{refused}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&library).unwrap(),
+            r#"(footprint "existing")"#
+        );
     }
+    let alias = dir.path().join("alias.svg");
+    let response = body(&mcp.tool(
+        "export_svg",
+        json!({
+            "board":board,"output":alias,"layers":["Front legend custom"],
+        }),
+    ));
+    assert_eq!(response["layers_used"], json!(["F.SilkS"]));
+    let source = std::fs::read_to_string(alias)
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert!(source.contains("M125.0000 60.0000\nL135.0000 60.0000"));
 }
 
 #[test]
@@ -379,6 +407,17 @@ fn named_schematic_svg_reports_root_and_hierarchy_outputs() {
         "existing child contents"
     );
     assert_eq!(std::fs::read(root_output).unwrap(), original_root);
+    let alias = tempfile::tempdir().unwrap();
+    let child_name = child.file_name().unwrap();
+    let refused = mcp.request(
+        "tools/call",
+        json!({
+            "name":"export_schematic_svg",
+            "arguments":{"schematic":fixture,"output":alias.path().join(child_name)}
+        }),
+    );
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert_eq!(std::fs::read_dir(alias.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -410,6 +449,17 @@ fn native_pcb_netlist_and_sibling_schematic_netlist_through_mcp() {
     assert_eq!(response["source"], json!(schematic));
     let netlist = std::fs::read_to_string(output).unwrap();
     assert!(netlist.contains("(export") && netlist.contains("(components"));
+    let rules = dir.path().join("sample.kicad_dru");
+    std::fs::write(&rules, "(version 1)").unwrap();
+    let refused = mcp.request(
+        "tools/call",
+        json!({
+            "name":"export_netlist",
+            "arguments":{"board":board,"output":rules,"format":"ipc"}
+        }),
+    );
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert_eq!(std::fs::read_to_string(rules).unwrap(), "(version 1)");
 }
 
 #[test]

@@ -59,13 +59,57 @@ pub(crate) fn optional_string_array(
 
 const FRONT_PLOT_LAYERS: [&str; 5] = ["F.Cu", "F.Paste", "F.SilkS", "F.Mask", "Edge.Cuts"];
 
-fn pcb_plot_layers(args: &serde_json::Value) -> Result<Vec<String>, CallToolResult> {
-    let layers = optional_string_array(args, "layers")?;
-    if layers.is_empty() {
-        Ok(FRONT_PLOT_LAYERS.into_iter().map(String::from).collect())
-    } else {
-        Ok(layers)
+async fn pcb_plot_layers(
+    board: &Path,
+    args: &serde_json::Value,
+) -> Result<Vec<String>, CallToolResult> {
+    use konnect_ipc::builders::{layer_from_name, layer_name};
+
+    let requested = optional_string_array(args, "layers")?;
+    if requested.is_empty() {
+        return Ok(FRONT_PLOT_LAYERS.into_iter().map(String::from).collect());
     }
+
+    let mut board_layers = None;
+    let mut selected = Vec::with_capacity(requested.len());
+    for (index, name) in requested.iter().enumerate() {
+        let canonical = if let Some(layer) = layer_name(layer_from_name(name.trim())) {
+            layer.to_owned()
+        } else {
+            // The CLI also accepts user-facing layer names. Resolve those from
+            // the saved board's layer table rather than letting KiCad silently
+            // drop an unrecognized name from the selection.
+            if board_layers.is_none() {
+                let source = tokio::fs::read_to_string(board).await.map_err(|error| {
+                    invalid_export_argument("board", format!("cannot read layer aliases: {error}"))
+                })?;
+                let parsed = konnect_sexp::parse_sexp(&source).map_err(|error| {
+                    invalid_export_argument("board", format!("cannot read layer aliases: {error}"))
+                })?;
+                board_layers = Some(konnect_sexp::layers::layers(&parsed));
+            }
+            let mut matches = board_layers
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter(|layer| layer.user_name.as_deref() == Some(name.as_str()));
+            let selected = matches
+                .next()
+                .filter(|_| matches.next().is_none())
+                .and_then(|layer| layer_name(layer_from_name(&layer.name)))
+                .ok_or_else(|| {
+                    invalid_export_argument(
+                        &format!("layers[{index}]"),
+                        format!("'{name}' is not an unambiguous KiCad layer or board layer alias"),
+                    )
+                })?;
+            selected.to_owned()
+        };
+        if !selected.contains(&canonical) {
+            selected.push(canonical);
+        }
+    }
+    Ok(selected)
 }
 
 /// Default Gerber selection for a fabrication package: every enabled copper
@@ -154,7 +198,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Output PDF file path" },
                     "layers": {
                         "type": "array",
-                        "description": "Layer names to include. Omit or use [] for F.Cu, F.Paste, F.SilkS, F.Mask, Edge.Cuts.",
+                        "description": "Canonical layer names or saved-board layer aliases. Omit or use [] for F.Cu, F.Paste, F.SilkS, F.Mask, Edge.Cuts.",
                         "items": { "type": "string" }
                     },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false }
@@ -173,7 +217,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Output SVG file path" },
                     "layers": {
                         "type": "array",
-                        "description": "Layer names to include. Omit or use [] for F.Cu, F.Paste, F.SilkS, F.Mask, Edge.Cuts.",
+                        "description": "Canonical layer names or saved-board layer aliases. Omit or use [] for F.Cu, F.Paste, F.SilkS, F.Mask, Edge.Cuts.",
                         "items": { "type": "string" }
                     },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false }
@@ -497,7 +541,7 @@ async fn handle_export_pdf(
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
 
-    let layers = match pcb_plot_layers(args) {
+    let layers = match pcb_plot_layers(&board, args).await {
         Ok(layers) => layers,
         Err(error) => return Ok(error),
     };
@@ -525,7 +569,7 @@ async fn handle_export_svg(
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
 
-    let layers = match pcb_plot_layers(args) {
+    let layers = match pcb_plot_layers(&board, args).await {
         Ok(layers) => layers,
         Err(error) => return Ok(error),
     };
@@ -1679,6 +1723,20 @@ printf '%s' "$6" > "$5"
             let error: serde_json::Value = serde_json::from_str(text).unwrap();
             assert_eq!(error["error"]["kind"], "invalid_argument");
             assert_eq!(error["error"]["field"], field);
+        }
+        for name in ["sibling.KICAD_SYM", "fp-lib-table"] {
+            let protected = dir.path().join(name);
+            std::fs::write(&protected, "design").unwrap();
+            let error = handle_export_netlist(
+                &json!({"board":board,"output":protected,"format":"ipc"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("reserved for a KiCad design or library"));
+            assert_eq!(std::fs::read_to_string(protected).unwrap(), "design");
         }
         assert!(!PathBuf::from(format!("{}.started", fake.display())).exists());
         assert!(!output.parent().unwrap().exists());
