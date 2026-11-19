@@ -241,7 +241,7 @@ points to a local JAR. When omitted, both tools search the directories named by
 `KICAD<major>_3RD_PARTY` in descending major version order. They then search
 existing `<major>.<minor>` directories under `$KICAD_DOCUMENTS_HOME`,
 `$HOME/Documents/KiCad`, `$HOME/.local/share/kicad`, and on Windows
-`$USERPROFILE/Documents/KiCad`, newest version first within each root. Each
+`$USERPROFILE/Documents/KiCad`, newest version first. Each
 version contributes its `3rdparty/plugins` path. The final locations are
 `freerouting.jar` in the server's working directory, `/usr/local/lib/freerouting`,
 `/opt/freerouting`, and every directory on `PATH`.

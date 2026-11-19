@@ -76,6 +76,13 @@ pub(crate) fn version_directories(base: &Path) -> impl Iterator<Item = PathBuf> 
     versioned_dirs(base).into_iter().map(|(_, path)| path)
 }
 
+pub(crate) fn version_directories_in(bases: &[PathBuf]) -> impl Iterator<Item = PathBuf> {
+    let mut directories: Vec<_> = bases.iter().flat_map(|base| versioned_dirs(base)).collect();
+    // Equal versions keep the caller's base precedence.
+    directories.sort_by_key(|(version, _)| std::cmp::Reverse(*version));
+    directories.into_iter().map(|(_, path)| path)
+}
+
 pub(crate) fn versioned_environment(
     env: impl IntoIterator<Item = (OsString, OsString)>,
     suffix: &str,
@@ -400,11 +407,7 @@ fn windows_well_known_install_roots(
 
 #[cfg(any(target_os = "windows", test))]
 fn windows_install_candidates(bases: &[PathBuf]) -> Vec<PathBuf> {
-    let mut versioned: Vec<_> = bases.iter().flat_map(|base| versioned_dirs(base)).collect();
-    versioned.sort_by_key(|(version, _)| std::cmp::Reverse(*version));
-    versioned
-        .into_iter()
-        .map(|(_, path)| path)
+    version_directories_in(bases)
         .chain(bases.iter().cloned())
         .collect()
 }

@@ -2043,7 +2043,7 @@ impl FreeroutingLocation {
                 "the directories named by KICAD<major>_3RD_PARTY, newest major first".to_string()
             }
             Self::KicadPluginFolder => format!(
-                "existing KiCad <major>.<minor> plugin folders (newest first within each root) {}",
+                "existing KiCad <major>.<minor> plugin folders (newest first) {}",
                 english_list(FREEROUTING_PLUGIN_FOLDERS.iter().map(
                     |(home, folder, windows_only)| {
                         let base = if folder.is_empty() {
@@ -2157,20 +2157,20 @@ fn freerouting_search_roots_from(
         );
     }
 
+    let mut plugin_bases = Vec::new();
     for (variable, folder, windows_only) in FREEROUTING_PLUGIN_FOLDERS {
         if windows_only && !cfg!(target_os = "windows") {
             continue;
         }
-        let Some(home) = var(variable).filter(|value| !value.is_empty()) else {
-            continue;
-        };
-        let base = working_directory.join(home).join(folder);
-        for directory in crate::kicad_install::version_directories(&base) {
-            push(
-                FreeroutingLocation::KicadPluginFolder,
-                directory.join("3rdparty").join("plugins"),
-            );
+        if let Some(home) = var(variable).filter(|value| !value.is_empty()) {
+            plugin_bases.push(working_directory.join(home).join(folder));
         }
+    }
+    for directory in crate::kicad_install::version_directories_in(&plugin_bases) {
+        push(
+            FreeroutingLocation::KicadPluginFolder,
+            directory.join("3rdparty").join("plugins"),
+        );
     }
 
     push(
@@ -2753,17 +2753,26 @@ mod freerouting_tests {
                 .collect::<Vec<_>>(),
             [temp.path().join("k11"), temp.path().join("k10")]
         );
-        assert_eq!(
-            observed(FreeroutingLocation::KicadPluginFolder)
-                .take(3)
-                .cloned()
-                .collect::<Vec<_>>(),
-            ["11.0", "10.99", "9.0"].map(|version| {
-                temp.path()
-                    .join("documents")
-                    .join(version)
-                    .join("3rdparty/plugins")
-            })
+        let plugin_paths: Vec<_> = observed(FreeroutingLocation::KicadPluginFolder)
+            .cloned()
+            .collect();
+        let plugin_path = |base: &str, version: &str| {
+            temp.path()
+                .join(base)
+                .join(version)
+                .join("3rdparty/plugins")
+        };
+        assert_eq!(plugin_paths[0], plugin_path("documents", "11.0"));
+        assert_eq!(plugin_paths[1], plugin_path("home/Documents/KiCad", "11.0"));
+        let position = |path| {
+            plugin_paths
+                .iter()
+                .position(|candidate| *candidate == path)
+                .unwrap()
+        };
+        assert!(
+            position(plugin_path("home/.local/share/kicad", "11.0"))
+                < position(plugin_path("documents", "10.99"))
         );
     }
 
