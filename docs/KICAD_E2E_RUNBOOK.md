@@ -105,6 +105,8 @@ gh run view <run-id> --repo takurot/Konnect-xai --log > "$E2E_ROOT/logs/hosted-e
 
 PRでは`run:e2e-kicad`ラベルを**付けるイベント**でも起動できる。既に付いているだけでは新しいpushの検証にならない。CIは失敗時のみ`dist/`と`e2e-artifacts/`をuploadするため、成功runでもログを保存する。C08が成功していてもGUIテストが実行されたことにはならない。
 
+配線済み基板の製造出力と未配線時の停止を併せて検証する場合は、[総合ワークフローの実機回帰テスト](KICAD_DESIGN_TO_GERBER_WORKFLOW.md#実機回帰テスト) を実行する。実CLIとPCB Editorが必要な独立した受け入れテスト。
+
 ## B. GUIとライブIPCの評価
 
 KiCadのPCB EditorでAPIを有効にし、**破棄可能なコピーだけを1枚**開く。一部の低レベルIPCテストはsole-board前提のため、別基板を使う追加確認とはセッションを分ける。APIが渡す`KICAD_API_SOCKET`と、必要な場合の`KICAD_API_TOKEN`を同じテストプロセスへ渡す。トークン値を結果表やログへ貼らない。詳細は [KiCad integration](KICAD_INTEGRATION.md#kicad-ipc) と [live_kicad_test.rs](../crates/konnect-ipc/tests/live_kicad_test.rs)。

@@ -83,6 +83,8 @@ jobs:
           python-version: "3.11"
       - name: Test
         run: python -m unittest discover -s plugin/tests -v
+      - name: Test routed KiCad acceptance checks
+        run: python -B -m unittest discover -s crates/konnect/tests/routed_kicad -v
 
   # flake.nix pins its own toolchain, dependency set and build flags, so
   # nothing else in CI would notice it going stale — and it names things
