@@ -2,7 +2,7 @@
 //!
 //! Drives the shipped binary over stdio through a full design loop:
 //! create project → place components → wire → ERC → export Gerbers → DRC.
-//! Also checks selected-layer PCB SVG export through the same MCP boundary.
+//! Also checks KiCad-backed PCB and schematic export tools through MCP.
 //!
 //! Requires kicad-cli and the standard symbol libraries, so it is `#[ignore]`
 //! by default and run explicitly by the e2e-kicad workflow (and locally):
@@ -137,6 +137,113 @@ impl Drop for Mcp {
 fn body(result: &Value) -> Value {
     serde_json::from_str(result["content"][0]["text"].as_str().unwrap_or("{}"))
         .unwrap_or(Value::Null)
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
+fn fabrication_and_document_exports_through_mcp() {
+    let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
+    let dir = tempfile::tempdir().unwrap();
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../konnect-core/tests/fixtures");
+    let board = dir.path().join("fabrication.kicad_pcb");
+    let schematic = dir.path().join("document.kicad_sch");
+    std::fs::copy(fixtures.join("specctra_soic8_roundrect.kicad_pcb"), &board).unwrap();
+    std::fs::copy(fixtures.join("ecc83_multiunit.kicad_sch"), &schematic).unwrap();
+
+    let mut mcp = Mcp::spawn(&kicad_cli);
+    mcp.load("pcb_export");
+    mcp.load("sch_export");
+
+    let placement = dir.path().join("placement.csv");
+    let response = body(&mcp.tool(
+        "export_position_file",
+        json!({"board":board,"output":placement,"side":"front","format":"csv"}),
+    ));
+    assert_eq!(response["output"], json!(placement));
+    let csv = std::fs::read_to_string(placement).unwrap();
+    let mut references: Vec<_> = csv
+        .lines()
+        .skip(1)
+        .map(|line| line.split(',').next().unwrap().trim_matches('"'))
+        .collect();
+    references.sort_unstable();
+    assert_eq!(references, ["U1", "U2"]);
+
+    for (tool, filename, format, signature, payload) in [
+        (
+            "export_3d",
+            "board.step",
+            Some("step"),
+            b"ISO-10303-21;".as_slice(),
+            b"MANIFOLD_SOLID_BREP".as_slice(),
+        ),
+        (
+            "export_3d",
+            "board.wrl",
+            Some("vrml"),
+            b"#VRML V2.0".as_slice(),
+            b"coordIndex".as_slice(),
+        ),
+        (
+            "export_gencad",
+            "board.cad",
+            None,
+            b"$HEADER".as_slice(),
+            b"COMPONENT \"U1\"".as_slice(),
+        ),
+        (
+            "export_ipc2581",
+            "board.xml",
+            None,
+            b"<IPC-2581 ".as_slice(),
+            b"refDes=\"U1\"".as_slice(),
+        ),
+        (
+            "export_odb",
+            "board.zip",
+            None,
+            b"PK\x03\x04".as_slice(),
+            b"steps/pcb/profile".as_slice(),
+        ),
+    ] {
+        let output = dir.path().join(filename);
+        let mut args = json!({"board":board,"output":output});
+        if let Some(format) = format {
+            args["format"] = json!(format);
+        }
+        let response = body(&mcp.tool(tool, args));
+        assert_eq!(response["output"], json!(output), "{tool} {filename}");
+        let contents = std::fs::read(&output).unwrap_or_else(|error| panic!("{filename}: {error}"));
+        for expected in [signature, payload] {
+            assert!(
+                contents
+                    .windows(expected.len())
+                    .any(|bytes| bytes == expected),
+                "missing {} in {filename}",
+                String::from_utf8_lossy(expected)
+            );
+        }
+    }
+
+    let dxf_dir = dir.path().join("dxf");
+    let response = body(&mcp.tool(
+        "export_dxf",
+        json!({"board":board,"output_dir":dxf_dir,"layers":["Edge.Cuts"]}),
+    ));
+    let files = response["files"].as_array().expect("DXF file inventory");
+    assert_eq!(files.len(), 1);
+    let dxf = std::fs::read_to_string(dxf_dir.join(files[0].as_str().unwrap())).unwrap();
+    assert!(dxf.lines().any(|line| line.trim() == "ENTITIES"));
+    assert_eq!(dxf.lines().filter(|line| line.trim() == "LINE").count(), 4);
+
+    let pdf = dir.path().join("schematic.pdf");
+    let response = body(&mcp.tool(
+        "export_schematic_pdf",
+        json!({"schematic":schematic,"output":pdf}),
+    ));
+    assert_eq!(response["exported"], json!(pdf));
+    assert!(std::fs::read(pdf).unwrap().starts_with(b"%PDF-"));
 }
 
 #[test]
