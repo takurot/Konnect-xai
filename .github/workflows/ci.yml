@@ -153,8 +153,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
         with:
+          command: check licenses
+          arguments: --locked --all-features
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
+        with:
+          manifest-path: crates/schematic-viewer/Cargo.toml
+          arguments: --locked --all-features
           command: check licenses
 
   # RUSTSEC advisory gate (deny.toml [advisories]). Accepted advisories live
@@ -165,8 +171,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
         with:
+          command: check advisories
+          arguments: --locked --all-features
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
+        with:
+          manifest-path: crates/schematic-viewer/Cargo.toml
+          arguments: --locked --all-features
           command: check advisories
 
   fmt:

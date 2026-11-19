@@ -76,3 +76,11 @@ test('missing platform package: message on stderr, nothing on stdout, non-zero e
   assert.equal(r.stdout, '');
   assert.match(r.stderr, /@konnect-xai\/konnect-/);
 });
+
+test('Linux loader failure gives the supported glibc floor on stderr', { skip: process.platform !== 'linux' }, () => {
+  const { root } = stubInstall('process.exit(127)');
+  const r = run(root, []);
+  assert.equal(r.status, 127);
+  assert.equal(r.stdout, '');
+  assert.match(r.stderr, /glibc 2\.35/);
+});

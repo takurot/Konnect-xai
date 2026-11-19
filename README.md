@@ -135,6 +135,13 @@ package name, for example `"args": ["-y", "@konnect-xai/konnect", "--config", "/
 Do not install with `--omit=optional` or `--no-optional`: the binary lives in
 the optional platform package. KiCad itself is still installed separately.
 
+Linux x64 and arm64 packages from v0.15.0 target glibc 2.35 or newer, with
+Ubuntu 22.04 and Debian 12 checked before publication. Alpine and other musl
+systems are unsupported by these binaries. The older v0.13.1 and v0.14.0
+Linux x64 binaries require glibc 2.43. The Linux x64 PCM viewer also needs
+the distribution's GTK 3 and WebKitGTK 4.1 runtimes
+(`libgtk-3-0`, `libwebkit2gtk-4.1-0` on Ubuntu 22.04).
+
 ### From the KiCAD Plugin Manager (recommended)
 
 1. Download the package for your OS from [Releases](https://github.com/mixelpixx/Konnect/releases):

@@ -44,10 +44,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             archive: tar.gz
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-latest
@@ -85,6 +85,10 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} -p konnect
 
+      - name: Check Linux server glibc requirements
+        if: runner.os == 'Linux'
+        run: packaging/check-glibc.sh "target/${{ matrix.target }}/release/konnect"
+
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -119,7 +123,7 @@ jobs:
           - platform: macos
             os: macos-latest
           - platform: linux
-            os: ubuntu-latest
+            os: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
 
@@ -175,6 +179,12 @@ jobs:
       - name: Require viewer binary (Linux)
         if: matrix.platform == 'linux'
         run: test -f crates/schematic-viewer/target/release/schematic-viewer
+
+      - name: Check Linux PCM binary glibc requirements
+        if: matrix.platform == 'linux'
+        run: |
+          packaging/check-glibc.sh target/release/konnect \
+            crates/schematic-viewer/target/release/schematic-viewer
 
       - name: Build universal binaries (macOS)
         if: matrix.platform == 'macos'
@@ -256,13 +266,54 @@ jobs:
           name: konnect-pcm-${{ matrix.platform }}
           path: dist/konnect-pcm-*.zip
 
+  linux-compatibility:
+    name: Linux npm compatibility (${{ matrix.os }}, ${{ matrix.image }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm]
+        image: ['ubuntu:22.04', 'debian:12']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: konnect-*
+          path: artifacts
+          merge-multiple: true
+      - name: Install candidate packages and initialize MCP
+        env:
+          LINUX_IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            version=$(node npm/scripts/version.js)
+          else
+            version=$(node npm/scripts/version.js "${RELEASE_VERSION#v}")
+          fi
+          node npm/scripts/stage.js "$version" artifacts
+          node_prefix=$(dirname "$(dirname "$(command -v node)")")
+          docker run --rm -v "$PWD:/work:ro" -v "$node_prefix:/opt/node:ro" -w /work \
+            "$LINUX_IMAGE" bash -euc '
+              export PATH="/opt/node/bin:$PATH"
+              getconf GNU_LIBC_VERSION
+              exec node npm/scripts/smoke.js "$1" npm
+            ' bash "$version"
+
   # Publishes @konnect-xai/konnect and its five platform packages. Auth is npm
   # Trusted Publishing (OIDC, registered per package for this workflow file), so
   # no npm token exists anywhere. A manual dispatch stages and smoke-tests the
   # packages and runs `npm publish --dry-run`.
   publish-npm:
     name: Publish to npm
-    needs: [real-kicad-acceptance, build]
+    needs: [real-kicad-acceptance, build, linux-compatibility]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -307,20 +358,24 @@ jobs:
         run: |
           tag=latest
           case "$VERSION" in *-*) tag=next ;; esac
+          publish_options=(--access public --provenance --tag "$tag")
+          if [[ -n "$DRY_RUN" ]]; then
+            publish_options+=(--dry-run)
+          fi
           # Platform packages first so the launcher never points at a missing one.
           for dir in konnect-linux-x64 konnect-linux-arm64 konnect-darwin-x64 konnect-darwin-arm64 konnect-win32-x64 konnect; do
             name="$(node -p "require('./npm/${dir}/package.json').name")"
-            if npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
+            if [[ -z "$DRY_RUN" ]] && npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
               echo "${name}@${VERSION} is already published, skipping"
               continue
             fi
-            npm publish "./npm/${dir}" --access public --provenance --tag "$tag" $DRY_RUN
+            npm publish "./npm/${dir}" "${publish_options[@]}"
           done
 
   release:
     name: Create Release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [real-kicad-acceptance, build, pcm-package]
+    needs: [real-kicad-acceptance, build, pcm-package, linux-compatibility]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
