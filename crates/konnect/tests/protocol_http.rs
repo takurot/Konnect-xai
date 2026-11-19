@@ -128,7 +128,11 @@ impl HttpServer {
         {
             req.push_str(&format!("Host: {}\r\n", self.addr));
         }
-        if body.starts_with('{') {
+        if !body.is_empty()
+            && !extra_headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        {
             req.push_str("Content-Type: application/json\r\n");
         }
         for (k, v) in extra_headers {
@@ -234,6 +238,112 @@ fn streamable_http_conformance() {
         )
         .unwrap();
     assert_eq!(status, 200);
+}
+
+#[test]
+fn protocol_notifications_have_empty_http_bodies() {
+    let server = HttpServer::spawn();
+    for method in [
+        "notifications/roots/list_changed",
+        "notifications/cancelled",
+        "ping",
+    ] {
+        let (status, _, body) = server
+            .raw_request(
+                "POST",
+                "/mcp",
+                &[],
+                Some(&json!({"jsonrpc":"2.0","method":method}).to_string()),
+            )
+            .unwrap();
+        assert_eq!(status, 202, "{method}: {body}");
+        assert!(body.is_empty(), "{method}: {body}");
+    }
+}
+
+#[test]
+fn protocol_errors_return_json_rpc_over_http() {
+    let server = HttpServer::spawn();
+    for (message, id, code, expected_status) in [
+        (
+            r#"{"jsonrpc":"2.0","id":2,"method":"resources/templates/list"}"#,
+            json!(2),
+            -32601,
+            200,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":3,"method":"logging/setLevel"}"#,
+            json!(3),
+            -32601,
+            200,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":4,"method":"completion/complete"}"#,
+            json!(4),
+            -32601,
+            200,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"file:///example"}}"#,
+            json!(5),
+            -32601,
+            200,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"arguments":{}}}"#,
+            json!(6),
+            -32602,
+            200,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":[]}"#,
+            json!(7),
+            -32602,
+            200,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"list_toolboxes","arguments":[]}}"#,
+            json!(8),
+            -32602,
+            200,
+        ),
+        (
+            r#"[{"jsonrpc":"2.0","id":9,"method":"ping"}]"#,
+            Value::Null,
+            -32600,
+            200,
+        ),
+        ("[]", Value::Null, -32600, 200),
+        (r#"{"id":10,"method":"ping"}"#, json!(10), -32600, 200),
+        (
+            r#"{"jsonrpc":"1.0","id":"wrong-version","method":"ping"}"#,
+            json!("wrong-version"),
+            -32600,
+            200,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+            Value::Null,
+            -32600,
+            200,
+        ),
+        (r#"{"jsonrpc":"2.0"}"#, Value::Null, -32600, 200),
+        ("{", Value::Null, -32700, 400),
+    ] {
+        let (status, headers, body) = server
+            .raw_request("POST", "/mcp", &[], Some(message))
+            .unwrap();
+        assert_eq!(status, expected_status, "{message}: {body}");
+        assert!(
+            headers.to_lowercase().contains("application/json"),
+            "{message}: {headers}"
+        );
+        let response: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(response["jsonrpc"], "2.0", "{message}: {response}");
+        assert_eq!(response.get("id"), Some(&id), "{message}: {response}");
+        assert_eq!(response["error"]["code"], code, "{message}: {response}");
+        assert!(response.get("result").is_none());
+    }
 }
 
 #[test]
