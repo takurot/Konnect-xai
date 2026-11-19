@@ -951,3 +951,250 @@ fn check_freerouting_reports_every_location_it_searched_over_stdio() {
     assert_eq!(last["location_path"], json!(bin_s), "{last}");
     assert_eq!(last["max_depth"], 1, "{last}");
 }
+
+#[cfg(unix)]
+mod child_stdio {
+    use super::{json, Value};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+    use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+    use tokio::time::{sleep, timeout};
+
+    const LIMIT: Duration = Duration::from_secs(10);
+
+    struct Session {
+        child: Child,
+        stdin: ChildStdin,
+        output: Lines<BufReader<ChildStdout>>,
+        next_id: u64,
+    }
+
+    impl Session {
+        async fn start(dir: &Path, setting: &str, executable: &Path) -> Self {
+            let config = dir.join("konnect.toml");
+            std::fs::write(&config, format!("{setting} = {:?}\n", executable)).unwrap();
+            let mut child = Command::new(env!("CARGO_BIN_EXE_konnect"))
+                .current_dir(dir)
+                .args(["--config", "konnect.toml"])
+                .env("HOME", dir)
+                .env("KONNECT_STATE_DIR", dir.join("state"))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut session = Self {
+                stdin: child.stdin.take().unwrap(),
+                output: BufReader::new(child.stdout.take().unwrap()).lines(),
+                child,
+                next_id: 1,
+            };
+            let init = session
+                .request(
+                    "initialize",
+                    json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "child-stdio", "version": "1"},
+                    }),
+                )
+                .await;
+            assert_eq!(init["serverInfo"]["name"], "konnect");
+            session
+                .stdin
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                .await
+                .unwrap();
+            session
+        }
+
+        async fn request(&mut self, method: &str, params: Value) -> Value {
+            let id = self.next_id;
+            self.next_id += 1;
+            let message = json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params});
+            self.stdin
+                .write_all(format!("{message}\n").as_bytes())
+                .await
+                .unwrap();
+            timeout(LIMIT, async {
+                loop {
+                    let line = self.output.next_line().await.unwrap().expect("MCP EOF");
+                    let message: Value = serde_json::from_str(&line)
+                        .unwrap_or_else(|_| panic!("Non-JSON line in MCP stdout: {line}"));
+                    assert_eq!(message["jsonrpc"], "2.0", "{message}");
+                    if message["id"] == id {
+                        return message["result"].clone();
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("No MCP response to {method}"))
+        }
+
+        async fn tool(&mut self, name: &str, arguments: Value) -> Value {
+            let result = self
+                .request("tools/call", json!({"name":name, "arguments":arguments}))
+                .await;
+            assert_ne!(result["isError"], true, "{name}: {result}");
+            assert!(result["content"][0]["text"].is_string(), "{name}: {result}");
+            super::McpProcess::tool_body(&result)
+        }
+
+        async fn close(self) {
+            let Self {
+                mut child,
+                stdin,
+                mut output,
+                ..
+            } = self;
+            drop(stdin);
+            assert!(
+                timeout(LIMIT, child.wait())
+                    .await
+                    .expect("Konnect did not exit")
+                    .unwrap()
+                    .success(),
+                "Konnect did not exit cleanly"
+            );
+            timeout(LIMIT, async {
+                while let Some(line) = output.next_line().await.unwrap() {
+                    let message: Value = serde_json::from_str(&line)
+                        .unwrap_or_else(|_| panic!("Non-JSON line in MCP stdout: {line}"));
+                    assert_eq!(message["jsonrpc"], "2.0", "{message}");
+                }
+            })
+            .await
+            .expect("a child kept the MCP stdout pipe open");
+        }
+    }
+
+    fn executable(dir: &Path, name: &str, content: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    async fn wait_for_file(path: &Path) {
+        timeout(LIMIT, async {
+            while !path.is_file() {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("Child did not create {}", path.display()));
+    }
+
+    #[tokio::test]
+    async fn cli_child_reads_eof_and_export_and_ping_leave_stdout_as_json_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = executable(
+            dir.path(),
+            "fake-kicad-cli",
+            "#!/bin/sh\n\
+             case \"$1\" in --version|-v|version) printf '10.0.8\\n'; exit 0;; esac\n\
+             printf 'CLI progress (not JSON)\\n'\n\
+             printf 'CLI diagnostic (not JSON)\\n' >&2\n\
+             if read -r ignored; then exit 3; fi\n\
+             printf 'stdin EOF' > cli-read-result\n\
+             [ \"$1 $2 $3 $4\" = 'sch export pdf --output' ] || exit 2\n\
+             printf '%%PDF-1.4\\n' > \"$5\"\n",
+        );
+        let schematic = dir.path().join("demo.kicad_sch");
+        std::fs::write(
+            &schematic,
+            "(kicad_sch (version 20250114) (generator eeschema))",
+        )
+        .unwrap();
+        let output = dir.path().join("demo.pdf");
+        let mut session = Session::start(dir.path(), "kicad_cli", &cli).await;
+        session
+            .tool("load_toolset", json!({"name":"sch_export"}))
+            .await;
+        session
+            .tool(
+                "export_schematic_pdf",
+                json!({"schematic":schematic,"output":output}),
+            )
+            .await;
+        assert_eq!(std::fs::read(output).unwrap(), b"%PDF-1.4\n");
+        assert_eq!(
+            std::fs::read(dir.path().join("cli-read-result")).unwrap(),
+            b"stdin EOF"
+        );
+        assert_eq!(session.request("ping", json!({})).await, json!({}));
+        session.close().await;
+    }
+
+    #[tokio::test]
+    async fn installation_version_probe_reads_eof_without_consuming_mcp_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = executable(
+            dir.path(),
+            "fake-kicad-version",
+            "#!/bin/sh\n\
+             [ \"$1\" = --version ] || exit 2\n\
+             printf 'CLI version diagnostic (not JSON)\\n' >&2\n\
+             if read -r ignored; then exit 3; fi\n\
+             printf '10.0.8\\n'\n",
+        );
+        let mut session = Session::start(dir.path(), "kicad_cli", &cli).await;
+        let body = session.tool("get_installation_info", json!({})).await;
+        assert_eq!(body["kicad"]["probe_status"], "ok", "{body}");
+        assert_eq!(body["kicad"]["version"], "10.0.8");
+        assert_eq!(session.request("ping", json!({})).await, json!({}));
+        session.close().await;
+    }
+
+    #[tokio::test]
+    async fn gui_child_leaves_mcp_stdout_and_eof_independent_of_its_lifetime() {
+        let dir = tempfile::tempdir().unwrap();
+        let gui = executable(
+            dir.path(),
+            "fake-kicad-gui",
+            "#!/bin/sh\n\
+             printf 'GUI progress (not JSON)\\n'\n\
+             printf 'GUI diagnostic (not JSON)\\n' >&2\n\
+             if read -r ignored; then exit 3; fi\n\
+             printf 'stdin EOF' > gui-read-result.tmp\n\
+             mv gui-read-result.tmp gui-read-result\n\
+             i=0; while [ \"$i\" -lt 200 ] && [ -d \"$PWD\" ] && [ ! -f gui-release ]; do\n\
+               sleep 0.1; i=$((i + 1))\n\
+             done\n\
+             [ ! -d \"$PWD\" ] || touch gui-finished\n",
+        );
+        // Bound the fake GUI even on a failed assertion and release it promptly.
+        struct ReleaseGui<'a>(&'a Path);
+        impl Drop for ReleaseGui<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::write(self.0, "");
+            }
+        }
+        let release_path = dir.path().join("gui-release");
+        let release = ReleaseGui(&release_path);
+        let mut session = Session::start(dir.path(), "kicad_binary", &gui).await;
+        session
+            .tool("load_toolset", json!({"name":"verification"}))
+            .await;
+        let started = session
+            .tool("launch_kicad_ui", json!({"wait_ready":false}))
+            .await;
+        assert_eq!(started["launched"], true, "{started}");
+        let evidence = dir.path().join("gui-read-result");
+        wait_for_file(&evidence).await;
+        assert_eq!(std::fs::read(evidence).unwrap(), b"stdin EOF");
+        assert_eq!(session.request("ping", json!({})).await, json!({}));
+        session.close().await;
+        let finished = dir.path().join("gui-finished");
+        assert!(
+            !finished.exists(),
+            "Konnect must exit while the GUI still runs"
+        );
+        drop(release);
+        wait_for_file(&finished).await;
+    }
+}
