@@ -1149,6 +1149,107 @@ mod placement_overlap_tests {
         assert_eq!(result["overlap_count"], 0, "{result}");
     }
 
+    const NATIVE: &str = include_str!("../../tests/fixtures/overlaps_kicad10.kicad_sch");
+
+    #[tokio::test]
+    async fn native_label_extents_and_power_pin_tip_are_distinguished() {
+        let result = overlaps(NATIVE).await;
+        let findings = result["overlaps"].as_array().unwrap();
+        assert_eq!(findings.len(), 1, "{result}");
+        assert_eq!(findings[0]["type"], "label_overlap");
+        let uuids = [&findings[0]["uuid_a"], &findings[0]["uuid_b"]];
+        assert!(uuids.contains(&&json!("fc0cc965-47c7-4935-964f-b2936fb5d4cf")));
+        assert!(uuids.contains(&&json!("0fa485e0-be78-49a0-8d1e-fecd5a02403a")));
+
+        let moved = NATIVE.replacen("(at 96.19 100 0)", "(at 100 99.5 0)", 1);
+        let result = overlaps(&moved).await;
+        let findings = result["overlaps"].as_array().unwrap();
+        let collision = findings
+            .iter()
+            .find(|finding| finding["type"] == "component_overlap")
+            .unwrap();
+        assert_eq!(collision["uuid_a"], "0bb65184-85ad-4de5-9aa6-9c6c8c3e92bc");
+        assert_eq!(collision["uuid_b"], "b88ea8a8-1554-4c53-94d5-5e6a70a26915");
+    }
+
+    #[tokio::test]
+    async fn oriented_labels_and_mirrored_symbol_fields_use_saved_layout() {
+        let extras = r#"
+  (wire (pts (xy 133 128) (xy 133 132)) (uuid "global-cross"))
+  (wire (pts (xy 173 120) (xy 177 120)) (uuid "hier-cross"))
+  (text "X" (at 101.2 95 0) (effects (font (size 0.6 0.6))) (uuid "field-probe"))
+"#;
+        let modified = format!("{}{extras})", NATIVE.trim_end().strip_suffix(')').unwrap());
+        let result = overlaps(&modified).await;
+        let findings = result["overlaps"].as_array().unwrap();
+        for (text, wire) in [
+            ("984f10b4-09d0-4215-bb1e-64ce340ee3bf", "global-cross"),
+            ("bd75fa5e-7bb2-4c8d-b77e-8b5af48ef288", "hier-cross"),
+        ] {
+            assert!(
+                findings.iter().any(|item| {
+                    item["type"] == "text_wire_overlap"
+                        && item["uuid_a"] == text
+                        && item["uuid_b"] == wire
+                }),
+                "{result}"
+            );
+        }
+        assert!(
+            findings.iter().any(|item| {
+                item["type"] == "text_overlap"
+                    && [item["uuid_a"].as_str(), item["uuid_b"].as_str()]
+                        .contains(&Some("field-probe"))
+                    && [item["uuid_a"].as_str(), item["uuid_b"].as_str()]
+                        .contains(&Some("b88ea8a8-1554-4c53-94d5-5e6a70a26915"))
+            }),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_reports_sheet_owners_and_other_bodies_but_skips_hidden_fields() {
+        let source = schematic(&[("R1", 100.0, 50.0), ("R2", 110.0, 50.0)])
+            .replacen(
+                "(property \"Value\" \"10k\")",
+                "(property \"Value\" \"10k\" (at 110 50 0) (effects (font (size 1.27 1.27))))",
+                1,
+            )
+            .replacen(
+                "(property \"Reference\" \"R2\")",
+                "(property \"Reference\" \"HIDDEN\" (at 130 50 0) (hide yes) (effects (font (size 1.27 1.27))))",
+                1,
+            );
+        let extras = r#"
+  (sheet (at 130 51) (size 10 10) (uuid "sheet")
+    (property "Sheetname" "CHILD" (at 130 50 0) (effects (font (size 1.27 1.27)))))
+  (text "NOTE" (at 130 50 0) (effects (font (size 1.27 1.27))))
+"#;
+        let result = overlaps(&format!(
+            "{}{extras})",
+            source.trim_end().strip_suffix(')').unwrap()
+        ))
+        .await;
+        let findings = result["overlaps"].as_array().unwrap();
+        assert_eq!(findings.len(), 2, "{result}");
+        assert!(
+            findings.iter().any(|item| {
+                item["type"] == "text_body_overlap"
+                    && item["uuid_a"] == "R1"
+                    && item["uuid_b"] == "R2"
+            }),
+            "{result}"
+        );
+        assert!(
+            findings.iter().any(|item| {
+                item["type"] == "text_overlap"
+                    && [item["uuid_a"].as_str(), item["uuid_b"].as_str()].contains(&Some("sheet"))
+                    && (item["uuid_a"].is_null() || item["uuid_b"].is_null())
+            }),
+            "{result}"
+        );
+    }
+
     #[tokio::test]
     async fn invalid_overlap_tolerance_is_a_named_argument_error() {
         let tmp = tempfile::tempdir().unwrap();
