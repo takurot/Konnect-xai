@@ -13,6 +13,7 @@ use konnect_sexp::geometry::round6;
 use konnect_sexp::writer::{write_atomic_if_unchanged, write_new_atomic};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -936,6 +937,18 @@ async fn handle_launch_kicad_ui(
     let binary = find_kicad_binary(&ctx.config.kicad_binary, &ctx.config.kicad_cli);
 
     let mut cmd = tokio::process::Command::new(&binary);
+    // KiCad can outlive this server. It must not keep carrying the MCP pipes
+    // or receive terminal interrupts meant for the caller's process group.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    #[cfg(windows)]
+    {
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(DETACHED_PROCESS);
+    }
     if let Some(project) = args["project"].as_str() {
         cmd.arg(project);
     }

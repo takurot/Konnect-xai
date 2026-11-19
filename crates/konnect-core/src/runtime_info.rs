@@ -6,6 +6,7 @@ use crate::tools::ServerConfig;
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -200,7 +201,10 @@ impl VersionProbe {
 
 async fn probe_command_version(path: &Path, command_kind: VersionCommand) -> VersionProbe {
     let mut command = Command::new(path);
-    command.arg("--version").kill_on_drop(true);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
     let output = match tokio::time::timeout(COMMAND_TIMEOUT, command.output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(_)) => {

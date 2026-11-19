@@ -602,6 +602,12 @@ including cheap reads, run in arrival order with at most 128 additional calls
 queued. The transport rejects excess queued requests instead of growing an
 unbounded work queue.
 
+GUI processes started by `launch_kicad_ui` have separate standard streams
+and may keep running after Konnect exits. KiCad CLI exports, checks and version
+probes give `kicad-cli` an empty stdin and capture its diagnostic output. An
+export or check that times out terminates and reaps its owned child before
+reporting the timeout.
+
 A client can cancel an active or queued request using
 `notifications/cancelled` with its exact `requestId` (numeric and string IDs
 are distinct). Konnect suppresses the cancelled response, drops the running

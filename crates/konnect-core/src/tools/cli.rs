@@ -444,6 +444,7 @@ async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Re
     let exe = resolve_cli_executable(cli);
     let mut cmd = Command::new(&exe);
     cmd.args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -487,8 +488,9 @@ async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Re
                 .terminate()
                 .await
                 .context("failed to stop timed-out kicad-cli")?;
-            return Err(elapsed)
-                .with_context(|| format!("kicad-cli timed out after {:?}", timeout_dur));
+            return Err(elapsed).with_context(|| {
+                format!("kicad-cli timed out after {timeout_dur:?} (child process reaped)")
+            });
         }
     };
     owned.disarm();
@@ -4299,7 +4301,12 @@ mod cancellation_tests {
         assert!(
             matches!(task.await.unwrap(), Err(error) if error.to_string().contains("timed out"))
         );
+        let reaped_at_return = !is_running(&pid);
         assert_terminated(&pid).await;
+        assert!(
+            reaped_at_return,
+            "timed-out CLI {pid} was reaped after the response"
+        );
     }
     #[tokio::test]
     async fn cancelled_cli_remains_request_owned_until_child_is_reaped() {
