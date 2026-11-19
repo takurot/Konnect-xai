@@ -224,17 +224,36 @@ fn is_npx_cached_binary(exe: &Path) -> bool {
 #[derive(Debug)]
 struct InstallPaths {
     home: PathBuf,
+    state: PathBuf,
+    use_legacy_state: bool,
 }
 
 impl InstallPaths {
     fn for_current_user() -> Result<Self> {
+        let home = dirs::home_dir()
+            .filter(|path| path.is_absolute())
+            .context("could not locate home directory")?;
+        let state = konnect_sexp::state::StateDir::resolve().map_err(anyhow::Error::msg)?;
         Ok(Self {
-            home: dirs::home_dir().context("could not locate home directory")?,
+            home,
+            state: state.root().to_owned(),
+            use_legacy_state: !state.is_overridden(),
         })
     }
 
-    fn data_dir(&self) -> PathBuf {
-        self.home.join(".konnect")
+    fn data_dir(&self) -> &Path {
+        &self.state
+    }
+
+    fn state_file(&self, name: &str) -> PathBuf {
+        let current = self.data_dir().join(name);
+        if self.use_legacy_state && !current.exists() {
+            let old = self.home.join(".konnect").join(name);
+            if old.exists() {
+                return old;
+            }
+        }
+        current
     }
 
     fn skills_dir(&self, client: InstallClient) -> PathBuf {
@@ -253,15 +272,15 @@ impl InstallPaths {
     }
 
     fn marker(&self, client: InstallClient) -> PathBuf {
-        self.data_dir().join(client.marker_name())
+        self.state_file(client.marker_name())
     }
 
     fn legacy_marker(&self) -> PathBuf {
-        self.data_dir().join(".installed")
+        self.state_file(".installed")
     }
 
     fn guidance_checked(&self, client: InstallClient) -> PathBuf {
-        self.data_dir().join(client.checked_name())
+        self.state_file(client.checked_name())
     }
 }
 
@@ -885,7 +904,7 @@ fn is_konnect_executable(path: &str) -> bool {
 /// The executable is captured at startup, before an update can replace it.
 ///
 /// Each installed guidance version is scanned once: the first process to see
-/// a new install marker scans, records the result under `~/.konnect`, and
+/// a new install marker scans, records the result under the Konnect state directory, and
 /// offers one notice. Later processes read the record, even after a binary
 /// update, so guidance the user chose to keep is not reported on every start.
 /// `konnect status` still scans on demand.
@@ -1391,6 +1410,8 @@ mod tests {
     fn test_paths(temp: &TempDir) -> InstallPaths {
         InstallPaths {
             home: temp.path().to_path_buf(),
+            state: temp.path().join(".konnect"),
+            use_legacy_state: false,
         }
     }
 

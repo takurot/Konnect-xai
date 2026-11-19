@@ -50,12 +50,8 @@ fn guidance_snapshot(home: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
             visit(home, &path, &mut entries);
         }
     }
-    for name in [
-        ".konnect/.installed",
-        ".konnect/.installed-claude",
-        ".konnect/.installed-codex",
-    ] {
-        let path = home.join(name);
+    for name in [".installed", ".installed-claude", ".installed-codex"] {
+        let path = home.join(".konnect-state").join(name);
         if path.exists() {
             entries.push((PathBuf::from(name), Some(fs::read(path).unwrap())));
         }
@@ -312,8 +308,49 @@ fn state_override_keeps_run_records_logs_and_markers_out_of_the_home_and_project
         .success());
     assert!(state.join(".installed-codex").is_file());
 
-    let mut server = konnect(home.path())
+    let mut command = konnect(home.path());
+    command.current_dir(project.path());
+    let mut server = call_server(command);
+    let record = state.join("run").join(format!("{}.json", server.id()));
+    let log = state.join("logs/calls.jsonl");
+    let registered = record.is_file();
+    let logged = fs::read_to_string(log).is_ok_and(|line| line.contains("list_toolboxes"));
+    stop_server(&mut server);
+    assert!(registered && !record.exists());
+    assert!(logged);
+    assert!(project.path().read_dir().unwrap().next().is_none());
+    assert!(!home.path().join(".konnect").exists());
+}
+
+#[test]
+fn missing_home_and_unavailable_state_do_not_write_into_cwd() {
+    let project = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+    command
         .current_dir(project.path())
+        .env_remove("HOME")
+        .env("KONNECT_STATE_DIR", "relative-invalid");
+    stop_server(&mut call_server(command));
+    assert!(project.path().read_dir().unwrap().next().is_none());
+}
+
+#[test]
+fn disabled_call_log_creates_no_log_or_rotation_lock() {
+    let home = tempfile::tempdir().unwrap();
+    let state = home.path().join(".konnect-state");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(state.join("config.toml"), "call_log = false\n").unwrap();
+    stop_server(&mut call_server(konnect(home.path())));
+    assert!(!state.join("logs").exists());
+}
+
+fn stop_server(server: &mut std::process::Child) {
+    drop(server.stdin.take());
+    assert!(server.wait().unwrap().success());
+}
+
+fn call_server(mut command: Command) -> std::process::Child {
+    let mut server = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -344,14 +381,6 @@ fn state_override_keeps_run_records_logs_and_markers_out_of_the_home_and_project
             }
         }
     }
-    let record = state.join("run").join(format!("{}.json", server.id()));
-    let log = state.join("logs/calls.jsonl");
-    let registered = record.is_file();
-    let logged = fs::read_to_string(log).is_ok_and(|line| line.contains("list_toolboxes"));
-    drop(stdin);
-    assert!(server.wait().unwrap().success());
-    assert!(registered && !record.exists());
-    assert!(logged);
-    assert!(project.path().read_dir().unwrap().next().is_none());
-    assert!(!home.path().join(".konnect").exists());
+    server.stdin = Some(stdin);
+    server
 }

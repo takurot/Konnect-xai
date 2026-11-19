@@ -23,25 +23,50 @@ MAX_DSN_BYTES = 512 * 1024 * 1024
 UI_TIMEOUT_SECONDS = 30
 
 
-def bridge_root():
-    """Return the per-user registration directory shared with Konnect Rust."""
-    override = os.environ.get("KONNECT_BRIDGE_DIR")
-    if override:
-        return os.path.abspath(os.path.expanduser(override))
-    if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
-    elif sys_platform() == "darwin":
-        base = os.path.expanduser("~/Library/Application Support")
-    else:
-        base = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
-    return os.path.join(base, "konnect", "native-bridge")
+def _absolute_override(name):
+    value = os.environ.get(name)
+    if value and not os.path.isabs(value):
+        raise ValueError(f"{name} must be an absolute path")
+    return value
 
 
-def sys_platform():
-    # Kept behind a function so platform-path behavior is easy to test.
+def state_root():
+    """Use the same platform-local data location as the Rust state resolver."""
     import sys
 
-    return sys.platform
+    override = _absolute_override("KONNECT_STATE_DIR")
+    if override:
+        return override
+    if os.name == "nt":
+        import ctypes
+
+        # CSIDL_LOCAL_APPDATA honors the Windows Known Folder location.
+        buffer = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 0x001C, None, 0, buffer):
+            raise OSError("Windows Local AppData is unavailable")
+        base = buffer.value
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        xdg = os.environ.get("XDG_DATA_HOME", "")
+        base = xdg if os.path.isabs(xdg) else os.path.expanduser("~/.local/share")
+    if not os.path.isabs(base):
+        raise OSError("no platform local-data directory is available")
+    return os.path.join(base, "konnect")
+
+
+def bridge_root():
+    """Return the per-user registration directory shared with Konnect Rust."""
+    return _absolute_override("KONNECT_BRIDGE_DIR") or os.path.join(state_root(), "native-bridge")
+
+
+def cache_root():
+    if os.environ.get("KONNECT_STATE_DIR") or os.name == "nt":
+        return os.path.join(state_root(), "cache")
+    cache = os.path.expanduser("~/.cache")
+    if not os.path.isabs(cache):
+        raise OSError("no platform cache directory is available")
+    return os.path.join(cache, "konnect", "cache")
 
 
 def _canonical(path):
@@ -146,14 +171,11 @@ class NativeSpecctraBridge:
     def __init__(self, pcbnew_module, wx_module, root=None):
         self.pcbnew = pcbnew_module
         self.wx = wx_module
-        self.root = root or bridge_root()
+        self.root = root
         self.token = secrets.token_urlsafe(32)
         self.server = None
         self.thread = None
-        self.registration_path = os.path.join(
-            self.root,
-            f"bridge-{os.getpid()}-{secrets.token_hex(8)}.json",
-        )
+        self.registration_path = None
         self.session_dir = None
         self.started_at = None
         self.operation_lock = threading.Lock()
@@ -169,6 +191,10 @@ class NativeSpecctraBridge:
             return True
         if not self.available():
             return False
+        self.root = self.root or bridge_root()
+        self.registration_path = os.path.join(
+            self.root, f"bridge-{os.getpid()}-{secrets.token_hex(8)}.json"
+        )
         os.makedirs(self.root, exist_ok=True)
         self.session_dir = tempfile.mkdtemp(prefix=f"session-{os.getpid()}-", dir=self.root)
         self.server = _BridgeServer(("127.0.0.1", 0), self)
@@ -208,7 +234,8 @@ class NativeSpecctraBridge:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=5)
         try:
-            os.remove(self.registration_path)
+            if self.registration_path is not None:
+                os.remove(self.registration_path)
         except OSError:
             pass
         if self.session_dir:

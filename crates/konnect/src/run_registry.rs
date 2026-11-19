@@ -107,12 +107,6 @@ impl Drop for RunGuard {
     }
 }
 
-/// `<konnect_dir>/run` — same convention as the logs directory, not a second
-/// path scheme.
-fn run_dir() -> PathBuf {
-    konnect_core::observability::konnect_dir().join("run")
-}
-
 /// The body that belongs to a `<pid>.lock`.
 fn body_for(lock: &Path) -> PathBuf {
     lock.with_extension("json")
@@ -143,7 +137,14 @@ fn is_our_stem(path: &Path) -> bool {
 /// Reap stale records, then register this process. Sweep first, so our own
 /// record is never a candidate for it.
 pub fn sweep_and_register(transport: &TransportMode) -> RunGuard {
-    let dir = run_dir();
+    let state = match konnect_sexp::state::StateDir::resolve() {
+        Ok(state) => state,
+        Err(error) => {
+            warn!(error, "run registry unavailable");
+            return RunGuard::inert();
+        }
+    };
+    let dir = state.root().join("run");
     sweep(&dir);
     register(
         &dir,

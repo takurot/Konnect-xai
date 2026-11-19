@@ -42,12 +42,18 @@ jobs:
       # regression gate; this makes contract drift immediately identifiable.
       - name: Reliability contract
         if: matrix.os == 'ubuntu-latest'
+        env:
+          KONNECT_STATE_DIR: ${{ runner.temp }}/konnect-ci-state
         run: cargo test -p konnect-core --locked reliability_contract -- --nocapture
       - name: Test (unit + integration)
+        env:
+          KONNECT_STATE_DIR: ${{ runner.temp }}/konnect-ci-state
         run: cargo test --workspace --locked --lib --tests
       # --doc cannot be combined with --lib/--tests; doctests broke silently
       # once (PR #49) because they were never run in CI.
       - name: Doctests
+        env:
+          KONNECT_STATE_DIR: ${{ runner.temp }}/konnect-ci-state
         run: cargo test --workspace --locked --doc
 
   # The npm launcher and the staging scripts are plain Node, so cargo never
