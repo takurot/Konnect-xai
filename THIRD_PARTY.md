@@ -1,9 +1,8 @@
 # Third-Party Notices
 
 Konnect incorporates data, algorithms, and code ported from the following
-projects. Konnect itself is licensed under the AGPL-3.0 (see LICENSE) with a
-commercial option (see COMMERCIAL.md); the notices below travel with every
-distribution of Konnect, under either license.
+projects. This fork is licensed under AGPL-3.0-only (see LICENSE). The
+notices below accompany distributions of Konnect-xai.
 
 ## topola_specctra
 
