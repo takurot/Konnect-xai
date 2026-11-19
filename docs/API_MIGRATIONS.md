@@ -236,17 +236,15 @@ never refuses a sync: staging is a starting position.
 
 ## Unreleased: `check_freerouting` reports where it searched (minor release)
 
-The `jar_path` argument of `check_freerouting` and `route_specctra_dsn` was
-described as "uses config default", but no Freerouting setting exists. Both
-descriptions now list where discovery looks, in order: the directories named
-by `KICAD10_3RD_PARTY`, `KICAD9_3RD_PARTY` and `KICAD8_3RD_PARTY`; the KiCad
-10.0, 9.0 and 8.0 plugin folders `$HOME/Documents/KiCad/<version>/3rdparty/plugins`,
-`$HOME/.local/share/kicad/<version>/3rdparty/plugins` and, on Windows,
-`$USERPROFILE/Documents/KiCad/<version>/3rdparty/plugins`; `freerouting.jar` in
-the server's working directory; `/usr/local/lib/freerouting` and
-`/opt/freerouting`; then every directory on `PATH`. The search and both
-descriptions are built from the same table of places, and the search itself is
-unchanged.
+The optional `jar_path` argument of `check_freerouting` and `route_specctra_dsn`
+points to a local JAR. When omitted, both tools search the directories named by
+`KICAD<major>_3RD_PARTY` in descending major version order. They then search
+existing `<major>.<minor>` directories under `$KICAD_DOCUMENTS_HOME`,
+`$HOME/Documents/KiCad`, `$HOME/.local/share/kicad`, and on Windows
+`$USERPROFILE/Documents/KiCad`, newest version first within each root. Each
+version contributes its `3rdparty/plugins` path. The final locations are
+`freerouting.jar` in the server's working directory, `/usr/local/lib/freerouting`,
+`/opt/freerouting`, and every directory on `PATH`.
 
 When nothing is found, `check_freerouting` adds `searched_locations`: one
 entry per location visited, with `kind`, `location_path`, `max_depth` and

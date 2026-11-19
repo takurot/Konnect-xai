@@ -5,10 +5,148 @@
 //! intentionally read-only: Windows and KiCad already persist install state,
 //! while an explicit Konnect configuration remains the durable override.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-#[cfg(target_os = "windows")]
-const SUPPORTED_VERSIONS: [&str; 3] = ["10.0", "9.0", "8.0"];
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+struct Version {
+    major: u32,
+    minor: u32,
+}
+
+impl Version {
+    const DEFAULT: Self = Self {
+        major: 10,
+        minor: 0,
+    };
+
+    fn from_directory(name: &OsStr) -> Option<Self> {
+        let (major, minor) = name.to_str()?.split_once('.')?;
+        Some(Self {
+            major: number(major)?,
+            minor: number(minor)?,
+        })
+    }
+
+    // kicad-cli reports a bare version such as 10.0.8 or 10.99.0-127-gabcd.
+    fn from_report(report: &str) -> Option<Self> {
+        let mut parts = report.trim().split('.');
+        let version = Self {
+            major: number(parts.next()?)?,
+            minor: number(parts.next()?)?,
+        };
+        if let Some(patch) = parts.next() {
+            number(patch.split(['-', '+']).next()?)?;
+        }
+        Some(version)
+    }
+
+    fn directory_name(self) -> String {
+        format!("{}.{}", self.major, self.minor)
+    }
+}
+
+fn number(value: &str) -> Option<u32> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn versioned_dirs(base: &Path) -> Vec<(Version, PathBuf)> {
+    let mut directories: Vec<_> = std::fs::read_dir(base)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let version = Version::from_directory(&entry.file_name())?;
+            let path = entry.path();
+            path.is_dir().then_some((version, path))
+        })
+        .collect();
+    directories.sort_by(|(left_version, left_path), (right_version, right_path)| {
+        right_version
+            .cmp(left_version)
+            .then_with(|| left_path.cmp(right_path))
+    });
+    directories
+}
+
+pub(crate) fn version_directories(base: &Path) -> impl Iterator<Item = PathBuf> {
+    versioned_dirs(base).into_iter().map(|(_, path)| path)
+}
+
+pub(crate) fn versioned_environment(
+    env: impl IntoIterator<Item = (OsString, OsString)>,
+    suffix: &str,
+) -> Vec<(u32, OsString)> {
+    let mut matches: Vec<_> = env
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let (major, found_suffix) = key.to_str()?.strip_prefix("KICAD")?.split_once('_')?;
+            if found_suffix != suffix {
+                return None;
+            }
+            Some((number(major)?, value))
+        })
+        .collect();
+    matches.sort_by_key(|(major, _)| std::cmp::Reverse(*major));
+    matches
+}
+
+tokio::task_local! {
+    // Library lookups can recurse into another table or follow a symbol source.
+    // The selection must follow the future across threads and yields.
+    pub(crate) static REQUEST_CONFIG_DIR: PathBuf;
+}
+
+pub(crate) fn config_dir() -> PathBuf {
+    REQUEST_CONFIG_DIR
+        .try_with(Clone::clone)
+        .unwrap_or_else(|| select_config_dir(&config_base(), None))
+}
+
+pub(crate) async fn resolve_config_dir(configured_cli: &str) -> PathBuf {
+    let executable = crate::tools::cli::resolve_cli_executable(configured_cli);
+    let version = if executable.as_os_str().is_empty() {
+        None
+    } else {
+        crate::runtime_info::probe_kicad_version(&executable).await
+    };
+    select_config_dir(&config_base(), version.as_deref())
+}
+
+fn select_config_dir(base: &Path, version: Option<&str>) -> PathBuf {
+    if let Some(version) = version.and_then(Version::from_report) {
+        return base.join(version.directory_name());
+    }
+    version_directories(base)
+        .next()
+        .unwrap_or_else(|| base.join(Version::DEFAULT.directory_name()))
+}
+
+fn config_base() -> PathBuf {
+    if let Some(base) = nonempty_env("KICAD_CONFIG_HOME") {
+        return base;
+    }
+    #[cfg(target_os = "windows")]
+    let base = nonempty_env("APPDATA").unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    let base = nonempty_env("HOME")
+        .unwrap_or_default()
+        .join("Library/Preferences");
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let base = nonempty_env("XDG_CONFIG_HOME")
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| nonempty_env("HOME").unwrap_or_default().join(".config"));
+    base.join("kicad")
+}
+
+fn nonempty_env(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
 
 /// Find `kicad-cli`, honoring an explicit configured value first.
 pub fn find_cli(configured: &str) -> Option<PathBuf> {
@@ -257,16 +395,18 @@ fn windows_well_known_install_roots(
         }
     }
 
-    let mut roots = Vec::new();
-    for version in SUPPORTED_VERSIONS {
-        for base in &bases {
-            roots.push(base.join(version));
-        }
-    }
-    for base in bases {
-        roots.push(base);
-    }
-    roots
+    windows_install_candidates(&bases)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_install_candidates(bases: &[PathBuf]) -> Vec<PathBuf> {
+    let mut versioned: Vec<_> = bases.iter().flat_map(|base| versioned_dirs(base)).collect();
+    versioned.sort_by_key(|(version, _)| std::cmp::Reverse(*version));
+    versioned
+        .into_iter()
+        .map(|(_, path)| path)
+        .chain(bases.iter().cloned())
+        .collect()
 }
 
 #[cfg(target_os = "windows")]
@@ -277,49 +417,47 @@ fn windows_registry_install_roots() -> Vec<PathBuf> {
     use winreg::RegKey;
 
     const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
-    let mut roots = Vec::new();
+    let mut uninstall_roots = Vec::new();
+    let mut legacy_roots = Vec::new();
 
-    for version in SUPPORTED_VERSIONS {
-        for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
-            for view in [KEY_WOW64_64KEY, KEY_WOW64_32KEY] {
-                let root = RegKey::predef(hive);
-                let Ok(uninstall) = root.open_subkey_with_flags(UNINSTALL, KEY_READ | view) else {
-                    continue;
-                };
+    for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        for view in [KEY_WOW64_64KEY, KEY_WOW64_32KEY] {
+            let root = RegKey::predef(hive);
+            if let Ok(uninstall) = root.open_subkey_with_flags(UNINSTALL, KEY_READ | view) {
                 for name in uninstall.enum_keys().flatten() {
                     let Ok(key) = uninstall.open_subkey_with_flags(&name, KEY_READ | view) else {
                         continue;
                     };
                     let display_name: String = key.get_value("DisplayName").unwrap_or_default();
+                    let lowercase = display_name.to_ascii_lowercase();
+                    let Some(name_version) = lowercase.strip_prefix("kicad ") else {
+                        continue;
+                    };
                     let display_version: String =
                         key.get_value("DisplayVersion").unwrap_or_default();
-                    if !display_name.to_ascii_lowercase().starts_with("kicad ")
-                        || !(display_version.starts_with(version) || display_name.contains(version))
-                    {
+                    let Some(version) = Version::from_report(&display_version)
+                        .or_else(|| Version::from_report(name_version.split_whitespace().next()?))
+                    else {
                         continue;
-                    }
+                    };
                     let location: String = key.get_value("InstallLocation").unwrap_or_default();
                     if !location.trim().is_empty() {
-                        let path = PathBuf::from(location.trim());
-                        if path.is_dir() && !roots.contains(&path) {
-                            roots.push(path);
-                        }
+                        uninstall_roots.push((version, PathBuf::from(location.trim())));
                     }
                 }
             }
-        }
-    }
 
-    // Older KiCad installers used vendor keys instead of an uninstall entry.
-    for version in SUPPORTED_VERSIONS {
-        for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
-            for view in [KEY_WOW64_64KEY, KEY_WOW64_32KEY] {
-                let root = RegKey::predef(hive);
-                for key_path in [
-                    format!(r"SOFTWARE\KiCad\{version}"),
-                    r"SOFTWARE\KiCad\KiCad".into(),
-                ] {
-                    let Ok(key) = root.open_subkey_with_flags(&key_path, KEY_READ | view) else {
+            // Older KiCad installers wrote vendor keys instead of an uninstall entry.
+            if let Ok(vendor) = root.open_subkey_with_flags(r"SOFTWARE\KiCad", KEY_READ | view) {
+                for name in vendor.enum_keys().flatten() {
+                    let version = if name.eq_ignore_ascii_case("KiCad") {
+                        None
+                    } else if let Some(version) = Version::from_directory(OsStr::new(&name)) {
+                        Some(version)
+                    } else {
+                        continue;
+                    };
+                    let Ok(key) = vendor.open_subkey_with_flags(&name, KEY_READ | view) else {
                         continue;
                     };
                     let location: String = key
@@ -327,17 +465,20 @@ fn windows_registry_install_roots() -> Vec<PathBuf> {
                         .or_else(|_| key.get_value(""))
                         .unwrap_or_default();
                     if !location.trim().is_empty() {
-                        let path = PathBuf::from(location.trim());
-                        if path.is_dir() && !roots.contains(&path) {
-                            roots.push(path);
-                        }
+                        legacy_roots.push((version, PathBuf::from(location.trim())));
                     }
                 }
             }
         }
     }
 
-    roots
+    uninstall_roots.sort_by_key(|(version, _)| std::cmp::Reverse(*version));
+    legacy_roots.sort_by_key(|(version, _)| std::cmp::Reverse(*version));
+    uninstall_roots
+        .into_iter()
+        .map(|(_, path)| path)
+        .chain(legacy_roots.into_iter().map(|(_, path)| path))
+        .collect()
 }
 
 #[cfg(test)]
@@ -356,23 +497,96 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
-    fn per_user_roots_are_newest_first() {
-        use std::ffi::OsStr;
+    fn install_candidates_are_newest_first_across_windows_install_bases() {
+        let temp = tempfile::tempdir().unwrap();
+        let user = temp.path().join("per-user");
+        let system = temp.path().join("system");
+        for path in [
+            user.join("10.99"),
+            user.join("9.0"),
+            system.join("11.0"),
+            system.join("10.99"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let roots = windows_install_candidates(&[user.clone(), system.clone()]);
+        assert_eq!(
+            roots,
+            [
+                system.join("11.0"),
+                user.join("10.99"),
+                system.join("10.99"),
+                user.join("9.0"),
+                user,
+                system,
+            ]
+        );
+    }
 
-        let roots = windows_well_known_install_roots(
-            Some(OsStr::new(r"C:\Users\casey\AppData\Local")),
-            Some(OsStr::new(r"C:\Program Files")),
-            None,
+    #[test]
+    fn config_selection_uses_report_then_newest_numeric_directory_then_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path();
+        assert_eq!(select_config_dir(base, None), base.join("10.0"));
+        for name in [
+            "9.0",
+            "10.0",
+            "10.99",
+            "11.2",
+            "11.12",
+            "99.0.backup",
+            "98.beta",
+        ] {
+            std::fs::create_dir(base.join(name)).unwrap();
+        }
+        std::fs::write(base.join("97.0"), "").unwrap();
+        assert_eq!(select_config_dir(base, None), base.join("11.12"));
+        assert_eq!(select_config_dir(base, Some("broken")), base.join("11.12"));
+        assert_eq!(select_config_dir(base, Some("10.0.8")), base.join("10.0"));
+        assert_eq!(
+            select_config_dir(base, Some("10.99.0-127-gabcd")),
+            base.join("10.99")
+        );
+        assert_eq!(select_config_dir(base, Some("11.13.0")), base.join("11.13"));
+    }
+
+    #[test]
+    fn library_variables_recognize_future_majors_and_require_exact_names() {
+        let vars = [
+            ("KICAD9_FOOTPRINT_DIR", "nine"),
+            ("KICAD11_FOOTPRINT_DIR", "eleven"),
+            ("KICAD10_FOOTPRINT_DIR", "ten"),
+            ("KICAD11_SYMBOL_DIR", "symbols"),
+            ("KICAD11_FOOTPRINT_DIR_BACKUP", "backup"),
+            ("KICAD11.1_FOOTPRINT_DIR", "malformed"),
+        ];
+        let found = versioned_environment(
+            vars.map(|(key, value)| (key.into(), value.into())),
+            "FOOTPRINT_DIR",
         );
         assert_eq!(
-            roots[0],
-            PathBuf::from(r"C:\Users\casey\AppData\Local\Programs\KiCad\10.0")
+            found,
+            [
+                (11, "eleven".into()),
+                (10, "ten".into()),
+                (9, "nine".into())
+            ]
         );
-        assert!(roots.contains(&PathBuf::from(
-            r"C:\Users\casey\AppData\Local\Programs\KiCad\9.0"
-        )));
+    }
+
+    #[test]
+    fn individual_discovery_sites_do_not_embed_the_old_version_list() {
+        let obsolete = ["10.0", "9.0", "8.0"]
+            .map(|version| format!("{version:?}"))
+            .join(",");
+        for source in [
+            include_str!("tools/mod.rs"),
+            include_str!("tools/integration.rs"),
+        ] {
+            let compact: String = source.chars().filter(|ch| !ch.is_whitespace()).collect();
+            assert!(!compact.contains(&obsolete));
+        }
     }
 
     #[cfg(target_os = "windows")]

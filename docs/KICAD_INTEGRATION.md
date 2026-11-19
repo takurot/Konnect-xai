@@ -182,6 +182,23 @@ through Python.
 
 ## Configuration
 
+The optional `kicad_config_dir` setting is the absolute path to the directory
+containing KiCad's global `sym-lib-table`, `fp-lib-table`, and `kicad_common.json`.
+Set it when the KiCad instance whose libraries you want to use has a different
+configuration directory from the CLI that Konnect runs.
+
+By default, Konnect selects the settings directory using the major and minor
+version reported by `kicad-cli --version`. For instance, KiCad 10.99 uses the
+`10.99` directory even if an older `10.0` directory exists. The base is
+`KICAD_CONFIG_HOME` when set, or the platform KiCad settings base otherwise.
+If the CLI version is unavailable, Konnect uses the numerically newest existing
+`<major>.<minor>` directory, falling back to `10.0` when there are none.
+On Windows, the standard install roots also discover versioned KiCad installs,
+including nightlies. Stock-library path discovery considers exported
+`KICAD<major>_SYMBOL_DIR`, `KICAD<major>_FOOTPRINT_DIR`, and
+`KICAD<major>_3DMODEL_DIR` variables in descending major version order.
+
+
 Konnect selects the first existing server configuration file in the order below
 and loads only that file. It does not merge settings from later locations. Call
 `get_installation_info` to see which file configured the running process and
