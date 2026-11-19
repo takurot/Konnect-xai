@@ -36,6 +36,24 @@ function makeArtifacts({ skip } = {}) {
   return dir;
 }
 
+test('installation documentation directs readers to the fork', () => {
+  const repo = path.join(NPM_DIR, '..');
+  const packageNames = ['konnect', ...PLATFORM_KEYS.map((key) => `konnect-${key}`)];
+  const files = [
+    path.join(repo, 'README.md'),
+    ...packageNames.map((name) => path.join(NPM_DIR, name, 'README.md')),
+  ];
+  for (const file of files) {
+    const readme = fs.readFileSync(file, 'utf8');
+    assert.doesNotMatch(readme, /github\.com\/mixelpixx\/konnect\/(?:releases|issues)(?:[/?#)\s]|$)/i, file);
+    if (file !== files[0]) {
+      assert.doesNotMatch(readme, /contains no code/i, file);
+      assert.match(readme, /@konnect-xai\/konnect/, file);
+      assert.match(readme, /github\.com\/takurot\/Konnect-xai/, file);
+    }
+  }
+});
+
 test('template: platform packages match the key table', () => {
   for (const key of PLATFORM_KEYS) {
     const pkg = readJson(path.join(NPM_DIR, `konnect-${key}`, 'package.json'));
