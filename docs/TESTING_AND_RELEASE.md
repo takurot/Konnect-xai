@@ -186,6 +186,24 @@ module changes, a contributor can find the claim by searching for the old path.
 Describe unimplemented future behavior explicitly as design intent rather than
 current capability.
 
+### Linux release compatibility and dependency gates
+
+Linux release binaries target glibc 2.35. The release build uses Ubuntu 22.04
+for x64 and arm64 and runs `packaging/check-glibc.sh` on the server binaries and
+the x64 PCM server and viewer before packaging. The Linux compatibility jobs
+install the candidate npm packages on Ubuntu 22.04 and Debian 12 on both
+architectures and exercise both `--version` and MCP `initialize`.
+The tag workflow gates publication on those jobs; the manual dispatch exercises
+the same builds and compatibility checks without publishing.
+
+The weekly CI dependency checks cover the root workspace and the separate
+viewer lockfile. To reproduce both gates locally:
+
+```sh
+cargo deny --locked --all-features check advisories licenses
+cargo deny --locked --all-features --manifest-path crates/schematic-viewer/Cargo.toml check advisories licenses
+```
+
 ## Packaging And Release
 
 Build the server with `cargo build --release -p konnect`. Build the viewer
