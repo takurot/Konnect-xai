@@ -15,9 +15,9 @@ function pack(dir, dest) {
   return path.join(dest, out.trim().split('\n').pop());
 }
 
-function handshake(bin) {
+function handshake(bin, args = []) {
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, [], { stdio: ['pipe', 'pipe', 'inherit'], shell: process.platform === 'win32' });
+    const child = spawn(bin, args, { stdio: ['pipe', 'pipe', 'inherit'], shell: process.platform === 'win32' && bin.endsWith('.cmd') });
     const timer = setTimeout(() => { child.kill(); reject(new Error('no initialize response within timeout')); }, HANDSHAKE_TIMEOUT_MS);
     let buf = '';
     child.stdout.on('data', (chunk) => {
@@ -59,7 +59,7 @@ async function smoke({ version, npmDir }) {
   console.log(`ok: ${packageFor(key)} ${version} answered initialize as ${reply.result.serverInfo.name}`);
 }
 
-module.exports = { smoke };
+module.exports = { handshake, smoke };
 
 if (require.main === module) {
   const [version, npmDir] = process.argv.slice(2);
