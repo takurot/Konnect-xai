@@ -198,8 +198,10 @@ assets against `SHA256SUMS`, generates GitHub attestations, and publishes npm
 platform packages before the launcher. GitHub Release publication requires npm
 success. Stable tags use npm `latest`; prereleases use npm `next` and are marked
 as prereleases on GitHub. The workflow uploads all eight archives and
-`SHA256SUMS` to a draft before publishing the GitHub Release. The reusable
-Windows KiCad workflow checks out the caller's exact tag commit.
+`SHA256SUMS` to a draft and compares the remote asset inventory, upload status,
+and recorded SHA-256 digests before publishing. An unexpected or mismatched
+draft asset stops promotion for inspection. The reusable Windows KiCad workflow
+checks out the caller's exact tag commit.
 
 Publication can still fail between services or midway through npm. Inspect the
 failed run and published versions, then rerun failed jobs with

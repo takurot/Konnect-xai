@@ -96,7 +96,9 @@ jobs:
       # rustup selects the checked-in toolchain. Cross targets must be
       # installed on that toolchain rather than on a second compiler.
       - name: Add matrix target to the pinned toolchain
-        run: rustup target add ${{ matrix.target }}
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add ${{ matrix.target }}
 
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
@@ -167,7 +169,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - run: rustup show
+      - run: rustup toolchain install --no-self-update
 
       # macOS packages ship a universal binary so one download serves both
       # Apple Silicon and Intel — PCM has no architecture dimension, only
@@ -483,6 +485,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
       - name: Download verified release assets
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -502,10 +508,20 @@ jobs:
             artifacts/SHA256SUMS
           fail_on_unmatched_files: true
           draft: true
+          overwrite_files: false
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify uploaded draft release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          gh release view "$GITHUB_REF_NAME" --json isDraft,tagName,assets |
+            python3 packaging/release-checksums.py --verify-draft artifacts "$GITHUB_REF_NAME"
 
       - name: Publish the complete GitHub Release
         env:

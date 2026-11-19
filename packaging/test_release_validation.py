@@ -9,7 +9,8 @@ import unittest
 
 
 PACKAGING = Path(__file__).resolve().parent
-generate = run_path(PACKAGING / "release-checksums.py")["generate"]
+archive_checks = run_path(PACKAGING / "release-checksums.py")
+generate = archive_checks["generate"]
 smoke = run_path(PACKAGING / "smoke-release-binary.py")["smoke"]
 
 
@@ -48,6 +49,29 @@ class ReleaseArchiveTest(unittest.TestCase):
                 for name in sorted(names)
             ]
             self.assertEqual(manifest.read_text().splitlines(), expected)
+
+
+            verify_draft = archive_checks["verify_draft"]
+            draft = {
+                "isDraft": True,
+                "tagName": "v0.0.0",
+                "assets": [
+                    {
+                        "name": name,
+                        "state": "uploaded",
+                        "digest": f"sha256:{hashlib.sha256((directory / name).read_bytes()).hexdigest()}",
+                    }
+                    for name in [*names, "SHA256SUMS"]
+                ],
+            }
+            verify_draft(directory, draft, "v0.0.0")
+            draft["assets"].append({"name": "manual.zip", "state": "uploaded", "digest": "sha256:extra"})
+            with self.assertRaisesRegex(ValueError, "unexpected.*manual.zip"):
+                verify_draft(directory, draft, "v0.0.0")
+            draft["assets"].pop()
+            draft["assets"][0]["digest"] = "sha256:stale"
+            with self.assertRaisesRegex(ValueError, "digest mismatch"):
+                verify_draft(directory, draft, "v0.0.0")
 
 
 class ReleaseBinaryTest(unittest.TestCase):

@@ -131,6 +131,24 @@ fn tag_publication_attests_and_uploads_the_checked_assets() {
     );
     let github = step("release", "Stage GitHub Release as a draft");
     assert_eq!(github["with"]["draft"], true);
+    assert_eq!(github["with"]["overwrite_files"], false);
+    let readback = step("release", "Verify uploaded draft release assets");
+    let readback_script = readback["run"].as_str().unwrap();
+    assert!(readback_script.contains("--json isDraft,tagName,assets"));
+    assert!(readback_script.contains("--verify-draft artifacts"));
+    let steps = release["jobs"]["release"]["steps"].as_array().unwrap();
+    let positions = [
+        github,
+        readback,
+        step("release", "Publish the complete GitHub Release"),
+    ]
+    .map(|step| {
+        steps
+            .iter()
+            .position(|candidate| candidate == step)
+            .unwrap()
+    });
+    assert!(positions[0] < positions[1] && positions[1] < positions[2]);
     assert_eq!(
         github["with"]["prerelease"],
         "${{ contains(github.ref_name, '-') }}"
