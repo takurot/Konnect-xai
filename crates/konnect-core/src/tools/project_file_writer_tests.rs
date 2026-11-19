@@ -216,3 +216,171 @@ async fn all_project_writers_refuse_an_eeschema_project_lock() {
         assert!(lock.exists());
     }
 }
+
+#[tokio::test]
+async fn design_rules_accept_fab_minima_and_refuse_out_of_range_batches() {
+    let fixture = project();
+    let handler = handler_talking_to("").await;
+    let before = std::fs::read(&fixture.project_file).unwrap();
+    for (field, value, upper_bound) in [
+        ("min_clearance", 30.0, 25),
+        ("min_trace_width", -0.1, 25),
+        ("min_via_drill", 25.1, 25),
+        ("min_via_size", 25.1, 25),
+        ("min_hole_to_hole", 10.1, 10),
+        ("min_via_annular_width", -0.1, 25),
+        ("min_hole_clearance", 100.1, 100),
+        ("min_text_height", 100.1, 100),
+        ("min_text_thickness", -0.1, 25),
+        ("min_silk_clearance", -10.1, 100),
+        ("min_copper_edge_clearance", -0.02, 25),
+    ] {
+        let result = call(
+            &handler,
+            "set_design_rules",
+            &fixture.board,
+            &json!({"min_hole_to_hole": 0.25, (field): value}),
+        )
+        .await;
+        assert!(result.is_error, "{field}: {}", text_of(&result));
+        let error: Value = serde_json::from_str(text_of(&result)).unwrap();
+        assert_eq!(error["error"]["kind"], "invalid_argument");
+        assert!(text_of(&result).contains(field), "{}", text_of(&result));
+        assert!(text_of(&result).contains(&upper_bound.to_string()));
+        assert_eq!(std::fs::read(&fixture.project_file).unwrap(), before);
+    }
+
+    let arguments = json!({
+        "min_clearance": 0.1,
+        "min_via_annular_width": 0.13,
+        "min_hole_clearance": 0.2,
+        "min_text_height": 0.8,
+        "min_text_thickness": 0.15,
+        "min_silk_clearance": 0.12,
+        "min_copper_edge_clearance": 0.3,
+    });
+    let result = call(&handler, "set_design_rules", &fixture.board, &arguments).await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    let result = call(&handler, "get_design_rules", &fixture.board, &json!({})).await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    let body: Value = serde_json::from_str(text_of(&result)).unwrap();
+    for (field, value) in arguments.as_object().unwrap() {
+        assert_eq!(&body["rules"][field], value, "{field}");
+    }
+}
+
+#[tokio::test]
+async fn differential_netclass_fields_roundtrip_and_inherit() {
+    let fixture = project();
+    let handler = handler_talking_to("").await;
+    let result = call(
+        &handler,
+        "create_netclass",
+        &fixture.board,
+        &json!({"name":"Default","diff_pair_via_gap":0.65}),
+    )
+    .await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    let result = call(
+        &handler,
+        "create_netclass",
+        &fixture.board,
+        &json!({"name":"Pair","diff_pair_width":0.18,"diff_pair_gap":0.14}),
+    )
+    .await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    let result = call(
+        &handler,
+        "get_netclasses",
+        &fixture.board,
+        &json!({"board_source":"saved"}),
+    )
+    .await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    let body: Value = serde_json::from_str(text_of(&result)).unwrap();
+    let pair = body["netclasses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|class| class["name"] == "Pair")
+        .unwrap();
+    assert_eq!(pair["diff_pair_width"], 0.18);
+    assert_eq!(pair["diff_pair_gap"], 0.14);
+    assert_eq!(pair["diff_pair_via_gap"], 0.65);
+    assert_eq!(pair["inherits"], json!(["diff_pair_via_gap"]));
+    let written: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.project_file).unwrap()).unwrap();
+    let stored_pair = written["net_settings"]["classes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|class| class["name"] == "Pair")
+        .unwrap();
+    assert!(stored_pair.get("diff_pair_via_gap").is_none());
+}
+
+#[tokio::test]
+async fn delete_netclass_preserves_surviving_matches_and_default_fallback() {
+    let fixture = project();
+    let mut saved: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.project_file).unwrap()).unwrap();
+    saved["net_settings"] = json!({
+        "meta":{"version":5},
+        "classes": [
+            {"name":"Default","clearance":0.41},
+            {"name":"Other","priority":4,"clearance":0.23},
+            {"name":"Remove","priority":1,"clearance":0.91}
+        ],
+        "netclass_patterns":[
+            {"netclass":"Other","pattern":"S*"},
+            {"netclass":"Remove","pattern":"SIG"},
+            {"netclass":"Other","pattern":"VCC"}
+        ],
+        "netclass_assignments":{"SIG":["Remove","Other"],"ONLY":["Remove"],"OLD":"Remove"}
+    });
+    std::fs::write(&fixture.project_file, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let handler = handler_talking_to("").await;
+    let board_before = std::fs::read(&fixture.board).unwrap();
+    let before = std::fs::read(&fixture.project_file).unwrap();
+    let result = call(
+        &handler,
+        "delete_netclass",
+        &fixture.board,
+        &json!({"name":"Default"}),
+    )
+    .await;
+    assert!(result.is_error, "{}", text_of(&result));
+    assert_eq!(std::fs::read(&fixture.project_file).unwrap(), before);
+
+    let locked = spawn_kicad_holding_boards(&[&fixture.board], |_| None);
+    let live_handler = handler_talking_to(locked.address()).await;
+    let args = json!({"name":"Remove"});
+    let result = call(&live_handler, "delete_netclass", &fixture.board, &args).await;
+    assert!(result.is_error, "{}", text_of(&result));
+    assert!(text_of(&result).contains("currently holds this board open"));
+    assert_eq!(std::fs::read(&fixture.project_file).unwrap(), before);
+    drop(locked);
+
+    let result = call(&handler, "delete_netclass", &fixture.board, &args).await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    let written: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.project_file).unwrap()).unwrap();
+    let net_settings = &written["net_settings"];
+    assert_eq!(net_settings["classes"].as_array().unwrap().len(), 2);
+    assert_eq!(net_settings["classes"][0]["name"], "Default");
+    assert_eq!(net_settings["classes"][0]["clearance"], 0.41);
+    assert_eq!(net_settings["classes"][0]["wire_width"], 6);
+    assert_eq!(
+        net_settings["classes"][1],
+        saved["net_settings"]["classes"][1]
+    );
+    assert_eq!(
+        net_settings["netclass_patterns"],
+        json!([{"netclass":"Other","pattern":"S*"},{"netclass":"Other","pattern":"VCC"}])
+    );
+    assert_eq!(
+        net_settings["netclass_assignments"],
+        json!({"SIG":["Other"]})
+    );
+    assert_eq!(std::fs::read(&fixture.board).unwrap(), board_before);
+}
