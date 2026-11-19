@@ -8013,6 +8013,12 @@ mod helper_tests {
         let (decoded, _) = graphic_style(&item);
         let points = geometry_points(decoded.shape.unwrap().geometry.as_ref().unwrap());
         let (center, rim) = (points[0], points[1]);
+        assert_eq!(center, (798_636, -601_815));
+        assert_eq!(
+            rim,
+            (2_002_266, 995_456),
+            "a circle retains its authored circumference point through placement"
+        );
         let radius = (((rim.0 - center.0).pow(2) + (rim.1 - center.1).pow(2)) as f64).sqrt();
         assert!(
             (radius - 2_000_000.0).abs() < 2.0,
