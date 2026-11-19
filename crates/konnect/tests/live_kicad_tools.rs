@@ -678,22 +678,17 @@ fn footprint_library_update_apply_then_dry_run_is_noop() {
         json!({
             "board": board,
             "severity": "info",
-            "tests": ["lib_footprint_mismatch"],
             "limit": 100
         }),
     );
     let drc: Value = serde_json::from_str(drc["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(drc["truncated"], false, "{drc}");
     assert!(
         drc["violations"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|violation| {
-                !violation["description"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("doesn't match the copy in the library")
-            }),
+            .all(|violation| violation["rule"] != "lib_footprint_mismatch"),
         "{drc}"
     );
 }
