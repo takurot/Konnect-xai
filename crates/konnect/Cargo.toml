@@ -40,3 +40,6 @@ fs4.workspace = true
 prost.workspace = true
 serde_yaml_ng = "0.10"
 tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

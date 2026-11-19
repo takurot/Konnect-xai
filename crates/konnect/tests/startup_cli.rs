@@ -7,15 +7,19 @@
 #![cfg(not(target_os = "windows"))]
 
 use serde_json::json;
-use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn konnect(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
     command.env("HOME", home);
     command.env("XDG_CONFIG_HOME", home.join(".config"));
+    command.env("KONNECT_STATE_DIR", home.join(".konnect-state"));
     command
 }
 
@@ -129,4 +133,101 @@ fn mcp_start_does_not_reverse_an_explicit_uninstall() {
         start_and_initialize_server(temp.path(), client);
         assert_eq!(guidance_snapshot(temp.path()), before, "client: {client}");
     }
+}
+
+#[test]
+fn cwd_configuration_is_not_loaded_implicitly() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    for (name, decoy) in [("konnect.toml", "["), ("settings.json", "[")] {
+        let path = project.path().join(name);
+        fs::write(&path, decoy).unwrap();
+        let output = konnect(home.path())
+            .current_dir(project.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cwd candidate {name} interrupted startup: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let explicit = konnect(home.path())
+            .current_dir(project.path())
+            .args(["--config", name])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            !explicit.status.success(),
+            "explicit configuration was bypassed"
+        );
+        fs::remove_file(path).unwrap();
+    }
+}
+
+fn terminal() -> (File, File) {
+    let (mut master, mut slave) = (-1, -1);
+    // openpty initializes both descriptors on success. Keeping the master
+    // open prevents a terminal hangup while the child uses the slave.
+    let status = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, 0, "{}", std::io::Error::last_os_error());
+    unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
+}
+
+#[test]
+fn terminal_start_with_http_config_serves_health_without_installing() {
+    let home = tempfile::tempdir().unwrap();
+    let address = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let config = home.path().join("http.toml");
+    fs::write(
+        &config,
+        format!("transport = \"http\"\nhttp_address = \"{address}\"\n"),
+    )
+    .unwrap();
+
+    let (_master, slave) = terminal();
+    let mut child = konnect(home.path())
+        .args(["--config", config.to_str().unwrap()])
+        .stdin(slave)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut healthy = false;
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        if let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
+            let mut reply = String::new();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            healthy = stream
+                .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .and_then(|_| stream.read_to_string(&mut reply))
+                .is_ok()
+                && reply.starts_with("HTTP/1.1 200 ")
+                && reply.ends_with("\r\n\r\nok");
+            if healthy {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    assert!(guidance_snapshot(home.path()).is_empty());
+    assert!(healthy, "{}", String::from_utf8_lossy(&output.stderr));
 }

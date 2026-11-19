@@ -1204,6 +1204,56 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn claude_settings_preserve_key_order_and_final_newline() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("settings.json");
+        let original = concat!(
+            "{\n",
+            r#"  "model": "opus", "permissions": {"deny": ["existing"], "allow": ["Read"]}, "env": {"Z_LAST": "1", "A_FIRST": "2"}"#,
+            "\n}\n",
+        );
+        fs::write(&path, original).unwrap();
+        patch_claude_settings(&path, "/opt/konnect").unwrap();
+        for uninstall in [false, true] {
+            if uninstall {
+                remove_hooks_from_settings(&path, "/opt/konnect").unwrap();
+            }
+            let saved = fs::read_to_string(&path).unwrap();
+            assert!(saved.ends_with('\n'));
+            for (first, second) in [
+                (r#""model""#, r#""permissions""#),
+                (r#""permissions""#, r#""env""#),
+                (r#""deny""#, r#""allow""#),
+                (r#""Z_LAST""#, r#""A_FIRST""#),
+            ] {
+                assert!(
+                    saved.find(first).unwrap() < saved.find(second).unwrap(),
+                    "{saved}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn claude_settings_noop_preserves_bytes_and_mtime() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("settings.json");
+        patch_claude_settings(&path, "/opt/konnect").unwrap();
+        let installed = fs::read_to_string(&path).unwrap() + " \n";
+        fs::write(&path, &installed).unwrap();
+        let file = fs::File::open(&path).unwrap();
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(3600)),
+        )
+        .unwrap();
+        let mtime = file.metadata().unwrap().modified().unwrap();
+        assert_eq!(patch_claude_settings(&path, "/opt/konnect").unwrap(), 0);
+        assert_eq!(fs::read_to_string(&path).unwrap(), installed);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    }
+
+    #[test]
     fn guidance_record_requires_matching_install_key_and_known_state() {
         let temp = TempDir::new().unwrap();
         let record = temp.path().join("state.json");
