@@ -217,6 +217,15 @@ architectures and exercise both `--version` and MCP `initialize`.
 The tag workflow gates publication on those jobs; the manual dispatch exercises
 the same builds and compatibility checks without publishing.
 
+`Published npm acceptance` checks the public registry with a clean npm cache on
+macOS ARM64, Windows x64, and Linux ARM64. Dispatch it with an exact published
+version, or run `node npm/scripts/smoke.js 0.16.0 --published` on a supported
+host. The smoke installs with scripts disabled, selects the native binary via
+the package launcher, and checks `--version`, MCP initialization, tool listing,
+and installation info. It exercises the transport used by desktop clients.
+Client-specific configuration, UI, and permission prompts require separate
+checks in the actual client.
+
 The weekly CI dependency checks cover the root workspace and the separate
 viewer lockfile. To reproduce both gates locally:
 

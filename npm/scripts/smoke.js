@@ -1,70 +1,145 @@
 'use strict';
 
-// Packs the staged host-platform package and the launcher, installs them into a
-// clean project, and speaks MCP to the installed `konnect` command.
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const readline = require('node:readline');
 const { execFileSync, spawn } = require('node:child_process');
-const { platformKey, packageFor } = require('../konnect/lib/platform');
+const { platformKey, packageFor, binaryFile } = require('../konnect/lib/platform');
+const { assertVersion } = require('./version');
 
-const HANDSHAKE_TIMEOUT_MS = 20000;
+const HANDSHAKE_TIMEOUT_MS = 60000;
 
-function pack(dir, dest) {
-  const out = execFileSync('npm', ['pack', '--silent', '--pack-destination', dest], { cwd: dir, encoding: 'utf8', shell: process.platform === 'win32' });
+function npm(args, options) {
+  if (process.platform === 'win32') {
+    const cli = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    return execFileSync(process.execPath, [cli, ...args], { timeout: 180000, ...options });
+  }
+  return execFileSync('npm', args, { timeout: 180000, ...options });
+}
+
+function pack(dir, dest, env) {
+  const out = npm(['pack', '--ignore-scripts', '--silent', '--pack-destination', dest], { cwd: dir, env, encoding: 'utf8' });
   return path.join(dest, out.trim().split('\n').pop());
 }
 
-function handshake(bin, args = []) {
+function handshake(command, args = [], { cwd, env } = {}) {
+  const requests = [
+    ['initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'npm-smoke', version: '0' } }],
+    ['tools/list', {}],
+    ['tools/call', { name: 'get_installation_info', arguments: {} }],
+  ];
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, { stdio: ['pipe', 'pipe', 'inherit'], shell: process.platform === 'win32' && bin.endsWith('.cmd') });
-    const timer = setTimeout(() => { child.kill(); reject(new Error('no initialize response within timeout')); }, HANDSHAKE_TIMEOUT_MS);
-    let buf = '';
-    child.stdout.on('data', (chunk) => {
-      buf += chunk;
-      const nl = buf.indexOf('\n');
-      if (nl < 0) return;
+    const child = spawn(command, args, { cwd, env, stdio: ['pipe', 'pipe', 'inherit'] });
+    const lines = readline.createInterface({ input: child.stdout });
+    const results = [];
+    let failure;
+    const fail = (error) => {
+      if (failure) return;
+      failure = error;
+      lines.close();
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.kill();
+    };
+    const timer = setTimeout(() => fail(new Error('MCP smoke deadline exceeded')), HANDSHAKE_TIMEOUT_MS);
+    const send = (message) => child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', ...message })}\n`);
+    const request = () => {
+      const [method, params] = requests[results.length];
+      send({ id: results.length + 1, method, params });
+    };
+    child.on('error', fail);
+    child.stdin.on('error', fail);
+    child.on('close', (code, signal) => {
       clearTimeout(timer);
-      child.stdin.end();
-      try {
-        resolve(JSON.parse(buf.slice(0, nl)));
-      } catch (e) {
-        reject(new Error(`first stdout line is not JSON (stdout must carry only protocol): ${buf.slice(0, nl)}`));
+      lines.close();
+      if (failure) {
+        reject(failure);
+      } else if (code !== 0 || results.length !== requests.length) {
+        reject(new Error(`launcher closed before successful MCP smoke (${signal ?? code})`));
+      } else {
+        resolve(results);
       }
     });
-    child.on('error', reject);
-    child.stdin.write(`${JSON.stringify({
-      jsonrpc: '2.0', id: 1, method: 'initialize',
-      params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'npm-smoke', version: '0' } },
-    })}\n`);
+    lines.on('line', (line) => {
+      if (failure) return;
+      const method = requests[results.length]?.[0] ?? 'after smoke';
+      try {
+        const { jsonrpc, id, error, result } = JSON.parse(line);
+        if (jsonrpc !== '2.0' || id !== results.length + 1 || results.length === requests.length) {
+          throw new Error(`unexpected response envelope for ${method}`);
+        }
+        if (error || !result || typeof result !== 'object' || Array.isArray(result)) {
+          throw new Error(`${method}: ${error?.message ?? 'missing result object'}`);
+        }
+        results.push(result);
+        if (results.length === 1) send({ method: 'notifications/initialized', params: {} });
+        if (results.length === requests.length) child.stdin.end();
+        else request();
+      } catch (error) {
+        fail(error);
+      }
+    });
+    request();
   });
 }
 
 async function smoke({ version, npmDir }) {
+  assertVersion(version);
   const key = platformKey(process.platform, process.arch);
   if (!key) throw new Error(`smoke cannot run on ${process.platform}-${process.arch}`);
+
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'konnect-smoke-'));
-  const tarballs = [pack(path.join(npmDir, `konnect-${key}`), work), pack(path.join(npmDir, 'konnect'), work)];
-  const project = path.join(work, 'project');
-  fs.mkdirSync(project);
-  fs.writeFileSync(path.join(project, 'package.json'), '{"private":true}\n');
-  execFileSync('npm', ['install', '--no-audit', '--no-fund', '--omit=optional', ...tarballs], { cwd: project, stdio: 'inherit', shell: process.platform === 'win32' });
+  try {
+    const project = path.join(work, 'project');
+    fs.mkdirSync(project);
+    fs.writeFileSync(path.join(project, 'package.json'), '{"private":true}\n');
+    const npmrc = path.join(work, 'npmrc');
+    fs.writeFileSync(npmrc, '');
+    const env = {
+      ...process.env,
+      KONNECT_STATE_DIR: path.join(work, 'state'),
+      npm_config_cache: path.join(work, 'npm-cache'),
+      npm_config_userconfig: npmrc,
+      npm_config_registry: 'https://registry.npmjs.org',
+    };
+    const packages = npmDir ? [
+      '--omit=optional',
+      pack(path.join(npmDir, `konnect-${key}`), work, env),
+      pack(path.join(npmDir, 'konnect'), work, env),
+    ] : ['--include=optional', `@konnect-xai/konnect@${version}`];
+    npm(['install', '--no-audit', '--no-fund', '--ignore-scripts', ...packages], { cwd: project, env, stdio: 'inherit' });
 
-  const bin = path.join(project, 'node_modules', '.bin', process.platform === 'win32' ? 'konnect.cmd' : 'konnect');
-  const reported = execFileSync(bin, ['--version'], { encoding: 'utf8', shell: process.platform === 'win32' }).trim();
-  if (reported !== `konnect ${version}`) throw new Error(`binary reports "${reported}", expected "konnect ${version}"`);
-
-  const reply = await handshake(bin);
-  if (!reply.result || !reply.result.serverInfo) throw new Error(`unexpected initialize reply: ${JSON.stringify(reply)}`);
-  console.log(`ok: ${packageFor(key)} ${version} answered initialize as ${reply.result.serverInfo.name}`);
+    const modules = path.join(project, 'node_modules');
+    const launcher = path.join(modules, '@konnect-xai', 'konnect', 'bin', 'konnect.js');
+    const expected = path.join(modules, packageFor(key), 'bin', binaryFile(process.platform));
+    const reported = execFileSync(process.execPath, [launcher, '--version'], { cwd: project, env, encoding: 'utf8', timeout: 60000 }).trim();
+    if (reported !== `konnect ${version}`) throw new Error(`binary reports "${reported}", expected "konnect ${version}"`);
+    const [initialized, listed, installation] = await handshake(process.execPath, [launcher], { cwd: project, env });
+    if (initialized.serverInfo?.name !== 'konnect' || initialized.serverInfo.version !== version) {
+      throw new Error('initialize server name or version did not match the package');
+    }
+    if (!Array.isArray(listed.tools) || !listed.tools.some((tool) => tool.name === 'get_installation_info')) {
+      throw new Error('tools/list omitted get_installation_info');
+    }
+    const info = JSON.parse(installation.content?.[0]?.text ?? '{}');
+    if (installation.isError || info.build?.version !== version || typeof info.runtime?.executable_path !== 'string'
+        || fs.realpathSync(info.runtime.executable_path) !== fs.realpathSync(expected)) {
+      throw new Error('installation info did not identify the expected package binary and version');
+    }
+    console.log(`ok: ${packageFor(key)} ${version} answered initialize, tools/list and get_installation_info`);
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true, maxRetries: 5 });
+  }
 }
 
 module.exports = { handshake, smoke };
 
 if (require.main === module) {
-  const [version, npmDir] = process.argv.slice(2);
-  smoke({ version, npmDir: path.resolve(npmDir || path.join(__dirname, '..')) }).catch((e) => {
-    console.error(`smoke failed: ${e.message}`);
-    process.exit(1);
+  const [version, source] = process.argv.slice(2);
+  const npmDir = source === '--published' ? undefined : path.resolve(source || path.join(__dirname, '..'));
+  smoke({ version, npmDir }).catch((error) => {
+    console.error(`smoke failed: ${error.message}`);
+    process.exitCode = 1;
   });
 }

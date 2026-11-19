@@ -29,3 +29,10 @@ function fakeServer(breakList) {
 test('launcher smoke refuses an initialize-only server whose tools/list fails', async () => {
   await assert.rejects(handshake(process.execPath, fakeServer(true)), /tools\/list.*list failed/);
 });
+
+test('launcher smoke returns all three correlated results', async () => {
+  const [initialized, listed, installation] = await handshake(process.execPath, fakeServer(false));
+  assert.equal(initialized.serverInfo.version, '1.2.3');
+  assert.deepEqual(listed.tools.map((tool) => tool.name), ['get_installation_info']);
+  assert.equal(JSON.parse(installation.content[0].text).runtime.executable_path, '/fixture/konnect');
+});

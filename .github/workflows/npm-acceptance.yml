@@ -1,0 +1,57 @@
+name: Published npm acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact published Konnect version without the v prefix
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - '.github/workflows/npm-acceptance.yml'
+      - 'npm/scripts/smoke.js'
+      - 'npm/test/smoke.test.js'
+
+permissions:
+  contents: read
+
+jobs:
+  registry:
+    name: npm registry MCP (${{ matrix.platform }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            platform: darwin
+            arch: arm64
+          - runner: windows-latest
+            platform: win32
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - name: Verify runner architecture
+        env:
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: node -e "if (process.platform !== process.env.EXPECTED_PLATFORM || process.arch !== process.env.EXPECTED_ARCH) process.exit(1)"
+      - name: Install exact public package and verify MCP
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          ver="$REQUESTED_VERSION"
+          if [ -z "$ver" ]; then
+            ver="$(npm view @konnect-xai/konnect@latest version --registry=https://registry.npmjs.org)"
+          fi
+          node npm/scripts/smoke.js "$ver" --published
