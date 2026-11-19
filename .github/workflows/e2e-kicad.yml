@@ -52,8 +52,7 @@ jobs:
       - name: Install KiCAD
         run: choco install kicad --version=10.0.5 --no-progress --yes
 
-      - name: Locate kicad-cli and demos
-        id: kicad
+      - name: Verify kicad-cli and locate its demos
         shell: pwsh
         run: |
           $cli = Get-ChildItem "C:\Program Files\KiCad" -Recurse -Filter kicad-cli.exe -ErrorAction SilentlyContinue |
@@ -61,11 +60,15 @@ jobs:
           if (-not $cli) { $cli = Get-ChildItem "C:\KiCad" -Recurse -Filter kicad-cli.exe -ErrorAction SilentlyContinue |
                  Select-Object -First 1 -ExpandProperty FullName }
           if (-not $cli) { throw "kicad-cli.exe not found after install" }
+          $version = (& $cli --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $version -ne "10.0.5") { throw "Expected KiCad 10.0.5 at ${cli}, got ${version}" }
+          Write-Host "KiCad $version at $cli"
           "KICAD_CLI=$cli" | Out-File $env:GITHUB_ENV -Append
           (Split-Path $cli) | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
           $demos = Join-Path (Split-Path (Split-Path $cli)) "share\kicad\demos"
-          if (Test-Path $demos) { "KICAD_DEMOS=$demos" | Out-File $env:GITHUB_ENV -Append }
-          & $cli --version
+          if (-not (Test-Path $demos -PathType Container)) { throw "KiCad demo directory missing: $demos" }
+          "KICAD_DEMOS=$demos" | Out-File $env:GITHUB_ENV -Append
+          Write-Host "KiCad demos at $demos"
 
       - name: E2E design loop (create → wire → ERC → Gerber → DRC)
         env:
@@ -73,7 +76,9 @@ jobs:
         run: cargo test -p konnect --test e2e_kicad -- --ignored --nocapture
 
       - name: Demo-corpus conformance (115+ eeschema-authored schematics)
-        run: cargo test -p konnect-core --test conformance_test -- --nocapture
+        env:
+          KONNECT_REQUIRE_DEMOS: "1"
+        run: cargo test -p konnect-core --locked --test conformance_test -- --nocapture
 
       # The variant grammar of record (fixtures/variants/README.md) is
       # evidence adjudicated by kicad-cli; this re-runs the adjudication so a

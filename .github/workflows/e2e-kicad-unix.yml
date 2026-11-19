@@ -1,0 +1,135 @@
+name: E2E (real KiCAD on macOS and Linux)
+
+# Keep these lanes outside the release gate until three scheduled runs pass.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    name: Full design loop on ${{ matrix.os }}
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run:e2e-kicad'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-24.04, ubuntu-24.04-arm]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: protoc@3.23.4
+          fallback: none
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: e2e-kicad
+
+      - name: Install KiCad 10.0.8 on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg="$RUNNER_TEMP/kicad-10.0.8.dmg"
+          mount="$RUNNER_TEMP/kicad-mount"
+          install="$HOME/Applications/KiCad"
+          mkdir -p "$mount" "$install"
+          curl --fail --location --retry 3 --output "$dmg" \
+            https://github.com/KiCad/kicad-source-mirror/releases/download/10.0.8/kicad-unified-universal-10.0.8.dmg
+          echo "501d3e2933a385f1833497469f55326662df7e5d40401239826c40d6fa583f16  $dmg" | shasum -a 256 -c -
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount" "$dmg"
+          trap 'hdiutil detach "$mount"' EXIT
+          app=$(find "$mount" -type d -name KiCad.app -prune -print -quit)
+          test -n "$app"
+          ditto "$app" "$install/KiCad.app"
+
+          # Some macOS packages put the demos beside the app bundle. If
+          # absent, use demos from the matching KiCad 10.0.8 source commit.
+          demos=$(find "$mount" -type d -name demos -print -quit)
+          if [[ -n "$demos" ]] && [[ -n "$(find "$demos" -name '*.kicad_sch' -type f -print -quit)" ]]; then
+            ditto "$demos" "$install/demos"
+          else
+            source="$RUNNER_TEMP/kicad-source"
+            commit=e432beac2668303194ba2040274f9e5efe773fc0
+            git init "$source"
+            git -C "$source" remote add origin https://github.com/KiCad/kicad-source-mirror.git
+            git -C "$source" sparse-checkout set demos
+            git -C "$source" fetch --depth=1 --filter=blob:none origin "$commit"
+            git -C "$source" checkout --detach FETCH_HEAD
+            mv "$source/demos" "$install/demos"
+          fi
+          echo "KICAD_CLI=$install/KiCad.app/Contents/MacOS/kicad-cli" >> "$GITHUB_ENV"
+          echo "KICAD_DEMOS=$install/demos" >> "$GITHUB_ENV"
+
+      - name: Install KiCad 10.0.8 on Ubuntu
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo add-apt-repository -y ppa:kicad/kicad-10.0-releases
+          sudo apt-get update
+          version=10.0.8~ubuntu24.04.1
+          sudo apt-get install -y --no-install-recommends \
+            "kicad=$version" "kicad-demos=$version" "kicad-symbols=$version" \
+            "kicad-footprints=$version" "kicad-templates=$version" xvfb xauth
+          echo "KICAD_CLI=/usr/bin/kicad-cli" >> "$GITHUB_ENV"
+          echo "KICAD_DEMOS=/usr/share/kicad/demos" >> "$GITHUB_ENV"
+
+      - name: Verify installed KiCad version and expose its CLI
+        shell: bash
+        run: |
+          version=$("$KICAD_CLI" --version)
+          echo "KiCad $version at $KICAD_CLI"
+          test "$version" = 10.0.8
+          dirname "$KICAD_CLI" >> "$GITHUB_PATH"
+          echo "KiCad demos at $KICAD_DEMOS"
+
+      - name: E2E design loop (create → wire → ERC → Gerber → DRC)
+        shell: bash
+        env:
+          KONNECT_E2E_KEEP_DIR: ${{ github.workspace }}/e2e-artifacts
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            xvfb-run -a cargo test -p konnect --locked --test e2e_kicad -- --ignored --nocapture
+          else
+            cargo test -p konnect --locked --test e2e_kicad -- --ignored --nocapture
+          fi
+
+      - name: Demo-corpus conformance (eeschema-authored schematics)
+        env:
+          KONNECT_REQUIRE_DEMOS: "1"
+        run: cargo test -p konnect-core --locked --test conformance_test -- --nocapture
+
+      - name: Variant-grammar adjudication (kicad-cli acceptance)
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            xvfb-run -a cargo test -p konnect-sexp --locked --test variant_fixture_test -- --ignored --nocapture
+          else
+            cargo test -p konnect-sexp --locked --test variant_fixture_test -- --ignored --nocapture
+          fi
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: e2e-failure-artifacts-${{ matrix.os }}
+          path: e2e-artifacts/
+          if-no-files-found: ignore
