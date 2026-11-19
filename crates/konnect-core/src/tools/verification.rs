@@ -1,17 +1,19 @@
 //! `verification` toolset — DRC, design rules, KiCAD UI management, routing utilities.
 //!
-//! DRC delegates to `kicad-cli`. Design rules are read/written as S-expressions.
+//! DRC delegates to `kicad-cli`. Board-wide constraints are stored in the KiCad project.
 //! KiCAD UI management uses process inspection + subprocess spawning.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    get_path, opt_str, require_f64, require_str, with_board_ipc_classified, ToolContext, ToolDef,
+    get_path, invalid_arg, opt_str, require_f64, require_str, with_board_ipc_classified,
+    ToolContext, ToolDef,
 };
 use konnect_sexp::geometry::round6;
 use konnect_sexp::writer::{write_atomic_if_unchanged, write_new_atomic};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -48,21 +50,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_design_rules",
-            "Set board-level design rules (clearance, trace width, via size) in the sibling KiCAD \
+            "Set board-level fabrication minima in the sibling KiCad \
              project file. Refuses while KiCad holds the board open, because KiCad's next save \
              rewrites the project file from its own copy.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
-                    "min_clearance": { "type": "number", "description": "Minimum clearance in mm" },
-                    "min_trace_width": { "type": "number", "description": "Minimum trace width in mm" },
-                    "min_via_drill": { "type": "number", "description": "Minimum via drill diameter in mm" },
-                    "min_via_size": { "type": "number", "description": "Minimum via pad diameter in mm" },
-                    "min_hole_to_hole": { "type": "number", "description": "Minimum hole-to-hole clearance in mm" }
-                },
-                "required": ["board"]
-            }),
+            design_rules_schema(),
             |args, ctx| async move { handle_set_design_rules(args, ctx).await }
         ),
         tool!(
@@ -333,6 +324,59 @@ fn sibling_custom_rules_path(board: &Path) -> PathBuf {
     board.with_extension("kicad_dru")
 }
 
+/// KiCad 10 board_design_settings.cpp PARAM_SCALED load ranges, in mm.
+/// Entries map (tool field, project key, minimum, maximum).
+const fn design_rule_fields() -> &'static [(&'static str, &'static str, f64, f64)] {
+    &[
+        ("min_clearance", "min_clearance", 0.0, 25.0),
+        ("min_trace_width", "min_track_width", 0.0, 25.0),
+        ("min_via_drill", "min_through_hole_diameter", 0.0, 25.0),
+        ("min_via_size", "min_via_diameter", 0.0, 25.0),
+        ("min_hole_to_hole", "min_hole_to_hole", 0.0, 10.0),
+        ("min_via_annular_width", "min_via_annular_width", 0.0, 25.0),
+        ("min_hole_clearance", "min_hole_clearance", 0.0, 100.0),
+        ("min_text_height", "min_text_height", 0.0, 100.0),
+        ("min_text_thickness", "min_text_thickness", 0.0, 25.0),
+        ("min_silk_clearance", "min_silk_clearance", -10.0, 100.0),
+        // -0.01 retains KiCad's legacy clearance calculation.
+        (
+            "min_copper_edge_clearance",
+            "min_copper_edge_clearance",
+            -0.01,
+            25.0,
+        ),
+    ]
+}
+
+fn design_rules_schema() -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "board".into(),
+        json!({
+            "type": "string", "description": "Path to .kicad_pcb file",
+        }),
+    );
+    for &(arg, _, lower, upper) in design_rule_fields() {
+        properties.insert(
+            arg.into(),
+            json!({
+                "type": "number",
+                "description": format!("Board-wide minimum in mm ({lower}..={upper})"),
+            }),
+        );
+    }
+    json!({"type": "object", "properties": properties, "required": ["board"]})
+}
+
+fn design_rule_values(project: &Value) -> Value {
+    Value::Object(
+        design_rule_fields()
+            .iter()
+            .map(|&(arg, key, _, _)| (arg.to_owned(), json!(project_rule_value(project, key))))
+            .collect(),
+    )
+}
+
 fn project_rules_mut(
     project: &mut serde_json::Value,
 ) -> anyhow::Result<&mut serde_json::Map<String, serde_json::Value>> {
@@ -427,6 +471,24 @@ async fn handle_set_design_rules(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let mut requested = Vec::new();
+    for &(arg, storage_key, lower, upper) in design_rule_fields() {
+        if args.get(arg).is_none() {
+            continue;
+        }
+        let value = match require_f64(args, arg) {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
+        if !(lower..=upper).contains(&value) {
+            return Ok(invalid_arg(
+                arg,
+                &format!("must be within {lower}..={upper} mm"),
+            ));
+        }
+        requested.push((storage_key, round6(value)));
+    }
+
     let board = get_path(args, "board")?;
     // KiCad rewrites the project file from memory when it saves the board, so
     // a rule written here while it holds the board is reverted (#791). Asked
@@ -443,24 +505,11 @@ async fn handle_set_design_rules(
 
     let mut changed = Vec::new();
 
-    let rules: &[(&str, &str)] = &[
-        ("min_clearance", "min_clearance"),
-        ("min_track_width", "min_trace_width"),
-        ("min_through_hole_diameter", "min_via_drill"),
-        ("min_via_size", "min_via_size"),
-        ("min_hole_to_hole", "min_hole_to_hole"),
-    ];
-
     let project_rules = project_rules_mut(&mut project)?;
-    for (project_key, arg_key) in rules {
-        if let Some(val) = args[arg_key].as_f64() {
-            let storage_key = if *project_key == "min_via_size" {
-                "min_via_diameter"
-            } else {
-                project_key
-            };
-            project_rules.insert(storage_key.to_string(), json!(val));
-            changed.push(format!("{} = {}", storage_key, val));
+    for (storage_key, value) in requested {
+        if project_rules.get(storage_key).and_then(Value::as_f64) != Some(value) {
+            project_rules.insert(storage_key.to_owned(), json!(value));
+            changed.push(format!("{storage_key} = {value}"));
         }
     }
 
@@ -474,7 +523,8 @@ async fn handle_set_design_rules(
         serde_json::to_string(&json!({
             "success": true,
             "project": project_path,
-            "changed": changed
+            "changed": changed,
+            "rules": design_rule_values(&project)
         }))
         .unwrap(),
     ))
@@ -493,13 +543,7 @@ async fn handle_get_design_rules(
         serde_json::to_string(&json!({
             "board": board.to_str().unwrap_or(""),
             "project": project_path.to_str().unwrap_or(""),
-            "rules": {
-                "min_clearance": project_rule_value(&project, "min_clearance"),
-                "min_trace_width": project_rule_value(&project, "min_track_width"),
-                "min_via_drill": project_rule_value(&project, "min_through_hole_diameter"),
-                "min_via_size": project_rule_value(&project, "min_via_diameter"),
-                "min_hole_to_hole": project_rule_value(&project, "min_hole_to_hole")
-            }
+            "rules": design_rule_values(&project)
         }))
         .unwrap(),
     ))
@@ -895,6 +939,18 @@ async fn handle_launch_kicad_ui(
     let binary = find_kicad_binary(&ctx.config.kicad_binary, &ctx.config.kicad_cli);
 
     let mut cmd = tokio::process::Command::new(&binary);
+    // KiCad can outlive this server. It must not keep carrying the MCP pipes
+    // or receive terminal interrupts meant for the caller's process group.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    #[cfg(windows)]
+    {
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(DETACHED_PROCESS);
+    }
     if let Some(project) = args["project"].as_str() {
         cmd.arg(project);
     }
@@ -2472,6 +2528,26 @@ mod coverage_verification_no_write {
             assert_eq!(body(&result)["copied"], 0);
             assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
         }
+    }
+
+    #[tokio::test]
+    async fn design_rule_wrong_type_does_not_apply_a_valid_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let project = board.with_extension("kicad_pro");
+        let source = "{ \"board\": {\"design_settings\": {\"rules\":{}}} }";
+        std::fs::write(&project, source).unwrap();
+        let result = handle_set_design_rules(
+            &json!({"board":board,"min_clearance":0.1,"min_via_annular_width":"narrow"}),
+            &ctx_talking_to(String::new()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let error = body(&result);
+        assert_eq!(error["error"]["kind"], "invalid_argument");
+        assert_eq!(error["error"]["field"], "min_via_annular_width");
+        assert_eq!(std::fs::read_to_string(&project).unwrap(), source);
     }
 
     #[tokio::test]

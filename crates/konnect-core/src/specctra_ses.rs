@@ -146,8 +146,21 @@ pub(crate) fn parse_import_plan(
     manifest_source: &str,
     ses_source: &str,
 ) -> Result<SesImportPlan> {
-    let manifest: Manifest =
-        serde_json::from_str(manifest_source).context("parse Specctra reverse manifest")?;
+    let manifest: Manifest = serde_json::from_str(manifest_source).map_err(|error| {
+        let kind = serde_json::from_str::<serde_json::Value>(manifest_source)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        if kind.as_deref() == Some("konnect_native_dsn_receipt") {
+            anyhow::anyhow!("Specctra receipt is native-only and cannot authorize SES import")
+        } else {
+            anyhow::Error::new(error).context("parse Specctra reverse manifest")
+        }
+    })?;
     validate_manifest(board_path, board_source, &manifest)?;
 
     let root = parse_sexp(ses_source).context("parse Specctra SES")?;

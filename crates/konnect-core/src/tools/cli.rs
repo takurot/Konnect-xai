@@ -444,6 +444,7 @@ async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Re
     let exe = resolve_cli_executable(cli);
     let mut cmd = Command::new(&exe);
     cmd.args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -487,8 +488,9 @@ async fn run_cli_captured(cli: &str, args: &[&str], timeout_dur: Duration) -> Re
                 .terminate()
                 .await
                 .context("failed to stop timed-out kicad-cli")?;
-            return Err(elapsed)
-                .with_context(|| format!("kicad-cli timed out after {:?}", timeout_dur));
+            return Err(elapsed).with_context(|| {
+                format!("kicad-cli timed out after {timeout_dur:?} (child process reaped)")
+            });
         }
     };
     owned.disarm();
@@ -595,6 +597,34 @@ fn export_staging_dir(destination: &Path) -> Result<Arc<ExportStaging>> {
         .tempdir_in(parent)
         .map(|directory| Arc::new(ExportStaging::new(directory)))
         .context("failed to create an export staging directory")
+}
+
+fn ensure_export_destination_is_not_design_file(destination: &Path) -> Result<()> {
+    let canonical = destination.canonicalize().ok();
+    let reserved = [Some(destination), canonical.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+        .any(|name| {
+            let name = name.trim_end_matches([' ', '.']).to_ascii_lowercase();
+            matches!(name.as_str(), "fp-lib-table" | "sym-lib-table")
+                || Path::new(&name)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        ext.starts_with("kicad_")
+                            || matches!(
+                                ext,
+                                "sch" | "brd" | "pro" | "lib" | "mod" | "dcm" | "pretty"
+                            )
+                    })
+        });
+    anyhow::ensure!(
+        !reserved,
+        "export destination {} is reserved for a KiCad design or library",
+        destination.display()
+    );
+    Ok(())
 }
 
 /// Publish a verified artifact without letting a stale destination stand in
@@ -1442,27 +1472,138 @@ pub async fn export_schematic_svg(
     options: &SchematicSvgOptions<'_>,
 ) -> Result<PathBuf> {
     let staging = export_staging_dir(output_dir)?;
+    let (root, files) = stage_schematic_svg(cli, schematic, options, &staging).await?;
+    publish_verified_files(&files, output_dir, "schematic SVG", &staging).await?;
+    Ok(output_dir.join(root.file_name().context("root SVG has no file name")?))
+}
+
+async fn stage_schematic_svg(
+    cli: &str,
+    schematic: &Path,
+    options: &SchematicSvgOptions<'_>,
+    staging: &ExportStaging,
+) -> Result<(PathBuf, Vec<PathBuf>)> {
     let args = schematic_svg_args(
         staging.path().to_str().unwrap(),
         schematic.to_str().unwrap(),
         options,
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    let stem = schematic.file_stem().unwrap_or_default().to_string_lossy();
-    let staged_root = staging.path().join(format!("{}.svg", stem));
+    let stem = schematic
+        .file_stem()
+        .context("schematic has no file stem")?;
+    let mut name = stem.to_os_string();
+    name.push(".svg");
+    let root = staging.path().join(name);
+    verify_nonempty_file(&root, "schematic SVG").await?;
 
-    let mut staged_files = Vec::new();
+    let mut files = Vec::new();
     let mut entries = tokio::fs::read_dir(staging.path()).await?;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) == Some("svg") {
-            staged_files.push(path);
+        if path.extension().is_some_and(|extension| extension == "svg") {
+            files.push(path);
         }
     }
-    staged_files.sort();
-    verify_nonempty_file(&staged_root, "schematic SVG").await?;
-    publish_verified_files(&staged_files, output_dir, "schematic SVG", &staging).await?;
-    Ok(output_dir.join(format!("{}.svg", stem)))
+    files.sort();
+    Ok((root, files))
+}
+
+/// Export to an exact root path. KiCad chooses child basenames, so implicit
+/// child paths may be created but never replace an existing directory entry.
+pub(crate) async fn export_named_schematic_svg(
+    cli: &str,
+    schematic: &Path,
+    output: &Path,
+    options: &SchematicSvgOptions<'_>,
+) -> Result<Vec<PathBuf>> {
+    anyhow::ensure!(
+        output
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("svg")),
+        "schematic SVG output must have a .svg extension"
+    );
+    let root_name = output
+        .file_name()
+        .context("root SVG output has no file name")?;
+    ensure_export_destination_is_not_design_file(output)?;
+    let root_exists = match tokio::fs::symlink_metadata(output).await {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_file(),
+                "root SVG destination must be a regular file"
+            );
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("could not inspect root SVG destination"),
+    };
+
+    let staging = export_staging_dir(output)?;
+    let (root, staged) = stage_schematic_svg(cli, schematic, options, &staging).await?;
+
+    let children = staged
+        .iter()
+        .filter(|path| **path != root)
+        .map(|path| {
+            let name = path.file_name().expect("staged child has a basename");
+            (path, output.with_file_name(name))
+        })
+        .collect::<Vec<_>>();
+
+    // Reserve filenames in an empty directory on the destination filesystem
+    // so case- or normalization-equivalent root/child names fail before any
+    // publication, using that filesystem's own filename comparison.
+    let names = staging.path().join(".names");
+    tokio::fs::create_dir(&names).await?;
+    tokio::fs::File::create_new(names.join(root_name)).await?;
+    for (source, destination) in &children {
+        verify_nonempty_file(source, "schematic SVG").await?;
+        let name = destination
+            .file_name()
+            .expect("child output has a basename");
+        tokio::fs::File::create_new(names.join(name))
+            .await
+            .with_context(|| {
+                format!(
+                    "cannot reserve schematic child filename {}",
+                    destination.display()
+                )
+            })?;
+        match tokio::fs::symlink_metadata(destination).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error).context("could not inspect child SVG destination"),
+            Ok(_) => anyhow::bail!(
+                "child SVG output {} already exists; choose a directory without conflicting child names",
+                destination.display()
+            ),
+        }
+    }
+    let mut outputs = vec![output.to_path_buf()];
+    for (source, destination) in children {
+        konnect_sexp::rename_noreplace(source, &destination).with_context(|| {
+            format!(
+                "failed to publish child SVG {} (child SVGs already published: {:?})",
+                destination.display(),
+                &outputs[1..]
+            )
+        })?;
+        outputs.push(destination);
+    }
+    let result = if root_exists {
+        publish_verified_file(&root, output, "schematic SVG", &staging)
+            .await
+            .map(|_| ())
+    } else {
+        konnect_sexp::rename_noreplace(&root, output).map_err(anyhow::Error::from)
+    };
+    result.with_context(|| {
+        format!(
+            "root SVG publication failed (child SVGs already published: {:?})",
+            &outputs[1..]
+        )
+    })?;
+    Ok(outputs)
 }
 
 #[derive(Debug, Clone)]
@@ -1836,23 +1977,7 @@ pub async fn export_pdf(
     layers: &[&str],
     black_and_white: bool,
 ) -> Result<()> {
-    let staging = export_staging_dir(output)?;
-    let staged = staging.path().join(
-        output
-            .file_name()
-            .context("PCB PDF output has no file name")?,
-    );
-    let args = single_file_pcb_export_args(
-        "pdf",
-        staged.to_str().unwrap(),
-        layers,
-        black_and_white,
-        pcb.to_str().unwrap(),
-    );
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
-    publish_verified_file(&staged, output, "PCB PDF", &staging).await?;
-    Ok(())
+    export_single_pcb_plot(cli, "pdf", pcb, output, layers, black_and_white).await
 }
 
 /// KiCAD 10: `pcb export svg --output <path> --mode-single [--layers <a,b>]
@@ -1864,15 +1989,43 @@ pub async fn export_svg_pcb(
     layers: &[&str],
     black_and_white: bool,
 ) -> Result<()> {
+    export_single_pcb_plot(cli, "svg", pcb, output, layers, black_and_white).await
+}
+
+async fn export_single_pcb_plot(
+    cli: &str,
+    format: &str,
+    pcb: &Path,
+    output: &Path,
+    layers: &[&str],
+    black_and_white: bool,
+) -> Result<()> {
+    ensure_export_destination_is_not_design_file(output)?;
+    anyhow::ensure!(
+        output
+            .canonicalize()
+            .ok()
+            .zip(pcb.canonicalize().ok())
+            .is_none_or(|(destination, source)| destination != source),
+        "PCB plot output must differ from the input board"
+    );
+    let staging = export_staging_dir(output)?;
+    let staged = staging.path().join(
+        output
+            .file_name()
+            .context("PCB plot output has no file name")?,
+    );
     let args = single_file_pcb_export_args(
-        "svg",
-        output.to_str().unwrap(),
+        format,
+        staged.to_str().unwrap(),
         layers,
         black_and_white,
         pcb.to_str().unwrap(),
     );
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_cli(cli, &args, LONG_TIMEOUT).await?;
+    let artifact = format!("PCB {}", format.to_ascii_uppercase());
+    publish_verified_file(&staged, output, &artifact, &staging).await?;
     Ok(())
 }
 
@@ -2007,6 +2160,29 @@ async fn export_position_file_with_options(
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     publish_verified_file(&staged, output, "position file", &staging).await?;
+    Ok(())
+}
+
+/// Publish a netlist for the PCB export tool from the appropriate native source.
+pub(crate) async fn export_native_netlist(
+    cli: &str,
+    source: &Path,
+    output: &Path,
+    schematic: bool,
+) -> Result<()> {
+    ensure_export_destination_is_not_design_file(output)?;
+    let staging = export_staging_dir(output)?;
+    let staged = staging.path().join(
+        output
+            .file_name()
+            .context("netlist output has no file name")?,
+    );
+    if schematic {
+        export_netlist(cli, source, &staged, "kicad").await?;
+    } else {
+        export_ipcd356(cli, source, &staged).await?;
+    }
+    publish_verified_file(&staged, output, "netlist", &staging).await?;
     Ok(())
 }
 
@@ -4125,7 +4301,12 @@ mod cancellation_tests {
         assert!(
             matches!(task.await.unwrap(), Err(error) if error.to_string().contains("timed out"))
         );
+        let reaped_at_return = !is_running(&pid);
         assert_terminated(&pid).await;
+        assert!(
+            reaped_at_return,
+            "timed-out CLI {pid} was reaped after the response"
+        );
     }
     #[tokio::test]
     async fn cancelled_cli_remains_request_owned_until_child_is_reaped() {
@@ -4414,6 +4595,129 @@ mod coverage_cli_artifact_lifecycle {
         unix.push_str("exit 0\n");
         windows.push_str("exit /b 0\r\n");
         test_support::write_script(dir, "produces-artifacts", &unix, &windows)
+    }
+
+    #[tokio::test]
+    async fn named_schematic_svg_reports_each_sheet_and_safely_replaces_an_explicit_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = files_cli(
+            dir.path(),
+            5,
+            &[
+                ("design.svg", "root-svg-output"),
+                ("design-child.svg", "child-svg-output"),
+                ("diagnostic.log", "not an export"),
+            ],
+        );
+        let cli = cli.to_str().unwrap();
+        let source = dir.path().join("design.kicad_sch");
+        let options = SchematicSvgOptions::default();
+        for replace in [false, true] {
+            let folder = dir
+                .path()
+                .join(if replace { "replacement" } else { "first" });
+            std::fs::create_dir(&folder).unwrap();
+            let output = folder.join("custom.svg");
+            let child = folder.join("design-child.svg");
+            if replace {
+                std::fs::write(&output, "previous explicit root").unwrap();
+            }
+
+            let files = export_named_schematic_svg(cli, &source, &output, &options)
+                .await
+                .unwrap();
+            assert_eq!(files, [output.clone(), child.clone()]);
+            assert_eq!(
+                std::fs::read_to_string(&output).unwrap().trim(),
+                "root-svg-output"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&child).unwrap().trim(),
+                "child-svg-output"
+            );
+            assert!(!folder.join("design.svg").exists());
+            assert!(!folder.join("diagnostic.log").exists());
+
+            std::fs::write(&child, "unrelated existing child").unwrap();
+            let error = export_named_schematic_svg(cli, &source, &output, &options)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("already exists"), "{error:#}");
+            assert_eq!(
+                std::fs::read_to_string(output).unwrap().trim(),
+                "root-svg-output"
+            );
+            assert_eq!(
+                std::fs::read_to_string(child).unwrap(),
+                "unrelated existing child"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn named_schematic_svg_refuses_an_obstructed_output_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let obstruction = dir.path().join("not-a-directory");
+        std::fs::write(&obstruction, "keep this file").unwrap();
+        let error = export_named_schematic_svg(
+            "",
+            &dir.path().join("design.kicad_sch"),
+            &obstruction.join("custom.svg"),
+            &SchematicSvgOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("could not inspect root SVG destination"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(obstruction).unwrap(),
+            "keep this file"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_backup_cleanup_keeps_recovery_data_after_export_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("preview.svg");
+        std::fs::write(&destination, "previous export").unwrap();
+        let staging = export_staging_dir(&destination).unwrap();
+        let staged = staging.path().join("preview.svg");
+        std::fs::write(&staged, "verified export").unwrap();
+        let backup = staging.path().join(".konnect-previous-preview.svg");
+        let saved_backup = staging.path().join("relocated-previous.svg");
+        let relocated = saved_backup.clone();
+
+        let error = publish_verified_file_with(
+            staged,
+            destination.clone(),
+            "PCB SVG".into(),
+            staging.clone(),
+            move || std::fs::rename(backup, relocated).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        drop(staging);
+        assert!(matches!(
+            error.downcast_ref::<konnect_sexp::SexpError>(),
+            Some(konnect_sexp::SexpError::MutationOutcomeUncertain { .. })
+        ));
+        assert!(
+            error.to_string().contains("backup cleanup failed"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination).unwrap(),
+            "verified export"
+        );
+        assert_eq!(
+            std::fs::read_to_string(saved_backup).unwrap(),
+            "previous export"
+        );
     }
 
     #[tokio::test]

@@ -8,6 +8,51 @@
 
 [KiCad実機E2E評価手順書](KICAD_E2E_RUNBOOK.md) の C01 は空基板からのガーバー出力とERC/DRC応答を、L08は回路図からPCBへの同期を検証する。本シナリオでは一つのプロジェクトで各工程をつなぎ、正しいネットが実際に銅箔でつながった基板から出力したことまで確認する。
 
+## 実機回帰テスト
+
+[配線済み基板の回帰テスト](../crates/konnect/tests/routed_kicad/run.py) は、同じ回路から正常な `routed` と `LOAD_B` を未配線にする `unrouted` を作る。Python 3.11以降、標準ライブラリ付きKiCad 10、対象コミットからビルドしたKonnectを使う。GUI操作が必要なため通常のCargoテストからは起動しない。
+
+最初にスタンドアロンPCB Editorを閉じ、リポジトリのルートで実行する。以下はmacOSの例。評価環境に合わせてKiCad CLIのパスを変える。
+
+```sh
+scratch="$(mktemp -d /Volumes/Storage/private/konnect-routed.XXXXXX)"
+export TMPDIR="$scratch/tmp"
+export CARGO_TARGET_DIR="$scratch/target"
+mkdir "$TMPDIR"
+sha="$(git rev-parse HEAD)"
+KONNECT_BUILD_COMMIT="$sha" cargo build --locked -p konnect
+runner=crates/konnect/tests/routed_kicad/run.py
+work="$scratch/evidence"
+python3 -B "$runner" prepare --work-dir "$work" \
+  --konnect "$CARGO_TARGET_DIR/debug/konnect" \
+  --kicad-cli /Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli \
+  --expect-sha "$sha"
+```
+
+`prepare` は出力先を新規作成し、両回路のERCとKiCad XMLネットリストのピン所属を確認する。準備後は各PCBを別のPCB Editorセッションで一枚ずつ開く。Schematic Editorは閉じたままとし、テスト時は手動編集・手動保存を行わない。
+
+1. IPCを有効にしたPCB Editorで `$work/routed/load-test.kicad_pcb` を開く。[実機E2E手順のライブIPC設定](KICAD_E2E_RUNBOOK.md#b-guiとライブipcの評価) に沿って、そのPCB Editorのソケットを `KICAD_API_SOCKET` に指定する。
+2. 下の `routed` コマンドを実行し、結果を記録する。実行中は同じPCB Editorを開いたままにする。
+3. 最初のPCB Editorを閉じ、`$work/unrouted/load-test.kicad_pcb` を新しく開く。そのPCB Editorのソケットに `KICAD_API_SOCKET` を設定し直して `unrouted` コマンドを実行する。
+
+```sh
+python3 -B "$runner" run --work-dir "$work" --case routed --ipc "$KICAD_API_SOCKET"
+# routedの結果が記録されたらPCB Editorを閉じ、別セッションでunroutedを開く。
+python3 -B "$runner" run --work-dir "$work" --case unrouted --ipc "$KICAD_API_SOCKET"
+```
+
+書き込み前に読み取り専用の要求で対象PCBが一枚だけ開いていることを確認する。起動直後の応答は既定25秒まで待機し、別の基板が見えた場合は失敗する。空PCBを対象指定の `run_drc(sync_live_board: true)` で保存し、KiCadの既定設定を書き出してから同期・配置・配線を行う。初回と配線後の保存では対象PCBとの一致を確認し、予備DRCは `bootstrap-drc.json` と `saved-snapshot-drc.json` に保存する。出力可否を判定するDRCの直前から出力完了まで、PCB・回路図・プロジェクトのハッシュを照合する。
+
+両ケースの `result.json` が `pass` で合格。`routed` のDRCは全カテゴリが0件となり、`routed/gerbers/` に出力される。`unrouted` ではDRCの `unconnected_items` ルールが対象パッドに1件発生し、出力の呼び出しも `unrouted/gerbers/` の作成も行われない。ファイル検証はこの回路でKiCadが出力するGerberとExcellonの形式を対象にする。
+
+`environment.json`、`prepare/`、`run-routed/`、`run-unrouted/` に、対象SHA、KiCadバージョン、MCP要求と応答、入力ハッシュ、出力検証を保存する。失敗時もログを残し、同一ケースへの上書き実行を拒否する。再実行は新規の作業領域で `prepare` から行う。Gerber Viewerの目視確認は、日時・使用バージョン・対象ファイルとともに `run-routed/viewer.md` などへ別途記録する。
+
+GUIを使わない受け入れ判定のテストは次で実行する。
+
+```sh
+python3 -B -m unittest discover -s crates/konnect/tests/routed_kicad
+```
+
 ## 回路と基板
 
 2ピンヘッダーの両端に10 kΩの抵抗を接続する受動回路。電源シンボル、未接続ピン、階層シート、ビア、ゾーンを使わず、ネット同期と配線を2本の接続で確認する。標準ライブラリの候補は次のとおり。

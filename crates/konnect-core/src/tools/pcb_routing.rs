@@ -1,14 +1,14 @@
 //! `pcb_routing` toolset — traces, vias, copper pours, nets, netclasses, and diff pairs.
 //!
-//! Routing operations use the KiCAD IPC API; `add_net`, `create_netclass`, and
-//! `add_copper_pour` use S-expression file manipulation.
+//! Routing operations use the KiCad IPC API. Netclass tools use the saved
+//! KiCad project. Some tools also support closed-board file edits.
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::board_source::{self, BoardSource};
 use crate::tools::{
-    get_path, opt_f64, require_f64, require_str, with_board_ipc_classified,
+    get_path, invalid_arg, opt_f64, require_f64, require_str, with_board_ipc_classified,
     with_bound_board_ipc_classified, BoardBinding, ToolContext, ToolDef,
 };
 use anyhow::Context;
@@ -253,11 +253,30 @@ pub fn tools() -> Vec<ToolDef> {
                     "clearance":    { "type": "number", "description": "Clearance in mm", "default": 0.2 },
                     "trace_width":  { "type": "number", "description": "Default trace width in mm", "default": 0.25 },
                     "via_drill":    { "type": "number", "description": "Via drill diameter in mm", "default": 0.4 },
-                    "via_diameter": { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 }
+                    "via_diameter": { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 },
+                    "diff_pair_width": { "type": "number", "description": "Differential pair trace width in mm" },
+                    "diff_pair_gap": { "type": "number", "description": "Differential pair trace gap in mm" },
+                    "diff_pair_via_gap": { "type": "number", "description": "Differential pair via gap in mm" }
                 },
                 "required": ["board", "name"]
             }),
             |args, ctx| async move { handle_create_netclass(args, ctx).await }
+        ),
+        tool!(
+            "delete_netclass",
+            "Delete a named non-Default netclass from the sibling .kicad_pro. Remove its project \
+             pattern and saved label assignments. Remaining classes and their priority are preserved, \
+             with KiCad's normal fallback rules. Does not edit schematic labels or \
+             the PCB. Refuses while KiCad holds the board or project lock.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file; the sibling .kicad_pro is edited" },
+                    "name": { "type": "string", "description": "Existing non-Default netclass name" }
+                },
+                "required": ["board", "name"]
+            }),
+            |args, ctx| async move { handle_delete_netclass(args, ctx).await }
         ),
         tool!(
             "get_netclasses",
@@ -273,7 +292,8 @@ pub fn tools() -> Vec<ToolDef> {
              property from the highest-priority class that sets it (lower number = \
              higher priority) and falls back to Default. Settings are reported \
              resolved, with 'inherits' naming the ones a class takes from the \
-             Default rather than setting itself; 'missing_fields' on the \
+             Default rather than setting itself. KiCad 10 leaves an omitted differential pair \
+             via gap unset on named classes. 'missing_fields' on the \
              Default names settings nothing can resolve. 'orphan_patterns' \
              lists patterns naming a class that does not exist; \
              'unmatched_patterns' lists patterns whose class exists but which \
@@ -1380,6 +1400,19 @@ fn kicad_default_class() -> serde_json::Value {
     })
 }
 
+/// KiCad backfills from Default, never into it. Repair only missing keys.
+fn backfill_default_class(class: &mut serde_json::Value) -> Vec<String> {
+    let seeded = kicad_default_class();
+    let mut backfilled = Vec::new();
+    for (key, value) in seeded.as_object().expect("KiCad's defaults are an object") {
+        if class[key].is_null() {
+            class[key] = value.clone();
+            backfilled.push(key.clone());
+        }
+    }
+    backfilled
+}
+
 async fn handle_create_netclass(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1392,16 +1425,26 @@ async fn handle_create_netclass(
     if let Some(refusal) = refuse_while_kicad_holds_the_board(ctx, &board_path).await? {
         return Ok(refusal);
     }
-    // KiCad's key, this tool's argument name, and the value a *new* class
-    // takes when the caller says nothing. The defaults belong to creation
-    // only: folding them in before an update turned "widen HV's track" into a
-    // silent reset of the clearance, drill and via size the caller had tuned.
-    const FIELDS: [(&str, &str, f64); 4] = [
-        ("clearance", "clearance", 0.2),
-        ("track_width", "trace_width", 0.25),
-        ("via_drill", "via_drill", 0.4),
-        ("via_diameter", "via_diameter", 0.8),
-    ];
+    // The differential fields are scaled into signed 32-bit nanometres by KiCad.
+    // Reject out-of-domain values before touching the project.
+    let mut requested = Vec::new();
+    for (key, arg, default) in NETCLASS_FIELDS {
+        let value = if default.is_none() && args.get(arg).is_some() {
+            match require_f64(args, arg) {
+                Ok(value) if (0.0..=MAX_NETCLASS_MM).contains(&value) => Some(round6(value)),
+                Ok(_) => {
+                    return Ok(invalid_arg(
+                        arg,
+                        &format!("must be within 0..={MAX_NETCLASS_MM} mm"),
+                    ))
+                }
+                Err(error) => return Ok(error),
+            }
+        } else {
+            opt_f64(args, arg)
+        };
+        requested.push((key, value, default));
+    }
     // Only the Default must be complete. Every other class may stay sparse.
     let is_default = name == DEFAULT_CLASS_NAME;
 
@@ -1435,28 +1478,13 @@ async fn handle_create_netclass(
     let mut backfilled: Vec<String> = Vec::new();
     let updated = if let Some(class) = classes.iter_mut().find(|c| c["name"] == json!(name)) {
         let before = class.clone();
-        for (key, arg, _) in FIELDS {
-            if let Some(value) = opt_f64(args, arg) {
+        for &(key, value, _) in &requested {
+            if let Some(value) = value {
                 class[key] = json!(value);
             }
         }
-        // KiCad backfills from the Default, never into it, so a Default left
-        // incomplete by an older Konnect can only be repaired here. Absent
-        // keys only: overwriting one already set is #220.
         if is_default {
-            let complete = kicad_default_class();
-            let seeded = complete
-                .as_object()
-                .expect("kicad_default_class builds an object");
-            let class = class.as_object_mut().ok_or_else(|| {
-                anyhow::anyhow!("{}: netclass '{name}' is not an object", pro.display())
-            })?;
-            for (key, value) in seeded {
-                if class.get(key).is_none_or(|v| v.is_null()) {
-                    class.insert(key.clone(), value.clone());
-                    backfilled.push(key.clone());
-                }
-            }
+            backfilled = backfill_default_class(class);
         }
         changed = *class != before;
         true
@@ -1465,8 +1493,8 @@ async fn handle_create_netclass(
         // to them, so start from the full set.
         let mut class = kicad_default_class();
         class["name"] = json!(name);
-        for (key, arg, _) in FIELDS {
-            if let Some(value) = opt_f64(args, arg) {
+        for &(key, value, _) in &requested {
+            if let Some(value) = value {
                 class[key] = json!(value);
             }
         }
@@ -1477,8 +1505,10 @@ async fn handle_create_netclass(
         // writing the full set would sever that inheritance. -1 is what
         // KiCad's constructor gives every non-default class.
         let mut class = json!({ "name": name, "priority": -1 });
-        for (key, arg, default) in FIELDS {
-            class[key] = json!(opt_f64(args, arg).unwrap_or(default));
+        for (key, value, default) in requested {
+            if let Some(value) = value.or(default) {
+                class[key] = json!(value);
+            }
         }
         classes.push(class);
         false
@@ -1517,8 +1547,109 @@ async fn handle_create_netclass(
         "is_default": is_default,
         "clearance": stored["clearance"], "trace_width": stored["track_width"],
         "via_drill": stored["via_drill"], "via_diameter": stored["via_diameter"],
+        "diff_pair_width": stored["diff_pair_width"], "diff_pair_gap": stored["diff_pair_gap"],
+        "diff_pair_via_gap": stored["diff_pair_via_gap"],
         "file": pro.display().to_string(),
         "note": note
+    })))
+}
+
+async fn handle_delete_netclass(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let name = match require_str(args, "name") {
+        Ok(DEFAULT_CLASS_NAME) => {
+            return Ok(invalid_arg(
+                "name",
+                "the Default netclass cannot be deleted",
+            ))
+        }
+        Ok(name) => name,
+        Err(error) => return Ok(error),
+    };
+    if let Some(refusal) = refuse_while_kicad_holds_the_board(ctx, &board).await? {
+        return Ok(refusal);
+    }
+    konnect_sexp::writer::ensure_kicad_design_document_is_closed(&project_settings_path(&board))?;
+    let (project, mut settings, source) = match load_project_settings(&board)? {
+        Ok(loaded) => loaded,
+        Err(refusal) => return Ok(refusal),
+    };
+    let unknown = || invalid_arg("name", &format!("netclass '{name}' does not exist"));
+    let Some(net_settings) = settings.get_mut("net_settings") else {
+        return Ok(unknown());
+    };
+    let Some(classes) = net_settings.get_mut("classes") else {
+        return Ok(unknown());
+    };
+    let classes = classes
+        .as_array_mut()
+        .context("net_settings.classes must be an array")?;
+    let previous_classes = classes.len();
+    classes.retain(|class| class["name"].as_str() != Some(name));
+    if classes.len() == previous_classes {
+        return Ok(unknown());
+    }
+
+    // An explicit Default can be sparse in older files. Preserve its authored
+    // values and restore only missing fields. An absent Default is KiCad's
+    // complete seeded class, so no new class needs to be written for that case.
+    let backfilled = classes
+        .iter_mut()
+        .find(|class| class["name"].as_str() == Some(DEFAULT_CLASS_NAME))
+        .map(backfill_default_class)
+        .unwrap_or_default();
+
+    // Remove membership in the deleted class without rewriting it into
+    // explicit Default patterns. A net can still match other class patterns,
+    // or have other label assignments that take precedence for some fields.
+    let mut removed_patterns = 0;
+    if let Some(patterns) = net_settings
+        .get_mut("netclass_patterns")
+        .filter(|value| !value.is_null())
+    {
+        let patterns = patterns
+            .as_array_mut()
+            .context("net_settings.netclass_patterns must be an array")?;
+        let previous_patterns = patterns.len();
+        patterns.retain(|pattern| pattern["netclass"].as_str() != Some(name));
+        removed_patterns = previous_patterns - patterns.len();
+    }
+    let mut removed_label_assignments = 0;
+    if let Some(assignments) = net_settings
+        .get_mut("netclass_assignments")
+        .filter(|value| !value.is_null())
+    {
+        let assignments = assignments
+            .as_object_mut()
+            .context("net_settings.netclass_assignments must be an object")?;
+        // Older project schemas store a single class string per net. Current
+        // KiCad stores lists. Keep either shape for surviving assignments.
+        assignments.retain(|_, value| {
+            if let Some(classes) = value.as_array_mut() {
+                let previous = classes.len();
+                classes.retain(|class| class.as_str() != Some(name));
+                let removed = previous - classes.len();
+                removed_label_assignments += removed;
+                removed == 0 || !classes.is_empty()
+            } else if value.as_str() == Some(name) {
+                removed_label_assignments += 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    save_project_settings(&project, &settings, &source)?;
+    Ok(CallToolResult::json(&json!({
+        "deleted_netclass": name,
+        "removed_patterns": removed_patterns,
+        "removed_label_assignments": removed_label_assignments,
+        "backfilled_default_fields": backfilled,
+        "file": project.display().to_string(),
     })))
 }
 
@@ -1559,18 +1690,19 @@ fn wildcard_matches(pattern: &str, name: &str) -> bool {
     p == pat.len()
 }
 
-/// The four settings `create_netclass` writes, as (KiCad's key, this API's
-/// name). Reported per class so a caller can see what a class holds before
-/// overwriting it — the gap that made #220 hard to review.
-///
-/// A key absent from a named class means inheritance, not an unset value, so
-/// these are reported resolved with `inherits` naming what came from the
-/// Default (#326).
-const NETCLASS_FIELDS: [(&str, &str); 4] = [
-    ("clearance", "clearance"),
-    ("track_width", "trace_width"),
-    ("via_drill", "via_drill"),
-    ("via_diameter", "via_diameter"),
+const MAX_NETCLASS_MM: f64 = i32::MAX as f64 / 1_000_000.0;
+
+/// KiCad key, tool argument, and creation default for a named class.
+/// Differential fields are absent unless explicitly set. KiCad inherits width
+/// and gap, but does not inherit the via gap for named classes.
+const NETCLASS_FIELDS: [(&str, &str, Option<f64>); 7] = [
+    ("clearance", "clearance", Some(0.2)),
+    ("track_width", "trace_width", Some(0.25)),
+    ("via_drill", "via_drill", Some(0.4)),
+    ("via_diameter", "via_diameter", Some(0.8)),
+    ("diff_pair_width", "diff_pair_width", None),
+    ("diff_pair_gap", "diff_pair_gap", None),
+    ("diff_pair_via_gap", "diff_pair_via_gap", None),
 ];
 
 /// Every distinct net the saved board names, sorted.
@@ -1703,11 +1835,13 @@ async fn handle_get_netclasses(
             "matched_nets": matched,
         });
         let mut inherits: Vec<&str> = Vec::new();
-        for (key, api) in NETCLASS_FIELDS {
+        for (key, api, _) in NETCLASS_FIELDS {
             let own = class.get(key).filter(|v| !v.is_null());
             entry[api] = match own {
                 Some(value) => value.clone(),
-                None if !is_default => {
+                // KiCad 10 NET_SETTINGS::addMissingDefaults deliberately leaves
+                // the via gap unset in an aggregate named class.
+                None if !is_default && key != "diff_pair_via_gap" => {
                     let inherited = effective_default[key].clone();
                     if !inherited.is_null() {
                         inherits.push(api);
@@ -2361,6 +2495,25 @@ mod netclass_tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn malformed_differential_fields_leave_the_project_unchanged() {
+        let (_dir, board) = fixture(true);
+        let project = board.with_extension("kicad_pro");
+        let before = std::fs::read(&project).unwrap();
+        for value in [json!("wide"), json!(-0.01), json!(2147.483648)] {
+            let result = create(
+                &board,
+                json!({"name":"Pair","trace_width":0.3,"diff_pair_via_gap":value}),
+            )
+            .await;
+            assert!(result.is_error, "{}", text_of(&result));
+            let body: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+            assert_eq!(body["error"]["kind"], "invalid_argument");
+            assert_eq!(body["error"]["field"], "diff_pair_via_gap");
+            assert_eq!(std::fs::read(&project).unwrap(), before);
+        }
     }
 
     /// The board file is data KiCad refuses if a netclass node lands in it;

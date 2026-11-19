@@ -57,6 +57,72 @@ pub(crate) fn optional_string_array(
         .collect()
 }
 
+const FRONT_PLOT_LAYERS: [&str; 5] = ["F.Cu", "F.Paste", "F.SilkS", "F.Mask", "Edge.Cuts"];
+
+async fn pcb_plot_layers(
+    board: &Path,
+    args: &serde_json::Value,
+) -> Result<Vec<String>, CallToolResult> {
+    use konnect_ipc::builders::{layer_from_name, layer_name};
+
+    let requested = optional_string_array(args, "layers")?;
+    let source = tokio::fs::read_to_string(board).await.map_err(|error| {
+        invalid_export_argument("board", format!("cannot read its plot layers: {error}"))
+    })?;
+    let parsed = konnect_sexp::parse_sexp(&source).map_err(|error| {
+        invalid_export_argument("board", format!("cannot read its plot layers: {error}"))
+    })?;
+    let board_layers = konnect_sexp::layers::layers(&parsed);
+    let enabled = |canonical: &str| board_layers.iter().any(|layer| layer.name == canonical);
+    if requested.is_empty() {
+        let selected: Vec<_> = FRONT_PLOT_LAYERS
+            .into_iter()
+            .filter(|name| enabled(name))
+            .map(String::from)
+            .collect();
+        if selected.is_empty() {
+            return Err(invalid_export_argument(
+                "board",
+                "no front plot layer is enabled",
+            ));
+        }
+        return Ok(selected);
+    }
+
+    let mut selected = Vec::with_capacity(requested.len());
+    for (index, name) in requested.iter().enumerate() {
+        let canonical = if let Some(layer) = layer_name(layer_from_name(name.trim())) {
+            if !enabled(layer) {
+                return Err(invalid_export_argument(
+                    &format!("layers[{index}]"),
+                    format!("'{name}' is not enabled on the board"),
+                ));
+            }
+            layer
+        } else {
+            // Resolve user-facing names from the saved layer table. KiCad can
+            // silently drop unknown or disabled names in a mixed selection.
+            let mut matching = board_layers
+                .iter()
+                .filter(|layer| layer.user_name.as_deref() == Some(name.as_str()));
+            matching
+                .next()
+                .filter(|_| matching.next().is_none())
+                .and_then(|layer| layer_name(layer_from_name(&layer.name)))
+                .ok_or_else(|| {
+                    invalid_export_argument(
+                        &format!("layers[{index}]"),
+                        format!("'{name}' is not an unambiguous KiCad layer or board layer alias"),
+                    )
+                })?
+        };
+        if !selected.iter().any(|name| name == canonical) {
+            selected.push(canonical.to_owned());
+        }
+    }
+    Ok(selected)
+}
+
 /// Default Gerber selection for a fabrication package: every enabled copper
 /// layer plus solder mask, silkscreen, and the board outline. It deliberately
 /// excludes drawings, comments, adhesive, courtyard, fab, and margin layers.
@@ -143,7 +209,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Output PDF file path" },
                     "layers": {
                         "type": "array",
-                        "description": "Layer names to include (empty = all visible layers)",
+                        "description": "Canonical layer names or saved-board layer aliases. Omit or use [] for F.Cu, F.Paste, F.SilkS, F.Mask, Edge.Cuts.",
                         "items": { "type": "string" }
                     },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false }
@@ -162,7 +228,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Output SVG file path" },
                     "layers": {
                         "type": "array",
-                        "description": "Layer names to include (empty = all visible layers)",
+                        "description": "Canonical layer names or saved-board layer aliases. Omit or use [] for F.Cu, F.Paste, F.SilkS, F.Mask, Edge.Cuts.",
                         "items": { "type": "string" }
                     },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false }
@@ -232,15 +298,17 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "export_netlist",
-            "Export the PCB netlist to a file in KiCAD or IPC-D-356 format.",
+            "Export IPC-D-356 from the saved PCB, or export a KiCad netlist from the saved schematic. \
+             KiCad format resolves a PCB input to its same-stem schematic; source reports the file read.",
             json!({
                 "type": "object",
                 "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file (or .kicad_sch for schematic netlist)" },
+                    "board": { "type": "string", "description": "Path to .kicad_pcb, or a .kicad_sch path for kicad format" },
                     "output": { "type": "string", "description": "Output netlist file path" },
                     "format": {
                         "type": "string",
-                        "description": "Netlist format: 'kicad' or 'ipc' (IPC-D-356)",
+                        "description": "kicad uses the schematic; ipc and ipcd356 use the PCB.",
+                        "enum": ["kicad", "ipc", "ipcd356"],
                         "default": "kicad"
                     }
                 },
@@ -250,17 +318,12 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "export_specctra_dsn",
-            "Export a deterministic Specctra DSN routing job from the exact live KiCad PCB \
-             editor revision. Requires the named board to be open with IPC enabled. On KiCad 10, \
-             an enabled authenticated ActionPlugin bridge supplies KiCad's native DSN while the \
-             IPC snapshot and reverse manifest remain authoritative; otherwise the Rust exporter \
-             is used. The first \
-             supported profile is deliberately narrow: two copper layers, front-side SMD or \
-             through-hole footprints, circle/rectangle pads, one straight-line closed outline, \
-             and no existing tracks, vias, or zones. Konnect refuses unsupported geometry or \
-             custom DRC rules, or incomplete effective routing rules instead of approximating \
-             them, and writes a \
-             revision-bound reverse manifest beside the DSN for later SES import.",
+            "Export a Specctra DSN routing job from an exact open KiCad PCB Editor revision. \
+             The default Rust profile supports two copper layers, front-side components, \
+             circular, rectangular, roundrect and oval pads, and locked tracks and vias. \
+             It refuses unsupported padstacks and custom rules. An authenticated KiCad 10 \
+             ActionPlugin may export a native DSN. For a board outside the SES profile, it \
+             emits a snapshot-bound export receipt with ses_importable:false.",
             json!({
                 "type": "object",
                 "properties": {
@@ -274,7 +337,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "manifest_output_path": {
                         "type": "string",
-                        "description": "Optional new reverse-manifest JSON path. Defaults to <output>.konnect.json. Existing files are never replaced."
+                        "description": "Optional new reverse-manifest or native export receipt JSON path. Defaults to <output>.konnect.json. Existing files are never replaced."
                     },
                     "native_bridge_mode": {
                         "type": "string",
@@ -489,15 +552,10 @@ async fn handle_export_pdf(
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
 
-    // Collect optional layer list
-    let layers: Vec<String> = args["layers"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let layers = match pcb_plot_layers(&board, args).await {
+        Ok(layers) => layers,
+        Err(error) => return Ok(error),
+    };
     let layer_refs: Vec<&str> = layers.iter().map(|s| s.as_str()).collect();
     let black_and_white = args["black_and_white"].as_bool().unwrap_or(false);
 
@@ -508,6 +566,7 @@ async fn handle_export_pdf(
         serde_json::to_string(&json!({
             "success": true,
             "output": output.to_str().unwrap_or(""),
+            "layers_used": layers,
             "black_and_white": black_and_white
         }))
         .unwrap(),
@@ -521,14 +580,10 @@ async fn handle_export_svg(
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
 
-    let layers: Vec<String> = args["layers"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let layers = match pcb_plot_layers(&board, args).await {
+        Ok(layers) => layers,
+        Err(error) => return Ok(error),
+    };
     let layer_refs: Vec<&str> = layers.iter().map(|s| s.as_str()).collect();
     let black_and_white = args["black_and_white"].as_bool().unwrap_or(false);
 
@@ -539,6 +594,7 @@ async fn handle_export_svg(
         serde_json::to_string(&json!({
             "success": true,
             "output": output.to_str().unwrap_or(""),
+            "layers_used": layers,
             "black_and_white": black_and_white
         }))
         .unwrap(),
@@ -615,21 +671,62 @@ async fn handle_export_netlist(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
-    let format = args["format"].as_str().unwrap_or("kicad");
+    let format = match args.get("format") {
+        None => "kicad",
+        Some(value) => match value.as_str() {
+            Some(format @ ("kicad" | "ipc" | "ipcd356")) => format,
+            _ => {
+                return Ok(invalid_export_argument(
+                    "format",
+                    "must be kicad, ipc, or ipcd356",
+                ));
+            }
+        },
+    };
+    let source = match format {
+        "kicad" if extension_is(&board, "kicad_sch") => board.clone(),
+        "kicad" if extension_is(&board, "kicad_pcb") => board.with_extension("kicad_sch"),
+        "ipc" | "ipcd356" if extension_is(&board, "kicad_pcb") => board.clone(),
+        _ => {
+            return Ok(invalid_export_argument(
+                "board",
+                "use a .kicad_pcb for IPC-D-356 or a .kicad_pcb/.kicad_sch for kicad",
+            ));
+        }
+    };
+    if !source.is_file() {
+        let detail = if format == "kicad" {
+            "pass a saved schematic explicitly or call generate_netlist with the schematic path"
+        } else {
+            "pass a saved PCB"
+        };
+        return Ok(invalid_export_argument(
+            "board",
+            format!("export source {} is not a file; {detail}", source.display()),
+        ));
+    }
+    if [&board, &source].into_iter().any(|input| {
+        output == *input
+            || output.canonicalize().is_ok_and(|destination| {
+                input
+                    .canonicalize()
+                    .is_ok_and(|source| source == destination)
+            })
+    }) {
+        return Ok(invalid_export_argument(
+            "output",
+            "must differ from the design input",
+        ));
+    }
 
-    let cli = &ctx.config.kicad_cli;
-    // kicad-cli `sch export netlist` works on both .kicad_sch and .kicad_pcb paths.
-    // For PCB-specific netlist formats (IPC-D-356), delegate same way.
-    cli::export_netlist(cli, &board, &output, format).await?;
+    cli::export_native_netlist(&ctx.config.kicad_cli, &source, &output, format == "kicad").await?;
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "format": format,
-            "output": output.to_str().unwrap_or("")
-        }))
-        .unwrap(),
-    ))
+    Ok(CallToolResult::json(&json!({
+        "success": true,
+        "format": format,
+        "output": output,
+        "source": source,
+    })))
 }
 
 fn extension_is(path: &Path, expected: &str) -> bool {
@@ -749,111 +846,129 @@ async fn handle_export_specctra_dsn(
         .canonicalize()
         .with_context(|| format!("resolve board {}", board_path.display()))?;
     let custom_rules_path = board_path.with_extension("kicad_dru");
-    if custom_rules_path.is_file() {
+    let custom_rules_reason = format!(
+        "custom DRC rules are outside the first supported routing profile ({})",
+        custom_rules_path.display()
+    );
+    let had_custom_rules = custom_rules_path.is_file();
+    if native_bridge_mode == "disable" && had_custom_rules {
         return Ok(CallToolResult::error_kind(
             ToolErrorKind::HandlerError {
-                reason: format!(
-                    "custom DRC rules are outside the first supported routing profile: {}",
-                    custom_rules_path.display()
-                ),
+                reason: custom_rules_reason.clone(),
             },
-            format!(
-                "Specctra export refused: custom DRC rules are outside the first supported routing profile ({})",
-                custom_rules_path.display()
-            ),
+            format!("Specctra export refused: {custom_rules_reason}"),
         ));
     }
-    let board_for_ipc = board_path.clone();
-    let addr = ctx.config.ipc_address.clone();
-    let export = with_ipc(addr, move |client| {
-        let document = client.find_open_board(&board_for_ipc)?;
-        let before = client.save_document_to_string_in(document.clone())?;
-        let rules = client.get_effective_routing_rules_in(document.clone())?;
-        let after = client.save_document_to_string_in(document)?;
-        if before != after {
-            anyhow::bail!(
-                "KiCad board changed while routing rules were captured; retry from a stable editor revision"
-            );
-        }
-        let export = crate::specctra::export_dsn(&board_for_ipc, &before, &rules)?;
-        Ok((export, before))
+    let requested = board_path.clone();
+    let source_snapshot = match with_ipc(ctx.config.ipc_address.clone(), move |client| {
+        client.save_document_to_string_in(client.find_open_board(&requested)?)
     })
-    .await?;
-    let (baseline, source_snapshot) = match export {
-        Ok(export) => export,
+    .await?
+    {
+        Ok(source) => source,
         Err(reason) => {
-            return Ok(CallToolResult::error_kind(
-                ToolErrorKind::HandlerError {
-                    reason: reason.clone(),
-                },
-                format!("Specctra export refused: {reason}"),
-            ));
+            return Ok(CallToolResult::error(format!(
+                "Specctra export refused: {reason}"
+            )))
         }
     };
-    // Preserve the method string shipped with the Rust exporter so existing
-    // callers do not break when the optional native path is introduced.
-    let mut method = "kicad_ipc_snapshot";
-    let mut bridge_pid = None;
-    let mut bridge_protocol_version = None;
+
+    // Try the native exporter before inspecting Rust-only profile restrictions.
     let mut bridge_diagnostics = Vec::new();
-    let export = if native_bridge_mode == "disable" {
-        baseline
+    let native = if native_bridge_mode == "disable" {
+        None
     } else {
         let attempt = crate::native_specctra_bridge::try_export(&board_path).await;
         bridge_diagnostics = attempt.diagnostics;
-        if let Some(native) = attempt.export {
-            let board_for_stability = board_path.clone();
-            let addr = ctx.config.ipc_address.clone();
-            let stable = with_ipc(addr, move |client| {
-                let document = client.find_open_board(&board_for_stability)?;
-                client.save_document_to_string_in(document)
-            })
-            .await?;
-            let stable = match stable {
-                Ok(stable) => stable,
-                Err(reason) => {
-                    return Ok(CallToolResult::error_kind(
-                        ToolErrorKind::HandlerError {
-                            reason: reason.clone(),
-                        },
-                        format!("Specctra export refused after native bridge call: {reason}"),
-                    ));
-                }
-            };
-            if stable != source_snapshot {
-                return Ok(CallToolResult::error_kind(
-                    ToolErrorKind::Conflict {
-                        paths: vec![board_path.display().to_string()],
-                    },
-                    "KiCad board changed during native Specctra export; retry from a stable editor revision",
-                ));
-            }
-            match crate::specctra::adopt_native_dsn(baseline.clone(), native.dsn) {
-                Ok(adopted) => {
-                    method = "kicad10_native_actionplugin";
-                    bridge_pid = Some(native.plugin_pid);
-                    bridge_protocol_version = Some(native.protocol_version);
-                    adopted
-                }
-                Err(error) if native_bridge_mode == "prefer" => {
-                    bridge_diagnostics.push(format!(
-                        "native DSN semantic validation failed; used Rust fallback: {error:#}"
-                    ));
-                    baseline
-                }
-                Err(error) => {
-                    return Ok(CallToolResult::error(format!(
-                        "KiCad native Specctra export was required but its semantic validation failed: {error:#}"
-                    )));
-                }
-            }
-        } else if native_bridge_mode == "require" {
+        if native_bridge_mode == "require" && attempt.export.is_none() {
             return Ok(CallToolResult::error(format!(
                 "KiCad 10 native Specctra bridge was required but unavailable: {}",
                 bridge_diagnostics.join("; ")
             )));
-        } else {
-            baseline
+        }
+        attempt.export
+    };
+
+    let has_custom_rules = had_custom_rules || custom_rules_path.is_file();
+    let requested = board_path.clone();
+    let expected = source_snapshot.clone();
+    let rules =
+        match with_ipc(ctx.config.ipc_address.clone(), move |client| {
+            let document = client.find_open_board(&requested)?;
+            if client.save_document_to_string_in(document.clone())? != expected {
+                return Ok(None);
+            }
+            if has_custom_rules {
+                return Ok(Some(None));
+            }
+            let rules = client.get_effective_routing_rules_in(document.clone());
+            if client.save_document_to_string_in(document)? != expected {
+                return Ok(None);
+            }
+            Ok(Some(Some(rules)))
+        })
+        .await?
+        {
+            Ok(Some(rules)) => rules,
+            Ok(None) => return Ok(CallToolResult::error_kind(
+                ToolErrorKind::Conflict {
+                    paths: vec![board_path.display().to_string()],
+                },
+                "KiCad board changed during Specctra export; retry from a stable editor revision",
+            )),
+            Err(reason) => {
+                return Ok(CallToolResult::error(format!(
+                    "Specctra export refused: {reason}"
+                )))
+            }
+        };
+    let baseline = match rules {
+        Some(rules) => rules
+            .context("capture effective KiCad routing rules")
+            .and_then(|rules| crate::specctra::export_dsn(&board_path, &source_snapshot, &rules)),
+        None => Err(anyhow::anyhow!(custom_rules_reason)),
+    };
+
+    let mut method = "kicad_ipc_snapshot";
+    let mut bridge_pid = None;
+    let mut bridge_protocol_version = None;
+    let export = if let Some(native) = native {
+        let adopted = match &baseline {
+            Ok(baseline) => crate::specctra::adopt_native_dsn(baseline.clone(), native.dsn),
+            Err(reason) => crate::specctra::native_export_only(
+                &board_path,
+                &source_snapshot,
+                native.dsn,
+                &format!("{reason:#}"),
+            ),
+        };
+        match adopted {
+            Ok(export) => {
+                method = "kicad10_native_actionplugin";
+                bridge_pid = Some(native.plugin_pid);
+                bridge_protocol_version = Some(native.protocol_version);
+                export
+            }
+            Err(error) if native_bridge_mode == "prefer" && baseline.is_ok() => {
+                bridge_diagnostics.push(format!(
+                    "native DSN semantic validation failed; used Rust fallback: {error:#}"
+                ));
+                baseline.expect("checked available Rust fallback")
+            }
+            Err(error) => {
+                return Ok(CallToolResult::error(format!(
+                    "KiCad native Specctra export failed semantic validation: {error:#}"
+                )))
+            }
+        }
+    } else {
+        match baseline {
+            Ok(export) => export,
+            Err(error) => {
+                return Ok(CallToolResult::error(format!(
+                    "Specctra export refused: {error:#}"
+                )))
+            }
         }
     };
 
@@ -884,16 +999,19 @@ async fn handle_export_specctra_dsn(
             "output": output_path,
             "manifest_output_path": manifest_output_path,
             "source_sha256": export.source_sha256,
+            "ses_importable": export.ses_importable,
             "component_count": export.component_count,
             "pad_count": export.pad_count,
             "net_count": export.net_count,
             "routing_class_count": export.class_count,
             "capabilities": {
                 "dsn_export_available": true,
-                "ses_import_available": false,
+                "ses_import_available": export.ses_importable,
                 "freerouting_bridge_available": false,
                 "source_revision_bound": true,
-                "supported_profile": "two_layer_front_side_circle_rect_no_existing_routing_or_zones"
+                "supported_profile": export.ses_importable.then_some(
+                    "two_layer_front_side_circle_rect_roundrect_oval_no_unlocked_routing_or_zones"
+                )
             }
         })
         .to_string(),
@@ -1406,6 +1524,40 @@ mod required_layers_tests {
 
     /// The neighbouring exporters read `layers` the same way but do not require
     /// it. Requiring it there would break every caller that omits it today.
+    #[tokio::test]
+    async fn plots_only_claim_enabled_standard_or_custom_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("two-layer.kicad_pcb");
+        tokio::fs::write(
+            &board,
+            r#"(kicad_pcb (layers
+            (0 "F.Cu" signal) (31 "B.Cu" signal)
+            (37 "F.SilkS" user "Custom legend"))) "#,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            pcb_plot_layers(&board, &json!({})).await.unwrap(),
+            ["F.Cu", "F.SilkS"]
+        );
+        assert_eq!(
+            pcb_plot_layers(
+                &board,
+                &json!({"layers":["F.Cu","Custom legend","F.SilkS"]})
+            )
+            .await
+            .unwrap(),
+            ["F.Cu", "F.SilkS"]
+        );
+        for layer in ["not-a-layer", "In1.Cu"] {
+            let result = pcb_plot_layers(&board, &json!({"layers":["F.Cu",layer]}))
+                .await
+                .unwrap_err();
+            assert!(result.is_error);
+        }
+    }
+
     #[test]
     fn export_pdf_and_svg_keep_layers_optional() {
         for tool_name in ["export_pdf", "export_svg", "export_gerber"] {
@@ -1541,6 +1693,186 @@ mod export_boundary_contract_tests {
             },
             Arc::new(ToolRouter::new()),
         )
+    }
+
+    fn response_body(result: &CallToolResult) -> serde_json::Value {
+        let wire = serde_json::to_value(result).unwrap();
+        serde_json::from_str(wire["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn default_plot_refuses_a_board_without_enabled_front_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("back-only.kicad_pcb");
+        std::fs::write(&board, r#"(kicad_pcb (layers (31 "B.Cu" signal)))"#).unwrap();
+
+        let error = pcb_plot_layers(&board, &json!({"layers": []}))
+            .await
+            .unwrap_err();
+        let error = response_body(&error);
+        assert_eq!(error["error"]["field"], "board");
+        assert_eq!(error["error"]["reason"], "no front plot layer is enabled");
+    }
+
+    #[tokio::test]
+    async fn kicad_netlist_reads_the_schematic_and_preserves_design_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = cli::test_support::write_script(
+            dir.path(),
+            "schematic-netlist-cli",
+            r#"#!/bin/sh
+[ "$1 $2 $3 $4 $6 $7" = "sch export netlist --output --format kicadsexpr" ] || exit 3
+printf '%s' "$8" > "$5"
+"#,
+            "@echo off\r\nif not \"%~1 %~2 %~3 %~4 %~6 %~7\"==\"sch export netlist --output --format kicadsexpr\" exit /b 3\r\n<nul set /p \"=%~8\">\"%~5\"\r\nexit /b 0\r\n",
+        );
+        let mut ctx = context();
+        ctx.config.kicad_cli = executable.to_string_lossy().into_owned();
+        let schematic = dir.path().join("fixture.kicad_sch");
+        let board = schematic.with_extension("kicad_pcb");
+        let output = schematic.with_extension("net");
+        std::fs::write(&schematic, "(kicad_sch)").unwrap();
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+
+        for input in [&schematic, &board] {
+            let result = handle_export_netlist(
+                &json!({"board":input,"output":output,"format":"kicad"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error);
+            assert_eq!(response_body(&result)["source"], json!(schematic));
+            assert_eq!(
+                std::fs::read_to_string(&output).unwrap(),
+                schematic.to_str().unwrap()
+            );
+        }
+
+        for (input, output, format, field, reason) in [
+            (
+                &board,
+                &schematic,
+                "kicad",
+                "output",
+                "must differ from the design input",
+            ),
+            (&output, &board, "kicad", "board", "use a .kicad_pcb"),
+            (
+                &board.with_file_name("missing.kicad_pcb"),
+                &output,
+                "ipc",
+                "board",
+                "pass a saved PCB",
+            ),
+        ] {
+            let result = handle_export_netlist(
+                &json!({"board":input,"output":output,"format":format}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error);
+            let error = response_body(&result);
+            assert_eq!(error["error"]["field"], field);
+            assert!(error["error"]["reason"].as_str().unwrap().contains(reason));
+        }
+        assert_eq!(std::fs::read_to_string(schematic).unwrap(), "(kicad_sch)");
+        assert_eq!(std::fs::read_to_string(board).unwrap(), "(kicad_pcb)");
+    }
+
+    #[tokio::test]
+    async fn pcb_netlist_ipc_formats_dispatch_to_native_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = cli::test_support::write_script(
+            dir.path(),
+            "netlist-cli",
+            r#"#!/bin/sh
+[ "$1 $2 $3 $4" = "pcb export ipcd356 --output" ] || exit 3
+printf '%s' "$6" > "$5"
+"#,
+            "@echo off\r\nif not \"%~1 %~2 %~3 %~4\"==\"pcb export ipcd356 --output\" exit /b 3\r\n<nul set /p \"=%~6\">\"%~5\"\r\nexit /b 0\r\n",
+        );
+        let mut ctx = context();
+        ctx.config.kicad_cli = fake.to_string_lossy().into_owned();
+        let board = dir.path().join("fixture.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        for format in ["ipc", "ipcd356"] {
+            let output = dir.path().join(format!("{format}.d356"));
+            let result = handle_export_netlist(
+                &json!({"board":board,"output":output,"format":format}),
+                &ctx,
+            )
+            .await
+            .expect("native IPC-D-356 CLI call");
+            assert!(!result.is_error);
+            assert_eq!(
+                std::fs::read_to_string(&output).unwrap(),
+                board.to_str().unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_pcb_netlist_requests_refuse_before_running_cli() {
+        let schema = tools()
+            .into_iter()
+            .find(|tool| tool.name == "export_netlist")
+            .unwrap()
+            .input_schema;
+        assert_eq!(
+            schema["properties"]["format"]["enum"],
+            json!(["kicad", "ipc", "ipcd356"])
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let fake = cli::test_support::write_script(
+            dir.path(),
+            "netlist-cli",
+            "#!/bin/sh\nprintf started > \"$0.started\"\nexit 0\n",
+            "@echo off\r\necho started>\"%~f0.started\"\r\nexit /b 0\r\n",
+        );
+        let mut ctx = context();
+        ctx.config.kicad_cli = fake.to_string_lossy().into_owned();
+        let board = dir.path().join("fixture.kicad_pcb");
+        let output = dir.path().join("nested/out.net");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        for (input, format, field) in [
+            (&board, json!("bogus"), "format"),
+            (&board, json!(9), "format"),
+            (&board, json!("kicad"), "board"),
+            (&board.with_extension("kicad_sch"), json!("ipc"), "board"),
+        ] {
+            let result = handle_export_netlist(
+                &json!({"board":input,"output":output,"format":format}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "unexpected success for {input:?} {format}");
+            let Some(crate::mcp::protocol::ToolContent::Text { text }) = result.content.first()
+            else {
+                panic!("expected structured invalid_argument");
+            };
+            let error: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(error["error"]["kind"], "invalid_argument");
+            assert_eq!(error["error"]["field"], field);
+        }
+        for name in ["sibling.KICAD_SYM", "fp-lib-table"] {
+            let protected = dir.path().join(name);
+            std::fs::write(&protected, "design").unwrap();
+            let error = handle_export_netlist(
+                &json!({"board":board,"output":protected,"format":"ipc"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("reserved for a KiCad design or library"));
+            assert_eq!(std::fs::read_to_string(protected).unwrap(), "design");
+        }
+        assert!(!PathBuf::from(format!("{}.started", fake.display())).exists());
+        assert!(!output.parent().unwrap().exists());
     }
 
     #[test]

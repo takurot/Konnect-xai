@@ -306,6 +306,186 @@ fn selected_layer_pcb_svg_export_through_mcp() {
 
 #[test]
 #[ignore = "requires kicad-cli; run via e2e workflow"]
+fn default_front_view_pcb_exports_through_mcp() {
+    let cli = find_kicad_cli().expect("KiCad CLI required");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../konnect-core/tests/fixtures/drc_ownership_j1.kicad_pcb");
+    let dir = tempfile::tempdir().unwrap();
+    let board = dir.path().join("source.kicad_pcb");
+    let original_board = std::fs::read_to_string(fixture)
+        .unwrap()
+        .replace(r#""F.Silkscreen""#, r#""Front legend custom""#);
+    std::fs::write(&board, &original_board).unwrap();
+    let library = dir.path().join("sibling.kicad_mod");
+    std::fs::write(&library, r#"(footprint "existing")"#).unwrap();
+    let mut mcp = Mcp::spawn(&cli);
+    mcp.load("pcb_export");
+    for (tool, name, magic) in [
+        ("export_svg", "front.svg", b"<?xml".as_slice()),
+        ("export_pdf", "front.pdf", b"%PDF-".as_slice()),
+    ] {
+        let output = dir.path().join(name);
+        let response = body(&mcp.tool(tool, json!({"board":board,"output":output})));
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(
+            response["layers_used"],
+            json!(["F.Cu", "F.Paste", "F.SilkS", "F.Mask", "Edge.Cuts"])
+        );
+        assert!(std::fs::read(&output).unwrap().starts_with(magic));
+
+        let refused = mcp.request(
+            "tools/call",
+            json!({"name":tool,"arguments":{"board":board,"output":board}}),
+        );
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), original_board);
+
+        for args in [
+            json!({"board":board,"output":library}),
+            json!({"board":board,"output":output,"layers":["F.Cu", "not-a-layer"]}),
+            json!({"board":board,"output":output,"layers":["F.Cu", "In1.Cu"]}),
+        ] {
+            let refused = mcp.request("tools/call", json!({"name":tool,"arguments":args}));
+            assert_eq!(refused["result"]["isError"], true, "{refused}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&library).unwrap(),
+            r#"(footprint "existing")"#
+        );
+    }
+    let alias = dir.path().join("alias.svg");
+    let response = body(&mcp.tool(
+        "export_svg",
+        json!({
+            "board":board,"output":alias,"layers":["Front legend custom"],
+        }),
+    ));
+    assert_eq!(response["layers_used"], json!(["F.SilkS"]));
+    let source = std::fs::read_to_string(alias)
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert!(source.contains("M125.0000 60.0000\nL135.0000 60.0000"));
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
+fn named_schematic_svg_reports_root_and_hierarchy_outputs() {
+    let cli = find_kicad_cli().expect("KiCad CLI required");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../konnect-core/tests/fixtures/sheet_pin_edges/sheet_pin_edges.kicad_sch");
+    let dir = tempfile::tempdir().unwrap();
+    let root_output = dir.path().join("custom.svg");
+    let mut mcp = Mcp::spawn(&cli);
+    mcp.load("sch_export");
+    let response = body(&mcp.tool(
+        "export_schematic_svg",
+        json!({"schematic":fixture,"output":root_output}),
+    ));
+    assert_eq!(response["exported"], json!(root_output));
+    let files = response["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2, "{response}");
+    assert_eq!(files[0], json!(root_output));
+    for output in files {
+        let source = std::fs::read_to_string(output.as_str().unwrap()).unwrap();
+        assert!(source.contains("<svg") && source.contains("</svg>"));
+    }
+    assert!(!dir.path().join("sheet_pin_edges.svg").exists());
+
+    let child = std::path::Path::new(files[1].as_str().unwrap());
+    assert_eq!(child.parent(), Some(dir.path()));
+    std::fs::write(child, "existing child contents").unwrap();
+    let original_root = std::fs::read(&root_output).unwrap();
+    let refused = mcp.request(
+        "tools/call",
+        json!({
+            "name":"export_schematic_svg",
+            "arguments":{"schematic":fixture,"output":root_output}
+        }),
+    );
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert_eq!(
+        std::fs::read_to_string(child).unwrap(),
+        "existing child contents"
+    );
+    assert_eq!(std::fs::read(root_output).unwrap(), original_root);
+    let alias = tempfile::tempdir().unwrap();
+    let child_name = child.file_name().unwrap();
+    let refused = mcp.request(
+        "tools/call",
+        json!({
+            "name":"export_schematic_svg",
+            "arguments":{"schematic":fixture,"output":alias.path().join(child_name)}
+        }),
+    );
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert_eq!(std::fs::read_dir(alias.path()).unwrap().count(), 0);
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
+fn native_pcb_netlist_and_sibling_schematic_netlist_through_mcp() {
+    let cli = find_kicad_cli().expect("KiCad CLI required");
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../konnect-core/tests/fixtures");
+    let dir = tempfile::tempdir().unwrap();
+    let board = dir.path().join("ecc83-pp.kicad_pcb");
+    let schematic = board.with_extension("kicad_sch");
+    std::fs::copy(fixtures.join("drc_ownership_j1.kicad_pcb"), &board).unwrap();
+    std::fs::copy(fixtures.join("ecc83_multiunit.kicad_sch"), &schematic).unwrap();
+    let mut mcp = Mcp::spawn(&cli);
+    mcp.load("pcb_export");
+
+    let ipc = dir.path().join("board.d356");
+    let response = body(&mcp.tool(
+        "export_netlist",
+        json!({"board":board,"output":ipc,"format":"ipc"}),
+    ));
+    assert_eq!(response["source"], json!(board));
+    let ipc = std::fs::read_to_string(ipc).unwrap();
+    // KiCad 10.0.5 writes CODE and UNITS, while 10.0.8 adds JOB and
+    // pads its records to 80 columns. Both versions carry the same pins.
+    assert!(ipc
+        .lines()
+        .any(|line| line.split_ascii_whitespace().eq(["P", "CODE", "00"])));
+    assert!(ipc.lines().any(|line| line
+        .split_ascii_whitespace()
+        .eq(["P", "UNITS", "CUST", "0"])));
+    for (record, pin) in [
+        ("327GND", "-1"),
+        ("327VCC", "-2"),
+        ("327SCL", "-3"),
+        ("327SDA", "-4"),
+    ] {
+        assert!(
+            ipc.lines().any(|line| line
+                .split_ascii_whitespace()
+                .take(3)
+                .eq([record, "J1", pin])),
+            "missing IPC-D-356 pad J1{pin} on {record}",
+        );
+    }
+    assert_eq!(ipc.lines().last().map(str::trim_end), Some("999"));
+
+    let output = dir.path().join("design.net");
+    let response = body(&mcp.tool("export_netlist", json!({"board":board,"output":output})));
+    assert_eq!(response["source"], json!(schematic));
+    let netlist = std::fs::read_to_string(output).unwrap();
+    assert!(netlist.contains("(export") && netlist.contains("(components"));
+    let rules = dir.path().join("sample.kicad_dru");
+    std::fs::write(&rules, "(version 1)").unwrap();
+    let refused = mcp.request(
+        "tools/call",
+        json!({
+            "name":"export_netlist",
+            "arguments":{"board":board,"output":rules,"format":"ipc"}
+        }),
+    );
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert_eq!(std::fs::read_to_string(rules).unwrap(), "(version 1)");
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
 fn structural_scan_fixture_reloads_through_real_kicad() {
     let Some(kicad_cli) = find_kicad_cli() else {
         panic!("kicad-cli not found — set KICAD_CLI or install KiCAD (this test is e2e-only)");

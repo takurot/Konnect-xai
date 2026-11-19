@@ -25,6 +25,7 @@ pub(crate) struct ExportBundle {
     pub dsn: String,
     pub manifest: String,
     pub source_sha256: String,
+    pub ses_importable: bool,
     pub component_count: usize,
     pub pad_count: usize,
     pub net_count: usize,
@@ -36,6 +37,9 @@ pub(crate) struct ExportBundle {
 enum PadShape {
     Circle,
     Rect,
+    #[serde(rename = "roundrect")]
+    RoundRect,
+    Oval,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -45,6 +49,8 @@ struct PadstackKey {
     size_x_um: i64,
     size_y_um: i64,
     drill_um: Option<i64>,
+    roundrect_size_nm: Option<(i64, i64)>,
+    round_radius_nm: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +274,7 @@ pub(crate) fn export_dsn(
         dsn,
         manifest,
         source_sha256,
+        ses_importable: true,
         component_count: footprints.len(),
         pad_count: footprints
             .iter()
@@ -278,6 +285,143 @@ pub(crate) fn export_dsn(
     })
 }
 
+/// Bind a native DSN outside the strict SES profile to its exact live
+/// snapshot. The receipt records identity and the refusal reason without
+/// inventing a reverse mapping for rules or geometry outside that profile.
+pub(crate) fn native_export_only(
+    board_path: &Path,
+    source: &str,
+    dsn: String,
+    reason: &str,
+) -> Result<ExportBundle> {
+    let board = parse_sexp(source).context("parse KiCad IPC board snapshot")?;
+    if board.head() != Some("kicad_pcb") {
+        bail!("KiCad IPC snapshot root is not 'kicad_pcb'");
+    }
+    let native = dsn_identity(&checked_native_tree(&dsn)?)?;
+    let layers = declared_copper_layers(&board)?;
+    if layers
+        .iter()
+        .enumerate()
+        .any(|(index, layer)| native.layers.get(&index) != Some(layer))
+        || layers.len() != native.layers.len()
+    {
+        bail!("native DSN changed the board's copper-layer inventory");
+    }
+    let mut components = BTreeMap::new();
+    let mut nets = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut pad_count = 0;
+    let net_table = top_level_net_table(&board);
+    for footprint in board.find_all("footprint") {
+        let reference = property_value(footprint, "Reference")
+            .filter(|r| !r.is_empty())
+            .context("footprint has no Reference property")?;
+        let kiid = footprint
+            .find_str("uuid")
+            .filter(|id| !id.is_empty())
+            .context("footprint has no UUID")?;
+        if components.insert(reference, kiid).is_some() {
+            bail!("board repeats footprint '{reference}'");
+        }
+        let actual = native
+            .components
+            .get(reference)
+            .with_context(|| format!("native DSN omitted component '{reference}'"))?;
+        let at = footprint.find("at").context("footprint has no position")?;
+        let rotation = optional_rotation(at, "footprint rotation")?;
+        let (side, flip) = match footprint.find_str("layer") {
+            Some("F.Cu") => ("front", 1.0),
+            Some("B.Cu") => ("back", -1.0),
+            _ => bail!("footprint '{reference}' is on an unrecognized component side"),
+        };
+        if actual.side != side
+            || !matches_dsn_position(at, actual.x, actual.y)?
+            || !angles_match(rotation * flip, actual.rotation)
+        {
+            bail!("native DSN placement cannot be bound to footprint '{reference}'");
+        }
+        let mut pin_ids = BTreeSet::new();
+        for pad in footprint.find_all("pad") {
+            // KiCad exports mechanical holes as image keepouts, outside
+            // the native signal pin inventory.
+            if pad.get(2).and_then(SexpNode::as_str) == Some("np_thru_hole")
+                && pad.find("net").is_none()
+            {
+                continue;
+            }
+            let number = pad
+                .get(1)
+                .and_then(SexpNode::as_str)
+                .filter(|n| !n.is_empty())
+                .context("native DSN verification requires numbered board pads")?;
+            if !pin_ids.insert(number) {
+                bail!("footprint '{reference}' repeats pin '{number}'");
+            }
+            let pin = actual
+                .pins
+                .get(number)
+                .with_context(|| format!("native DSN omitted pin '{reference}-{number}'"))?;
+            let at = pad.find("at").context("pad has no position")?;
+            let pin_rotation =
+                relative_pad_rotation(optional_rotation(at, "pad rotation")?, rotation);
+            // KiCad's back image reverses the local Y axis and rotations.
+            if !matches_dsn_position(at, pin.x, pin.y * flip)?
+                || !angles_match(pin_rotation * flip, pin.rotation)
+                || !native.padstacks.contains_key(&pin.padstack)
+            {
+                bail!("native DSN cannot bind pin '{reference}-{number}'");
+            }
+            if let Some(net) = pad
+                .find("net")
+                .and_then(|node| resolve_net(node, &net_table))
+            {
+                nets.entry(net)
+                    .or_default()
+                    .insert(format!("{reference}-{number}"));
+            }
+        }
+        if pin_ids.len() != actual.pins.len() {
+            bail!("native DSN changed pins for component '{reference}'");
+        }
+        pad_count += pin_ids.len();
+    }
+    if components.is_empty() || components.len() != native.components.len() {
+        bail!("native DSN changed the component inventory");
+    }
+    if nets != native.nets {
+        bail!("native DSN changed net or pin membership");
+    }
+    let source_sha256 = sha256_hex(source.as_bytes());
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "kind": "konnect_native_dsn_receipt",
+        "schema_version": 1,
+        "ses_importable": false,
+        "reason": reason,
+        "board_path": board_path,
+        "source_sha256": source_sha256,
+        "dsn_sha256": sha256_hex(dsn.as_bytes()),
+        "components": components,
+        "layers": layers,
+        "nets": nets,
+    }))?;
+    Ok(ExportBundle {
+        dsn,
+        manifest,
+        source_sha256,
+        ses_importable: false,
+        component_count: components.len(),
+        pad_count,
+        net_count: nets.len(),
+        class_count: native.classes.len(),
+    })
+}
+
+fn matches_dsn_position(at: &SexpNode, x: f64, y: f64) -> Result<bool> {
+    let source_x = finite_number(at.get_f64(1), "board x")? * UM_PER_MM;
+    let source_y = finite_number(at.get_f64(2), "board y")? * UM_PER_MM;
+    Ok((x - source_x).abs() <= 0.5 && (y + source_y).abs() <= 0.5)
+}
+
 /// Replace Konnect's deterministic DSN with a KiCad-native DSN while keeping
 /// the same fail-closed board profile and rewriting the reverse manifest to
 /// the exact identifiers KiCad emitted. This lets the strict SES importer
@@ -286,9 +430,8 @@ pub(crate) fn adopt_native_dsn(
     mut baseline: ExportBundle,
     native_dsn: String,
 ) -> Result<ExportBundle> {
-    validate_dsn_syntax(&native_dsn, "KiCad native DSN")?;
     let baseline_tree = parse_dsn_sexp(&baseline.dsn).context("parse Konnect baseline DSN")?;
-    let native_tree = parse_dsn_sexp(&native_dsn).context("parse KiCad native DSN")?;
+    let native_tree = checked_native_tree(&native_dsn)?;
     let baseline_identity = dsn_identity(&baseline_tree)?;
     let native_identity = dsn_identity(&native_tree)?;
     let mut manifest: Manifest =
@@ -311,6 +454,8 @@ pub(crate) fn adopt_native_dsn(
             .get(&component.reference)
             .with_context(|| format!("native DSN omitted component '{}'", component.reference))?;
         component.image_name = native.image_name.clone();
+        component.x_um = native.x.round() as i64;
+        component.y_um = native.y.round() as i64;
         for pin in &mut component.pads {
             pin.padstack_name = padstack_names
                 .get(&pin.padstack_name)
@@ -352,30 +497,29 @@ pub(crate) fn adopt_native_dsn(
 #[derive(Debug, Clone)]
 struct DsnPlacementIdentity {
     image_name: String,
-    x: i64,
-    y: i64,
+    x: f64,
+    y: f64,
     side: String,
-    rotation: OrderedF64,
+    rotation: f64,
     pins: BTreeMap<String, DsnPinIdentity>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct DsnPinIdentity {
     padstack: String,
-    x: i64,
-    y: i64,
+    x: f64,
+    y: f64,
+    rotation: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct OrderedF64(u64);
+fn relative_pad_rotation(absolute: f64, footprint: f64) -> f64 {
+    (absolute.rem_euclid(360.0) - footprint.rem_euclid(360.0)).rem_euclid(360.0)
+}
 
-impl OrderedF64 {
-    fn new(value: f64) -> Result<Self> {
-        if !value.is_finite() {
-            bail!("DSN contains a non-finite number");
-        }
-        Ok(Self(value.to_bits()))
-    }
+fn angles_match(left: f64, right: f64) -> bool {
+    const SERIALIZED_ANGLE_TOLERANCE_DEGREES: f64 = 1e-6;
+    let difference = left.rem_euclid(360.0) - right.rem_euclid(360.0);
+    ((difference + 180.0).rem_euclid(360.0) - 180.0).abs() <= SERIALIZED_ANGLE_TOLERANCE_DEGREES
 }
 
 #[derive(Debug, Clone)]
@@ -386,19 +530,18 @@ struct DsnClassIdentity {
     clearance: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DsnShapeIdentity {
-    Circle {
-        layer: String,
-        diameter: i64,
-    },
-    Rect {
-        layer: String,
-        x1: i64,
-        y1: i64,
-        x2: i64,
-        y2: i64,
-    },
+#[derive(Debug, Clone, PartialEq)]
+struct DsnShapeIdentity {
+    layer: String,
+    geometry: DsnGeometry,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum DsnGeometry {
+    Circle { diameter: f64, offset: (f64, f64) },
+    Rect([f64; 4]),
+    Path { width: f64, points: Vec<(f64, f64)> },
+    Polygon { width: f64, points: Vec<(f64, f64)> },
 }
 
 #[derive(Debug, Clone)]
@@ -428,9 +571,196 @@ fn parse_dsn_sexp(source: &str) -> Result<SexpNode> {
     parse_sexp(&compatible).context("parse normalized Specctra S-expression")
 }
 
+fn checked_native_tree(source: &str) -> Result<SexpNode> {
+    let native = parse_dsn_sexp(source).context("parse KiCad native DSN")?;
+    // Topola's outline type only recognizes paths. For syntax validation
+    // only, adapt KiCad's image outline polygons to equivalent closed paths.
+    // The authenticated native DSN itself is returned byte-for-byte.
+    let mut validation = native.clone();
+    if let SexpNode::List(root) = &mut validation {
+        for group in root
+            .iter_mut()
+            .filter(|node| node.head() == Some("library"))
+        {
+            let SexpNode::List(library) = group else {
+                continue;
+            };
+            for node in library
+                .iter_mut()
+                .filter(|node| node.head() == Some("image"))
+            {
+                let SexpNode::List(image) = node else {
+                    continue;
+                };
+                for outline in image
+                    .iter_mut()
+                    .filter(|node| node.head() == Some("outline"))
+                {
+                    let SexpNode::List(outline) = outline else {
+                        continue;
+                    };
+                    if let Some(SexpNode::List(shape)) = outline.get_mut(1) {
+                        if shape.first().and_then(SexpNode::as_str) == Some("polygon") {
+                            if shape.len() < 9 || (shape.len() - 3) % 2 != 0 {
+                                bail!("native DSN has a malformed polygon outline");
+                            }
+                            shape[0] = SexpNode::Atom("path".into());
+                            if shape[3..5] != shape[shape.len() - 2..] {
+                                shape.extend_from_within(3..5);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fn write_validation(node: &SexpNode, output: &mut String) {
+        match node {
+            SexpNode::Atom(atom) => output.push_str(atom),
+            SexpNode::Str(text) => {
+                output.push_str(&serde_json::to_string(text).expect("string serialization"))
+            }
+            SexpNode::List(children) => {
+                if node.head() == Some("string_quote")
+                    && node.get(1).and_then(SexpNode::as_str) == Some("\"")
+                {
+                    output.push_str(r#"(string_quote ")"#);
+                    return;
+                }
+                output.push('(');
+                for (index, child) in children.iter().enumerate() {
+                    if index > 0 {
+                        output.push(' ');
+                    }
+                    write_validation(child, output);
+                }
+                output.push(')');
+            }
+        }
+    }
+    let mut projected = String::new();
+    write_validation(&validation, &mut projected);
+    validate_dsn_syntax(&projected, "KiCad native DSN")?;
+    Ok(native)
+}
+
+fn dsn_shape(node: &SexpNode) -> Result<DsnShapeIdentity> {
+    let kind = node.head().context("DSN padstack geometry has no kind")?;
+    let layer = dsn_atom(node, 1, "pad geometry layer")?.to_string();
+    let len = node.children().unwrap_or(&[]).len();
+    let n = |i| dsn_number(node, i, "pad geometry coordinate");
+    let coordinate_pairs = || -> Result<Vec<(f64, f64)>> {
+        if !(len - 3).is_multiple_of(2) {
+            bail!("DSN pad geometry has an incomplete coordinate pair");
+        }
+        (3..len)
+            .step_by(2)
+            .map(|i| Ok((n(i)?, n(i + 1)?)))
+            .collect()
+    };
+    let geometry = match kind {
+        "circle" if len == 3 || len == 5 => {
+            let diameter = n(2)?;
+            if diameter <= 0.0 {
+                bail!("DSN circle diameter must be positive");
+            }
+            let offset = if len == 5 { (n(3)?, n(4)?) } else { (0.0, 0.0) };
+            DsnGeometry::Circle { diameter, offset }
+        }
+        "rect" if len == 6 => DsnGeometry::Rect([n(2)?, n(3)?, n(4)?, n(5)?]),
+        "path" if len >= 7 && n(2)? > 0.0 => DsnGeometry::Path {
+            width: n(2)?,
+            points: coordinate_pairs()?,
+        },
+        "polygon" if len >= 9 && n(2)? >= 0.0 => DsnGeometry::Polygon {
+            width: n(2)?,
+            points: coordinate_pairs()?,
+        },
+        _ => bail!("DSN padstack has malformed or unsupported shape '{kind}'"),
+    };
+    Ok(DsnShapeIdentity { layer, geometry })
+}
+
+/// The sampled native KiCad contour and the tangent polygon use different
+/// tessellations of the same roundrect. Bound the difference for polygon
+/// pairs; preserve exact checks for every other geometry and pin rotation.
+fn equivalent_pad_geometry(expected: &[DsnShapeIdentity], actual: &[DsnShapeIdentity]) -> bool {
+    expected.len() == actual.len()
+        && expected.iter().zip(actual).all(|(left, right)| {
+            if left == right {
+                return true;
+            }
+            match (&left.geometry, &right.geometry) {
+                (
+                    DsnGeometry::Polygon {
+                        width: a,
+                        points: left_points,
+                    },
+                    DsnGeometry::Polygon {
+                        width: b,
+                        points: right_points,
+                    },
+                ) => {
+                    left.layer == right.layer
+                        && a == b
+                        && near_convex_polygon(left_points, right_points)
+                        && near_convex_polygon(right_points, left_points)
+                }
+                _ => false,
+            }
+        })
+}
+
+fn near_convex_polygon(points: &[(f64, f64)], boundary: &[(f64, f64)]) -> bool {
+    const TOLERANCE_UM: f64 = 3.0;
+    let boundary = boundary.strip_suffix(&[boundary[0]]).unwrap_or(boundary);
+    if boundary.len() < 3 {
+        return false;
+    }
+    let edges = || {
+        boundary
+            .iter()
+            .copied()
+            .zip(boundary.iter().copied().cycle().skip(1))
+    };
+    let delta = |(a, b), (c, d)| (a - c, b - d);
+    let cross = |(a, b), (c, d)| a * d - b * c;
+    let mut signs = edges()
+        .zip(edges().cycle().skip(1))
+        .map(|((a, b), (_, c))| cross(delta(b, a), delta(c, b)))
+        .filter(|v| *v != 0.0);
+    let Some(first) = signs.next() else {
+        return false;
+    };
+    if signs.any(|value| value * first < 0.0) {
+        return false;
+    }
+    points.iter().copied().all(|point| {
+        edges().all(|(a, b)| cross(delta(b, a), delta(point, a)) * first >= 0.0)
+            || edges().any(|(a, b)| {
+                let (dx, dy) = delta(b, a);
+                let (x, y) = delta(point, a);
+                let len2 = dx * dx + dy * dy;
+                let t = if len2 == 0.0 {
+                    0.0
+                } else {
+                    ((x * dx + y * dy) / len2).clamp(0.0, 1.0)
+                };
+                (x - t * dx).powi(2) + (y - t * dy).powi(2) <= TOLERANCE_UM.powi(2)
+            })
+    })
+}
+
 fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
     if root.head() != Some("pcb") {
         bail!("Specctra export root is not 'pcb'");
+    }
+    let resolution = root.find("resolution").context("DSN has no resolution")?;
+    if resolution.get(1).and_then(SexpNode::as_str) != Some("um")
+        || resolution.get_f64(2) != Some(DSN_RESOLUTION as f64)
+        || root.find_str("unit") != Some("um")
+    {
+        bail!("DSN does not use the supported micrometre coordinate system");
     }
     let structure = root.find("structure").context("DSN has no structure")?;
     let mut layers = BTreeMap::new();
@@ -456,11 +786,18 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
         let mut pins = BTreeMap::new();
         for pin in image.find_all("pin") {
             let padstack = dsn_atom(pin, 1, "pin padstack")?.to_string();
-            let number = dsn_atom(pin, 2, "pin number")?.to_string();
+            let (number_index, rotation) = match pin.get(2) {
+                Some(rotate) if rotate.head() == Some("rotate") => {
+                    (3, dsn_number(rotate, 1, "pin rotation")?)
+                }
+                _ => (2, 0.0),
+            };
+            let number = dsn_atom(pin, number_index, "pin number")?.to_string();
             let identity = DsnPinIdentity {
                 padstack,
-                x: dsn_integer(pin, 3, "pin x")?,
-                y: dsn_integer(pin, 4, "pin y")?,
+                x: dsn_number(pin, number_index + 1, "pin x")?,
+                y: dsn_number(pin, number_index + 2, "pin y")?,
+                rotation,
             };
             if pins.insert(number, identity).is_some() {
                 bail!("DSN image '{name}' repeats a pin number");
@@ -478,20 +815,7 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
             .into_iter()
             .map(|shape| {
                 let geometry = shape.get(1).context("DSN shape has no geometry")?;
-                match geometry.head() {
-                    Some("circle") => Ok(DsnShapeIdentity::Circle {
-                        layer: dsn_atom(geometry, 1, "circle layer")?.to_string(),
-                        diameter: dsn_integer(geometry, 2, "circle diameter")?,
-                    }),
-                    Some("rect") => Ok(DsnShapeIdentity::Rect {
-                        layer: dsn_atom(geometry, 1, "rect layer")?.to_string(),
-                        x1: dsn_integer(geometry, 2, "rect x1")?,
-                        y1: dsn_integer(geometry, 3, "rect y1")?,
-                        x2: dsn_integer(geometry, 4, "rect x2")?,
-                        y2: dsn_integer(geometry, 5, "rect y2")?,
-                    }),
-                    other => bail!("DSN padstack has unsupported shape {other:?}"),
-                }
+                dsn_shape(geometry)
             })
             .collect::<Result<Vec<_>>>()?;
         if shapes.is_empty() || padstacks.insert(name.clone(), shapes).is_some() {
@@ -509,10 +833,10 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
             .clone();
         for place in component.find_all("place") {
             let reference = dsn_atom(place, 1, "place reference")?.to_string();
-            let x = dsn_integer(place, 2, "place x")?;
-            let y = dsn_integer(place, 3, "place y")?;
+            let x = dsn_number(place, 2, "place x")?;
+            let y = dsn_number(place, 3, "place y")?;
             let side = dsn_atom(place, 4, "place side")?.to_string();
-            let rotation = OrderedF64::new(dsn_number(place, 5, "place rotation")?)?;
+            let rotation = dsn_number(place, 5, "place rotation")?;
             let identity = DsnPlacementIdentity {
                 image_name: image_name.clone(),
                 x,
@@ -640,10 +964,10 @@ fn correlate_components(
             .components
             .get(reference)
             .with_context(|| format!("native DSN omitted component '{reference}'"))?;
-        if baseline_component.x != native_component.x
-            || baseline_component.y != native_component.y
+        if (baseline_component.x - native_component.x).abs() > 0.5
+            || (baseline_component.y - native_component.y).abs() > 0.5
             || baseline_component.side != native_component.side
-            || baseline_component.rotation != native_component.rotation
+            || !angles_match(baseline_component.rotation, native_component.rotation)
             || baseline_component.pins.keys().collect::<Vec<_>>()
                 != native_component.pins.keys().collect::<Vec<_>>()
         {
@@ -651,8 +975,13 @@ fn correlate_components(
         }
         for (pin, baseline_pin) in &baseline_component.pins {
             let native_pin = native_component.pins.get(pin).unwrap();
-            if baseline_pin.x != native_pin.x || baseline_pin.y != native_pin.y {
+            if (baseline_pin.x - native_pin.x).abs() > 0.5
+                || (baseline_pin.y - native_pin.y).abs() > 0.5
+            {
                 bail!("native DSN changed pin position for component '{reference}' pin '{pin}'");
+            }
+            if !angles_match(baseline_pin.rotation, native_pin.rotation) {
+                bail!("native DSN changed pin rotation for component '{reference}' pin '{pin}'");
             }
             let baseline_shape = baseline
                 .padstacks
@@ -666,7 +995,7 @@ fn correlate_components(
                 .with_context(|| {
                     format!("native DSN omitted padstack '{}'", native_pin.padstack)
                 })?;
-            if baseline_shape != native_shape {
+            if !equivalent_pad_geometry(baseline_shape, native_shape) {
                 bail!("native DSN changed pad geometry for component '{reference}' pin '{pin}'");
             }
             if padstacks
@@ -894,7 +1223,7 @@ fn locked_routing(
     Ok(routing)
 }
 
-fn copper_layers(tree: &SexpNode) -> Result<Vec<String>> {
+fn declared_copper_layers(tree: &SexpNode) -> Result<Vec<String>> {
     let layers = tree.find("layers").context("board has no layers table")?;
     let mut copper = layers
         .children()
@@ -908,6 +1237,11 @@ fn copper_layers(tree: &SexpNode) -> Result<Vec<String>> {
         .map(str::to_string)
         .collect::<Vec<_>>();
     copper.dedup();
+    Ok(copper)
+}
+
+fn copper_layers(tree: &SexpNode) -> Result<Vec<String>> {
+    let copper = declared_copper_layers(tree)?;
     if copper != ["F.Cu".to_string(), "B.Cu".to_string()] {
         bail!(
             "unsupported first routing profile: expected exactly F.Cu and B.Cu, got [{}]",
@@ -1018,7 +1352,7 @@ fn footprints(
         let at = footprint.find("at").context("footprint has no position")?;
         let x_um = finite_um(at.get_f64(1), "footprint x")?;
         let y_um = -finite_um(at.get_f64(2), "footprint y")?;
-        let rotation_degrees = finite_number(at.get_f64(3).or(Some(0.0)), "footprint rotation")?;
+        let rotation_degrees = optional_rotation(at, "footprint rotation")?;
         let image_name = format!("konnect_image_{reference}");
 
         let mut pads = Vec::new();
@@ -1045,18 +1379,41 @@ fn footprints(
             let shape = match pad.get(3).and_then(SexpNode::as_str) {
                 Some("circle") => PadShape::Circle,
                 Some("rect") => PadShape::Rect,
+                Some("roundrect") => PadShape::RoundRect,
+                Some("oval") => PadShape::Oval,
                 Some(other) => bail!(
                     "unsupported first routing profile: pad {reference}-{number} has shape '{other}'"
                 ),
                 None => bail!("pad {reference}-{number} has no shape"),
             };
+            if pad.find("padstack").is_some_and(|stack| {
+                stack.find_str("mode") != Some("normal")
+                    || stack.children().is_none_or(|children| children.len() != 2)
+            }) {
+                bail!("unsupported first routing profile: pad {reference}-{number} has a per-layer or unrecognized padstack");
+            }
             let at = pad.find("at").context("pad has no position")?;
             let x_um = finite_um(at.get_f64(1), "pad x")?;
             let y_um = -finite_um(at.get_f64(2), "pad y")?;
-            let rotation_degrees = finite_number(at.get_f64(3).or(Some(0.0)), "pad rotation")?;
+            let absolute_rotation = optional_rotation(at, "pad rotation")?;
+            let rotation_degrees = relative_pad_rotation(absolute_rotation, rotation_degrees);
             let size = pad.find("size").context("pad has no size")?;
             let size_x_um = positive_um(size.get_f64(1), "pad width")?;
             let size_y_um = positive_um(size.get_f64(2), "pad height")?;
+            let (roundrect_size_nm, round_radius_nm) = if shape == PadShape::RoundRect {
+                let width_nm = roundrect_dimension_nm(size.get_f64(1), "pad width")?;
+                let height_nm = roundrect_dimension_nm(size.get_f64(2), "pad height")?;
+                let ratio =
+                    finite_number(pad.find_f64("roundrect_rratio"), "roundrect radius ratio")
+                        .with_context(|| format!("pad {reference}-{number}"))?;
+                if !(0.0..=0.5).contains(&ratio) {
+                    bail!("pad {reference}-{number} roundrect radius ratio is outside 0..=0.5");
+                }
+                let radius_nm = (ratio * width_nm.min(height_nm) as f64).floor() as i64;
+                (Some((width_nm, height_nm)), radius_nm)
+            } else {
+                (None, 0)
+            };
             if shape == PadShape::Circle && size_x_um != size_y_um {
                 bail!("circle pad {reference}-{number} does not have equal X/Y size");
             }
@@ -1133,6 +1490,8 @@ fn footprints(
                     size_x_um,
                     size_y_um,
                     drill_um,
+                    roundrect_size_nm,
+                    round_radius_nm,
                 },
             });
         }
@@ -1266,7 +1625,7 @@ fn build_pcb(
     let mut padstacks = padstack_names
         .iter()
         .map(|(key, name)| padstack(name, key))
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     padstacks.extend(via_names.iter().map(|(rule, name)| {
         dsn::Padstack {
             name: name.clone(),
@@ -1417,30 +1776,87 @@ fn build_pcb(
     })
 }
 
-fn padstack(name: &str, key: &PadstackKey) -> dsn::Padstack {
+fn padstack(name: &str, key: &PadstackKey) -> Result<dsn::Padstack> {
+    let (width, height) = key.roundrect_size_nm.map_or(
+        (key.size_x_um as f64, key.size_y_um as f64),
+        |(width_nm, height_nm)| (width_nm as f64 / 1000.0, height_nm as f64 / 1000.0),
+    );
     let shapes = key
         .layers
         .iter()
-        .map(|layer| match key.shape {
-            PadShape::Circle => dsn::Shape::Circle(dsn::Circle {
-                layer: layer.clone(),
-                diameter: key.size_x_um as f64,
-                offset: None,
-            }),
-            PadShape::Rect => dsn::Shape::Rect(dsn::Rect {
-                layer: layer.clone(),
-                x1: -(key.size_x_um as f64) / 2.0,
-                y1: -(key.size_y_um as f64) / 2.0,
-                x2: key.size_x_um as f64 / 2.0,
-                y2: key.size_y_um as f64 / 2.0,
-            }),
+        .map(|layer| {
+            let circle = || {
+                dsn::Shape::Circle(dsn::Circle {
+                    layer: layer.clone(),
+                    diameter: width,
+                    offset: None,
+                })
+            };
+            let rect = || {
+                dsn::Shape::Rect(dsn::Rect {
+                    layer: layer.clone(),
+                    x1: -width / 2.0,
+                    y1: -height / 2.0,
+                    x2: width / 2.0,
+                    y2: height / 2.0,
+                })
+            };
+            Ok(match key.shape {
+                PadShape::Circle => circle(),
+                PadShape::Rect => rect(),
+                PadShape::RoundRect if key.round_radius_nm == 0 => rect(),
+                PadShape::RoundRect => dsn::Shape::Polygon(dsn::Polygon {
+                    layer: layer.clone(),
+                    width: 0.0,
+                    coords: rounded_pad_outline(width, height, key.round_radius_nm as f64 / 1000.0)
+                        .with_context(|| format!("padstack '{name}'"))?,
+                }),
+                PadShape::Oval if width == height => circle(),
+                PadShape::Oval => {
+                    let d = (width - height).abs() / 2.0;
+                    let (x, y) = if width > height { (d, 0.0) } else { (0.0, d) };
+                    dsn::Shape::Path(dsn::Path {
+                        layer: layer.clone(),
+                        width: width.min(height),
+                        coords: vec![dsn::Point { x: -x, y: -y }, dsn::Point { x, y }],
+                    })
+                }
+            })
         })
-        .collect();
-    dsn::Padstack {
+        .collect::<Result<_>>()?;
+    Ok(dsn::Padstack {
         name: name.to_string(),
         shapes,
         attach: Some(false),
+    })
+}
+
+/// A tangent polygon contains the true roundrect copper. The circumradius
+/// error is bounded by 0.5 µm, plus at most 1 nm from flooring the radius
+/// against the original KiCad dimensions.
+fn rounded_pad_outline(width: f64, height: f64, radius: f64) -> Result<Vec<dsn::Point>> {
+    use std::f64::consts::{FRAC_PI_2, FRAC_PI_4};
+
+    let steps = (FRAC_PI_4 / (radius / (radius + 0.5)).acos()).ceil() as usize;
+    if !(1..=1024).contains(&steps) {
+        bail!("roundrect radius exceeds the supported tangent-polygon budget");
     }
+    let step = FRAC_PI_2 / steps as f64;
+    let tangent_radius = radius / (step / 2.0).cos();
+    let dx = width / 2.0 - radius;
+    let dy = height / 2.0 - radius;
+    let mut coords = Vec::with_capacity(4 * steps + 1);
+    for (quadrant, cx, cy) in [(0, dx, dy), (1, -dx, dy), (2, -dx, -dy), (3, dx, -dy)] {
+        for i in 0..steps {
+            let a = quadrant as f64 * FRAC_PI_2 + (i as f64 + 0.5) * step;
+            coords.push(dsn::Point {
+                x: cx + tangent_radius * a.cos(),
+                y: cy + tangent_radius * a.sin(),
+            });
+        }
+    }
+    coords.push(coords[0].clone());
+    Ok(coords)
 }
 
 fn serialize_and_validate(pcb: dsn::Pcb) -> Result<String> {
@@ -1538,7 +1954,9 @@ fn build_manifest(
         supported_profile: SupportedProfile {
             copper_layers: 2,
             component_side: "front".to_string(),
-            pad_shapes: vec!["circle".to_string(), "rect".to_string()],
+            pad_shapes: ["circle", "rect", "roundrect", "oval"]
+                .map(str::to_string)
+                .into(),
             existing_routing: !locked_routing.tracks.is_empty() || !locked_routing.vias.is_empty(),
             locked_track_count: locked_routing.tracks.len(),
             locked_via_count: locked_routing.vias.len(),
@@ -1602,6 +2020,14 @@ fn point_um(node: &SexpNode, tag: &str) -> Result<(i64, i64)> {
     ))
 }
 
+fn optional_rotation(node: &SexpNode, label: &str) -> Result<f64> {
+    if node.get(3).is_none() {
+        Ok(0.0)
+    } else {
+        finite_number(node.get_f64(3), label)
+    }
+}
+
 fn finite_number(value: Option<f64>, label: &str) -> Result<f64> {
     let value = value.with_context(|| format!("missing {label}"))?;
     if !value.is_finite() {
@@ -1616,6 +2042,14 @@ fn finite_um(value: Option<f64>, label: &str) -> Result<i64> {
         bail!("{label} is outside the supported coordinate range");
     }
     Ok(value.round() as i64)
+}
+
+fn roundrect_dimension_nm(value: Option<f64>, label: &str) -> Result<i64> {
+    let nanometres = finite_number(value, label)? * 1_000_000.0;
+    if nanometres > i64::MAX as f64 {
+        bail!("{label} is outside the supported nanometre range");
+    }
+    Ok(nanometres.round() as i64)
 }
 
 fn positive_um(value: Option<f64>, label: &str) -> Result<i64> {
@@ -1816,6 +2250,366 @@ mod tests {
             crate::specctra_ses::parse_import_plan(&board_path, source, &export.manifest, &ses)
                 .expect("strict SES planner accepts native KiCad identifiers");
         assert!(!plan.tracks.is_empty() || !plan.vias.is_empty());
+    }
+
+    const ROTATED_SOIC: &str = include_str!("../tests/fixtures/specctra_soic8_roundrect.kicad_pcb");
+    const ROTATED_SOIC_NATIVE: &str =
+        include_str!("../tests/fixtures/specctra_soic8_roundrect.native-kicad-10.dsn");
+
+    fn stock_soic_rules() -> IpcEffectiveRoutingRules {
+        let rule = native_fixture_rules()["GND"].clone();
+        (1..=8)
+            .map(|pin| (format!("SIG{pin}"), rule.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn rotated_stock_soic_exports_roundrect_without_double_rotation() {
+        let exported = export_dsn(
+            Path::new("soic8.kicad_pcb"),
+            ROTATED_SOIC,
+            &stock_soic_rules(),
+        )
+        .unwrap();
+        let tree = parse_dsn_sexp(&exported.dsn).unwrap();
+        let library = tree.find("library").unwrap();
+        let image = library
+            .find_all("image")
+            .into_iter()
+            .find(|image| image.get(1).and_then(SexpNode::as_str) == Some("konnect_image_U1"))
+            .unwrap();
+        assert_eq!(image.find_all("pin").len(), 8);
+        assert!(image
+            .find_all("pin")
+            .iter()
+            .all(|pin| pin.find("rotate").is_none()));
+        let shape = library.find("padstack").unwrap().find("shape").unwrap();
+        assert_eq!(shape.get(1).unwrap().head(), Some("polygon"));
+        adopt_native_dsn(exported, ROTATED_SOIC_NATIVE.to_string()).unwrap();
+    }
+
+    #[test]
+    fn native_only_export_authenticates_identity_without_a_reverse_manifest() {
+        let path = Path::new("soic8.kicad_pcb");
+        let exported = native_export_only(
+            path,
+            ROTATED_SOIC,
+            ROTATED_SOIC_NATIVE.into(),
+            "custom rules",
+        )
+        .unwrap();
+        assert!(!exported.ses_importable);
+        assert_eq!(exported.dsn, ROTATED_SOIC_NATIVE);
+        assert_eq!(exported.source_sha256, sha256_hex(ROTATED_SOIC.as_bytes()));
+        let error =
+            crate::specctra_ses::parse_import_plan(path, ROTATED_SOIC, &exported.manifest, "")
+                .unwrap_err();
+        assert!(error.to_string().contains("native-only"));
+        let changed = ROTATED_SOIC_NATIVE.replace("(pins U2-1 U1-1)", "(pins U2-2 U1-1)");
+        assert!(
+            native_export_only(path, ROTATED_SOIC, changed, "custom rules")
+                .unwrap_err()
+                .to_string()
+                .contains("net or pin membership")
+        );
+    }
+
+    #[test]
+    fn native_only_export_binds_back_pads_and_ignores_mechanical_keepout_identity() {
+        let source = include_str!("../tests/fixtures/specctra_stock_soic8_bottom_4layer.kicad_pcb");
+        let native = include_str!(
+            "../tests/fixtures/specctra_stock_soic8_bottom_4layer.native-kicad-10.dsn"
+        );
+        let path = Path::new("bottom.kicad_pcb");
+        let exported = native_export_only(path, source, native.into(), "custom rules").unwrap();
+        assert_eq!(
+            (
+                exported.component_count,
+                exported.pad_count,
+                exported.net_count
+            ),
+            (2, 16, 8)
+        );
+        assert!(!exported.ses_importable);
+        let changed = native.replace("345) 1 -2475 1905", "346) 1 -2475 1905");
+        assert!(native_export_only(path, source, changed, "custom rules").is_err());
+    }
+
+    #[test]
+    fn native_only_export_tolerates_serialized_relative_rotation_arithmetic() {
+        let source = ROTATED_SOIC
+            .replace("(at -2.475 -1.905 90)", "(at -2.475 -1.905 90.1)")
+            .replace("(at -2.475 -1.905)", "(at -2.475 -1.905 0.1)");
+        let native = ROTATED_SOIC_NATIVE.replace("0 1 -2475 1905)", "0 (rotate 0.1) 1 -2475 1905)");
+        assert_ne!((90.1_f64 - 90.0).to_bits(), 0.1_f64.to_bits());
+        native_export_only(
+            Path::new("soic8.kicad_pcb"),
+            &source,
+            native,
+            "custom rules",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn roundrect_outline_does_not_shrink_fractional_pad_dimensions() {
+        let pads = COVERAGE_ROUTING_PAD
+            .replace("smd rect", "smd roundrect")
+            .replace(
+                "(size 2 2)",
+                "(size 1.50049 0.80049) (roundrect_rratio 0.25)",
+            );
+        let board = coverage_routing_board(&pads, "", "");
+        let exported = export_dsn(Path::new("board.kicad_pcb"), &board, &rules()).unwrap();
+        let identity = dsn_identity(&parse_dsn_sexp(&exported.dsn).unwrap()).unwrap();
+        let pin = &identity.components["U1"].pins["1"];
+        let DsnGeometry::Polygon { points, .. } = &identity.padstacks[&pin.padstack][0].geometry
+        else {
+            panic!("expected a roundrect polygon");
+        };
+        for (actual, expected) in [
+            (
+                points.iter().map(|(x, _)| x.abs()).fold(0.0, f64::max),
+                750.245,
+            ),
+            (
+                points.iter().map(|(_, y)| y.abs()).fold(0.0, f64::max),
+                400.245,
+            ),
+        ] {
+            assert!(
+                actual >= expected - 1e-8,
+                "fractional copper shrank from {expected} to {actual}"
+            );
+            assert!(actual <= expected + 0.501);
+        }
+    }
+
+    #[test]
+    fn native_receipt_refuses_mismatched_placements_pins_and_layers() {
+        for (from, to, expected) in [
+            ("(layer B.Cu", "(layer In1.Cu", "copper-layer inventory"),
+            (
+                "(boundary",
+                "(layer In1.Cu (type signal) (property (index 2))) (boundary",
+                "copper-layer inventory",
+            ),
+            ("U2 108000 -56000 front 0", "U2 108000 -56000 back 0", "placement cannot be bound"),
+            ("U2 108000 -56000 front 0", "U2 108001 -56000 front 0", "placement cannot be bound"),
+            ("U2 108000 -56000 front 0", "U2 108000 -56001 front 0", "placement cannot be bound"),
+            ("U2 108000 -56000 front 0", "U2 108000 -56000 front 1", "placement cannot be bound"),
+            ("1 -2475 1905)", "1 -2476 1905)", "cannot bind pin"),
+            ("1 -2475 1905)", "1 -2475 1906)", "cannot bind pin"),
+            (
+                "0 1 -2475 1905)",
+                "0 1 -2475 1905) (pin RoundRect[T]Pad_1950.000000x600.000000_150.571000_um_0.000000_0 9 3000 1905)",
+                "changed pins for component",
+            ),
+            (
+                "U2 108000 -56000 front 0 (PN SOIC8_fixture))",
+                "U2 108000 -56000 front 0 (PN SOIC8_fixture)) (place U3 113000 -56000 front 0)",
+                "changed the component inventory",
+            ),
+            (
+                "(pin RoundRect[T]Pad_1950.000000x600.000000_150.571000_um_0.000000_0 1",
+                "(pin MissingPadstack 1",
+                "cannot bind pin",
+            ),
+        ] {
+            let changed = ROTATED_SOIC_NATIVE.replace(from, to);
+            assert_ne!(changed, ROTATED_SOIC_NATIVE, "ineffective DSN mutation {from}");
+            let error = native_export_only(
+                Path::new("board.kicad_pcb"), ROTATED_SOIC, changed, "custom rules"
+            ).unwrap_err();
+            assert!(error.to_string().contains(expected), "{to}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn native_receipt_refuses_board_identity_gaps() {
+        for (from, to, expected) in [
+            ("(kicad_pcb", "(other_pcb", "snapshot root"),
+            (
+                "(property \"Reference\" \"U2\"",
+                "(property \"Reference\" \"U1\"",
+                "repeats footprint",
+            ),
+            (
+                "(pad \"2\" smd roundrect",
+                "(pad \"1\" smd roundrect",
+                "repeats pin",
+            ),
+            ("(net \"SIG1\")", "", "changed net or pin membership"),
+        ] {
+            let changed = ROTATED_SOIC.replacen(from, to, 1);
+            assert_ne!(changed, ROTATED_SOIC, "ineffective board mutation {from}");
+            let error = native_export_only(
+                Path::new("board.kicad_pcb"),
+                &changed,
+                ROTATED_SOIC_NATIVE.into(),
+                "custom rules",
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{to}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn native_pad_shape_parser_preserves_aperture_coordinates() {
+        for (source, expected) in [
+            (
+                "(circle F.Cu 600 15 -25)",
+                DsnGeometry::Circle {
+                    diameter: 600.0,
+                    offset: (15.0, -25.0),
+                },
+            ),
+            (
+                "(path F.Cu 600 -375 0 375 0)",
+                DsnGeometry::Path {
+                    width: 600.0,
+                    points: vec![(-375.0, 0.0), (375.0, 0.0)],
+                },
+            ),
+        ] {
+            let geometry = dsn_shape(&parse_sexp(source).unwrap()).unwrap();
+            assert_eq!(geometry.layer, "F.Cu");
+            assert_eq!(geometry.geometry, expected);
+        }
+    }
+
+    #[test]
+    fn native_pad_shape_parser_refuses_malformed_apertures() {
+        for (source, expected) in [
+            ("(circle F.Cu 0)", "diameter must be positive"),
+            (
+                "(circle F.Cu 600 0)",
+                "malformed or unsupported shape 'circle'",
+            ),
+            ("(circle F.Cu NaN)", "not finite"),
+            (
+                "(rect F.Cu -10 -10 10)",
+                "malformed or unsupported shape 'rect'",
+            ),
+            (
+                "(path F.Cu 100 0 0)",
+                "malformed or unsupported shape 'path'",
+            ),
+            (
+                "(path F.Cu 0 -10 0 10 0)",
+                "malformed or unsupported shape 'path'",
+            ),
+            (
+                "(path F.Cu 100 -10 0 10 0 10)",
+                "incomplete coordinate pair",
+            ),
+            (
+                "(polygon F.Cu 0 -10 0 10 0)",
+                "malformed or unsupported shape 'polygon'",
+            ),
+            (
+                "(polygon F.Cu -1 -10 0 10 0 0 10)",
+                "malformed or unsupported shape 'polygon'",
+            ),
+        ] {
+            let error = dsn_shape(&parse_sexp(source).unwrap()).unwrap_err();
+            assert!(error.to_string().contains(expected), "{source}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn native_courtyard_projection_rejects_truncated_polygons() {
+        for outline in [
+            "(outline (polygon signal 0 0 0 10 0))",
+            "(outline (polygon signal 0 0 0 10 0 10 10 0))",
+        ] {
+            let dsn = format!("(pcb board (library (image part {outline})))");
+            let error = checked_native_tree(&dsn).unwrap_err();
+            assert!(
+                error.to_string().contains("malformed polygon outline"),
+                "{outline}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn roundrect_radius_above_half_the_minor_axis_is_refused() {
+        let pad = COVERAGE_ROUTING_PAD
+            .replace("smd rect", "smd roundrect")
+            .replace("(size 2 2)", "(size 2 2) (roundrect_rratio 0.501)");
+        let board = coverage_routing_board(&pad, "", "");
+        let error = export_dsn(Path::new("board.kicad_pcb"), &board, &rules()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pad U1-1 roundrect radius ratio is outside"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn native_pin_half_micrometre_rounding_is_adoptable() {
+        let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
+        let native = include_str!("../tests/fixtures/specctra_two_resistors.native-kicad-10.dsn");
+        let baseline = export_dsn(
+            Path::new("board.kicad_pcb"),
+            source,
+            &native_fixture_rules(),
+        )
+        .unwrap();
+        adopt_native_dsn(baseline, native.replace("1 -500 0)", "1 -500.5 0)")).unwrap();
+    }
+
+    #[test]
+    fn nonzero_relative_pad_rotation_is_normalized() {
+        let board = coverage_routing_board(
+            &COVERAGE_ROUTING_PAD.replace("(at 1 2 90)", "(at 1 2 75)"),
+            "",
+            "",
+        );
+        let export = export_dsn(Path::new("board.kicad_pcb"), &board, &rules()).unwrap();
+        let identity = dsn_identity(&parse_dsn_sexp(&export.dsn).unwrap()).unwrap();
+        assert_eq!(identity.components["U1"].rotation, 90.0);
+        assert_eq!(identity.components["U1"].pins["1"].rotation, 345.0);
+    }
+
+    #[test]
+    fn oval_uses_its_minor_axis_as_path_width() {
+        let board = coverage_routing_board(
+            &COVERAGE_ROUTING_PAD
+                .replace("smd rect", "smd oval")
+                .replace("(size 2 2)", "(size 3 2)"),
+            "",
+            "",
+        );
+        let exported = export_dsn(Path::new("board.kicad_pcb"), &board, &rules()).unwrap();
+        let tree = parse_dsn_sexp(&exported.dsn).unwrap();
+        let shape = tree
+            .find("library")
+            .unwrap()
+            .find("padstack")
+            .unwrap()
+            .find("shape")
+            .unwrap();
+        let path = shape.get(1).unwrap();
+        assert_eq!(path.head(), Some("path"));
+        assert_eq!(path.get_f64(2), Some(2000.0));
+        assert_eq!(
+            (path.get_f64(3), path.get_f64(5)),
+            (Some(-500.0), Some(500.0))
+        );
+    }
+
+    #[test]
+    fn differing_copper_padstack_is_refused_with_pad_identity() {
+        let pad = COVERAGE_ROUTING_PAD.replace(
+            "(size 2 2)",
+            r#"(size 2 2) (padstack (mode custom) (layer "B.Cu" (shape rect) (size 3 2)))"#,
+        );
+        let board = coverage_routing_board(&pad, "", "");
+        let error = export_dsn(Path::new("board.kicad_pcb"), &board, &rules()).unwrap_err();
+        assert!(error.to_string().contains("pad U1-1"));
+        assert!(error.to_string().contains("padstack"));
     }
 
     #[test]
@@ -2112,6 +2906,7 @@ mod tests {
         let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
         let native = include_str!("../tests/fixtures/specctra_two_resistors.native-kicad-10.dsn");
         for (from, to, expected) in [
+            ("(unit um)", "(unit mm)", "micrometre coordinate system"),
             (
                 "(layer B.Cu",
                 "(layer In1.Cu",
@@ -2255,9 +3050,9 @@ mod tests {
             (layer, "".into(), "changed the copper-layer count"),
             (class, "".into(), "changed the routing-class count"),
             (place, "".into(), "changed the component count"),
-            ("1 -500 0)", "1 -500.5 0)".into(), "not a supported integer"),
-            ("1 -500 0)", "1 -1e30 0)".into(), "not a supported integer"),
-            ("1 -500 0)", "1 1e30 0)".into(), "not a supported integer"),
+            ("1 -500 0)", "1 -500.501 0)".into(), "changed pin position"),
+            ("1 -500 0)", "1 -1e30 0)".into(), "changed pin position"),
+            ("1 -500 0)", "1 1e30 0)".into(), "changed pin position"),
         ] {
             let changed = native.replace(from,&to);
             assert_ne!(changed,native,"ineffective pinned fixture mutation: {from}");
