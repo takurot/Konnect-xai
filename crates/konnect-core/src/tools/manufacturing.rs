@@ -1676,6 +1676,79 @@ mod package_export_option_tests {
     }
 
     #[tokio::test]
+    async fn issue6_invalid_catalog_prices_and_large_boards_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let factory = |x, y| {
+            format!(
+                r#"(kicad_pcb
+            (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+            (gr_line (start 0 0) (end {x} 0) (layer "Edge.Cuts"))
+            (gr_line (start {x} 0) (end {x} {y}) (layer "Edge.Cuts"))
+            (gr_line (start {x} {y}) (end 0 {y}) (layer "Edge.Cuts"))
+            (gr_line (start 0 {y}) (end 0 0) (layer "Edge.Cuts"))
+            (footprint "Pkg" (property "Reference" "U1") (property "LCSC" "C100"))
+            (footprint "Pkg" (property "Reference" "R1") (property "LCSC" "C999")))"#
+            )
+        };
+        let db = dir.path().join("catalog.db");
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: Some(db.clone()),
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+
+        let refused = handle_estimate_cost(&json!({"board":board,"quantity":0}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(result_json(&refused)["error"]["field"], "quantity");
+        assert!(!board.exists());
+
+        std::fs::write(&board, factory(120, 20)).unwrap();
+        let without_db = result_json(
+            &handle_estimate_cost(&json!({"board":board}), &ctx)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            without_db["component_pricing"]["fallback_average"],
+            json!(["R1", "U1"])
+        );
+        assert_eq!(without_db["fabrication_scope"], "board_exceeds_model");
+
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE components(LCSC TEXT PRIMARY KEY, Price REAL, Library_Type TEXT);
+             INSERT INTO components VALUES ('C100', 1e308, 'Preferred');",
+            )
+            .unwrap();
+        std::fs::write(&board, factory(20, 120)).unwrap();
+        let overflow = result_json(
+            &handle_estimate_cost(&json!({"board":board}), &ctx)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(overflow["fabrication_scope"], "board_exceeds_model");
+        assert_eq!(overflow["cost_estimate"]["components_estimate"], "$0.50");
+        assert_eq!(
+            overflow["component_pricing"]["unknown_feeder_fee_refs"],
+            json!(["R1", "U1"])
+        );
+        assert!(overflow["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("overflow"));
+    }
+
+    #[tokio::test]
     async fn package_is_an_error_when_cli_success_produces_no_artifacts() {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("live_ipc.kicad_pcb");

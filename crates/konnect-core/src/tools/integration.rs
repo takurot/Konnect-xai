@@ -3797,7 +3797,9 @@ mod jlcpcb_cache_tests {
             ("1k", "11k 10k 1k5 0.1k 1kV 1kHz", false),
             ("4.7kΩ", "4.7Kohm", true),
             ("100nF", "0.1uF", true),
-            ("0.0V", "0V", true),
+            ("500nF", ".5uF", true),
+            ("5nF", "5µF", false),
+            ("0.0V", "-0V", true),
             ("5V", "5VF -5V", false),
             ("5V", "+5V", true),
             ("-5V", "5V, -5V", true),
@@ -3817,8 +3819,40 @@ mod jlcpcb_cache_tests {
                 "{query} against {text}"
             );
         }
-        for non_value in ["", "0402", "1x7", "50%", ".k", "1.2.3V"] {
+        for non_value in ["", "0402", "1x7", "50%", ".k", "1.2.3V", "4.7k5"] {
             assert!(electrical_value(non_value).is_none(), "{non_value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn issue34_missing_catalog_and_invalid_numeric_values_are_explicit() {
+        let (dir, path) = seed_test_db();
+        let missing = dir.path().join("missing.db");
+        let ctx = test_ctx();
+        let search =
+            handle_search_jlcpcb_parts(&json!({"query":"20pF","output_path":missing}), &ctx)
+                .await
+                .unwrap();
+        let lookup = handle_get_jlcpcb_part(&json!({"lcsc_id":"C901","output_path":missing}), &ctx)
+            .await
+            .unwrap();
+        for result in [search, lookup] {
+            assert!(result.is_error);
+        }
+        assert!(!missing.exists());
+
+        rusqlite::Connection::open(&path).unwrap().execute_batch(
+            "INSERT INTO components VALUES ('C901', '', '', '', 'Basic', 'bad inventory', '', 1e500, -3, 'Cap');
+             INSERT INTO components VALUES ('C902', '', '', '', 'Basic', 'bad inventory', '', -0.5, -1, 'Cap');",
+        ).unwrap();
+        for id in ["C901", "C902"] {
+            let result = handle_get_jlcpcb_part(&json!({"lcsc_id":id,"output_path":path}), &ctx)
+                .await
+                .unwrap();
+            let part = response_json(&result);
+            assert_eq!(part["lcsc"], id);
+            assert!(part["price"].is_null());
+            assert!(part["stock"].is_null());
         }
     }
 
