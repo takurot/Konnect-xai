@@ -50,7 +50,19 @@ jobs:
       # day KiCAD 11 ships, while metadata.json still declares kicad_version
       # 10.x. Bump deliberately alongside the supported-version claim.
       - name: Install KiCAD
-        run: choco install kicad --version=10.0.5 --no-progress --yes
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "kicad-10.0.5-x86_64.exe"
+          curl.exe --fail --location --retry 3 --max-time 240 --output $installer `
+            https://github.com/KiCad/kicad-source-mirror/releases/download/10.0.5/kicad-10.0.5-x86_64.exe
+          if ($LASTEXITCODE -ne 0) { throw "KiCad installer download failed: $LASTEXITCODE" }
+          $sha256 = (Get-FileHash -Algorithm SHA256 -Path $installer).Hash
+          if ($sha256 -ne "d2702ed1fabf2b52bd631450407f141563bc14393a607fb335b63194a8284d33") {
+            throw "Unexpected KiCad installer SHA256: $sha256"
+          }
+          $process = Start-Process -FilePath $installer -ArgumentList "/S", "/allusers" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "KiCad installer exited $($process.ExitCode)" }
 
       - name: Verify kicad-cli and locate its demos
         shell: pwsh

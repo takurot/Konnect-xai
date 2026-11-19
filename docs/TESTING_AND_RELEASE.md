@@ -174,8 +174,8 @@ documentation tests, viewer, plugin, Nix, and PCM validation. The real-KiCad
 workflows install KiCad on demand. Apply the `run:e2e-kicad` label when a pull
 request needs hosted KiCad acceptance evidence.
 
-The existing Windows workflow uses KiCad 10.0.5 and continues to gate
-publication. The [macOS and Linux workflow](../.github/workflows/e2e-kicad-unix.yml)
+The existing Windows workflow verifies and installs the official KiCad 10.0.5
+installer and continues to gate publication. The [macOS and Linux workflow](../.github/workflows/e2e-kicad-unix.yml)
 uses KiCad 10.0.8 on macOS arm64 and Ubuntu 24.04 x64 and arm64. The macOS lane
 verifies the official DMG checksum and falls back to the matching upstream
 source commit for demos. The Ubuntu lanes install exact versions from the
