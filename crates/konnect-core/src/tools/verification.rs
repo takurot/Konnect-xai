@@ -1609,6 +1609,43 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launching_an_immediately_failed_process_reports_exit_and_diagnostic() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let gui = dir.path().join("failing-kicad");
+        std::fs::write(
+            &gui,
+            "#!/bin/sh\nprintf '%s\\n' 'synthetic launch error' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gui, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut ctx = test_ctx();
+        ctx.config.kicad_binary = gui.display().to_string();
+        ctx.config.ipc_address = format!("ipc://{}", dir.path().join("absent").display());
+
+        for wait_ready in [true, false] {
+            let result = handle_launch_kicad_ui(
+                &json!({"timeout_seconds": 1, "wait_ready": wait_ready}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected launch status");
+            };
+            let response: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(response["launched"], false, "{response}");
+            assert_eq!(response["exit_status"], 1, "{response}");
+            assert_eq!(
+                response["stderr_tail"], "synthetic launch error",
+                "{response}"
+            );
+        }
+    }
+
     #[test]
     fn health_timeout_is_bounded_and_typed() {
         assert_eq!(health_timeout_seconds(&json!({})).unwrap(), 5);
