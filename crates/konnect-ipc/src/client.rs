@@ -6589,11 +6589,9 @@ mod footprint_graphics_tests {
         // Center (1,0) at 90° around (10,10): (10, 9).
         assert_eq!(c.center.unwrap().x_nm, 10_000_000);
         assert_eq!(c.center.unwrap().y_nm, 9_000_000);
-        // Radius 0.5 mm regardless of rotation.
-        assert_eq!(
-            c.radius_point.unwrap().x_nm - c.center.unwrap().x_nm,
-            500_000
-        );
+        // The authored +X radius rotates onto -Y and remains 0.5 mm long.
+        assert_eq!(c.radius_point.unwrap().x_nm, 10_000_000);
+        assert_eq!(c.radius_point.unwrap().y_nm, 8_500_000);
     }
 
     /// #117 guard for the pad path: the same PST_NORMAL rule that broke
