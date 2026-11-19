@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 mod instance_contract_tests;
 mod instances;
+mod page_history;
 use instances::HierarchySnapshot;
 
 pub fn tools() -> Vec<ToolDef> {
@@ -92,7 +93,7 @@ pub fn tools() -> Vec<ToolDef> {
              links to it as-is if it does — reusing an existing file places the *same* \
              sub-circuit at a second location (KiCAD's multi-instance sheet pattern) rather \
              than duplicating it. Maintains symbol and nested sheet instance paths and assigns \
-             pages above the highest live page across the owning project's top-level trees.",
+             pages above the highest allocated page across the owning project's top-level trees.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1229,7 +1230,7 @@ async fn handle_add_hierarchical_sheet(
         Err(error) => return hierarchy_error(error),
     };
     let root_path = graph.parent_paths.first().expect("parent placement");
-    let page = graph.first_page();
+    let page = graph.first_page()?;
     let project_name = graph.project_name.clone();
     let block = format_hierarchical_sheet(HierarchicalSheetSpec {
         name: &sheet_name,
@@ -1570,7 +1571,7 @@ async fn handle_duplicate_sheet(
             Err(error) => return hierarchy_error(error),
         };
     let root_path = graph.parent_paths.first().expect("parent placement");
-    let page = graph.first_page();
+    let page = graph.first_page()?;
     let project_name = graph.project_name.clone();
     let block = format_hierarchical_sheet(HierarchicalSheetSpec {
         name: &new_name,

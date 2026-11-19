@@ -69,7 +69,7 @@ async fn nested_additions_allocate_across_all_live_placements() {
         .await
         .unwrap(),
     );
-    assert_eq!(add(&root, "C", "c.kicad_sch").await["sheet"]["page"], "5");
+    assert_eq!(add(&root, "C", "c.kicad_sch").await["sheet"]["page"], "6");
 }
 
 #[tokio::test]
@@ -357,4 +357,190 @@ async fn graph_commit_refuses_changed_project_config_before_any_write() {
     assert!(konnect_sexp::inspect_file_transactions(directory.path())
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn repoint_rekeys_an_annotated_shared_leaf_and_its_nested_page() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("project.kicad_sch");
+    let a = directory.path().join("a.kicad_sch");
+    let b = directory.path().join("b.kicad_sch");
+    let leaf = directory.path().join("leaf.kicad_sch");
+    let twig = directory.path().join("twig.kicad_sch");
+    for file in [&root, &a, &b, &leaf, &twig] {
+        create_blank_schematic(file).unwrap();
+    }
+    for file in [&a, &b] {
+        let mut sch = cse::Schematic::load(file).unwrap();
+        sch.add_sheet(cse::Sheet::new(
+            "Leaf",
+            "leaf.kicad_sch",
+            20.0,
+            20.0,
+            40.0,
+            30.0,
+        ));
+        sch.overwrite().unwrap();
+    }
+    let mut sch = cse::Schematic::load(&leaf).unwrap();
+    sch.add_sheet(cse::Sheet::new(
+        "Twig",
+        "twig.kicad_sch",
+        20.0,
+        20.0,
+        40.0,
+        30.0,
+    ));
+    sch.overwrite().unwrap();
+    symbol(&leaf, "R1");
+
+    std::fs::write(root.with_extension("kicad_pro"), "{}").unwrap();
+    let persistent = add(&root, "Persistent", "leaf.kicad_sch").await;
+    let rotating = add(&root, "Rotating", "a.kicad_sch").await;
+    let root_id = cse::Schematic::load(&root).unwrap().uuid.unwrap();
+    let prefix = format!("/{root_id}/{}", rotating["sheet"]["uuid"].as_str().unwrap());
+    let persistent = format!(
+        "/{root_id}/{}",
+        persistent["sheet"]["uuid"].as_str().unwrap()
+    );
+    let leaf_id = |path: &Path| {
+        cse::Schematic::load(path)
+            .unwrap()
+            .sheets
+            .by_name("Leaf")
+            .unwrap()
+            .uuid
+            .clone()
+    };
+    let old_path = format!("{prefix}/{}", leaf_id(&a));
+    let new_path = format!("{prefix}/{}", leaf_id(&b));
+    let mut before = cse::Schematic::load(&leaf).unwrap();
+    before.symbols[0].set_instance_path("project", &old_path, "R7", 1);
+    let old_page = before
+        .sheets
+        .by_name("Twig")
+        .unwrap()
+        .instances
+        .iter()
+        .find(|row| row.path == old_path)
+        .unwrap()
+        .page
+        .clone();
+    before.overwrite().unwrap();
+
+    decoded(
+        handle_edit_sheet(
+            &json!({"schematic": root, "sheet_name": "Rotating", "new_file": "b.kicad_sch"}),
+            &context(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    let mut expected = [persistent, new_path.clone()];
+    expected.sort();
+    assert_instances(&leaf, &expected);
+    let after = cse::Schematic::load(&leaf).unwrap();
+    let instances = after.symbols[0].instances();
+    assert!(instances
+        .iter()
+        .any(|row| row.path.as_ref() == Some(&new_path) && row.reference.as_deref() == Some("R7")));
+    assert!(after
+        .sheets
+        .by_name("Twig")
+        .unwrap()
+        .instances
+        .iter()
+        .any(|row| row.path == new_path && row.page == old_page));
+}
+
+#[tokio::test]
+async fn repoint_with_ambiguous_predecessor_placements_writes_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("project.kicad_sch");
+    let a = directory.path().join("a.kicad_sch");
+    let b = directory.path().join("b.kicad_sch");
+    let leaf = directory.path().join("leaf.kicad_sch");
+    let files = [&root, &a, &b, &leaf];
+    for file in files {
+        create_blank_schematic(file).unwrap();
+    }
+    for file in [&a, &b] {
+        let mut sch = cse::Schematic::load(file).unwrap();
+        for name in ["First", "Second"] {
+            sch.add_sheet(cse::Sheet::new(
+                name,
+                "leaf.kicad_sch",
+                20.0,
+                20.0,
+                40.0,
+                30.0,
+            ));
+        }
+        sch.overwrite().unwrap();
+    }
+    symbol(&leaf, "R1");
+    std::fs::write(root.with_extension("kicad_pro"), "{}").unwrap();
+    add(&root, "Rotating", "a.kicad_sch").await;
+    let expected = files.map(|file| std::fs::read(file).unwrap());
+
+    let result = handle_edit_sheet(
+        &json!({"schematic": root, "sheet_name": "Rotating", "new_file": "b.kicad_sch"}),
+        &context(),
+    )
+    .await;
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(files.map(|file| std::fs::read(file).unwrap()), expected);
+}
+
+#[tokio::test]
+async fn explicit_renumber_retains_the_saved_allocation_watermark() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("project.kicad_sch");
+    create_blank_schematic(&root).unwrap();
+    std::fs::write(root.with_extension("kicad_pro"), "{}").unwrap();
+    assert_eq!(add(&root, "A", "a.kicad_sch").await["sheet"]["page"], "2");
+    assert_eq!(add(&root, "B", "b.kicad_sch").await["sheet"]["page"], "3");
+    decoded(
+        handle_delete_sheet(&json!({"schematic": root, "sheet_name": "A"}), &context())
+            .await
+            .unwrap(),
+    );
+    let history = directory.path().join(".konnect-sheet-pages.json");
+    let before = std::fs::read(&history).unwrap();
+
+    decoded(
+        handle_renumber_sheet_pages(&json!({"schematic": root}), &context())
+            .await
+            .unwrap(),
+    );
+
+    let schematic = cse::Schematic::load(&root).unwrap();
+    assert_eq!(
+        schematic.sheets.by_name("B").unwrap().page("project"),
+        Some("2")
+    );
+    assert_eq!(std::fs::read(history).unwrap(), before);
+    assert_eq!(add(&root, "C", "c.kicad_sch").await["sheet"]["page"], "4");
+}
+
+#[tokio::test]
+async fn invalid_page_history_blocks_topology_edits() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("project.kicad_sch");
+    let history = directory.path().join(".konnect-sheet-pages.json");
+    create_blank_schematic(&root).unwrap();
+    let before = std::fs::read(&root).unwrap();
+    let invalid = r#"{"version":9001,"allocations":[]}"#;
+    std::fs::write(&history, invalid).unwrap();
+
+    let result = handle_add_hierarchical_sheet(
+        &json!({"schematic": root, "sheet_name": "A", "sheet_file": "a.kicad_sch"}),
+        &context(),
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&root).unwrap(), before);
+    assert_eq!(std::fs::read_to_string(history).unwrap(), invalid);
+    assert!(!directory.path().join("a.kicad_sch").exists());
 }

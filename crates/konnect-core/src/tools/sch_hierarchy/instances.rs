@@ -1,4 +1,5 @@
 //! Resolve placement paths from the project graph and reconcile topology edits.
+use super::page_history::{PageHistory, PageHistoryInput};
 use super::*;
 use crate::tools::{
     project_schematic_roots, resolve_schematic_ownership, resolve_schematic_ownership_with,
@@ -9,6 +10,14 @@ use std::collections::BTreeMap;
 
 type Placements = BTreeMap<PathBuf, BTreeSet<String>>;
 
+#[derive(Default)]
+struct Forest {
+    placements: Placements,
+    missing: BTreeSet<PathBuf>,
+    roots: Vec<(PathBuf, String)>,
+    max_page: u32,
+}
+
 pub(super) struct HierarchySnapshot {
     pub project_name: String,
     pub parent_paths: BTreeSet<String>,
@@ -16,9 +25,9 @@ pub(super) struct HierarchySnapshot {
     project: Option<(PathBuf, String)>,
     roots: Vec<(PathBuf, Option<String>)>,
     sources: BTreeMap<PathBuf, String>,
-    before: Placements,
-    missing: BTreeSet<PathBuf>,
-    next_page: u32,
+    before: Forest,
+    max_page: u32,
+    page_history: Option<PageHistory>,
 }
 
 #[derive(Default)]
@@ -60,19 +69,19 @@ impl HierarchySnapshot {
             project,
             roots,
             sources: BTreeMap::from([(path.clone(), before_source.to_owned())]),
-            before: BTreeMap::new(),
-            missing: BTreeSet::new(),
-            next_page: 2,
+            before: Forest::default(),
+            max_page: 1,
+            page_history: None,
         };
-        let (before, missing, max_page) = result.walk(&BTreeMap::new(), true)?;
-        result.parent_paths = before.get(&path).cloned().ok_or_else(|| {
+        let before = result.walk(&BTreeMap::new(), true)?;
+        result.parent_paths = before.placements.get(&path).cloned().ok_or_else(|| {
             anyhow::anyhow!("Project topology changed while reading {}", path.display())
         })?;
+        let project = result.project.as_ref().map(|(path, _)| path.as_path());
+        let page_history = PageHistory::load(&result.directory, project, before.roots.clone())?;
+        result.max_page = before.max_page.max(page_history.high_water());
         result.before = before;
-        result.missing = missing;
-        result.next_page = max_page
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("No numeric sheet pages remain"))?;
+        result.page_history = Some(page_history);
         Ok(result)
     }
 
@@ -83,8 +92,8 @@ impl HierarchySnapshot {
             .ok_or_else(|| anyhow::anyhow!("No saved snapshot for {}", path.display()))
     }
 
-    pub fn first_page(&self) -> String {
-        self.next_page.to_string()
+    pub fn first_page(&self) -> anyhow::Result<String> {
+        Ok(following_page(self.max_page)?.to_string())
     }
 
     /// The before and projected after forests share saved snapshots. A source
@@ -93,11 +102,12 @@ impl HierarchySnapshot {
         &mut self,
         overrides: &BTreeMap<PathBuf, String>,
         reading_before: bool,
-    ) -> anyhow::Result<(Placements, BTreeSet<PathBuf>, u32)> {
-        let mut placements = BTreeMap::new();
-        let mut missing = BTreeSet::new();
-        let mut max_page = 1;
-        let mut roots = BTreeSet::new();
+    ) -> anyhow::Result<Forest> {
+        let mut forest = Forest {
+            max_page: 1,
+            ..Forest::default()
+        };
+        let mut root_ids = BTreeSet::new();
         let mut identities = BTreeSet::new();
         for (root, configured_id) in self.roots.clone() {
             let root = normalize_path(&root)?;
@@ -107,12 +117,13 @@ impl HierarchySnapshot {
                 .or(document.uuid)
                 .ok_or_else(|| anyhow::anyhow!("Missing root UUID in {}", root.display()))?;
             anyhow::ensure!(
-                roots.insert(root_id.clone()),
+                root_ids.insert(root_id.clone()),
                 "Duplicate top-level sheet UUID {root_id}"
             );
+            forest.roots.push((root.clone(), root_id.clone()));
             for footer in parse_sexp(source)?.find_all("sheet_instances") {
                 for instance in footer.find_all("path") {
-                    include_page(&mut max_page, instance.find_str("page"));
+                    include_page(&mut forest.max_page, instance.find_str("page"));
                 }
             }
             let mut pending = vec![(root, format!("/{root_id}"), Vec::new())];
@@ -126,7 +137,8 @@ impl HierarchySnapshot {
                     identities.insert(placement.clone()),
                     "Duplicate sheet placement {placement}"
                 );
-                placements
+                forest
+                    .placements
                     .entry(file.clone())
                     .or_insert_with(BTreeSet::new)
                     .insert(placement.clone());
@@ -136,18 +148,18 @@ impl HierarchySnapshot {
                 for sheet in document.sheets.iter().rev() {
                     for page in &sheet.instances {
                         if page.project_name == self.project_name && page.path == placement {
-                            include_page(&mut max_page, Some(&page.page));
+                            include_page(&mut forest.max_page, Some(&page.page));
                         }
                     }
                     let child = normalize_path(&parent_dir(&file).join(sheet.file()))?;
                     if !overrides.contains_key(&child) && !child.is_file() {
                         anyhow::ensure!(
                             self.project.is_none()
-                                && (reading_before || self.missing.contains(&child)),
+                                && (reading_before || self.before.missing.contains(&child)),
                             "Referenced schematic file is missing: {}",
                             child.display()
                         );
-                        missing.insert(child);
+                        forest.missing.insert(child);
                         continue;
                     }
                     anyhow::ensure!(
@@ -163,7 +175,7 @@ impl HierarchySnapshot {
                 }
             }
         }
-        Ok((placements, missing, max_page))
+        Ok(forest)
     }
 
     fn source<'a>(
@@ -192,23 +204,24 @@ impl HierarchySnapshot {
         if let Some((path, source)) = created {
             overrides.insert(normalize_path(&path)?, source);
         }
-        let (projected, _, max_page) = self.walk(&overrides, false)?;
+        let projected = self.walk(&overrides, false)?;
         let candidates = self
             .before
+            .placements
             .keys()
-            .chain(projected.keys())
+            .chain(projected.placements.keys())
             .cloned()
             .collect::<BTreeSet<_>>();
         let mut update = InstanceUpdate::default();
-        let mut next_page = self.next_page.max(max_page.saturating_add(1));
+        let mut high_water = self.max_page.max(projected.max_page);
         let mut transitions = Vec::new();
         let mut verify = Vec::new();
         let empty = BTreeSet::new();
         let mut competing_sources = BTreeMap::new();
 
         for path in candidates {
-            let prior_paths = self.before.get(&path).unwrap_or(&empty);
-            let paths = projected.get(&path).unwrap_or(&empty);
+            let prior_paths = self.before.placements.get(&path).unwrap_or(&empty);
+            let paths = projected.placements.get(&path).unwrap_or(&empty);
             if !overrides.contains_key(&path) && (repair.is_some() || prior_paths == paths) {
                 continue;
             }
@@ -241,16 +254,24 @@ impl HierarchySnapshot {
                 .filter(|project| active != Some(project.as_path()))
                 .map(|project| project_name_for(project))
                 .collect::<BTreeSet<_>>();
-            let source = self.source(&path, &overrides)?.to_owned();
+            let source = overrides.get(&path).or_else(|| self.sources.get(&path))
+                .ok_or_else(|| anyhow::anyhow!("Missing snapshot for {}", path.display()))?;
             let context = instance_context(&self.project_name, paths);
             if repair.is_some() {
-                let sch = cse::Schematic::from_source(&path, &source)?;
+                let sch = cse::Schematic::from_source(&path, source)?;
                 if let Err(error) = validate_sheet_instance_state(&path, &sch, &context) {
                     update.diagnostics.push(error.to_string());
                 }
             }
-            let (after, symbols, sheets) =
-                reconcile(&path, &source, &context, &foreign_projects, &mut next_page)?;
+            let predecessors = match_placement_moves(prior_paths, paths)?;
+            let (after, symbols, sheets) = reconcile(
+                &path,
+                source,
+                &context,
+                &predecessors,
+                &foreign_projects,
+                &mut high_water,
+            )?;
             update.patched_symbols += symbols;
             update.patched_sheets += sheets;
             if !paths.is_empty() {
@@ -279,6 +300,11 @@ impl HierarchySnapshot {
                 .collect::<Vec<_>>();
             dependencies.extend(competing_sources);
             dependencies.extend(self.project);
+            let page_history = self.page_history.expect("loaded page history");
+            match page_history.commit_input(high_water)? {
+                PageHistoryInput::Write(transition) => transitions.push(transition),
+                PageHistoryInput::Read(path, source) => dependencies.push((path, source)),
+            }
             commit_file_transaction_with_dependencies(&self.directory, transitions, dependencies)?;
             for (path, context) in verify {
                 let checked = cse::Schematic::load(&path)
@@ -298,6 +324,11 @@ impl HierarchySnapshot {
         }
         Ok(update)
     }
+}
+
+fn following_page(page: u32) -> anyhow::Result<u32> {
+    page.checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("No numeric sheet pages remain"))
 }
 
 fn include_page(max: &mut u32, page: Option<&str>) {
@@ -328,12 +359,71 @@ fn instance_context(project: &str, paths: &BTreeSet<String>) -> SheetInstanceCon
     }
 }
 
+/// A single repoint can move occurrences of the same physical document under
+/// the edited edge. Match both ways and preserve saved annotation only when
+/// the shared ancestor and surviving suffix identify one predecessor.
+fn match_placement_moves<'a>(
+    before: &'a BTreeSet<String>,
+    after: &'a BTreeSet<String>,
+) -> anyhow::Result<BTreeMap<&'a str, &'a str>> {
+    let removed: Vec<_> = before.difference(after).map(String::as_str).collect();
+    let added: Vec<_> = after.difference(before).map(String::as_str).collect();
+    let mut moves = BTreeMap::new();
+    for new in &added {
+        let Some(old) = best_placement(new, &removed)? else {
+            continue;
+        };
+        anyhow::ensure!(
+            best_placement(old, &added)? == Some(*new),
+            "Ambiguous placement rekey from {old} to {new}"
+        );
+        moves.insert(*new, old);
+    }
+    Ok(moves)
+}
+
+fn best_placement<'a>(path: &str, candidates: &[&'a str]) -> anyhow::Result<Option<&'a str>> {
+    let mut ranked = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let prefix = path
+                .split('/')
+                .zip(candidate.split('/'))
+                .take_while(|(a, b)| a == b)
+                .count();
+            // An empty segment and the root UUID are insufficient evidence.
+            if prefix < 3 {
+                return None;
+            }
+            let suffix = path
+                .rsplit('/')
+                .zip(candidate.rsplit('/'))
+                .take_while(|(a, b)| a == b)
+                .count();
+            Some(((prefix, suffix), *candidate))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_unstable_by_key(|(score, _)| std::cmp::Reverse(*score));
+    if let Some((score, candidate)) = ranked.first() {
+        anyhow::ensure!(
+            ranked
+                .get(1)
+                .is_none_or(|(other_score, _)| other_score != score),
+            "Ambiguous predecessor for sheet placement {path}"
+        );
+        Ok(Some(candidate))
+    } else {
+        Ok(None)
+    }
+}
+
 fn reconcile(
     path: &Path,
     source: &str,
     context: &SheetInstanceContext,
+    predecessors: &BTreeMap<&str, &str>,
     foreign_projects: &BTreeSet<String>,
-    next_page: &mut u32,
+    high_water: &mut u32,
 ) -> anyhow::Result<(String, usize, usize)> {
     let mut document = cse::Schematic::from_source(path, source)?;
     let mut changed = Vec::new();
@@ -359,18 +449,24 @@ fn reconcile(
                 .ok_or_else(|| anyhow::anyhow!("Symbol {} has no reference", symbol.uuid))?;
             let mut desired = Vec::new();
             for path in &context.instance_paths {
-                let saved = instances
-                    .iter()
-                    .filter(|entry| {
-                        entry.project.as_deref() == Some(&context.project_name)
-                            && entry.path.as_ref() == Some(path)
-                    })
-                    .filter_map(|entry| entry.reference.as_deref())
-                    .filter(|candidate| {
-                        !candidate.is_empty()
-                            && reference_prefix(candidate) == reference_prefix(reference)
-                    })
-                    .collect::<BTreeSet<_>>();
+                let saved_at = |path: &str| {
+                    instances
+                        .iter()
+                        .filter(|entry| {
+                            entry.project.as_deref() == Some(&context.project_name)
+                                && entry.path.as_deref() == Some(path)
+                        })
+                        .filter_map(|entry| entry.reference.as_deref())
+                        .filter(|candidate| {
+                            !candidate.is_empty()
+                                && reference_prefix(candidate) == reference_prefix(reference)
+                        })
+                        .collect::<BTreeSet<_>>()
+                };
+                let mut saved = saved_at(path);
+                if saved.is_empty() && let Some(old) = predecessors.get(path.as_str()) {
+                    saved = saved_at(old);
+                }
                 anyhow::ensure!(
                     saved.len() <= 1,
                     "Conflicting references for symbol {} at {path}",
@@ -422,11 +518,17 @@ fn reconcile(
         );
         sheet.instances.clear();
         for path in &context.instance_paths {
-            let pages = instances
-                .iter()
-                .filter(|row| row.project_name == context.project_name && &row.path == path)
-                .map(|row| row.page.as_str())
-                .collect::<BTreeSet<_>>();
+            let pages_at = |path: &str| {
+                instances
+                    .iter()
+                    .filter(|row| row.project_name == context.project_name && row.path == path)
+                    .map(|row| row.page.as_str())
+                    .collect::<BTreeSet<_>>()
+            };
+            let mut pages = pages_at(path);
+            if pages.is_empty() && let Some(old) = predecessors.get(path.as_str()) {
+                pages = pages_at(old);
+            }
             anyhow::ensure!(
                 pages.len() <= 1,
                 "Conflicting page numbers for sheet {} at {path}",
@@ -435,11 +537,8 @@ fn reconcile(
             let page = if let Some(page) = pages.first() {
                 (*page).to_owned()
             } else {
-                let page = next_page.to_string();
-                *next_page = next_page
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("No numeric sheet pages remain"))?;
-                page
+                *high_water = following_page(*high_water)?;
+                high_water.to_string()
             };
             sheet.set_page(&context.project_name, path, &page);
         }

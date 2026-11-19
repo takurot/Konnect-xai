@@ -1034,6 +1034,38 @@ mod tests {
     }
 
     #[test]
+    fn recovery_completes_a_page_allocation_with_the_schematic() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let parent = root.join("root.kicad_sch");
+        let history = root.join(".konnect-sheet-pages.json");
+        let replacement = r#"{"version":1,"allocations":[]}"#;
+        std::fs::write(&parent, "before").unwrap();
+        std::fs::write(&history, replacement).unwrap();
+        let journal = Journal {
+            version: JOURNAL_VERSION,
+            id: "page-allocation".to_owned(),
+            entries: normalize_transitions(
+                &root,
+                vec![
+                    FileTransition::create(&history, replacement),
+                    FileTransition::replace(&parent, "before", "after"),
+                ],
+            )
+            .unwrap(),
+        };
+        let active_journal = journal_path(&root, &journal.id);
+        persist_journal(&active_journal, &journal).unwrap();
+
+        let outcomes = recover_file_transactions(&root).unwrap();
+
+        assert_eq!(outcomes[0].completed_files, 1);
+        assert_eq!(std::fs::read_to_string(parent).unwrap(), "after");
+        assert_eq!(std::fs::read_to_string(history).unwrap(), replacement);
+        assert!(!active_journal.exists());
+    }
+
+    #[test]
     fn recovery_defers_to_an_editor_lock_without_changing_the_journal() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let root = directory.path().canonicalize().unwrap();

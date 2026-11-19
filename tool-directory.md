@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **229 registered tools** + **7 always-visible meta-tools** = **236 total**
+- **230 registered tools** + **7 always-visible meta-tools** = **237 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -215,7 +215,7 @@ and Windows servers do not.
 |------|-------------|
 | `create_schematic` | Create a new blank `.kicad_sch` schematic file, on A4 unless another paper size is given. Use `set_schematic_page` to change it later. |
 | `set_schematic_page` | Set the sheet's paper size (A0–A5, A–E, US Letter/Legal/Ledger) and orientation. Returns the size in mm — content outside the frame still exports and still nets up, so a too-small page is a silent defect. |
-| `add_hierarchical_sheet` | Insert a hierarchical sheet into a parent schematic, linking it to a child `.kicad_sch` file. Creates the child file if it doesn't exist, or links to an existing one (multi-instance reuse). Updates symbol and nested sheet instances and allocates pages above the highest live number across the project roots. |
+| `add_hierarchical_sheet` | Insert a hierarchical sheet into a parent schematic, linking it to a child `.kicad_sch` file. Creates the child file if it doesn't exist, or links to an existing one (multi-instance reuse). Updates symbol and nested sheet instances and allocates pages above the highest recorded number across the project roots. |
 | `edit_sheet` | Rename, resize, reposition, or repoint (`Sheetfile`) an existing sheet. Repointing reconciles paths in the old and new subtrees in one transaction. |
 | `move_sheet` | Reposition a sheet on the parent canvas without touching any other field. |
 | `delete_sheet` | Remove a sheet reference from the parent schematic. Prunes removed instance paths while preserving the child schematic file. |
