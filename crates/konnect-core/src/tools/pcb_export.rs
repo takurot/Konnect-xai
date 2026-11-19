@@ -890,11 +890,11 @@ async fn handle_export_specctra_dsn(
             if has_custom_rules {
                 return Ok(Some(None));
             }
-            let rules = client.get_effective_routing_rules_in(document.clone())?;
+            let rules = client.get_effective_routing_rules_in(document.clone());
             if client.save_document_to_string_in(document)? != expected {
                 return Ok(None);
             }
-            Ok(Some(rules))
+            Ok(Some(Some(rules)))
         })
         .await?
         {
