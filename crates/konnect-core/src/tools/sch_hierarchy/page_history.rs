@@ -109,7 +109,7 @@ impl PageHistory {
             let previous = self.allocations.insert(root, high_water);
             changed |= previous != Some(high_water);
         }
-        if !changed && let Some(before) = self.before {
+        if let Some(before) = self.before.take_if(|_| !changed) {
             return Ok(PageHistoryInput::Read(self.path, before));
         }
         let history = History {

@@ -254,7 +254,9 @@ impl HierarchySnapshot {
                 .filter(|project| active != Some(project.as_path()))
                 .map(|project| project_name_for(project))
                 .collect::<BTreeSet<_>>();
-            let source = overrides.get(&path).or_else(|| self.sources.get(&path))
+            let source = overrides
+                .get(&path)
+                .or_else(|| self.sources.get(&path))
                 .ok_or_else(|| anyhow::anyhow!("Missing snapshot for {}", path.display()))?;
             let context = instance_context(&self.project_name, paths);
             if repair.is_some() {
@@ -464,7 +466,7 @@ fn reconcile(
                         .collect::<BTreeSet<_>>()
                 };
                 let mut saved = saved_at(path);
-                if saved.is_empty() && let Some(old) = predecessors.get(path.as_str()) {
+                if let Some(old) = predecessors.get(path.as_str()).filter(|_| saved.is_empty()) {
                     saved = saved_at(old);
                 }
                 anyhow::ensure!(
@@ -526,7 +528,7 @@ fn reconcile(
                     .collect::<BTreeSet<_>>()
             };
             let mut pages = pages_at(path);
-            if pages.is_empty() && let Some(old) = predecessors.get(path.as_str()) {
+            if let Some(old) = predecessors.get(path.as_str()).filter(|_| pages.is_empty()) {
                 pages = pages_at(old);
             }
             anyhow::ensure!(
