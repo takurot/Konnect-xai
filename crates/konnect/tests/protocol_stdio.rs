@@ -339,20 +339,32 @@ fn protocol_request_errors_have_standard_codes() {
 
 #[test]
 fn protocol_notifications_emit_no_stdout() {
-    let mut p = McpProcess::spawn();
-    for _ in 0..100 {
-        p.notify("notifications/roots/list_changed");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_konnect"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        for _ in 0..100 {
+            writeln!(
+                stdin,
+                "{}",
+                json!({"jsonrpc":"2.0","method":"notifications/roots/list_changed"})
+            )
+            .unwrap();
+        }
+        for method in ["notifications/cancelled", "ping"] {
+            writeln!(stdin, "{}", json!({"jsonrpc":"2.0","method":method})).unwrap();
+        }
     }
-    p.notify("notifications/cancelled");
-    p.notify("ping");
-    writeln!(p.stdin, r#"{{"jsonrpc":"2.0","id":99,"method":"ping"}}"#).unwrap();
-    p.stdin.flush().unwrap();
-
-    let mut line = String::new();
-    p.reader.read_line(&mut line).unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&line).unwrap(),
-        json!({"jsonrpc":"2.0","id":99,"result":{}})
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 

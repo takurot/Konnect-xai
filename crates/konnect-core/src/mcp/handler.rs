@@ -148,42 +148,47 @@ impl McpHandler {
     }
 
     /// Process one JSON-RPC message and return an optional response.
-    /// Returns `None` for notifications (no response required).
+    /// Returns `None` for notifications and incoming responses.
     pub async fn handle_message(&self, msg: Value) -> Option<JsonRpcResponse> {
-        // Distinguish request (has "method") from response (has "result"/"error")
-        msg.get("method")?;
-
-        let req: JsonRpcRequest = match serde_json::from_value(msg) {
-            Ok(r) => r,
-            Err(e) => {
-                return Some(JsonRpcResponse::error(
-                    Value::Null,
-                    JsonRpcError {
-                        code: INVALID_REQUEST,
-                        message: format!("Invalid request: {}", e),
-                        data: None,
-                    },
-                ));
+        let id = msg.get("id").filter(|id| is_request_id(id));
+        let Some(method) = request_method(&msg) else {
+            // Client responses have no method. No server request is pending
+            // here, so a response envelope has nothing to dispatch.
+            if msg.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+                && msg.get("method").is_none()
+                && msg
+                    .get("id")
+                    .is_some_and(|id| id.is_null() || is_request_id(id))
+                && (msg.get("result").is_some() ^ msg.get("error").is_some())
+            {
+                return None;
             }
+
+            let message = if msg.is_array() {
+                "JSON-RPC batching is not supported"
+            } else {
+                "Invalid JSON-RPC request"
+            };
+            return Some(JsonRpcResponse::error(
+                id.cloned().unwrap_or(Value::Null),
+                JsonRpcError::new(INVALID_REQUEST, message),
+            ));
         };
 
-        let id = req.id.clone().unwrap_or(Value::Null);
-        debug!("Handling method: {}", req.method);
+        let Some(id) = id else {
+            // STDIO consumes cancellation before dispatch; initialized and
+            // the remaining client notifications require no handler work.
+            debug!(method, "Ignoring MCP notification");
+            return None;
+        };
 
-        let result = self.dispatch(&req).await;
-
-        match result {
-            Ok(None) => None, // notification — no response
-            Ok(Some(val)) => Some(JsonRpcResponse::success(id, val)),
-            Err(e) => Some(JsonRpcResponse::error(
-                id,
-                JsonRpcError {
-                    code: INTERNAL_ERROR,
-                    message: e.to_string(),
-                    data: None,
-                },
-            )),
-        }
+        debug!(method, "Handling MCP request");
+        let result = self.dispatch(method, msg.get("params")).await;
+        let id = id.clone();
+        Some(match result {
+            Ok(result) => JsonRpcResponse::success(id, result),
+            Err(error) => JsonRpcResponse::error(id, error),
+        })
     }
 
     /// At `initialize`, look at who is on the other end. A client that caches
@@ -213,21 +218,21 @@ impl McpHandler {
         }
     }
 
-    async fn dispatch(&self, req: &JsonRpcRequest) -> anyhow::Result<Option<Value>> {
-        match req.method.as_str() {
+    async fn dispatch(&self, method: &str, params: Option<&Value>) -> Result<Value, JsonRpcError> {
+        let serialization_error = |_| JsonRpcError::new(INTERNAL_ERROR, "Failed to encode result");
+        match method {
             // ── Lifecycle ──────────────────────────────────────────────────
             "initialize" => {
-                self.adapt_to_client(req.params.as_ref()).await;
+                self.adapt_to_client(params).await;
                 let notice = self
                     .ctx
                     .guidance
                     .get()
                     .and_then(|probe| probe.take_notice());
                 let result = McpServerState::build_initialize_result(notice);
-                Ok(Some(serde_json::to_value(result)?))
+                serde_json::to_value(result).map_err(serialization_error)
             }
-            "notifications/initialized" => Ok(None),
-            "ping" => Ok(Some(json!({}))),
+            "ping" => Ok(json!({})),
 
             // ── Tool listing ───────────────────────────────────────────────
             "tools/list" => {
@@ -240,26 +245,39 @@ impl McpHandler {
                     tools,
                     next_cursor: None,
                 };
-                Ok(Some(serde_json::to_value(result)?))
+                serde_json::to_value(result).map_err(serialization_error)
             }
 
             // ── Tool execution ─────────────────────────────────────────────
             "tools/call" => {
-                let params: CallToolParams =
-                    serde_json::from_value(req.params.clone().unwrap_or(Value::Null))?;
+                let params = params.filter(|value| value.is_object()).ok_or_else(|| {
+                    JsonRpcError::new(INVALID_PARAMS, "tools/call params must be an object")
+                })?;
+                let params: CallToolParams = serde_json::from_value(params.clone())
+                    .map_err(|error| JsonRpcError::new(INVALID_PARAMS, error.to_string()))?;
+                if params
+                    .arguments
+                    .as_ref()
+                    .is_some_and(|arguments| !arguments.is_object())
+                {
+                    return Err(JsonRpcError::new(
+                        INVALID_PARAMS,
+                        "tools/call arguments must be an object",
+                    ));
+                }
 
                 let call_result = self.execute_tool(&params).await;
-                Ok(Some(serde_json::to_value(call_result)?))
+                serde_json::to_value(call_result).map_err(serialization_error)
             }
 
-            // ── Unimplemented MCP methods ──────────────────────────────────
-            "resources/list" | "resources/read" => Ok(Some(json!({ "resources": [] }))),
-            "prompts/list" => Ok(Some(json!({ "prompts": [] }))),
+            // Empty list responses retained for existing clients.
+            "resources/list" => Ok(json!({ "resources": [] })),
+            "prompts/list" => Ok(json!({ "prompts": [] })),
 
-            method => {
-                warn!("Unknown method: {}", method);
-                Err(anyhow::anyhow!("Method not found: {}", method))
-            }
+            method => Err(JsonRpcError::new(
+                METHOD_NOT_FOUND,
+                format!("Method not found: {method}"),
+            )),
         }
     }
 
@@ -2376,21 +2394,11 @@ mod client_adaptation_tests {
         .expect("handler builds")
     }
 
-    fn request(method: &str, params: Value) -> JsonRpcRequest {
-        JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(json!(1)),
-            method: method.to_string(),
-            params: Some(params),
-        }
-    }
-
     async fn listed_tool_count(handler: &McpHandler) -> usize {
         let out = handler
-            .dispatch(&request("tools/list", json!({})))
+            .dispatch("tools/list", None)
             .await
-            .expect("tools/list dispatches")
-            .expect("tools/list returns a result");
+            .expect("tools/list dispatches");
         out["tools"].as_array().expect("tools array").len()
     }
 
@@ -2416,7 +2424,7 @@ mod client_adaptation_tests {
         let handler = lazy_handler().await;
         let starter = listed_tool_count(&handler).await;
         handler
-            .dispatch(&request("initialize", initialize_from("claude-ai")))
+            .dispatch("initialize", Some(&initialize_from("claude-ai")))
             .await
             .expect("initialize dispatches");
         let after = listed_tool_count(&handler).await;
@@ -2438,7 +2446,7 @@ mod client_adaptation_tests {
         let handler = lazy_handler().await;
         let starter = listed_tool_count(&handler).await;
         handler
-            .dispatch(&request("initialize", initialize_from("some-other-client")))
+            .dispatch("initialize", Some(&initialize_from("some-other-client")))
             .await
             .expect("initialize dispatches");
         assert_eq!(listed_tool_count(&handler).await, starter);
@@ -2450,7 +2458,7 @@ mod client_adaptation_tests {
         let handler = lazy_handler().await;
         let starter = listed_tool_count(&handler).await;
         handler
-            .dispatch(&request("initialize", json!({})))
+            .dispatch("initialize", Some(&json!({})))
             .await
             .expect("initialize dispatches");
         assert_eq!(listed_tool_count(&handler).await, starter);
@@ -2470,10 +2478,9 @@ mod client_adaptation_tests {
 
     async fn initialize_result(handler: &McpHandler) -> Value {
         handler
-            .dispatch(&request("initialize", initialize_from("claude-code")))
+            .dispatch("initialize", Some(&initialize_from("claude-code")))
             .await
             .expect("initialize dispatches")
-            .expect("initialize returns a result")
     }
 
     /// Drift reaches the model through `instructions` (#728); with nothing
