@@ -2386,6 +2386,168 @@ mod tests {
     }
 
     #[test]
+    fn native_receipt_refuses_mismatched_placements_pins_and_layers() {
+        for (from, to, expected) in [
+            ("(layer B.Cu", "(layer In1.Cu", "copper-layer inventory"),
+            (
+                "(boundary",
+                "(layer In1.Cu (type signal) (property (index 2))) (boundary",
+                "copper-layer inventory",
+            ),
+            ("U2 108000 -56000 front 0", "U2 108000 -56000 back 0", "placement cannot be bound"),
+            ("U2 108000 -56000 front 0", "U2 108001 -56000 front 0", "placement cannot be bound"),
+            ("U2 108000 -56000 front 0", "U2 108000 -56001 front 0", "placement cannot be bound"),
+            ("U2 108000 -56000 front 0", "U2 108000 -56000 front 1", "placement cannot be bound"),
+            ("1 -2475 1905)", "1 -2476 1905)", "cannot bind pin"),
+            ("1 -2475 1905)", "1 -2475 1906)", "cannot bind pin"),
+            (
+                "0 1 -2475 1905)",
+                "0 1 -2475 1905) (pin RoundRect[T]Pad_1950.000000x600.000000_150.571000_um_0.000000_0 9 3000 1905)",
+                "changed pins for component",
+            ),
+            (
+                "U2 108000 -56000 front 0 (PN SOIC8_fixture))",
+                "U2 108000 -56000 front 0 (PN SOIC8_fixture)) (place U3 113000 -56000 front 0)",
+                "changed the component inventory",
+            ),
+            (
+                "(pin RoundRect[T]Pad_1950.000000x600.000000_150.571000_um_0.000000_0 1",
+                "(pin MissingPadstack 1",
+                "cannot bind pin",
+            ),
+        ] {
+            let changed = ROTATED_SOIC_NATIVE.replace(from, to);
+            assert_ne!(changed, ROTATED_SOIC_NATIVE, "ineffective DSN mutation {from}");
+            let error = native_export_only(
+                Path::new("board.kicad_pcb"), ROTATED_SOIC, changed, "custom rules"
+            ).unwrap_err();
+            assert!(error.to_string().contains(expected), "{to}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn native_receipt_refuses_board_identity_gaps() {
+        for (from, to, expected) in [
+            ("(kicad_pcb", "(other_pcb", "snapshot root"),
+            (
+                "(property \"Reference\" \"U2\"",
+                "(property \"Reference\" \"U1\"",
+                "repeats footprint",
+            ),
+            (
+                "(pad \"2\" smd roundrect",
+                "(pad \"1\" smd roundrect",
+                "repeats pin",
+            ),
+            ("(net \"SIG1\")", "", "changed net or pin membership"),
+        ] {
+            let changed = ROTATED_SOIC.replacen(from, to, 1);
+            assert_ne!(changed, ROTATED_SOIC, "ineffective board mutation {from}");
+            let error = native_export_only(
+                Path::new("board.kicad_pcb"),
+                &changed,
+                ROTATED_SOIC_NATIVE.into(),
+                "custom rules",
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{to}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn native_pad_shape_parser_preserves_aperture_coordinates() {
+        for (source, expected) in [
+            (
+                "(circle F.Cu 600 15 -25)",
+                DsnGeometry::Circle {
+                    diameter: 600.0,
+                    offset: (15.0, -25.0),
+                },
+            ),
+            (
+                "(path F.Cu 600 -375 0 375 0)",
+                DsnGeometry::Path {
+                    width: 600.0,
+                    points: vec![(-375.0, 0.0), (375.0, 0.0)],
+                },
+            ),
+        ] {
+            let geometry = dsn_shape(&parse_sexp(source).unwrap()).unwrap();
+            assert_eq!(geometry.layer, "F.Cu");
+            assert_eq!(geometry.geometry, expected);
+        }
+    }
+
+    #[test]
+    fn native_pad_shape_parser_refuses_malformed_apertures() {
+        for (source, expected) in [
+            ("(circle F.Cu 0)", "diameter must be positive"),
+            (
+                "(circle F.Cu 600 0)",
+                "malformed or unsupported shape 'circle'",
+            ),
+            ("(circle F.Cu NaN)", "not finite"),
+            (
+                "(rect F.Cu -10 -10 10)",
+                "malformed or unsupported shape 'rect'",
+            ),
+            (
+                "(path F.Cu 100 0 0)",
+                "malformed or unsupported shape 'path'",
+            ),
+            (
+                "(path F.Cu 0 -10 0 10 0)",
+                "malformed or unsupported shape 'path'",
+            ),
+            (
+                "(path F.Cu 100 -10 0 10 0 10)",
+                "incomplete coordinate pair",
+            ),
+            (
+                "(polygon F.Cu 0 -10 0 10 0)",
+                "malformed or unsupported shape 'polygon'",
+            ),
+            (
+                "(polygon F.Cu -1 -10 0 10 0 0 10)",
+                "malformed or unsupported shape 'polygon'",
+            ),
+        ] {
+            let error = dsn_shape(&parse_sexp(source).unwrap()).unwrap_err();
+            assert!(error.to_string().contains(expected), "{source}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn native_courtyard_projection_rejects_truncated_polygons() {
+        for outline in [
+            "(outline (polygon signal 0 0 0 10 0))",
+            "(outline (polygon signal 0 0 0 10 0 10 10 0))",
+        ] {
+            let dsn = format!("(pcb board (library (image part {outline})))");
+            let error = checked_native_tree(&dsn).unwrap_err();
+            assert!(
+                error.to_string().contains("malformed polygon outline"),
+                "{outline}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn roundrect_radius_above_half_the_minor_axis_is_refused() {
+        let pad = COVERAGE_ROUTING_PAD
+            .replace("smd rect", "smd roundrect")
+            .replace("(size 2 2)", "(size 2 2) (roundrect_rratio 0.501)");
+        let board = coverage_routing_board(&pad, "", "");
+        let error = export_dsn(Path::new("board.kicad_pcb"), &board, &rules()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pad U1-1 roundrect radius ratio is outside"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn native_pin_half_micrometre_rounding_is_adoptable() {
         let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
         let native = include_str!("../tests/fixtures/specctra_two_resistors.native-kicad-10.dsn");
