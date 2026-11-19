@@ -299,3 +299,59 @@ fn claude_init_from_npx_cache_warns_about_hook_path() {
         String::from_utf8_lossy(&output.stderr).contains("Claude hooks use this npx cache binary")
     );
 }
+
+#[test]
+fn state_override_keeps_run_records_logs_and_markers_out_of_the_home_and_project() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let state = home.path().join(".konnect-state");
+    assert!(konnect(home.path())
+        .args(["init", "--client", "codex"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(state.join(".installed-codex").is_file());
+
+    let mut server = konnect(home.path())
+        .current_dir(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = server.stdin.take().unwrap();
+    let mut stdout = BufReader::new(server.stdout.take().unwrap());
+    for message in [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "startup-test", "version": "0"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_toolboxes", "arguments": {}}}),
+    ] {
+        writeln!(stdin, "{message}").unwrap();
+        stdin.flush().unwrap();
+        if let Some(id) = message.get("id") {
+            loop {
+                let mut line = String::new();
+                assert_ne!(
+                    stdout.read_line(&mut line).unwrap(),
+                    0,
+                    "missing response to {id}"
+                );
+                let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if response.get("id") == Some(id) {
+                    assert!(response.get("result").is_some(), "{response}");
+                    break;
+                }
+            }
+        }
+    }
+    let record = state.join("run").join(format!("{}.json", server.id()));
+    let log = state.join("logs/calls.jsonl");
+    let registered = record.is_file();
+    let logged = fs::read_to_string(log).is_ok_and(|line| line.contains("list_toolboxes"));
+    drop(stdin);
+    assert!(server.wait().unwrap().success());
+    assert!(registered && !record.exists());
+    assert!(logged);
+    assert!(project.path().read_dir().unwrap().next().is_none());
+    assert!(!home.path().join(".konnect").exists());
+}
