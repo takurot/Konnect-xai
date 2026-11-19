@@ -11,7 +11,6 @@ const REMOVED: &[(&str, &str)] = &[
     ("audit_decoupling", "max_distance_mm"),
     ("export_manufacturing_package", "quantity"),
     ("validate_for_manufacturing", "schematic"),
-    ("estimate_cost", "schematic"),
 ];
 
 fn tool(name: &str) -> konnect_core::tools::ToolDef {
@@ -42,6 +41,15 @@ fn every_removed_input_has_a_migration_note() {
             "missing migration for {tool_name}.{field}"
         );
     }
+}
+
+#[test]
+fn estimate_cost_declares_an_optional_schematic_for_linked_catalog_fields() {
+    let schema = tool("estimate_cost").input_schema;
+    assert_eq!(schema["required"], serde_json::json!(["board"]));
+    let input = &schema["properties"]["schematic"];
+    assert_eq!(input["type"], "string");
+    assert!(input["description"].as_str().unwrap().contains("LCSC"));
 }
 
 #[test]
