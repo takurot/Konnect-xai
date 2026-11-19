@@ -160,17 +160,20 @@ captures the immutable IPC snapshot, rejects a board revision change, and
 checks the native DSN against the captured components, pins, layers, and
 net membership. For the supported SES profile it also checks pad geometry
 and routing rules, then writes a revision-bound reverse manifest. Native
-exports beyond that profile, including boards with custom DRC rules, receive
-an export receipt with `ses_importable: false`. Konnect's SES planner rejects
-that receipt. The temporary native DSN is consumed and deleted.
+exports beyond that profile, including boards with custom DRC rules or
+unavailable effective routing rules, receive an export receipt with
+`ses_importable: false`. For those exports, identity checks include both
+component sides and the signal pins. KiCad represents mechanical holes as
+keepouts. Konnect's SES planner rejects the receipt. The temporary native DSN
+is consumed and deleted.
 
 The `native_bridge_mode` argument defaults to `disable` for deterministic Rust
 export. `prefer` tries the enabled native bridge first and falls back to Rust
 only when its profile is supported. `require` requires a valid native export.
 The Rust exporter uses footprint-relative pad rotations and handles oval
 pads as stroked paths and roundrect pads as outward tangent polygons with a
-0.5 µm tessellation bound. It refuses padstacks with per-layer overrides and
-identifies the affected pad in the error.
+0.5 µm tessellation bound plus at most 1 nm of radius rounding. It refuses
+padstacks with per-layer overrides and identifies the affected pad in the error.
 
 Native export is disabled in the plugin settings by default. This bridge is a
 KiCad 10 compatibility path, not a substitute for the executable IPC plugin or

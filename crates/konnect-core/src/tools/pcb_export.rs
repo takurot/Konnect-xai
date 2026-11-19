@@ -894,7 +894,7 @@ async fn handle_export_specctra_dsn(
             if client.save_document_to_string_in(document)? != expected {
                 return Ok(None);
             }
-            Ok(Some(Some(rules)))
+            Ok(Some(rules))
         })
         .await?
         {
@@ -912,7 +912,9 @@ async fn handle_export_specctra_dsn(
             }
         };
     let baseline = match rules {
-        Some(rules) => crate::specctra::export_dsn(&board_path, &source_snapshot, &rules),
+        Some(rules) => rules
+            .context("capture effective KiCad routing rules")
+            .and_then(|rules| crate::specctra::export_dsn(&board_path, &source_snapshot, &rules)),
         None => Err(anyhow::anyhow!(custom_rules_reason)),
     };
 
