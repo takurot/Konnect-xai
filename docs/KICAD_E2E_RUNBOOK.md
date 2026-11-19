@@ -60,7 +60,7 @@ run_case() {
 }
 ```
 
-`KICAD_CLI`だけではvariantテストに届かないため、CLIのディレクトリを`PATH`にも追加する。デモ不在のconformanceテストやCLI不在のvariantテストには、早期returnでテスト自体が`ok`になる経路がある。**終了コード0や`0 ignored`だけで合格にしない。** 各ログの`SKIP`・`skipping`、対象テスト名、実処理件数も読む。
+`KICAD_CLI`だけではvariantテストに届かないため、CLIのディレクトリを`PATH`にも追加する。デモ不在のconformanceテストには、早期returnでテスト自体が`ok`になる経路がある。C07はCLI未検出時に失敗する。**終了コード0や`0 ignored`だけで合格にしない。** 各ログの`SKIP`・`skipping`、対象テスト名、実処理件数も読む。
 
 ## A. KiCad CLIとMCPの自動評価
 
@@ -74,7 +74,7 @@ run_case() {
 | C04 | 保存互換性：`structural_scan_fixture_reloads_through_real_kicad` | 編集fixtureをKiCadでupgrade・netlist出力。成功し、R1/R3が残ること | 未実施 |
 | C05 | 配線描画：`a_written_default_netclass_still_plots_wires` | Default netclassを更新してSVG化。配線のstrokeとjunction半径が維持され、追加クラスでDefaultが壊れないこと | 未実施 |
 | C06 | デモ互換性：`conformance_test` | KiCad同梱デモを4テストでparse・構造抽出・編集往復・ラベル方向評価。デモが0件でなく、全件parseされ、SKIPがないこと | 未実施 |
-| C07 | variant：`kicad_cli_still_honors_the_variant_clause` | 専用fixtureを実CLIでBOM出力し、variant句の効果をgoldenと照合。CLI探索のskipがないこと | 未実施 |
+| C07 | variant：`kicad_cli_still_honors_the_variant_clause` | Default・Lite・LiteのDNP除外を実CLIで出力。CSVの値とR1だけが除外されることを照合し、値・DNP句を個別に壊したコピーも検出する。DNP欄の表記はKiCadの言語設定に従う | 未実施 |
 | C08 | 応答停止：`wedged_server_times_out_instead_of_hanging` | 応答しない**mock**サーバーに対して25秒以上60秒未満でエラーとなること。実KiCadのハング再現ではない | 未実施 |
 | C09 | PCMパッケージ | CIのAssemble + schema-validate PCM packageを実施し、生成ZIPがvalidatorに受理されること。GUIでのインストール・起動は別途確認する | 未実施 |
 

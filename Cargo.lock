@@ -2716,6 +2716,7 @@ name = "konnect-sexp"
 version = "0.14.0"
 dependencies = [
  "anyhow",
+ "csv",
  "dirs",
  "fs4",
  "libc",
