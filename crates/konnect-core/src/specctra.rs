@@ -650,7 +650,7 @@ fn dsn_shape(node: &SexpNode) -> Result<DsnShapeIdentity> {
     let len = node.children().unwrap_or(&[]).len();
     let n = |i| dsn_number(node, i, "pad geometry coordinate");
     let coordinate_pairs = || -> Result<Vec<(f64, f64)>> {
-        if (len - 3) % 2 != 0 {
+        if !(len - 3).is_multiple_of(2) {
             bail!("DSN pad geometry has an incomplete coordinate pair");
         }
         (3..len)

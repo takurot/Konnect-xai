@@ -2002,11 +2002,11 @@ async fn export_single_pcb_plot(
 ) -> Result<()> {
     ensure_export_destination_is_not_design_file(output)?;
     anyhow::ensure!(
-        !output
+        output
             .canonicalize()
             .ok()
             .zip(pcb.canonicalize().ok())
-            .is_some_and(|(destination, source)| destination == source),
+            .is_none_or(|(destination, source)| destination != source),
         "PCB plot output must differ from the input board"
     );
     let staging = export_staging_dir(output)?;
