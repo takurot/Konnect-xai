@@ -107,7 +107,7 @@ where
     let mut consecutive_reads = 0;
     enum Event {
         Input(std::io::Result<Option<String>>),
-        Completed(Option<Result<Option<JsonRpcResponse>, tokio::task::JoinError>>),
+        Completed(Option<Box<Result<Option<JsonRpcResponse>, tokio::task::JoinError>>>),
     }
 
     loop {
@@ -132,12 +132,12 @@ where
             None
         };
         let event = if let Some(completed) = ready {
-            Event::Completed(Some(completed))
+            Event::Completed(Some(Box::new(completed)))
         } else {
             tokio::select! {
                 biased;
                 line = lines.next_line(), if !eof => Event::Input(line),
-                completed = tasks.join_next(), if active.is_some() => Event::Completed(completed),
+                completed = tasks.join_next(), if active.is_some() => Event::Completed(completed.map(Box::new)),
             }
         };
         match event {
@@ -219,7 +219,7 @@ where
             Event::Completed(completed) => {
                 consecutive_reads = 0;
                 let call = active.take().expect("only active calls have tasks");
-                let response = match completed.expect("active call owns a task") {
+                let response = match *completed.expect("active call owns a task") {
                     Ok(response) => response,
                     Err(error) if error.is_cancelled() => None,
                     Err(_) => {
