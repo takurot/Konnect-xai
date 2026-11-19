@@ -442,8 +442,29 @@ fn native_pcb_netlist_and_sibling_schematic_netlist_through_mcp() {
     ));
     assert_eq!(response["source"], json!(board));
     let ipc = std::fs::read_to_string(ipc).unwrap();
-    assert!(ipc.lines().any(|line| line.starts_with("P  JOB")));
-    assert!(ipc.lines().any(|line| line.starts_with("999")));
+    // KiCad 10.0.5 writes CODE and UNITS, while 10.0.8 adds JOB and
+    // pads its records to 80 columns. Both versions carry the same pins.
+    assert!(ipc
+        .lines()
+        .any(|line| line.split_ascii_whitespace().eq(["P", "CODE", "00"])));
+    assert!(ipc.lines().any(|line| line
+        .split_ascii_whitespace()
+        .eq(["P", "UNITS", "CUST", "0"])));
+    for (record, pin) in [
+        ("327GND", "-1"),
+        ("327VCC", "-2"),
+        ("327SCL", "-3"),
+        ("327SDA", "-4"),
+    ] {
+        assert!(
+            ipc.lines().any(|line| line
+                .split_ascii_whitespace()
+                .take(3)
+                .eq([record, "J1", pin])),
+            "missing IPC-D-356 pad J1{pin} on {record}",
+        );
+    }
+    assert_eq!(ipc.lines().last().map(str::trim_end), Some("999"));
 
     let output = dir.path().join("design.net");
     let response = body(&mcp.tool("export_netlist", json!({"board":board,"output":output})));
