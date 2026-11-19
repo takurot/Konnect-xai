@@ -1081,6 +1081,29 @@ mod placement_overlap_tests {
     }
 
     #[tokio::test]
+    async fn conflicting_opposite_labels_still_use_anchor_tolerance() {
+        use super::tool_call_support::call;
+
+        let source = r#"(kicad_sch
+            (label "RIGHT" (at 100 100 0)
+                (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "right"))
+            (label "LEFT" (at 99.8 100 180)
+                (effects (font (size 1.27 1.27)) (justify right bottom)) (uuid "left")))"#;
+        let result = overlaps(source).await;
+        assert_eq!(result["overlap_count"], 1);
+        assert_eq!(result["overlaps"][0]["uuid_a"], "right");
+        assert_eq!(result["overlaps"][0]["uuid_b"], "left");
+
+        let result = call(
+            source,
+            "check_schematic_overlaps",
+            json!({ "tolerance": 0.1 }),
+        )
+        .await;
+        assert_eq!(result["overlap_count"], 0);
+    }
+
+    #[tokio::test]
     async fn oriented_labels_and_mirrored_symbol_fields_use_saved_layout() {
         let extras = r#"
   (wire (pts (xy 133 128) (xy 133 132)) (uuid "global-cross"))

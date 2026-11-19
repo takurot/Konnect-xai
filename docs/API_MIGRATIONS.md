@@ -1836,7 +1836,8 @@ text rectangles from the saved schematic. It reports `label_overlap`,
 `text_overlap`, `text_body_overlap`, or `text_wire_overlap`. Text dimensions are
 an estimate based on the saved font size, line length, alignment and rotation.
 Custom fonts, variable expansion, graphic label outlines and individual glyphs
-can differ from the estimated rectangles.
+can differ from the estimated rectangles. Conflicting label names at near-coincident
+anchors are still reported using the requested tolerance.
 
 Every finding includes `uuid_a` and `uuid_b`. An unnumbered field uses its
 owning symbol or sheet UUID. A missing identifier is explicitly `null`.

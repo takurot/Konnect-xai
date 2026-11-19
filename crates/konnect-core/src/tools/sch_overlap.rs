@@ -384,15 +384,14 @@ fn sheet_text<'a>(tree: &'a SexpNode, symbols: &[PlacedSymbol<'a>]) -> Vec<TextI
 
 fn text_overlap(a: &TextItem<'_>, b: &TextItem<'_>, tolerance: f64) -> Option<Value> {
     let labels = a.is_label() && b.is_label();
-    let collides = match (a.bounds, b.bounds) {
-        (Some(a), Some(b)) => boxes_overlap(a, b),
-        _ => {
-            labels
-                && a.text != b.text
-                && points_coincident(a.anchor.0, a.anchor.1, b.anchor.0, b.anchor.1, tolerance)
-        }
-    };
-    if !collides {
+    let conflicting_anchors = labels
+        && a.text != b.text
+        && points_coincident(a.anchor.0, a.anchor.1, b.anchor.0, b.anchor.1, tolerance);
+    let overlapping_text = a
+        .bounds
+        .zip(b.bounds)
+        .is_some_and(|(a, b)| boxes_overlap(a, b));
+    if !conflicting_anchors && !overlapping_text {
         return None;
     }
     if labels {
