@@ -444,7 +444,7 @@ fn append_field_layer_state(
     Ok(())
 }
 
-fn pad_layer_state(mut pad: kiapi::board::types::Pad) -> Result<LayerState> {
+fn normalize_pad_geometry(pad: &mut kiapi::board::types::Pad) -> Result<()> {
     let stack = pad
         .pad_stack
         .as_mut()
@@ -479,6 +479,10 @@ fn pad_layer_state(mut pad: kiapi::board::types::Pad) -> Result<LayerState> {
         .sort_by_key(prost::Message::encode_to_vec);
     pad.parent = None;
     pad.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
+    Ok(())
+}
+
+fn pad_layer_state(pad: kiapi::board::types::Pad) -> Result<LayerState> {
     let definition = kiapi::board::types::Footprint {
         items: vec![konnect_ipc::builders::pack_any(
             &pad,
@@ -521,17 +525,7 @@ fn footprint_layer_state(
                 item.value.as_slice(),
             )?)?);
         } else if konnect_ipc::builders::any_is(item, "kiapi.board.types.BoardGraphicShape") {
-            let mut graphic =
-                kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())?;
-            graphic.parent = None;
-            if let Some(fill) = graphic
-                .shape
-                .as_mut()
-                .and_then(|shape| shape.attributes.as_mut())
-                .and_then(|attributes| attributes.fill.as_mut())
-            {
-                fill.color = None;
-            }
+            let graphic = kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())?;
             let definition = kiapi::board::types::Footprint {
                 items: vec![konnect_ipc::builders::pack_any(
                     &graphic,
@@ -1730,6 +1724,7 @@ fn normalized_items(
         .map(|item| {
             if suffix == "Pad" {
                 let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
+                normalize_pad_geometry(&mut pad)?;
                 pad.id = None;
                 pad.net = None;
                 pad.pad_to_die_length = None;
@@ -1787,9 +1782,11 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
         .filter_map(|item| {
             if item.type_url.ends_with("BoardGraphicShape") {
                 Some(
-                    kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).map(
-                        |mut shape| {
+                    kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+                        .map_err(anyhow::Error::from)
+                        .map(|mut shape| {
                             shape.id = None;
+                            shape.parent = None;
                             shape.net = None;
                             shape.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
                             if let Some(graphic) = shape.shape.as_mut() {
@@ -1809,26 +1806,29 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                                     }
                                     stroke.color = None;
                                 }
+                                if let Some(fill) = graphic
+                                    .attributes
+                                    .as_mut()
+                                    .and_then(|attributes| attributes.fill.as_mut())
+                                {
+                                    fill.color = None;
+                                }
                                 konnect_ipc::normalize_footprint_graphic_geometry(graphic);
                             }
                             shape.encode_to_vec()
-                        },
-                    ),
+                        }),
                 )
             } else if item.type_url.ends_with("BoardText") {
                 Some(
-                    kiapi::board::types::BoardText::decode(item.value.as_slice()).map(
-                        |mut text| {
-                            text.id = None;
-                            text.encode_to_vec()
-                        },
-                    ),
+                    kiapi::board::types::BoardText::decode(item.value.as_slice())
+                        .map_err(anyhow::Error::from)
+                        .and_then(|text| normalized_layer_text(&text)),
                 )
             } else {
                 None
             }
         })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>>>()?;
     graphics.sort();
     Ok(graphics)
 }
