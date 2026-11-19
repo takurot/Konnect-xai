@@ -138,7 +138,7 @@ fn normalize_polyline(polyline: &mut common::PolyLine) {
 }
 
 impl Presentation {
-    fn of(footprint: &board::FootprintInstance) -> Result<Self> {
+    fn of(footprint: &board::FootprintInstance, expected: Option<&Self>) -> Result<Self> {
         let definition = footprint
             .definition
             .as_ref()
@@ -172,10 +172,22 @@ impl Presentation {
         ] {
             if let Some(field) = primary.as_ref().or(fallback.as_ref()) {
                 check_parent(field.text.as_ref().and_then(|text| text.parent.as_ref()))?;
-                fields.insert(
-                    name.into(),
-                    normalize_footprint_field(field)?.encode_to_vec(),
-                );
+                let normalized = normalize_footprint_field(field)?;
+                // KiCad materializes omitted empty standard fields during CreateItems.
+                // Field.visible governs the field; its nested text can still be visible.
+                if expected.is_some_and(|expected| !expected.fields.contains_key(name))
+                    && matches!(name, "Datasheet" | "Description")
+                    && field.name == name
+                    && !field.visible
+                    && field
+                        .text
+                        .as_ref()
+                        .and_then(|text| text.text.as_ref())
+                        .is_some_and(|text| text.text.is_empty())
+                {
+                    continue;
+                }
+                fields.insert(name.into(), normalized.encode_to_vec());
             }
         }
         let mut strokes = Vec::new();
@@ -271,7 +283,7 @@ impl FootprintPresentation {
             let reference = crate::client::footprint_reference(&footprint).to_string();
             if reference.is_empty()
                 || expected
-                    .insert(reference.clone(), Presentation::of(&footprint)?)
+                    .insert(reference.clone(), Presentation::of(&footprint, None)?)
                     .is_some()
             {
                 bail!("empty or duplicate footprint reference '{reference}' during presentation verification");
@@ -303,7 +315,7 @@ impl FootprintPresentation {
             let footprint = observed.get(reference).with_context(|| {
                 format!("footprint '{reference}' is missing from presentation readback")
             })?;
-            let mut actual = Presentation::of(footprint)?;
+            let mut actual = Presentation::of(footprint, Some(expected))?;
             if expected.kiid.is_none() {
                 actual.kiid = None;
             }

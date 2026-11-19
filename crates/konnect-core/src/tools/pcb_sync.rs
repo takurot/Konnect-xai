@@ -531,55 +531,30 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             let symbol_paths = FootprintSymbolPaths::prepare(&creates, &updates)?;
             let chamfers = konnect_ipc::FootprintChamfers::from_items(creates.iter().chain(updates.iter()))?;
             let native_expected = native_assembly_expectations(&plan);
-            let mutation = client.run_commit_recovering_in(snapshot.document.clone(), "Update PCB from saved schematic", |client| {
+            // Create/UpdateItems validate command and per-item acknowledgements.
+            // KiCad exposes the changes through GetItems only after EndCommit.
+            client.run_commit_recovering_in(snapshot.document.clone(), "Update PCB from saved schematic", |client| {
                 create_sync_items_in(client, &snapshot.document, &creates)?;
-                client.update_items_in(snapshot.document.clone(), updates)?;
-                verify_native_assembly_attributes(client, &snapshot.document, &native_expected)?;
-                symbol_paths.verify(client, &snapshot.document).map_err(|error| error.context(SymbolPathReadbackFailure))?;
-                Ok(())
-            });
-            mutation.map_err(|error| {
-                let settled = error.downcast_ref::<konnect_ipc::client::IpcOutcomeUnknown>().is_some()
-                    || error.downcast_ref::<konnect_ipc::client::IpcBatchRecovered>().is_some();
-                if error.downcast_ref::<SymbolPathReadbackFailure>().is_some() && !settled {
-                    anyhow::Error::new(konnect_ipc::client::IpcOutcomeUnknown {
-                        command: "GetItems".to_string(),
-                        reason: format!("symbol-path verification did not establish completion on {}: {error:#}", ipc_board.display()),
-                    })
-                } else if error.downcast_ref::<NativeAssemblyVerificationError>().is_some() && !settled {
-                    error.context(konnect_ipc::client::IpcOutcomeUnknown {
-                        command: "update_pcb_from_schematic native assembly verification".to_owned(),
-                        reason: "native attribute verification failed after mutation; rollback was attempted, but complete live-state restoration has not been independently verified".to_owned(),
-                    })
-                } else {
-                    error
-                }
+                client.update_items_in(snapshot.document.clone(), updates)
             })?;
-            client.verify_footprint_chamfers_in(snapshot.document.clone(), &chamfers)?;
-            client.verify_footprint_presentation_in(snapshot.document.clone(), &presentation)?;
             let readback = (|| {
                 let items = client.get_items_in(
                     snapshot.document.clone(),
                     konnect_ipc::gen::kiapi::common::types::KiCadObjectType::KotPcbFootprint,
                 )?;
                 symbol_paths.verify_items(&items)?;
+                chamfers.verify(&items).context("footprint chamfer readback")?;
+                presentation.verify(&items).context("footprint presentation readback")?;
                 verify_board_matches_what_was_sent(&items, &expected, &native_expected)
             })()
             .map_err(|error: anyhow::Error| {
-                if error.downcast_ref::<konnect_ipc::client::IpcOutcomeUnknown>().is_some()
-                    || error.downcast_ref::<konnect_ipc::client::IpcBatchRecovered>().is_some()
-                {
-                    error.context(format!("published PCB sync readback failed on {}", ipc_board.display()))
-                } else {
-                    let reason = format!(
-                        "published PCB sync readback failed on {}: {error:#}; inspect the board before retrying",
+                error.context(konnect_ipc::client::IpcOutcomeUnknown {
+                    command: "PCB sync post-commit readback".to_owned(),
+                    reason: format!(
+                        "PCB sync commit succeeded on {}; readback failed, inspect the board before retrying",
                         ipc_board.display()
-                    );
-                    error.context(konnect_ipc::client::IpcOutcomeUnknown {
-                        command: "GetItems".to_string(),
-                        reason,
-                    })
-                }
+                    ),
+                })
             })?;
             for detail in readback {
                 plan.diagnostics.push(conflict(
@@ -1661,10 +1636,6 @@ impl AttributeSet {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("PCB sync symbol-path readback failed")]
-struct SymbolPathReadbackFailure;
-
 #[derive(Debug)]
 enum FootprintPathTarget {
     Kiid(String),
@@ -1715,18 +1686,6 @@ impl FootprintSymbolPaths {
             });
         }
         Ok(Self(expected))
-    }
-
-    fn verify(
-        &self,
-        client: &konnect_ipc::KiCadIpcClient,
-        document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
-    ) -> Result<()> {
-        let items = client.get_items_in(
-            document.clone(),
-            konnect_ipc::gen::kiapi::common::types::KiCadObjectType::KotPcbFootprint,
-        )?;
-        self.verify_items(&items)
     }
 
     fn verify_items(&self, items: &[prost_types::Any]) -> Result<()> {
@@ -1894,20 +1853,6 @@ fn decode_native_assembly_footprint(
     FootprintInstance::decode(item.value.as_slice()).context(NativeAssemblyVerificationError(
         "native assembly readback cannot decode FootprintInstance".to_owned(),
     ))
-}
-
-fn verify_native_assembly_attributes(
-    client: &konnect_ipc::KiCadIpcClient,
-    document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
-    expected: &BTreeMap<String, NativeAssemblyExpectation>,
-) -> Result<()> {
-    use konnect_ipc::gen::kiapi::common::types::KiCadObjectType;
-    let items = client
-        .get_items_in(document.clone(), KiCadObjectType::KotPcbFootprint)
-        .context(NativeAssemblyVerificationError(
-            "native assembly readback is unavailable".to_owned(),
-        ))?;
-    verify_native_assembly_snapshot(expected, &items)
 }
 
 fn verify_native_assembly_snapshot(
@@ -4432,51 +4377,6 @@ mod tests {
     }
 
     #[test]
-    fn symbol_path_readback_context_preserves_native_outcomes() {
-        for source in [
-            anyhow::Error::new(konnect_ipc::client::IpcOutcomeUnknown {
-                command: "GetItems".into(),
-                reason: "missing response status".into(),
-            }),
-            anyhow::Error::new(konnect_ipc::client::IpcBatchRecovered {
-                commit_id: "recovered-commit".into(),
-            }),
-        ] {
-            let unknown = source
-                .downcast_ref::<konnect_ipc::client::IpcOutcomeUnknown>()
-                .is_some();
-            let recovered = source
-                .downcast_ref::<konnect_ipc::client::IpcBatchRecovered>()
-                .is_some();
-            let error = source.context(SymbolPathReadbackFailure);
-            assert!(error.downcast_ref::<SymbolPathReadbackFailure>().is_some());
-            assert_eq!(
-                error
-                    .downcast_ref::<konnect_ipc::client::IpcOutcomeUnknown>()
-                    .is_some(),
-                unknown
-            );
-            assert_eq!(
-                error
-                    .downcast_ref::<konnect_ipc::client::IpcBatchRecovered>()
-                    .is_some(),
-                recovered
-            );
-        }
-        let ordinary =
-            anyhow::anyhow!("missing expected footprint").context(SymbolPathReadbackFailure);
-        assert!(ordinary
-            .downcast_ref::<SymbolPathReadbackFailure>()
-            .is_some());
-        assert!(ordinary
-            .downcast_ref::<konnect_ipc::client::IpcOutcomeUnknown>()
-            .is_none());
-        assert!(ordinary
-            .downcast_ref::<konnect_ipc::client::IpcBatchRecovered>()
-            .is_none());
-    }
-
-    #[test]
     fn symbol_path_readback_checks_complete_paths_and_stable_update_identity() {
         use konnect_ipc::gen::kiapi;
 
@@ -5828,26 +5728,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_474_apply_preserves_every_board_only_object() {
-        sync_with_symbol_path_readback(SymbolPathReadback::AsSent, false).await;
-    }
-
-    #[tokio::test]
-    async fn sync_never_reports_applied_when_symbol_path_readback_differs() {
-        for readback in [
-            SymbolPathReadback::WrongUuid,
-            SymbolPathReadback::WrongHumanReadable,
-            SymbolPathReadback::WrongReference,
-            SymbolPathReadback::MissingPath,
-            SymbolPathReadback::MissingFootprint,
-            SymbolPathReadback::MalformedFootprint,
-        ] {
-            sync_with_symbol_path_readback(readback, false).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn symbol_path_readback_native_unknown_never_blindly_drops_the_commit() {
-        sync_with_symbol_path_readback(SymbolPathReadback::NativeUnknown, false).await;
+        sync_with_symbol_path_readback(SymbolPathReadback::AsSent).await;
     }
 
     #[tokio::test]
@@ -5863,14 +5744,11 @@ mod tests {
             SymbolPathReadback::RejectedReadback,
             SymbolPathReadback::NativeUnknown,
         ] {
-            sync_with_symbol_path_readback(readback, true).await;
+            sync_with_symbol_path_readback(readback).await;
         }
     }
 
-    async fn sync_with_symbol_path_readback(
-        path_readback: SymbolPathReadback,
-        after_publish: bool,
-    ) {
+    async fn sync_with_symbol_path_readback(path_readback: SymbolPathReadback) {
         use crate::router::ToolRouter;
         use crate::tools::cli::test_support::write_script;
         use crate::tools::{ServerConfig, ToolContext};
@@ -6026,10 +5904,9 @@ mod tests {
                             if responder_state
                                 .mutated
                                 .load(std::sync::atomic::Ordering::SeqCst)
-                                && (!after_publish
-                                    || responder_state
-                                        .published
-                                        .load(std::sync::atomic::Ordering::SeqCst))
+                                && responder_state
+                                    .published
+                                    .load(std::sync::atomic::Ordering::SeqCst)
                             {
                                 match path_readback {
                                     SymbolPathReadback::MissingFootprint => {
@@ -6216,10 +6093,9 @@ mod tests {
                     && transport_state
                         .mutated
                         .load(std::sync::atomic::Ordering::SeqCst)
-                    && (!after_publish
-                        || transport_state
-                            .published
-                            .load(std::sync::atomic::Ordering::SeqCst))
+                    && transport_state
+                        .published
+                        .load(std::sync::atomic::Ordering::SeqCst)
                 {
                     let request =
                         kiapi::common::commands::GetItems::decode(command.value.as_slice())
@@ -6295,35 +6171,23 @@ mod tests {
                 Some("ipc_outcome_unknown"),
                 "{path_readback:?}: {applied:?}"
             );
-            if after_publish {
-                let ToolContent::Text { text } = &applied.content[0] else {
-                    panic!("uncertain response was not JSON text");
-                };
-                let uncertain: serde_json::Value = serde_json::from_str(text).unwrap();
-                assert_eq!(uncertain["error"]["retry_safe"], false);
-                assert_eq!(uncertain["error"]["board_state"], "unknown");
-                assert_eq!(
-                    *state.commit_actions.lock().unwrap(),
-                    vec![kiapi::common::commands::CommitAction::CmaCommit as i32],
-                    "{path_readback:?}"
-                );
-                assert!(state.mutated.load(std::sync::atomic::Ordering::SeqCst));
-                assert_ne!(*state.footprints.lock().unwrap(), footprints_before);
-            } else if path_readback == SymbolPathReadback::NativeUnknown {
-                assert!(state.commit_actions.lock().unwrap().is_empty());
-                assert!(state.mutated.load(std::sync::atomic::Ordering::SeqCst));
-            } else {
-                assert_eq!(
-                    *state.commit_actions.lock().unwrap(),
-                    vec![kiapi::common::commands::CommitAction::CmaDrop as i32],
-                    "{path_readback:?}"
-                );
-                assert_eq!(
-                    *state.footprints.lock().unwrap(),
-                    footprints_before,
-                    "{path_readback:?}"
-                );
-            }
+            let ToolContent::Text { text } = &applied.content[0] else {
+                panic!("uncertain response was not JSON text");
+            };
+            let uncertain: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(uncertain["error"]["retry_safe"], false);
+            assert_eq!(uncertain["error"]["board_state"], "unknown");
+            assert!(uncertain["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("commit succeeded"));
+            assert_eq!(
+                *state.commit_actions.lock().unwrap(),
+                vec![kiapi::common::commands::CommitAction::CmaCommit as i32],
+                "{path_readback:?}"
+            );
+            assert!(state.mutated.load(std::sync::atomic::Ordering::SeqCst));
+            assert_ne!(*state.footprints.lock().unwrap(), footprints_before);
             return;
         }
         let applied: serde_json::Value = serde_json::from_str(&match &applied.content[0] {
@@ -6694,8 +6558,8 @@ mod tests {
     /// Everything a served dry run needs without KiCad: a stand-in
     /// `kicad-cli` that hands back `netlist`, and a protobuf mock holding the
     /// project's board open with nothing on it. It can also apply: the mock
-    /// keeps what `CreateItems` sent and lists it back as the board's
-    /// footprints, shaped by `readback`.
+    /// stages what `CreateItems` sent and only lists it after committing,
+    /// shaped by `readback`.
     struct ServedSync {
         _temp: tempfile::TempDir,
         _kicad: crate::test_support::MockIpcServer,
@@ -7164,6 +7028,8 @@ mod tests {
         let netlist = exported_netlist(&[("R1", STOCK_0603, &["1", "2"])]);
         assert_eq!(sync.apply(&netlist).await["status"], "applied");
         let before = sync.begins.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(before, 1, "one transaction must publish the new footprint");
+        assert_eq!(sync.sent_footprints().len(), 1);
         let plan = sync.dry_run(&netlist).await;
         assert_eq!(plan["status"], "noop", "{plan}");
         let (_, result) = sync
@@ -7590,7 +7456,7 @@ mod tests {
     /// schematic set it, the final value sent, not the library's: the 0603's
     /// library footprint is not DNP.
     #[tokio::test]
-    async fn issue25_a_lost_native_dnp_flag_aborts_and_attempts_rollback() {
+    async fn issue25_a_lost_native_dnp_flag_is_reported_after_publication() {
         let served = ServedSync::reading_back(Readback::WithoutDnp).await;
         let netlist = with_dnp(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]), "C1");
         let plan = served.dry_run(&netlist).await;
@@ -7610,8 +7476,8 @@ mod tests {
             "{result}"
         );
         assert!(
-            served.sent_footprints().is_empty(),
-            "the mock must apply confirmed Drop"
+            !served.sent_footprints().is_empty(),
+            "published work must remain visible"
         );
     }
 
@@ -7686,7 +7552,7 @@ mod tests {
                 assert_eq!(result["error"]["retry_safe"], false, "{result}");
                 assert_ne!(result["status"], "applied", "{result}");
                 assert!(result.to_string().contains(attribute), "{result}");
-                assert!(served.sent_footprints().is_empty());
+                assert!(!served.sent_footprints().is_empty());
             }
         }
     }

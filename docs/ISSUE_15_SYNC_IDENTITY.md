@@ -124,3 +124,20 @@ this worktree's isolated Cargo target. Its historical log name is
 `issue15-postpublish-red.log`, but that queued run executed the corrected code
 and is Green evidence. Final-head workspace gates and real KiCad verification
 remain required.
+
+## KiCad 10.0.8 staged changes
+
+Issue #80 supersedes the pre-publication identity checks above. KiCad returns
+the published footprint inventory while a commit is open. Create and update
+requests check KiCad's per-item acknowledgements, then publish the changes as
+one undo operation. The sync verifies symbol paths, native assembly attributes,
+chamfers, presentation and geometry using one exact-document footprint
+inventory after publication. When this verification fails, the response
+reports that the commit succeeded and marks the outcome uncertain with
+`retry_safe: false`.
+
+KiCad 10.0.8 also supplies empty hidden Datasheet and Description fields for
+some created footprints (#77). A field that the caller omitted may appear in
+this form without a presentation mismatch. The comparison still checks
+explicitly requested fields in full, and rejects newly visible or nonempty
+fields and incorrect parent IDs.
