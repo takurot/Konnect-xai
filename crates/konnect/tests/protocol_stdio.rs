@@ -888,26 +888,42 @@ fn check_freerouting_reports_every_location_it_searched_over_stdio() {
     let tmp = tempfile::tempdir().unwrap();
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    let third_party: Vec<String> = ["3rd-10", "3rd-9", "3rd-8"]
+    let third_party: Vec<_> = ["3rd-11", "3rd-10", "3rd-9"]
         .iter()
         .map(|name| {
             let dir = tmp.path().join(name);
             std::fs::create_dir_all(&dir).unwrap();
-            dir.display().to_string()
+            dir
         })
         .collect();
-    let (bin_s, home_s) = (bin.display().to_string(), tmp.path().display().to_string());
-    let mut p = McpProcess::spawn_with_env(
-        Some(tmp.path()),
-        true,
-        &[
-            ("PATH", bin_s.as_str()),
-            ("USERPROFILE", home_s.as_str()),
-            ("KICAD10_3RD_PARTY", third_party[0].as_str()),
-            ("KICAD9_3RD_PARTY", third_party[1].as_str()),
-            ("KICAD8_3RD_PARTY", third_party[2].as_str()),
-        ],
-    );
+    let plugin_dirs: Vec<_> = ["11.0", "10.99", "9.0"]
+        .into_iter()
+        .flat_map(|version| {
+            ["Documents/KiCad", ".local/share/kicad"]
+                .map(|base| tmp.path().join(base).join(version).join("3rdparty/plugins"))
+        })
+        .collect();
+    for dir in &plugin_dirs {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy().to_ascii_uppercase();
+        if name.starts_with("KICAD") && name.ends_with("_3RD_PARTY") {
+            command.env_remove(key);
+        }
+    }
+    command
+        .current_dir(tmp.path())
+        .env("HOME", tmp.path())
+        .env("APPDATA", tmp.path())
+        .env("USERPROFILE", tmp.path())
+        .env("PATH", &bin)
+        .env_remove("KICAD_DOCUMENTS_HOME")
+        .env("KICAD11_3RD_PARTY", &third_party[0])
+        .env("KICAD10_3RD_PARTY", &third_party[1])
+        .env("KICAD9_3RD_PARTY", &third_party[2]);
+    let mut p = McpProcess::spawn_command(command);
     McpProcess::tool_body(&p.call_tool("load_toolset", json!({"name": "integration"})));
 
     let result = p.call_tool("check_freerouting", json!({}));
@@ -925,7 +941,7 @@ fn check_freerouting_reports_every_location_it_searched_over_stdio() {
         .collect();
     // `HOME` and `USERPROFILE` name the same directory here, so on Windows the
     // `Documents` plugin folders are reached twice and searched once.
-    let plugin_folders = 6;
+    let plugin_folders = plugin_dirs.len();
     let mut expected = vec!["kicad_3rd_party_variable"; 3];
     expected.extend(vec!["kicad_plugin_folder"; plugin_folders]);
     expected.extend(["working_directory", "system_directory", "system_directory"]);
@@ -934,6 +950,10 @@ fn check_freerouting_reports_every_location_it_searched_over_stdio() {
 
     for (root, dir) in searched[..3].iter().zip(&third_party) {
         assert_eq!(root["location_path"], json!(dir), "{root}");
+        assert_eq!(root["exists"], true, "{root}");
+    }
+    for (root, path) in searched[3..3 + plugin_folders].iter().zip(&plugin_dirs) {
+        assert_eq!(root["location_path"], json!(path), "{root}");
         assert_eq!(root["exists"], true, "{root}");
     }
     let working = std::path::PathBuf::from(
@@ -948,7 +968,7 @@ fn check_freerouting_reports_every_location_it_searched_over_stdio() {
     );
     assert_eq!(searched[3 + plugin_folders]["exists"], false);
     let last = searched.last().unwrap();
-    assert_eq!(last["location_path"], json!(bin_s), "{last}");
+    assert_eq!(last["location_path"], json!(bin), "{last}");
     assert_eq!(last["max_depth"], 1, "{last}");
 }
 
