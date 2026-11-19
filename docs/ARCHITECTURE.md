@@ -45,6 +45,10 @@ transaction journals. It does not require a live KiCad process.
 resolution, and parse-mutate-serialize workflows for symbols, wires, labels,
 sheets, and related schematic concepts.
 
+Both S-expression parsers accept at most 256 nested lists, counting the root
+list. The first opening parenthesis beyond the limit yields a parse error with
+its byte offset. Parentheses in quoted values do not count toward the limit.
+
 `crates/konnect-ipc` owns the KiCad IPC client, generated protobuf types, NNG
 request/reply transport, typed board operations, and the distinction among an
 unreachable transport, a requested board positively absent from KiCad's complete
