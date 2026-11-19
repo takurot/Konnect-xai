@@ -1,6 +1,7 @@
 """Accept only the netlist, reports and CAM data this two-net fixture expects."""
 
 import json
+import math
 import re
 import xml.etree.ElementTree as ET
 from collections import Counter
@@ -69,6 +70,14 @@ def verify_netlist(contents):
     return observed
 
 
+def verify_drc_source(summary):
+    require(
+        summary.get("source") == "saved_file"
+        and summary.get("live_board_synced") is True,
+        "DRC did not verify the saved live board",
+    )
+
+
 def verify_drc(summary, report, *, omitted_pads):
     """Return whether export is authorized, or raise on incomplete/bad evidence."""
     omitted = 0 if omitted_pads is None else 1
@@ -92,11 +101,7 @@ def verify_drc(summary, report, *, omitted_pads):
         summary.get("categories_not_reported") == [],
         "DRC categories_not_reported must be empty",
     )
-    require(
-        summary.get("source") == "saved_file"
-        and summary.get("live_board_synced") is True,
-        "DRC did not verify the saved live board",
-    )
+    verify_drc_source(summary)
     require(
         summary.get("severity_filter") == "info" and summary.get("truncated") is False,
         "DRC report was filtered or truncated",
@@ -150,6 +155,38 @@ def segments(points):
     return [canonical_segment(a, b) for a, b in pairwise(points)]
 
 
+def valid_aperture(shape, parameter_text, macros):
+    """Validate stock aperture geometry and arguments to declared macros."""
+    fields = [] if parameter_text is None else parameter_text.split("X")
+    if not all(
+        re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)", value)
+        for value in fields
+    ):
+        return False
+    numbers = list(map(float, fields))
+    if not all(math.isfinite(number) for number in numbers):
+        return False
+    if shape in ("C", "R", "O"):
+        size_count = 1 if shape == "C" else 2
+        return (
+            len(numbers) in (size_count, size_count + 1)
+            and all(dimension > 0 for dimension in numbers[:size_count])
+            and (
+                len(numbers) == size_count
+                or 0 < numbers[-1] < min(numbers[:size_count])
+            )
+        )
+    if shape == "P":
+        return (
+            2 <= len(numbers) <= 4
+            and numbers[0] > 0
+            and numbers[1].is_integer()
+            and 3 <= numbers[1] <= 12
+            and (len(numbers) < 4 or 0 < numbers[3] < numbers[0])
+        )
+    return shape in macros
+
+
 def gerber_geometry(text, layer):
     """Read stock KiCad's absolute mm, 4.6-format linear geometry for this case."""
     require(
@@ -158,29 +195,37 @@ def gerber_geometry(text, layer):
     )
     moves, flashes = [], []
     prior = net = selected = None
-    apertures = set()
-    in_macro = False
+    apertures, macros = set(), set()
+    macro = None
     lines = text.splitlines()
     require(
         lines and lines[-1] == "M02*" and lines.count("M02*") == 1,
         f"{layer}: expected one Gerber end command",
     )
     for line in lines:
-        if in_macro:
+        if macro is not None:
             require(
                 re.fullmatch(r"(?:0 .+|[1-9][0-9]*,[0-9,$+./xX -]+)\*%?", line),
                 f"{layer}: malformed aperture macro line {line!r}",
             )
-            in_macro = not line.endswith("%")
+            if line.endswith("%"):
+                macros.add(macro)
+                macro = None
             continue
-        if re.fullmatch(r"%AM[A-Za-z0-9_]+\*", line):
-            in_macro = True
+        declaration = re.fullmatch(r"%AM([A-Za-z0-9_]+)\*", line)
+        if declaration:
+            macro = declaration[1]
+            require(macro not in macros, f"{layer}: duplicate aperture macro {macro}")
             continue
-        aperture = re.fullmatch(r"%ADD([0-9]+)[A-Za-z][^*]*\*%", line)
-        if aperture:
+        if line.startswith("%ADD"):
+            aperture = re.fullmatch(
+                r"%ADD([1-9][0-9]+)([A-Za-z][A-Za-z0-9_]*)(?:,([^*]+))?\*%", line
+            )
             require(
-                aperture[1] not in apertures,
-                f"{layer}: duplicate aperture D{aperture[1]}",
+                aperture is not None
+                and aperture[1] not in apertures
+                and valid_aperture(aperture[2], aperture[3], macros),
+                f"{layer}: invalid aperture definition {line!r}",
             )
             apertures.add(aperture[1])
             continue
@@ -216,7 +261,7 @@ def gerber_geometry(text, layer):
                 ),
                 f"{layer}: unsupported Gerber line {line!r}",
             )
-    require(not in_macro, f"{layer}: unterminated aperture macro")
+    require(macro is None, f"{layer}: unterminated aperture macro")
     return moves, flashes
 
 
@@ -343,6 +388,10 @@ def verify_fabrication(directory, exported):
             Counter(moves) == Counter(expected if layer == "F.Cu" else ()),
             f"{layer}: tracks differ from the fixture",
         )
+    # Silk has no fixture-specific topology contract, but its emitted commands
+    # must still be valid, including the empty back plot.
+    for layer in ("F.SilkS", "B.SilkS"):
+        gerber_geometry(plots[layer], layer)
     edges, flashes = gerber_geometry(plots["Edge.Cuts"], "Edge.Cuts")
     require(
         not flashes

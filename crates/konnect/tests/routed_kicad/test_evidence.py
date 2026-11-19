@@ -4,6 +4,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import Mock
 
 from evidence import (
     LAYERS,
@@ -14,6 +15,7 @@ from evidence import (
     verify_fabrication,
     verify_netlist,
 )
+from run import snapshot_drc
 
 
 class DrcTests(unittest.TestCase):
@@ -56,6 +58,33 @@ class DrcTests(unittest.TestCase):
             "unconnected_items": rules,
             "schematic_parity": [],
         }
+
+    def test_snapshot_requests_targeted_save_and_requires_sync_evidence(self):
+        summary, report = self.report(omitted=True)
+        with TemporaryDirectory() as folder:
+            reports = Path(folder)
+            board = str(reports / "exact-target.kicad_pcb")
+            path = reports / "bootstrap.json"
+            path.write_text(json.dumps(report), encoding="utf-8")
+            mcp = Mock()
+            mcp.tool.return_value = summary
+            self.assertEqual(
+                snapshot_drc(mcp, board, reports, "bootstrap"), (summary, report)
+            )
+            mcp.tool.assert_called_once_with(
+                "run_drc",
+                board=board,
+                sync_live_board=True,
+                refill_zones=False,
+                severity="info",
+                output=str(path),
+            )
+            self.assertEqual(
+                json.loads((reports / "bootstrap-summary.json").read_text()), summary
+            )
+            summary["live_board_synced"] = False
+            with self.assertRaisesRegex(ValueError, "saved live board"):
+                snapshot_drc(mcp, board, reports, "bootstrap")
 
     def test_clean_drc_allows_export_and_unrouted_control_does_not(self):
         self.assertTrue(verify_drc(*self.report(), omitted_pads=None))
@@ -185,6 +214,35 @@ class FabricationTests(unittest.TestCase):
         mask.write_text(text.replace("D10*", "D20*"), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "undefined aperture"):
             self.verify()
+
+    def test_malformed_front_and_back_silk_bodies_fail(self):
+        for layer in ("F.SilkS", "B.SilkS"):
+            with self.subTest(layer=layer):
+                path = self.directory / f"{layer}.plot"
+                body = path.read_text(encoding="utf-8")
+                path.write_text(
+                    body.replace("M02*", "NOT-GERBER*\nM02*"), encoding="utf-8"
+                )
+                with self.assertRaisesRegex(ValueError, layer):
+                    self.verify()
+                path.write_text(body, encoding="utf-8")
+
+    def test_aperture_needs_supported_shape_dimensions_or_declared_macro(self):
+        path = self.directory / "F.Cu.plot"
+        source = path.read_text(encoding="utf-8")
+        for definition in (
+            "Bogus,garbage",
+            "RoundRect,0.3",
+            "C,-0.2",
+            "R,0.2",
+            "O,1X0",
+        ):
+            with self.subTest(definition=definition):
+                path.write_text(
+                    source.replace("C,0.300000", definition), encoding="utf-8"
+                )
+                with self.assertRaisesRegex(ValueError, "F.Cu.*aperture"):
+                    self.verify()
 
     def test_copper_extra_segment_does_not_pass_on_back(self):
         path = self.directory / "B.Cu.plot"

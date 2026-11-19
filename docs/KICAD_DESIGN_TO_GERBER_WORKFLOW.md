@@ -41,7 +41,7 @@ python3 -B "$runner" run --work-dir "$work" --case routed --ipc "$KICAD_API_SOCK
 python3 -B "$runner" run --work-dir "$work" --case unrouted --ipc "$KICAD_API_SOCKET"
 ```
 
-書き込み前に読み取り専用の要求で対象PCBが一枚だけ開いていることを確認する。起動直後の応答は既定25秒まで待機し、別の基板が見えた場合は失敗する。空PCBを最初に保存してKiCadの既定設定を書き出し、その後に同期・配置・配線を行う。最終保存の後、DRCと出力の前後でPCB・回路図・プロジェクトのハッシュを確認する。
+書き込み前に読み取り専用の要求で対象PCBが一枚だけ開いていることを確認する。起動直後の応答は既定25秒まで待機し、別の基板が見えた場合は失敗する。空PCBを対象指定の `run_drc(sync_live_board: true)` で保存し、KiCadの既定設定を書き出してから同期・配置・配線を行う。初回と配線後の保存では対象PCBとの一致を確認し、予備DRCは `bootstrap-drc.json` と `saved-snapshot-drc.json` に保存する。出力可否を判定するDRCの直前から出力完了まで、PCB・回路図・プロジェクトのハッシュを照合する。
 
 両ケースの `result.json` が `pass` で合格。`routed` のDRCは全カテゴリが0件となり、`routed/gerbers/` に出力される。`unrouted` ではDRCの `unconnected_items` ルールが対象パッドに1件発生し、出力の呼び出しも `unrouted/gerbers/` の作成も行われない。ファイル検証はこの回路でKiCadが出力するGerberとExcellonの形式を対象にする。
 

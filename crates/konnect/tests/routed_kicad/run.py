@@ -23,6 +23,7 @@ from evidence import (
     segments,
     target_ready,
     verify_drc,
+    verify_drc_source,
     verify_fabrication,
     verify_netlist,
 )
@@ -135,7 +136,7 @@ class Mcp:
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"MCP request timed out: {method}")
 
-    def tool(self, tool_name, *, timeout=90, plain=False, **arguments):
+    def tool(self, tool_name, *, timeout=90, **arguments):
         self.called_tools.append(tool_name)
         result = self.request(
             "tools/call", {"name": tool_name, "arguments": arguments}, timeout
@@ -143,8 +144,6 @@ class Mcp:
         require(result.get("isError") is False, f"{tool_name}: {result}")
         text = result["content"][0]["text"]
         require(isinstance(text, str) and text, f"{tool_name}: missing tool result")
-        if plain:
-            return text
         body = json.loads(text)
         require(
             isinstance(body, dict) and body.get("success") is not False,
@@ -467,6 +466,22 @@ def layout(mcp, board, *, unrouted):
     return omitted
 
 
+def snapshot_drc(mcp, board, reports, name):
+    """Save the exact live target, verify its snapshot and retain the DRC report."""
+    path = reports / f"{name}.json"
+    summary = mcp.tool(
+        "run_drc",
+        board=board,
+        sync_live_board=True,
+        refill_zones=False,
+        severity="info",
+        output=str(path),
+    )
+    write_json(reports / f"{name}-summary.json", summary)
+    verify_drc_source(summary)
+    return summary, read_json(path)
+
+
 def run(args, root, reports):
     require(
         read_json(root / "prepare" / "result.json")["status"] == "pass",
@@ -520,13 +535,9 @@ def run(args, root, reports):
             "KiCad CLI and PCB Editor versions differ",
         )
         write_json(reports / "editor-state.json", editor)
-        # save_project saves the sole open board. Check the target immediately
-        # before each save; the operator keeps the isolated editor idle.
-        require(
-            target_ready(mcp.tool("open_project", path=board), Path(board)),
-            "board target changed before first save",
-        )
-        mcp.tool("save_project", plain=True)
+        # Bootstrap defaults through a bound PCB save. The intentionally empty
+        # board's preliminary DRC is evidence of synchronization, not the gate.
+        snapshot_drc(mcp, board, reports, "bootstrap-drc")
         require(
             hashes([paths[1]])[paths[1].name]
             == read_json(root / "prepare" / args.case / "design-sha256.json")[
@@ -542,25 +553,12 @@ def run(args, root, reports):
             "layout did not establish the expected control",
         )
 
-        require(
-            target_ready(mcp.tool("open_project", path=board), Path(board)),
-            "board target changed before final save",
-        )
-        mcp.tool("save_project", plain=True)
+        snapshot_drc(mcp, board, reports, "saved-snapshot-drc")
         inputs = hashes(paths)
         write_json(reports / "input-sha256.json", inputs)
-        drc_path = reports / "drc.json"
-        summary = mcp.tool(
-            "run_drc",
-            board=board,
-            sync_live_board=True,
-            refill_zones=False,
-            severity="info",
-            output=str(drc_path),
-        )
-        write_json(reports / "drc-summary.json", summary)
+        summary, report = snapshot_drc(mcp, board, reports, "drc")
         require(hashes(paths) == inputs, "design inputs changed during DRC")
-        approved = verify_drc(summary, read_json(drc_path), omitted_pads=omitted)
+        approved = verify_drc(summary, report, omitted_pads=omitted)
         if unrouted:
             require(
                 not approved
