@@ -1625,6 +1625,24 @@ mod package_export_option_tests {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("board.kicad_pcb");
         std::fs::write(&board, r#"(kicad_pcb (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+            (gr_line
+                (start 106 102)
+                (end 126 102)
+                (stroke (width 0.05) (type solid))
+                (layer "Edge.Cuts"))
+            (gr_line
+                (start 126 102)
+                (end 126 122)
+                (layer "Edge.Cuts"))
+            (gr_line
+                (start 126 122)
+                (end 106 122)
+                (layer "Edge.Cuts"))
+            (gr_line
+                (start 106 122)
+                (end 106 102)
+                (stroke (width 0.05) (type solid))
+                (layer "Edge.Cuts"))
             (footprint "Pkg" (property "Reference" "U1") (property "LCSC" "C100"))
             (footprint "Pkg" (property "Reference" "U2") (property "LCSC" "C100"))
             (footprint "Pkg" (property "Reference" "R1") (property "LCSC" "C101"))
@@ -1653,6 +1671,9 @@ mod package_export_option_tests {
                 .await
                 .unwrap(),
         );
+        assert_eq!(body["board"]["width_mm"], 20.0);
+        assert_eq!(body["board"]["height_mm"], 20.0);
+        assert_eq!(body["fabrication_scope"], "within_model_dimensions");
         assert_eq!(body["cost_estimate"]["components_estimate"], "$56.45");
         assert_eq!(
             body["component_pricing"]["priced_from_catalog"],
