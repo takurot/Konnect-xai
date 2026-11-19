@@ -103,7 +103,7 @@ Konnect/
 │   │           ├── pcb_board.rs      # 11 tools (S-expr file editing, IPC fallback, SVG logo import)
 │   │           ├── pcb_components.rs # 20 tools (IPC real-time + safe headless single-placement fallback)
 │   │           ├── pcb_footprint_update.rs # library refresh planner + one-commit IPC apply
-│   │           ├── pcb_routing.rs    # 15 tools (traces, vias, nets, netclasses, SES import)
+│   │           ├── pcb_routing.rs    # 16 tools (traces, vias, nets, netclasses, SES import)
 │   │           ├── pcb_export.rs     # 14 tools (Gerber, PDF, 3D, Specctra DSN, DRC, DXF/GenCAD/IPC-2581/ODB++)
 │   │           ├── library.rs        # 17 tools (symbol/footprint library management)
 │   │           ├── footprint_graphics.rs # footprint primitive validation, inspection, and atomic edits
