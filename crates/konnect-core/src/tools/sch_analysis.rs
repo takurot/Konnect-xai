@@ -1477,6 +1477,124 @@ mod power_symbol_net_tests {
 }
 
 #[cfg(test)]
+mod net_query_tests {
+    use super::tool_call_support::{call, call_result};
+    use super::*;
+    use crate::mcp::protocol::ToolContent;
+
+    const SCH: &str = include_str!("../../tests/fixtures/single_pin_nets.kicad_sch");
+    const RAIL: &str = include_str!("../../tests/fixtures/power_rail.kicad_sch");
+
+    #[tokio::test]
+    async fn named_net_reports_real_sheet_pins() {
+        let ground = call(SCH, "get_net_connections", json!({ "net": "GND" })).await;
+        let pins = ground["pins"].as_array().unwrap();
+        let identities: BTreeSet<_> = pins
+            .iter()
+            .map(|pin| {
+                (
+                    pin["reference"].as_str().unwrap(),
+                    pin["pin_number"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        // KiCad 10.0.8's GND netlist also has R10.1 and R11.1 on the child sheet.
+        assert_eq!(pins.len(), 7);
+        assert_eq!(
+            identities,
+            BTreeSet::from([
+                ("R1", "1"),
+                ("R3", "1"),
+                ("R4", "1"),
+                ("R6", "1"),
+                ("R7", "1"),
+                ("R8", "1"),
+                ("R9", "1")
+            ])
+        );
+        let split = call(SCH, "get_net_connections", json!({ "net": "SPLIT" })).await;
+        assert_eq!(split["pins"].as_array().unwrap().len(), 2);
+        let flagged = call(SCH, "get_net_connections", json!({ "net": "FLAGGED" })).await;
+        assert_eq!(flagged["pins"].as_array().unwrap().len(), 1);
+
+        let rail = call(RAIL, "get_net_connections", json!({ "net": "GND" })).await;
+        assert_eq!(
+            rail["pins"],
+            json!([{
+                "reference": "R1", "unit": 1, "pin_number": "2", "pin_name": "~",
+                "electrical_type": "passive", "x": 100.0, "y": 103.81
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn net_queries_preserve_uuid_and_alias_membership() {
+        let aliased = RAIL.replace(
+            "(label \"SIG\" (at 100 96.19 0)",
+            "(label \"ALT\" (at 100 110 0)",
+        );
+        let gnd = call(&aliased, "get_net_connections", json!({ "net": "GND" })).await;
+        let alt = call(&aliased, "get_net_connections", json!({ "net": "ALT" })).await;
+        assert_eq!(gnd["pins"], alt["pins"]);
+        assert_eq!(gnd["labels"][0]["uuid"], "p1");
+        assert_eq!(alt["labels"][0]["uuid"], "l1");
+        assert_eq!(alt["label_count"], 1);
+
+        let connectivity = call(&aliased, "get_net_connectivity", json!({ "net": "ALT" })).await;
+        assert_eq!(connectivity["labels"], alt["labels"]);
+        assert_eq!(connectivity["wires"][0]["uuid"], "w1");
+
+        let legacy = aliased
+            .replace(" (uuid \"l1\")", "")
+            .replace(" (uuid \"w1\")", "");
+        let connectivity = call(&legacy, "get_net_connectivity", json!({ "net": "ALT" })).await;
+        assert_eq!(
+            connectivity["labels"][0].get("uuid"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            connectivity["wires"][0].get("uuid"),
+            Some(&serde_json::Value::Null)
+        );
+    }
+
+    #[tokio::test]
+    async fn net_queries_distinguish_absent_names_from_pinless_nets() {
+        for tool in ["get_net_connections", "get_net_connectivity"] {
+            for (name, suggestions) in [("NOPE", json!([])), ("gnd", json!(["GND"]))] {
+                let result = call_result(SCH, tool, json!({ "net": name })).await;
+                assert!(result.is_error, "{tool} accepted {name}");
+                let ToolContent::Text { text } = &result.content[0] else {
+                    panic!("expected text content");
+                };
+                let body: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(
+                    body["error"],
+                    json!({
+                        "kind": "not_found", "net": name, "suggestions": suggestions
+                    })
+                );
+            }
+            let stub = call(SCH, tool, json!({ "net": "STUB" })).await;
+            assert_eq!(stub["labels"].as_array().unwrap().len(), 1);
+
+            let unwired = RAIL.replace(
+                "(wire (pts (xy 100 103.81) (xy 100 110)) (uuid \"w1\"))",
+                "",
+            );
+            let rail = call(&unwired, tool, json!({ "net": "GND" })).await;
+            assert_eq!(rail["labels"][0]["uuid"], "p1");
+            if tool == "get_net_connections" {
+                assert_eq!(stub["pins"], json!([]));
+                assert_eq!(rail["pins"], json!([]));
+            } else {
+                assert_eq!(rail["wires"], json!([]));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod single_pin_net_tests {
     use super::tool_call_support::call;
     use super::*;
