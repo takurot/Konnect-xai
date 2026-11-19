@@ -145,9 +145,18 @@ impl HierarchySnapshot {
                 let source = self.source(&file, overrides)?;
                 let document = cse::Schematic::from_source(&file, source)?;
                 ancestors.push(file.clone());
+                let survives = reading_before
+                    || self
+                        .before
+                        .placements
+                        .get(&file)
+                        .is_some_and(|previous| previous.contains(&placement));
                 for sheet in document.sheets.iter().rev() {
                     for page in &sheet.instances {
-                        if page.project_name == self.project_name && page.path == placement {
+                        if survives
+                            && page.project_name == self.project_name
+                            && page.path == placement
+                        {
                             include_page(&mut forest.max_page, Some(&page.page));
                         }
                     }
@@ -270,6 +279,7 @@ impl HierarchySnapshot {
                 &path,
                 source,
                 &context,
+                prior_paths,
                 &predecessors,
                 &foreign_projects,
                 &mut high_water,
@@ -419,10 +429,23 @@ fn best_placement<'a>(path: &str, candidates: &[&'a str]) -> anyhow::Result<Opti
     }
 }
 
+fn prior_instance_path<'a>(
+    path: &'a str,
+    prior_paths: &BTreeSet<String>,
+    predecessors: &BTreeMap<&'a str, &'a str>,
+) -> Option<&'a str> {
+    if prior_paths.contains(path) {
+        Some(path)
+    } else {
+        predecessors.get(path).copied()
+    }
+}
+
 fn reconcile(
     path: &Path,
     source: &str,
     context: &SheetInstanceContext,
+    prior_paths: &BTreeSet<String>,
     predecessors: &BTreeMap<&str, &str>,
     foreign_projects: &BTreeSet<String>,
     high_water: &mut u32,
@@ -465,10 +488,9 @@ fn reconcile(
                         })
                         .collect::<BTreeSet<_>>()
                 };
-                let mut saved = saved_at(path);
-                if let Some(old) = predecessors.get(path.as_str()).filter(|_| saved.is_empty()) {
-                    saved = saved_at(old);
-                }
+                let saved = prior_instance_path(path, prior_paths, predecessors)
+                    .map(saved_at)
+                    .unwrap_or_default();
                 anyhow::ensure!(
                     saved.len() <= 1,
                     "Conflicting references for symbol {} at {path}",
@@ -527,10 +549,9 @@ fn reconcile(
                     .map(|row| row.page.as_str())
                     .collect::<BTreeSet<_>>()
             };
-            let mut pages = pages_at(path);
-            if let Some(old) = predecessors.get(path.as_str()).filter(|_| pages.is_empty()) {
-                pages = pages_at(old);
-            }
+            let pages = prior_instance_path(path, prior_paths, predecessors)
+                .map(pages_at)
+                .unwrap_or_default();
             anyhow::ensure!(
                 pages.len() <= 1,
                 "Conflicting page numbers for sheet {} at {path}",

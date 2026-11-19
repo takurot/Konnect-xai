@@ -416,6 +416,7 @@ async fn repoint_rekeys_an_annotated_shared_leaf_and_its_nested_page() {
     let new_path = format!("{prefix}/{}", leaf_id(&b));
     let mut before = cse::Schematic::load(&leaf).unwrap();
     before.symbols[0].set_instance_path("project", &old_path, "R7", 1);
+    before.symbols[0].set_instance_path("project", &new_path, "R3", 1);
     let old_page = before
         .sheets
         .by_name("Twig")
@@ -426,6 +427,12 @@ async fn repoint_rekeys_an_annotated_shared_leaf_and_its_nested_page() {
         .unwrap()
         .page
         .clone();
+    // Prior buggy metadata for the future path is not a live placement.
+    before
+        .sheets
+        .by_name_mut("Twig")
+        .unwrap()
+        .set_page("project", &new_path, "99");
     before.overwrite().unwrap();
 
     decoded(
