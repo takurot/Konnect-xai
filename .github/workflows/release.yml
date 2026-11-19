@@ -310,7 +310,7 @@ jobs:
   # Publishes @konnect-xai/konnect and its five platform packages. Auth is npm
   # Trusted Publishing (OIDC, registered per package for this workflow file), so
   # no npm token exists anywhere. A manual dispatch stages and smoke-tests the
-  # packages and runs `npm publish --dry-run`.
+  # packages and checks their local pack contents without contacting the registry.
   publish-npm:
     name: Publish to npm
     needs: [real-kicad-acceptance, build, linux-compatibility]
@@ -351,25 +351,29 @@ jobs:
       - name: Smoke test the installed package
         run: node npm/scripts/smoke.js "${{ steps.version.outputs.version }}" npm
 
+      - name: Check local npm packages
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          # npm publish --dry-run still rejects versions already in the registry.
+          for dir in konnect-linux-x64 konnect-linux-arm64 konnect-darwin-x64 konnect-darwin-arm64 konnect-win32-x64 konnect; do
+            npm pack --dry-run "./npm/${dir}"
+          done
+
       - name: Publish
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && '--dry-run' || '' }}
         run: |
           tag=latest
           case "$VERSION" in *-*) tag=next ;; esac
-          publish_options=(--access public --provenance --tag "$tag")
-          if [[ -n "$DRY_RUN" ]]; then
-            publish_options+=(--dry-run)
-          fi
           # Platform packages first so the launcher never points at a missing one.
           for dir in konnect-linux-x64 konnect-linux-arm64 konnect-darwin-x64 konnect-darwin-arm64 konnect-win32-x64 konnect; do
             name="$(node -p "require('./npm/${dir}/package.json').name")"
-            if [[ -z "$DRY_RUN" ]] && npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
+            if npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
               echo "${name}@${VERSION} is already published, skipping"
               continue
             fi
-            npm publish "./npm/${dir}" "${publish_options[@]}"
+            npm publish "./npm/${dir}" --access public --provenance --tag "$tag"
           done
 
   release:

@@ -52,6 +52,18 @@ fn release_workflow_has_a_non_publishing_pre_tag_entry_point() {
         "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')",
         "a manual release smoke run must never publish a GitHub release"
     );
+    let steps = release["jobs"]["publish-npm"]["steps"].as_array().unwrap();
+    let publish = steps.iter().find(|step| step["name"] == "Publish").unwrap();
+    assert_eq!(
+        publish["if"], "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')",
+        "a manual run must avoid registry version and authentication checks"
+    );
+    assert!(steps.iter().any(|step| {
+        step["if"] == "github.event_name == 'workflow_dispatch'"
+            && step["run"]
+                .as_str()
+                .is_some_and(|script| script.contains("npm pack --dry-run"))
+    }));
 }
 
 #[test]
