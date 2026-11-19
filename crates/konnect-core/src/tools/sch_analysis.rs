@@ -14,9 +14,8 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident, round6},
     schematic::{
-        extract_all_net_labels, extract_buses, extract_labels, extract_sheet_pins,
-        extract_symbol_instances, extract_wires, find_lib_symbol, read_schematic,
-        symbol_bounds_for_instance, Label, LabelKind, LibPin, SymbolBounds, Wire,
+        extract_all_net_labels, extract_buses, extract_sheet_pins, extract_symbol_instances,
+        extract_wires, read_schematic, Label, LabelKind, LibPin, Wire,
     },
 };
 use serde_json::json;
@@ -187,9 +186,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_schematic_overlaps",
-            "Find overlapping symbols from their transformed drawing/pin bounds (excluding \
-             free text), plus conflicting labels at the same location. Reports any symbol whose \
-             embedded geometry could not be resolved and used the origin fallback instead.",
+            "Find overlapping symbols, visible text, and text over wires. Uses placed body and pin \
+             geometry, approximate saved text extents, and reports unresolved symbol bounds.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -948,99 +946,9 @@ async fn handle_check_overlaps(
         ));
     }
     let (_, tree) = read_schematic(&sch_path)?;
-    let instances = extract_symbol_instances(&tree);
-    let lib_symbols = tree
-        .find("lib_symbols")
-        .map(|node| node.find_all("symbol"))
-        .unwrap_or_default();
-
-    // Compare the actual selected-unit graphic/pin envelopes. Distinct origins
-    // can still place two large symbols on top of each other; the old origin
-    // comparison missed that normal collision shape entirely.
-    let placements = instances
-        .iter()
-        .map(|instance| {
-            let bounds = find_lib_symbol(&lib_symbols, instance)
-                .and_then(|symbol| symbol_bounds_for_instance(symbol, instance));
-            (instance, bounds)
-        })
-        .collect::<Vec<_>>();
-    let mut comp_overlaps: Vec<serde_json::Value> = Vec::new();
-    let bounds_json = |bounds: SymbolBounds| {
-        json!({
-            "x_min": round6(bounds.min_x),
-            "y_min": round6(bounds.min_y),
-            "x_max": round6(bounds.max_x),
-            "y_max": round6(bounds.max_y)
-        })
-    };
-    for (index, (a, a_bounds)) in placements.iter().enumerate() {
-        for (b, b_bounds) in &placements[index + 1..] {
-            match (a_bounds, b_bounds) {
-                (Some(a_bounds), Some(b_bounds)) => {
-                    let (overlap_x, overlap_y) = a_bounds.overlap_depth(*b_bounds);
-                    // Edge/pin contact is a normal connection. Positive area
-                    // on both axes means the placed symbol envelopes collide.
-                    if overlap_x > 1e-9 && overlap_y > 1e-9 {
-                        comp_overlaps.push(json!({
-                            "type": "component_overlap",
-                            "a": a.reference,
-                            "unit_a": a.unit,
-                            "b": b.reference,
-                            "unit_b": b.unit,
-                            "overlap_x_mm": overlap_x,
-                            "overlap_y_mm": overlap_y,
-                            "bounds_a": bounds_json(*a_bounds),
-                            "bounds_b": bounds_json(*b_bounds),
-                            "detection": "symbol_geometry"
-                        }));
-                    }
-                }
-                // Preserve a useful conservative check when an old or damaged
-                // schematic lacks the embedded definition. The response names
-                // every such fallback below so it cannot look authoritative.
-                _ if points_coincident(a.x, a.y, b.x, b.y, tol) => {
-                    comp_overlaps.push(json!({
-                        "type": "component_overlap",
-                        "a": a.reference,
-                        "unit_a": a.unit,
-                        "b": b.reference,
-                        "unit_b": b.unit,
-                        "x": round6(a.x),
-                        "y": round6(a.y),
-                        "detection": "origin_fallback"
-                    }));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // The structural extractor already combines local, global, and
-    // hierarchical labels.
-    let all_labels = extract_labels(&tree);
-    let mut label_overlaps: Vec<serde_json::Value> = Vec::new();
-    for (i, a) in all_labels.iter().enumerate() {
-        for b in &all_labels[i + 1..] {
-            if points_coincident(a.x, a.y, b.x, b.y, tol) && a.net != b.net {
-                label_overlaps.push(json!({ "type": "label_overlap", "net_a": a.net, "net_b": b.net, "x": round6(a.x), "y": round6(a.y) }));
-            }
-        }
-    }
-
-    let mut all = comp_overlaps;
-    all.extend(label_overlaps);
-    let bounds_unresolved = placements
-        .iter()
-        .filter(|(_, bounds)| bounds.is_none())
-        .map(|(instance, _)| instance.reference.as_str())
-        .collect::<Vec<_>>();
-    Ok(CallToolResult::json(&json!({
-        "overlap_count": all.len(),
-        "overlaps": all,
-        "bounds_resolved": placements.len() - bounds_unresolved.len(),
-        "bounds_unresolved": bounds_unresolved
-    })))
+    Ok(CallToolResult::json(&super::sch_overlap::find_overlaps(
+        &tree, tol,
+    )))
 }
 
 #[cfg(test)]

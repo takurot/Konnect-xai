@@ -449,7 +449,11 @@ fn include_arc(bounds: &mut Option<SymbolBounds>, arc: &SexpNode) {
     }
 }
 
-fn collect_direct_symbol_geometry(node: &SexpNode, bounds: &mut Option<SymbolBounds>) {
+fn collect_direct_symbol_geometry(
+    node: &SexpNode,
+    bounds: &mut Option<SymbolBounds>,
+    include_pins: bool,
+) {
     for rectangle in node
         .find_all("rectangle")
         .into_iter()
@@ -489,6 +493,9 @@ fn collect_direct_symbol_geometry(node: &SexpNode, bounds: &mut Option<SymbolBou
     for arc in node.find_all("arc") {
         include_arc(bounds, arc);
     }
+    if !include_pins {
+        return;
+    }
     for pin in node.find_all("pin") {
         let Some(pin) = parse_lib_pin(pin) else {
             continue;
@@ -503,10 +510,14 @@ fn collect_direct_symbol_geometry(node: &SexpNode, bounds: &mut Option<SymbolBou
     }
 }
 
-fn collect_symbol_geometry_recursive(node: &SexpNode, bounds: &mut Option<SymbolBounds>) {
-    collect_direct_symbol_geometry(node, bounds);
+fn collect_symbol_geometry_recursive(
+    node: &SexpNode,
+    bounds: &mut Option<SymbolBounds>,
+    include_pins: bool,
+) {
+    collect_direct_symbol_geometry(node, bounds, include_pins);
     for child in node.find_all("symbol") {
-        collect_symbol_geometry_recursive(child, bounds);
+        collect_symbol_geometry_recursive(child, bounds, include_pins);
     }
 }
 
@@ -514,18 +525,25 @@ fn collect_symbol_geometry_recursive(node: &SexpNode, bounds: &mut Option<Symbol
 ///
 /// KiCad stores common graphics in `Name_0_M` and unit-specific graphics and
 /// pins in `Name_N_M`. The selection mirrors [`extract_lib_pins_for_unit`]:
-/// common nodes, the requested unit, and un-suffixed nested nodes participate;
-/// other units do not.
+/// common nodes, the requested unit, and un-suffixed nested nodes participate.
 pub fn symbol_local_bounds_for_unit(sym_node: &SexpNode, unit: u32) -> Option<SymbolBounds> {
+    symbol_local_geometry(sym_node, unit, true)
+}
+
+fn symbol_local_geometry(
+    sym_node: &SexpNode,
+    unit: u32,
+    include_pins: bool,
+) -> Option<SymbolBounds> {
     let mut bounds = None;
-    collect_direct_symbol_geometry(sym_node, &mut bounds);
+    collect_direct_symbol_geometry(sym_node, &mut bounds, include_pins);
     for child in sym_node.find_all("symbol") {
         let child_unit = child
             .get(1)
             .and_then(|node| node.as_str())
             .and_then(parse_subsymbol_unit);
         if !matches!(child_unit, Some(child_unit) if child_unit != 0 && child_unit != unit) {
-            collect_symbol_geometry_recursive(child, &mut bounds);
+            collect_symbol_geometry_recursive(child, &mut bounds, include_pins);
         }
     }
     bounds
@@ -537,7 +555,25 @@ pub fn symbol_bounds_for_instance(
     sym_node: &SexpNode,
     instance: &SymbolInstance,
 ) -> Option<SymbolBounds> {
-    let local = symbol_local_bounds_for_unit(sym_node, instance.unit)?;
+    transform_symbol_bounds(
+        symbol_local_bounds_for_unit(sym_node, instance.unit)?,
+        instance,
+    )
+}
+
+/// Bounds of the placed drawing primitives. Pin segments are separate
+/// geometry so an electrically joined pin tip need not collide with its peer.
+pub fn symbol_body_bounds_for_instance(
+    sym_node: &SexpNode,
+    instance: &SymbolInstance,
+) -> Option<SymbolBounds> {
+    transform_symbol_bounds(
+        symbol_local_geometry(sym_node, instance.unit, false)?,
+        instance,
+    )
+}
+
+fn transform_symbol_bounds(local: SymbolBounds, instance: &SymbolInstance) -> Option<SymbolBounds> {
     let transform = instance.pin_transform();
     let mut placed = None;
     for (x, y) in [
@@ -672,73 +708,76 @@ mod symbol_bounds_tests {
 
 pub fn extract_symbol_instances(tree: &SexpNode) -> Vec<SymbolInstance> {
     tree.find_all("symbol")
-        .iter()
-        .filter_map(|node| {
-            // Top-level symbols only have lib_id and at; filter out library definitions
-            let lib_id = node.find("lib_id")?.get(1)?.as_str()?.to_string();
-            let lib_name = node
-                .find("lib_name")
-                .and_then(|n| n.get(1))
-                .and_then(|n| n.as_str())
-                .map(String::from);
-            let (x, y, rotation) = parse_at(node)?;
-
-            let mirror_node = node.find("mirror");
-            let mirror_x = mirror_node
-                .and_then(|m| m.get(1))
-                .and_then(|m| m.as_str())
-                .map(|s| s == "x" || s == "xy")
-                .unwrap_or(false);
-            let mirror_y = mirror_node
-                .and_then(|m| m.get(1))
-                .and_then(|m| m.as_str())
-                .map(|s| s == "y" || s == "xy")
-                .unwrap_or(false);
-
-            let prop = |name: &str| -> String {
-                node.find_all("property")
-                    .iter()
-                    .find(|p| {
-                        let offset = usize::from(
-                            matches!(p.get(1), Some(SexpNode::Atom(flag)) if flag == "private"),
-                        );
-                        p.get(1 + offset).and_then(|n| n.as_str()) == Some(name)
-                    })
-                    .and_then(|p| {
-                        let offset = usize::from(
-                            matches!(p.get(1), Some(SexpNode::Atom(flag)) if flag == "private"),
-                        );
-                        p.get(2 + offset)
-                    })
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            };
-
-            let uuid = node
-                .find("uuid")
-                .and_then(|u| u.get(1))
-                .and_then(|u| u.as_str())
-                .map(String::from);
-
-            let unit = node.find_f64("unit").map(|u| u as u32).unwrap_or(1);
-
-            Some(SymbolInstance {
-                reference: prop("Reference"),
-                value: prop("Value"),
-                footprint: prop("Footprint"),
-                lib_name,
-                lib_id,
-                x,
-                y,
-                rotation,
-                mirror_x,
-                mirror_y,
-                uuid,
-                unit,
-            })
-        })
+        .into_iter()
+        .filter_map(extract_symbol_instance)
         .collect()
+}
+
+/// Read a placed symbol, retaining the caller's access to the source node.
+pub fn extract_symbol_instance(node: &SexpNode) -> Option<SymbolInstance> {
+    // Top-level symbols only have lib_id and at; filter out library definitions
+    let lib_id = node.find("lib_id")?.get(1)?.as_str()?.to_string();
+    let lib_name = node
+        .find("lib_name")
+        .and_then(|n| n.get(1))
+        .and_then(|n| n.as_str())
+        .map(String::from);
+    let (x, y, rotation) = parse_at(node)?;
+
+    let mirror_node = node.find("mirror");
+    let mirror_x = mirror_node
+        .and_then(|m| m.get(1))
+        .and_then(|m| m.as_str())
+        .map(|s| s == "x" || s == "xy")
+        .unwrap_or(false);
+    let mirror_y = mirror_node
+        .and_then(|m| m.get(1))
+        .and_then(|m| m.as_str())
+        .map(|s| s == "y" || s == "xy")
+        .unwrap_or(false);
+
+    let prop = |name: &str| -> String {
+        node.find_all("property")
+            .iter()
+            .find(|p| {
+                let offset = usize::from(
+                    matches!(p.get(1), Some(SexpNode::Atom(flag)) if flag == "private"),
+                );
+                p.get(1 + offset).and_then(|n| n.as_str()) == Some(name)
+            })
+            .and_then(|p| {
+                let offset = usize::from(
+                    matches!(p.get(1), Some(SexpNode::Atom(flag)) if flag == "private"),
+                );
+                p.get(2 + offset)
+            })
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let uuid = node
+        .find("uuid")
+        .and_then(|u| u.get(1))
+        .and_then(|u| u.as_str())
+        .map(String::from);
+
+    let unit = node.find_f64("unit").map(|u| u as u32).unwrap_or(1);
+
+    Some(SymbolInstance {
+        reference: prop("Reference"),
+        value: prop("Value"),
+        footprint: prop("Footprint"),
+        lib_name,
+        lib_id,
+        x,
+        y,
+        rotation,
+        mirror_x,
+        mirror_y,
+        uuid,
+        unit,
+    })
 }
 
 /// Resolve an instance's embedded `lib_symbols` definition the way KiCAD does:
