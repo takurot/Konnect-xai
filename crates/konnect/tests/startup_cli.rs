@@ -180,7 +180,16 @@ fn terminal() -> (File, File) {
         )
     };
     assert_eq!(status, 0, "{}", std::io::Error::last_os_error());
-    unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
+    // Transfer ownership before setting close-on-exec so any panic closes both FDs.
+    let files = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+    for fd in [master, slave] {
+        // These descriptors are open and owned by files.
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
+    files
 }
 
 #[test]
@@ -230,4 +239,63 @@ fn terminal_start_with_http_config_serves_health_without_installing() {
     let output = child.wait_with_output().unwrap();
     assert!(guidance_snapshot(home.path()).is_empty());
     assert!(healthy, "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn terminal_start_with_default_stdio_prints_help_without_installing() {
+    let home = tempfile::tempdir().unwrap();
+    let (_master, slave) = terminal();
+    let mut child = konnect(home.path())
+        .stdin(slave)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "default terminal startup did not exit successfully: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("shows help on a terminal"));
+    assert!(guidance_snapshot(home.path()).is_empty());
+}
+
+#[test]
+fn claude_init_from_npx_cache_warns_about_hook_path() {
+    let home = tempfile::tempdir().unwrap();
+    let bin = home
+        .path()
+        .join("_npx/test/node_modules/@konnect-xai/konnect-platform/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let executable = bin.join("konnect");
+    let source = env!("CARGO_BIN_EXE_konnect");
+    fs::hard_link(source, &executable)
+        .or_else(|_| fs::copy(source, &executable).map(|_| ()))
+        .unwrap();
+
+    let output = Command::new(&executable)
+        .args(["init", "--client", "claude"])
+        .env("HOME", home.path())
+        .env("KONNECT_STATE_DIR", home.path().join(".konnect-state"))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Claude hooks use this npx cache binary")
+    );
 }

@@ -3,6 +3,18 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased – Server configuration and terminal startup
+
+Automatic server configuration discovery now uses the recognized PCM plugin
+layout and the user's platform configuration directory. If you previously
+kept `konnect.toml` or `settings.json` in the working directory or beside a
+standalone executable, add `--config <path>` to your MCP client command or
+move the file to the platform location listed in [KiCad integration](KICAD_INTEGRATION.md#configuration).
+
+Starting the default stdio transport from a terminal prints usage. To serve HTTP from a terminal, pass a config
+with `transport = "http"` or `transport = "both"`. Run `konnect init` to
+install guidance explicitly.
+
 ## v0.14.0: conditional-write failures distinguish committed uncertainty
 
 A stale source revision returns `conflict`. If the replacement has committed

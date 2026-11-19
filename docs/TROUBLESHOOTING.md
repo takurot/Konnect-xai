@@ -219,15 +219,15 @@ The known workaround: run Konnect outside the sandbox, as the same user as
 KiCad, over HTTP:
 
 ```toml
-# konnect.toml in the directory Konnect is started from
+# Example: konnect-http.toml
 transport = "http"
 http_address = "127.0.0.1:3000"
 ipc_address = "ipc://C:/Users/<you>/AppData/Local/Temp/kicad/api.sock"
 ```
 
-Start `konnect` from a normal terminal and point the client at
-`http://127.0.0.1:3000/mcp`; `http://127.0.0.1:3000/health` answers `ok` while
-the server is up. Keep the address on `127.0.0.1`, as
+Start `konnect --config /path/to/konnect-http.toml` from a normal terminal and
+point the client at `http://127.0.0.1:3000/mcp`. The
+`http://127.0.0.1:3000/health` endpoint answers `ok` while the server is up. Keep the address on `127.0.0.1`, as
 [HTTP transport security](#http-transport-security) explains. KiCad needs no
 change.
 
@@ -398,7 +398,8 @@ result is not what you expect.
 
 Common install paths are auto-detected (including the Windows registry). If
 your install is somewhere unusual, set the path in the plugin settings dialog
-in a `settings.json` beside the binary, or in a `konnect.toml` in the working directory (`kicad_cli`). Discovery order is `konnect.toml` and `settings.json` in the CWD, then `settings.json` next to the binary and one level up, then the platform config dir. **Only the first existing file is loaded — later ones are not merged in**, so a `kicad_cli` set in a lower-priority file is ignored while a higher-priority file exists. A file under any other name is only read when passed with `--config`.
+or set `kicad_cli` in a server configuration passed with `--config <path>`.
+Automatic discovery uses [the server configuration search order](KICAD_INTEGRATION.md#configuration).
 
 If a setting appears to be ignored, call `get_installation_info` and read its
 `configuration` block: `selected_path` is the file that configured the running
@@ -522,8 +523,9 @@ callable tools, the fix is to make the *first* listing complete:
 { "eager_toolsets": true }
 ```
 
-in `konnect.toml` in the working directory, or a `settings.json` beside the binary. Every toolset is then loaded at
-startup, so `tools/list` carries all 235 tools from the first call.
+in a server configuration passed with `--config <path>` or discovered at a
+trusted location. Every toolset is then loaded at startup, so `tools/list`
+carries all 235 tools from the first call.
 
 It is off by default because it costs what the router exists to save: roughly
 25K tokens per listing instead of ~2K. Turn it on only if your client needs it.

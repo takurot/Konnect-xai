@@ -75,6 +75,7 @@ async fn cancellation_kills_cli_keeps_ping_responsive_and_never_sends_cancelled_
     );
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_konnect"))
         .current_dir(dir.path())
+        .args(["--config", "konnect.toml"])
         .env("KONNECT_TEST_PID", &pid_file)
         .env("KONNECT_STATE_DIR", dir.path().join("state"))
         .stdin(Stdio::piped())

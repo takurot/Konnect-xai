@@ -37,10 +37,8 @@ SETTINGS_PATH = os.path.join(PLUGIN_DIR, "settings.json")
 _server_process = None
 _server_thread = None
 
-# Windows GUI parents (pcbnew) attach a new console to their subprocesses.
-# That console makes stdin look like a TTY, which triggers konnect's
-# double-click install wizard instead of MCP server mode. CREATE_NO_WINDOW
-# suppresses the console; stdin=PIPE stays intact.
+# Avoid opening a separate console when the Windows PCB editor starts
+# the server. The plugin uses pipes for its stdio transport.
 _POPEN_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 _CACHE_DIR = os.path.join(

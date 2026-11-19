@@ -179,20 +179,15 @@ which later files were shadowed.
 So a value present only in a lower-priority file has no effect while a
 higher-priority file exists.
 
-1. `konnect.toml` in the working directory;
-2. `settings.json` in the working directory;
-3. `settings.json` beside the executable;
-4. `settings.json` one directory above the executable;
-5. the platform configuration directory.
+1. `settings.json` at the root of a recognized KiCad PCM plugin layout. The
+   binary must be in `bin/` and match the native server action in `plugin.json`.
+2. `konnect/config.toml` under the platform configuration directory
+   (`~/Library/Application Support` on macOS, `~/.config` on Linux,
+   `%APPDATA%` on Windows). A relative or unavailable platform root is skipped.
 
-Two consequences worth stating outright, because both have been reported as
-missing functionality:
-
-- In the standard plugin layout a `settings.json` exists beside the binary, so
-  the platform configuration directory is never reached and any `config.toml`
-  there is inert.
-- A stray `konnect.toml` or `settings.json` in a working directory takes over the
-  entire configuration for that run.
+Konnect ignores configuration files in the project working directory during
+automatic discovery. Pass `--config <path>` to select a project configuration
+you trust. The KiCad Python ActionPlugin supplies its settings explicitly.
 
 Call **`get_installation_info`** to see which file configured the running
 process: its `configuration` block reports `source`

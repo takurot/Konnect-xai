@@ -210,31 +210,15 @@ fn legacy_hook_command_tail(hook_name: &str) -> String {
     format!(" skill {hook_name}")
 }
 
-/// Double-click behavior remains Claude-focused for backward compatibility.
-pub fn run_double_click_install() -> Result<()> {
-    println!("===========================================");
-    println!("  Konnect v{}", env!("CARGO_PKG_VERSION"));
-    println!("  First-time Setup");
-    println!("===========================================\n");
-    run_install(InstallClient::Claude)?;
-
-    let exe = std::env::current_exe()?;
-    let exe_str = exe.to_string_lossy().replace('\\', "\\\\");
-    println!("\n-------------------------------------------");
-    println!("Add this to your Claude MCP config:");
-    println!("-------------------------------------------\n");
-    println!(r#"  "konnect": {{"#);
-    println!(r#"    "command": "{}","#, exe_str);
-    println!(r#"    "env": {{ "RUST_LOG": "info" }}"#);
-    println!(r#"  }}"#);
-    println!("\nConfig locations:");
-    println!("  Claude Desktop: %APPDATA%\\Claude\\claude_desktop_config.json");
-    println!("  Claude Code:    .mcp.json in your project root");
-    println!("\nAfter editing the config, restart Claude.\n");
-    println!("Press Enter to close...");
-    let mut buf = String::new();
-    let _ = std::io::stdin().read_line(&mut buf);
-    Ok(())
+fn is_npx_cached_binary(exe: &Path) -> bool {
+    exe.ancestors().any(|dir| {
+        dir.file_name().is_some_and(|name| name == "node_modules")
+            && dir
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == "_npx")
+    })
 }
 
 #[derive(Debug)]
@@ -306,6 +290,12 @@ fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
         }
 
         let exe = std::env::current_exe()?;
+        if verbose && is_npx_cached_binary(&exe) {
+            eprintln!(
+                "Warning: Claude hooks use this npx cache binary and will break if the cache is removed. \
+                 Uninstall this guidance, move Konnect to a stable path, then run `konnect init` there."
+            );
+        }
         let settings_path = paths.claude_settings_path();
         let exe_str = exe.to_string_lossy();
         hook_count = if verbose {
@@ -1055,16 +1045,56 @@ fn display_home_path(path: &Path, home: &Path) -> String {
         .unwrap_or_else(|_| path.display().to_string())
 }
 
+/// Follow an existing settings symlink so atomically replacing its contents
+/// does not turn the link itself into a separate settings file.
+fn claude_settings_target(path: &Path) -> Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(target) => Ok(target),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_claude_settings(
+    path: &Path,
+    original: Option<&str>,
+    settings: &serde_json::Value,
+) -> Result<()> {
+    use konnect_sexp::writer::{write_atomic_if_unchanged, write_new_atomic};
+    use konnect_sexp::SexpError;
+
+    let mut content = serde_json::to_string_pretty(settings)?;
+    let outcome = if let Some(raw) = original {
+        if raw.contains("\r\n") {
+            content = content.replace('\n', "\r\n");
+        }
+        let end = raw.trim_end_matches(['\r', '\n']).len();
+        content.push_str(&raw[end..]);
+        write_atomic_if_unchanged(path, raw, &content)
+    } else {
+        content.push('\n');
+        write_new_atomic(path, &content)
+    };
+    match outcome {
+        Err(SexpError::Conflict { .. }) => {
+            outcome.context("Claude settings changed during the update; review the file and rerun")
+        }
+        _ => outcome.context("could not update Claude settings atomically"),
+    }
+}
+
 fn patch_claude_settings(path: &Path, exe_str: &str) -> Result<usize> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let raw = if path.exists() {
-        fs::read_to_string(path)?
-    } else {
-        "{}".to_string()
+    let path = claude_settings_target(path)?;
+    let original = match fs::read_to_string(&path) {
+        Ok(raw) => Some(raw),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
     };
-    let mut settings: serde_json::Value = serde_json::from_str(&raw)?;
+    let mut settings: serde_json::Value =
+        serde_json::from_str(original.as_deref().unwrap_or("{}"))?;
     let hooks_obj = settings
         .as_object_mut()
         .context("Claude settings root is not an object")?
@@ -1130,50 +1160,59 @@ fn patch_claude_settings(path: &Path, exe_str: &str) -> Result<usize> {
             patched += 1;
         }
     }
-    fs::write(path, serde_json::to_string_pretty(&settings)?)?;
+    if patched != 0 {
+        write_claude_settings(&path, original.as_deref(), &settings)?;
+    }
     Ok(patched)
 }
 
-fn remove_exact_commands(event_arr: &mut Vec<serde_json::Value>, commands: &[&str]) {
-    remove_exact_commands_except(event_arr, commands, None);
+fn remove_exact_commands(event_arr: &mut Vec<serde_json::Value>, commands: &[&str]) -> bool {
+    remove_exact_commands_except(event_arr, commands, None)
 }
 
-/// [`remove_exact_commands`], leaving the entry at index `keep` untouched.
+/// Remove our handlers, pruning only entries that have just lost their last handler.
 fn remove_exact_commands_except(
     event_arr: &mut Vec<serde_json::Value>,
     commands: &[&str],
     keep: Option<usize>,
-) {
-    for (index, entry) in event_arr.iter_mut().enumerate() {
-        if Some(index) == keep {
-            continue;
+) -> bool {
+    let mut index = 0;
+    let mut changed = false;
+    event_arr.retain_mut(|entry| {
+        let skip = Some(index) == keep;
+        index += 1;
+        if skip {
+            return true;
         }
-        if let Some(handlers) = entry
+        let Some(handlers) = entry
             .get_mut("hooks")
             .and_then(|hooks| hooks.as_array_mut())
-        {
-            handlers.retain(|handler| {
-                !handler
-                    .get("command")
-                    .and_then(|command| command.as_str())
-                    .is_some_and(|command| commands.contains(&command))
-            });
-        }
-    }
-    event_arr.retain(|entry| {
-        entry
-            .get("hooks")
-            .and_then(|hooks| hooks.as_array())
-            .is_none_or(|handlers| !handlers.is_empty())
+        else {
+            return true;
+        };
+        let before = handlers.len();
+        handlers.retain(|handler| {
+            !handler
+                .get("command")
+                .and_then(|command| command.as_str())
+                .is_some_and(|command| commands.contains(&command))
+        });
+        let edited = handlers.len() != before;
+        changed |= edited;
+        !edited || !handlers.is_empty()
     });
+    changed
 }
 
 fn remove_hooks_from_settings(path: &Path, exe_str: &str) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let raw = fs::read_to_string(path)?;
+    let path = claude_settings_target(path)?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
     let mut settings: serde_json::Value = serde_json::from_str(&raw)?;
+    let mut changed = false;
     if let Some(hooks_obj) = settings
         .get_mut("hooks")
         .and_then(|hooks| hooks.as_object_mut())
@@ -1185,11 +1224,13 @@ fn remove_hooks_from_settings(path: &Path, exe_str: &str) -> Result<()> {
             {
                 let current = hook_command(exe_str, "hook", hook.name);
                 let legacy = legacy_hook_command(exe_str, hook.name);
-                remove_exact_commands(event_arr, &[current.as_str(), legacy.as_str()]);
+                changed |= remove_exact_commands(event_arr, &[current.as_str(), legacy.as_str()]);
             }
         }
     }
-    fs::write(path, serde_json::to_string_pretty(&settings)?)?;
+    if changed {
+        write_claude_settings(&path, Some(&raw), &settings)?;
+    }
     Ok(())
 }
 
@@ -1241,16 +1282,46 @@ mod tests {
         patch_claude_settings(&path, "/opt/konnect").unwrap();
         let installed = fs::read_to_string(&path).unwrap() + " \n";
         fs::write(&path, &installed).unwrap();
-        let file = fs::File::open(&path).unwrap();
+        let file = fs::File::options().write(true).open(&path).unwrap();
         file.set_times(
             std::fs::FileTimes::new()
                 .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(3600)),
         )
         .unwrap();
         let mtime = file.metadata().unwrap().modified().unwrap();
+        drop(file);
         assert_eq!(patch_claude_settings(&path, "/opt/konnect").unwrap(), 0);
         assert_eq!(fs::read_to_string(&path).unwrap(), installed);
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    }
+
+    #[test]
+    fn claude_settings_external_edit_is_never_overwritten() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("settings.json");
+        let original = r#"{"model":"opus"}"#;
+        let external = r#"{"model":"opus","env":{"MY_SETTING":"1"}}"#;
+        fs::write(&path, original).unwrap();
+        let observed = fs::read_to_string(&path).unwrap();
+        fs::write(&path, external).unwrap();
+
+        let incoming = serde_json::json!({"model":"opus","hooks":{}});
+        let error = write_claude_settings(&path, Some(&observed), &incoming).unwrap_err();
+        assert!(
+            error.to_string().contains("changed during the update"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), external);
+    }
+
+    #[test]
+    fn claude_settings_uninstall_without_own_hooks_preserves_bytes() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("settings.json");
+        let original = r#"{"hooks":{"PreToolUse":[{"matcher":"user","hooks":[]}]}}"#;
+        fs::write(&path, original).unwrap();
+        remove_hooks_from_settings(&path, "/opt/konnect").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
