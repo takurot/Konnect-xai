@@ -1543,6 +1543,77 @@ mod export_boundary_contract_tests {
         )
     }
 
+    #[tokio::test]
+    async fn pcb_netlist_ipc_formats_dispatch_to_native_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = cli::test_support::write_script(
+            dir.path(),
+            "netlist-cli",
+            r#"#!/bin/sh
+[ "$1 $2 $3 $4" = "pcb export ipcd356 --output" ] || exit 3
+printf '%s' "$6" > "$5"
+"#,
+            "@echo off\r\nif not \"%~1 %~2 %~3 %~4\"==\"pcb export ipcd356 --output\" exit /b 3\r\n<nul set /p \"=%~6\">\"%~5\"\r\nexit /b 0\r\n",
+        );
+        let mut ctx = context();
+        ctx.config.kicad_cli = fake.to_string_lossy().into_owned();
+        let board = dir.path().join("fixture.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        for format in ["ipc", "ipcd356"] {
+            let output = dir.path().join(format!("{format}.d356"));
+            let result = handle_export_netlist(
+                &json!({"board":board,"output":output,"format":format}),
+                &ctx,
+            )
+            .await
+            .expect("native IPC-D-356 CLI call");
+            assert!(!result.is_error);
+            assert_eq!(
+                std::fs::read_to_string(&output).unwrap(),
+                board.to_str().unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_pcb_netlist_requests_refuse_before_running_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = cli::test_support::write_script(
+            dir.path(),
+            "netlist-cli",
+            "#!/bin/sh\nprintf started > \"$0.started\"\nexit 0\n",
+            "@echo off\r\necho started>\"%~f0.started\"\r\nexit /b 0\r\n",
+        );
+        let mut ctx = context();
+        ctx.config.kicad_cli = fake.to_string_lossy().into_owned();
+        let board = dir.path().join("fixture.kicad_pcb");
+        let output = dir.path().join("nested/out.net");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        for (input, format, field) in [
+            (&board, json!("bogus"), "format"),
+            (&board, json!(9), "format"),
+            (&board, json!("kicad"), "board"),
+            (&board.with_extension("kicad_sch"), json!("ipc"), "board"),
+        ] {
+            let result = handle_export_netlist(
+                &json!({"board":input,"output":output,"format":format}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "unexpected success for {input:?} {format}");
+            let Some(crate::mcp::protocol::ToolContent::Text { text }) = result.content.first()
+            else {
+                panic!("expected structured invalid_argument");
+            };
+            let error: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(error["error"]["kind"], "invalid_argument");
+            assert_eq!(error["error"]["field"], field);
+        }
+        assert!(!PathBuf::from(format!("{}.started", fake.display())).exists());
+        assert!(!output.parent().unwrap().exists());
+    }
+
     #[test]
     fn position_options_refuse_the_incompatible_field_and_layer_lists_require_strings() {
         for (format, side, units, field) in [
