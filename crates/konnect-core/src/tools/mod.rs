@@ -2028,6 +2028,7 @@ pub struct SheetInstanceContext {
 pub(crate) struct SchematicOwnership {
     pub project_file: std::path::PathBuf,
     pub root_schematic: std::path::PathBuf,
+    pub is_top_level: bool,
     pub instance_paths: Vec<String>,
 }
 
@@ -2131,10 +2132,18 @@ impl SchematicTargetError {
 pub(crate) fn resolve_schematic_ownership(
     target: &std::path::Path,
 ) -> Result<Option<SchematicOwnership>, SchematicTargetError> {
+    resolve_schematic_ownership_with(target, None, &mut |path| {
+        konnect_sexp::read_consistent(path).map_err(anyhow::Error::from)
+    })
+}
+
+pub(crate) fn schematic_project_candidates(
+    target: &std::path::Path,
+) -> Result<std::collections::BTreeSet<std::path::PathBuf>, SchematicTargetError> {
     use std::collections::BTreeSet;
 
     let Some(start) = target.parent() else {
-        return Ok(None);
+        return Ok(BTreeSet::new());
     };
     // A relative path still belongs to the same filesystem hierarchy. Starting
     // at its lexical parent alone would stop at cwd and miss higher projects.
@@ -2168,52 +2177,95 @@ pub(crate) fn resolve_schematic_ownership(
         }
     }
 
-    let roots = project_files
-        .iter()
-        .map(|path| path.with_extension("kicad_sch"))
-        .collect::<Vec<_>>();
+    Ok(project_files)
+}
+
+pub(crate) fn resolve_schematic_ownership_with(
+    target: &std::path::Path,
+    excluded: Option<&std::path::Path>,
+    read: &mut impl FnMut(&std::path::Path) -> anyhow::Result<String>,
+) -> Result<Option<SchematicOwnership>, SchematicTargetError> {
+    use std::collections::BTreeSet;
+
+    let project_files = schematic_project_candidates(target)?;
+    let mut roots = Vec::new();
     let mut owners = Vec::new();
     let mut complete = true;
     for project_file in project_files {
-        let root_schematic = project_file.with_extension("kicad_sch");
-        let Ok(root) = konnect_schematic_editor::Schematic::load(&root_schematic) else {
+        if excluded.is_some_and(|active| same_schematic_document(active, &project_file)) {
+            continue;
+        }
+        let configured =
+            read(&project_file).and_then(|source| project_schematic_roots(&project_file, &source));
+        let Ok(configured) = configured else {
+            roots.push(project_file.with_extension("kicad_sch"));
             complete = false;
             continue;
         };
-        let Some(root_uuid) = root.uuid.clone() else {
-            complete = false;
-            continue;
-        };
-
+        let mut matched_root = None;
+        let mut top_level = None;
         let mut instance_paths = Vec::new();
-        if same_schematic_document(&root_schematic, target) {
-            instance_paths.push(format!("/{root_uuid}"));
-        } else {
-            let mut suffix = Vec::new();
-            let mut stack = std::collections::HashSet::new();
-            complete &= collect_sheet_instance_paths(
-                &root_schematic,
-                target,
-                &mut suffix,
-                &mut stack,
-                0,
-                &root_uuid,
-                &mut instance_paths,
-            );
+        let mut root_ids = BTreeSet::new();
+        for (root_schematic, override_uuid) in configured {
+            roots.push(root_schematic.clone());
+            let Ok(root) = read(&root_schematic).and_then(|source| {
+                Ok(konnect_schematic_editor::Schematic::from_source(
+                    &root_schematic,
+                    source,
+                )?)
+            }) else {
+                complete = false;
+                continue;
+            };
+            let Some(root_uuid) = override_uuid.or(root.uuid) else {
+                complete = false;
+                continue;
+            };
+            if !root_ids.insert(root_uuid.clone()) {
+                complete = false;
+                continue;
+            }
+
+            if same_schematic_document(&root_schematic, target) {
+                instance_paths.push(format!("/{root_uuid}"));
+                top_level = Some(root_schematic);
+            } else {
+                let mut suffix = Vec::new();
+                let mut stack = std::collections::HashSet::new();
+                let count_before = instance_paths.len();
+                complete &= collect_sheet_instance_paths(
+                    &root_schematic,
+                    target,
+                    &mut suffix,
+                    &mut stack,
+                    &root_uuid,
+                    &mut instance_paths,
+                    read,
+                );
+                if instance_paths.len() > count_before && matched_root.is_none() {
+                    matched_root = Some(root_schematic);
+                }
+            }
         }
         instance_paths.sort();
         instance_paths.dedup();
-        if !instance_paths.is_empty() {
+        let is_top_level = top_level.is_some();
+        if let Some(root_schematic) = top_level.or(matched_root) {
             owners.push(SchematicOwnership {
                 project_file,
                 root_schematic,
+                is_top_level,
                 instance_paths,
             });
         }
     }
 
+    roots.sort();
+    roots.dedup();
     owners.sort_by(|left, right| left.root_schematic.cmp(&right.root_schematic));
-    if !roots.is_empty() && (owners.len() != 1 || !complete) {
+    if !roots.is_empty()
+        && (owners.len() > 1 || !complete || (owners.is_empty() && excluded.is_none()))
+    {
         return Err(SchematicTargetError::ProjectConflict {
             target: target.to_path_buf(),
             roots,
@@ -2222,16 +2274,65 @@ pub(crate) fn resolve_schematic_ownership(
     Ok(owners.pop())
 }
 
+/// KiCad's project roots in configured order. Nil UUIDs use the file UUID,
+/// as do projects saved before top-level sheets were configurable.
+pub(crate) fn project_schematic_roots(
+    project: &std::path::Path,
+    source: &str,
+) -> anyhow::Result<Vec<(std::path::PathBuf, Option<String>)>> {
+    let config: Value = serde_json::from_str(source)?;
+    anyhow::ensure!(config.is_object(), "Invalid project settings");
+    anyhow::ensure!(
+        config.get("schematic").is_none_or(Value::is_object),
+        "Invalid schematic settings"
+    );
+    let Some(roots) = config.pointer("/schematic/top_level_sheets") else {
+        return Ok(vec![(project.with_extension("kicad_sch"), None)]);
+    };
+    let roots = roots
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Invalid top_level_sheets"))?;
+    if roots.is_empty() {
+        return Ok(vec![(project.with_extension("kicad_sch"), None)]);
+    }
+
+    let directory = project
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    roots
+        .iter()
+        .map(|root| {
+            let filename = root
+                .get("filename")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("Missing top-level sheet filename"))?;
+            anyhow::ensure!(!filename.is_empty(), "Empty top-level sheet filename");
+            let uuid = root
+                .get("uuid")
+                .map(|value| {
+                    let uuid = value
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid top-level sheet UUID"))?;
+                    Ok::<_, anyhow::Error>(uuid::Uuid::parse_str(uuid)?)
+                })
+                .transpose()?
+                .filter(|uuid| !uuid.is_nil())
+                .map(|uuid| uuid.to_string());
+            Ok((directory.join(filename), uuid))
+        })
+        .collect()
+}
+
 fn collect_sheet_instance_paths(
     current: &std::path::Path,
     target: &std::path::Path,
     suffix: &mut Vec<String>,
     stack: &mut std::collections::HashSet<std::path::PathBuf>,
-    depth: usize,
     root_uuid: &str,
     found: &mut Vec<String>,
+    read: &mut impl FnMut(&std::path::Path) -> anyhow::Result<String>,
 ) -> bool {
-    if depth > crate::tools::sch_hierarchy::MAX_HIERARCHY_DEPTH {
+    if suffix.len() > crate::tools::sch_hierarchy::MAX_HIERARCHY_DEPTH {
         return false;
     }
     let canonical = canonical_schematic_path(current);
@@ -2240,7 +2341,11 @@ fn collect_sheet_instance_paths(
     }
 
     let mut complete = true;
-    if let Ok(schematic) = konnect_schematic_editor::Schematic::load(current) {
+    if let Ok(schematic) = read(current).and_then(|source| {
+        Ok(konnect_schematic_editor::Schematic::from_source(
+            current, source,
+        )?)
+    }) {
         let directory = current
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
@@ -2256,13 +2361,7 @@ fn collect_sheet_instance_paths(
                 found.push(path);
             } else {
                 complete &= collect_sheet_instance_paths(
-                    &child,
-                    target,
-                    suffix,
-                    stack,
-                    depth + 1,
-                    root_uuid,
-                    found,
+                    &child, target, suffix, stack, root_uuid, found, read,
                 );
             }
             suffix.pop();
@@ -2316,7 +2415,7 @@ pub(crate) fn sheet_instance_context(
             .to_string(),
         instance_path,
         instance_paths: ownership.instance_paths,
-        is_child_sheet: !same_schematic_document(&ownership.root_schematic, sch_path),
+        is_child_sheet: !ownership.is_top_level,
     })
 }
 

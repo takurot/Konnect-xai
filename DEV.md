@@ -99,7 +99,7 @@ Konnect/
 │   │           ├── sch_export.rs     # 7 tools (SVG/PDF/netlist/ERC/PCB sync)
 │   │           ├── sch_bus.rs        # 4 tools (buses, bus entries, pin fan-out)
 │   │           ├── pcb_sync.rs       # update_pcb_from_schematic: pure planner + one-commit IPC apply
-│   │           ├── sch_hierarchy.rs  # 14 tools (typed Sheet model, sheet-file creation and page size, sheet CRUD + hierarchy/page queries + pin lifecycle)
+│   │           ├── sch_hierarchy.rs  # 15 tools (typed Sheet model, sheet-file creation and page size, sheet CRUD + hierarchy/page queries + pin lifecycle)
 │   │           ├── pcb_board.rs      # 11 tools (S-expr file editing, IPC fallback, SVG logo import)
 │   │           ├── pcb_components.rs # 20 tools (IPC real-time + safe headless single-placement fallback)
 │   │           ├── pcb_footprint_update.rs # library refresh planner + one-commit IPC apply

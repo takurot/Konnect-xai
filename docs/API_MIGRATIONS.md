@@ -306,6 +306,22 @@ The `Hooks: N entries patched` count now includes refreshed entries and a
 removed legacy handler, so it is non-zero whenever the hook settings changed
 (#739).
 
+## Unreleased: hierarchy instance maintenance
+
+Schematic writes recognize the top-level files and effective root UUIDs in
+`schematic.top_level_sheets` in KiCad 10 projects. Add, duplicate, repoint, and
+delete reconcile saved instance paths for affected sheets and symbols in a
+single file transaction. Page allocation starts above the largest live page
+number across the project's configured roots. Deleted page numbers above the
+current maximum may be assigned again.
+
+On a stale sheet, call `repair_sheet_instances` in the `sch_hierarchy` toolset
+with `schematic` set to the file path. The default dry run reports the symbol
+guard's diagnosis and proposed changes for the selected file. Pass
+`"apply": true` to commit and verify the repair. Projects whose ownership
+cannot be proved, including conflicting project owners, require manual
+inspection.
+
 ## Unreleased: `create_schematic` and `set_schematic_page` move to `sch_hierarchy` (minor release)
 
 `create_schematic` and `set_schematic_page` move from the `sch_components`
