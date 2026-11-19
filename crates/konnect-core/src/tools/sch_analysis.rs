@@ -3,7 +3,7 @@
 //! All operations are read-only S-expression analysis. Connectivity — the net
 //! graph and what counts as attached at a point — lives in `sch_connectivity`.
 
-use crate::mcp::protocol::CallToolResult;
+use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::sch_connectivity::{label_roots, net_graph_for, pt_key, ConnectivityIndex};
 use crate::tools::{
@@ -51,7 +51,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_net_connections",
-            "Get all pins and labels connected to a named net.",
+            "Get the component pins and labels for an exact net name on the requested schematic sheet.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -62,8 +62,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_net_connectivity",
-            "Build the full connectivity graph for a net using union-find. \
-             Returns all wire segments, labels, and T-junction locations.",
+            "Get the wires, labels, and T-junction locations for an exact net name on the requested schematic sheet.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -260,6 +259,47 @@ async fn handle_list_labels(
     ))
 }
 
+fn net_query_points(
+    tree: &konnect_sexp::SexpNode,
+    wires: &[Wire],
+    labels: &[Label],
+    net: &str,
+) -> Result<HashSet<(i64, i64)>, CallToolResult> {
+    let mut graph = net_graph_for(tree, wires, labels);
+    let points = graph.points_on_net(net);
+    if points.is_empty() {
+        let folded = net.to_lowercase();
+        let suggestions = labels
+            .iter()
+            .filter(|label| label.net.to_lowercase() == folded)
+            .map(|label| label.net.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        return Err(CallToolResult::error_kind(
+            ToolErrorKind::NotFound {
+                net: net.to_owned(),
+                suggestions,
+            },
+            format!("Net '{net}' was not found on the requested schematic sheet"),
+        ));
+    }
+    Ok(points.into_iter().collect())
+}
+
+fn net_query_labels(labels: &[Label], net: &str) -> Vec<serde_json::Value> {
+    labels
+        .iter()
+        .filter(|label| label.net == net)
+        .map(|label| {
+            json!({
+                "type": format!("{:?}", label.kind), "x": round6(label.x), "y": round6(label.y),
+                "uuid": label.uuid
+            })
+        })
+        .collect()
+}
+
 async fn handle_get_net_connections(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -272,15 +312,30 @@ async fn handle_get_net_connections(
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
-    let matching: Vec<_> = labels
-        .iter()
-        .filter(|l| l.net == net)
-        .map(|l| json!({ "type": format!("{:?}", l.kind), "x": round6(l.x), "y": round6(l.y) }))
-        .collect();
-    let mut g = net_graph_for(&tree, &wires, &labels);
-    let pts = g.points_on_net(&net).len();
+    let net_pts = match net_query_points(&tree, &wires, &labels, &net) {
+        Ok(points) => points,
+        Err(error) => return Ok(error),
+    };
+    let matching = net_query_labels(&labels, &net);
+    let mut pins = Vec::new();
+    for (instance, placed_pins) in placed_pins_by_reference(&tree) {
+        if is_power_symbol_reference(&instance.reference) {
+            continue;
+        }
+        for (pin, transform) in placed_pins {
+            let (x, y) = konnect_sexp::schematic::pin_endpoint(&pin, transform);
+            if net_pts.contains(&pt_key(x, y)) {
+                pins.push(json!({
+                    "reference": instance.reference, "unit": instance.unit,
+                    "pin_number": pin.number, "pin_name": pin.name,
+                    "electrical_type": pin.electrical_type, "x": round6(x), "y": round6(y)
+                }));
+            }
+        }
+    }
     Ok(CallToolResult::json(
-        &json!({ "net": net, "label_count": matching.len(), "labels": matching, "connected_points": pts }),
+        &json!({ "net": net, "label_count": matching.len(), "labels": matching,
+            "connected_points": net_pts.len(), "pins": pins }),
     ))
 }
 
@@ -296,23 +351,19 @@ async fn handle_get_net_connectivity(
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
-    let mut g = net_graph_for(&tree, &wires, &labels);
-    let net_pts: HashSet<(i64, i64)> = g.points_on_net(&net).into_iter().collect();
-    let net_wires: Vec<_> = wires
-        .iter()
-        .filter(|w| net_pts.contains(&pt_key(w.x1, w.y1)) || net_pts.contains(&pt_key(w.x2, w.y2)))
-        .map(|w| json!({ "x1": round6(w.x1), "y1": round6(w.y1), "x2": round6(w.x2), "y2": round6(w.y2) }))
-        .collect();
-    let net_labels: Vec<_> = labels
-        .iter()
-        .filter(|l| l.net == net)
-        .map(|l| json!({ "type": format!("{:?}", l.kind), "x": round6(l.x), "y": round6(l.y) }))
-        .collect();
+    let net_pts = match net_query_points(&tree, &wires, &labels, &net) {
+        Ok(points) => points,
+        Err(error) => return Ok(error),
+    };
     let net_wire_objs: Vec<Wire> = wires
-        .iter()
+        .into_iter()
         .filter(|w| net_pts.contains(&pt_key(w.x1, w.y1)) || net_pts.contains(&pt_key(w.x2, w.y2)))
-        .cloned()
         .collect();
+    let net_wires: Vec<_> = net_wire_objs
+        .iter()
+        .map(|w| json!({ "x1": round6(w.x1), "y1": round6(w.y1), "x2": round6(w.x2), "y2": round6(w.y2), "uuid": w.uuid }))
+        .collect();
+    let net_labels = net_query_labels(&labels, &net);
     let t_junctions = konnect_sexp::schematic::find_t_junctions(&net_wire_objs, 0.01);
     Ok(CallToolResult::json(&json!({
         "net": net,
@@ -1501,6 +1552,10 @@ mod net_query_tests {
         // KiCad 10.0.8's GND netlist also has R10.1 and R11.1 on the child sheet.
         assert_eq!(pins.len(), 7);
         assert_eq!(
+            ground["labels"][0]["uuid"],
+            "d6100939-dee2-4924-b9eb-80523f363191"
+        );
+        assert_eq!(
             identities,
             BTreeSet::from([
                 ("R1", "1"),
@@ -1525,6 +1580,29 @@ mod net_query_tests {
                 "electrical_type": "passive", "x": 100.0, "y": 103.81
             }])
         );
+    }
+
+    #[tokio::test]
+    async fn midwire_pin_membership_requires_a_junction() {
+        let crossed = RAIL
+            .replace(
+                "(label \"SIG\" (at 100 96.19 0)",
+                "(label \"SIG\" (at 105 103.81 0)",
+            )
+            .replace(
+                "(xy 100 103.81) (xy 100 110)",
+                "(xy 95 103.81) (xy 105 103.81)",
+            );
+        let bare = call(&crossed, "get_net_connections", json!({ "net": "SIG" })).await;
+        assert_eq!(bare["pins"], json!([]));
+
+        let joined = crossed.replace(
+            "(sheet_instances",
+            "(junction (at 100 103.81) (diameter 0) (color 0 0 0 0) (uuid \"j1\")) (sheet_instances",
+        );
+        let joined = call(&joined, "get_net_connections", json!({ "net": "SIG" })).await;
+        assert_eq!(joined["pins"].as_array().unwrap().len(), 1);
+        assert_eq!(joined["pins"][0]["pin_number"], "2");
     }
 
     #[tokio::test]
@@ -1577,6 +1655,10 @@ mod net_query_tests {
             }
             let stub = call(SCH, tool, json!({ "net": "STUB" })).await;
             assert_eq!(stub["labels"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                stub["labels"][0]["uuid"],
+                "485c0c1a-2a15-4c84-85da-d32ed20d613a"
+            );
 
             let unwired = RAIL.replace(
                 "(wire (pts (xy 100 103.81) (xy 100 110)) (uuid \"w1\"))",
@@ -1589,6 +1671,10 @@ mod net_query_tests {
                 assert_eq!(rail["pins"], json!([]));
             } else {
                 assert_eq!(rail["wires"], json!([]));
+                assert_eq!(
+                    stub["wires"][0]["uuid"],
+                    "e20b570e-9f71-4204-a907-fdeb365956b8"
+                );
             }
         }
     }
