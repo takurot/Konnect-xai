@@ -200,6 +200,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nesting_limit_accepts_deepest_list_and_rejects_next_opening() {
+        let prefix = " \n";
+        let allowed = format!("{prefix}{}atom{}", "(".repeat(256), ")".repeat(256));
+        assert!(parse_sexp(&allowed).is_ok());
+        let too_deep = format!("{prefix}{}atom{}", "(".repeat(257), ")".repeat(257));
+        let error = parse_sexp(&too_deep).unwrap_err();
+        assert!(matches!(error, SexpError::Parse { offset, ref message }
+            if offset == prefix.len() + 256 && message.contains("256")));
+    }
+
+    #[test]
+    fn nesting_limit_carries_byte_offset_across_top_level_forms() {
+        let prefix = "(label \"日本語\")  \n  ";
+        let too_deep = format!("{prefix}{}atom{}", "(".repeat(257), ")".repeat(257));
+        let error = parse_sexp(&too_deep).unwrap_err();
+        assert!(matches!(error, SexpError::Parse { offset, ref message }
+            if offset == prefix.len() + 256 && message.contains("256")));
+    }
+
+    #[test]
+    fn nesting_limit_ignores_parentheses_in_quoted_values() {
+        let value = "(())".repeat(257);
+        let input = format!("(label \"{value}\")");
+        let parsed = parse_sexp(&input).unwrap();
+        assert_eq!(
+            parsed.get(1).and_then(SexpNode::as_str),
+            Some(value.as_str())
+        );
+    }
+
+    #[test]
     fn atom() {
         let n = parse_sexp("hello").unwrap();
         assert_eq!(n.as_str(), Some("hello"));

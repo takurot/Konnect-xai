@@ -109,3 +109,27 @@ fn parse_atom(b: &[u8], pos: &mut usize) -> Result<SexpNode> {
         String::from_utf8_lossy(&b[start..*pos]).into_owned(),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nesting_limit_accepts_deepest_list_and_rejects_next_opening() {
+        let prefix = "(label \"日本語\" \n  ";
+        let allowed = format!("{prefix}{}atom{}", "(".repeat(255), ")".repeat(256));
+        assert!(parse(&allowed).is_ok());
+        let too_deep = format!("{prefix}{}atom{}", "(".repeat(256), ")".repeat(257));
+        let error = parse(&too_deep).unwrap_err();
+        assert!(matches!(error, Error::Parse { pos, ref msg }
+            if pos == prefix.len() + 255 && msg.contains("256")));
+    }
+
+    #[test]
+    fn nesting_limit_ignores_parentheses_in_quoted_values() {
+        let value = "(())".repeat(257);
+        let input = format!("(label \"{value}\")");
+        let parsed = parse(&input).unwrap();
+        assert_eq!(parsed.value(), Some(value.as_str()));
+    }
+}
