@@ -4731,8 +4731,8 @@ mod tests {
         let readback_fault = std::sync::Arc::new(std::sync::Mutex::new(ReadbackFault::None));
         let live_readback_fault = readback_fault.clone();
         let thread = std::thread::spawn(move || {
-            let original = footprint.clone();
             let mut footprint = footprint;
+            let mut pending_footprint = None;
             let mut update_applied = false;
             while let Ok(message) = socket.recv() {
                 let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
@@ -4805,11 +4805,7 @@ mod tests {
                             .unwrap();
                         continue;
                     }
-                    let published = captured
-                        .lock()
-                        .unwrap()
-                        .commit_actions
-                        .contains(&kiapi::common::commands::CommitAction::CmaCommit);
+                    let published = update_applied;
                     let mut returned = footprint.clone();
                     if published
                         && matches!(
@@ -4873,12 +4869,7 @@ mod tests {
                             Vec::new()
                         } else {
                             let mut observed = returned;
-                            if update_applied
-                                && matches!(
-                                    fault,
-                                    ReadbackFault::WrongLayer | ReadbackFault::RollbackFailure
-                                )
-                            {
+                            if update_applied && matches!(fault, ReadbackFault::WrongLayer) {
                                 let mut decoded = kiapi::board::types::FootprintInstance::decode(
                                     observed.value.as_slice(),
                                 )
@@ -4968,16 +4959,13 @@ mod tests {
                         .update_batches
                         .push(update.items.len());
                     if !fail_update {
-                        update_applied = true;
-                        footprint = update.items[0].clone();
+                        let mut staged = update.items[0].clone();
                         if matches!(
                             readback,
-                            ChamferReadback::DropCorners
-                                | ChamferReadback::RollbackFailure
-                                | ChamferReadback::Unreadable
+                            ChamferReadback::DropCorners | ChamferReadback::Unreadable
                         ) {
                             let mut instance = kiapi::board::types::FootprintInstance::decode(
-                                footprint.value.as_slice(),
+                                staged.value.as_slice(),
                             )
                             .unwrap();
                             for child in &mut instance.definition.as_mut().unwrap().items {
@@ -5000,11 +4988,12 @@ mod tests {
                                     }
                                 }
                             }
-                            footprint = builders::pack_any(
+                            staged = builders::pack_any(
                                 &instance,
                                 "kiapi.board.types.FootprintInstance",
                             );
                         }
+                        pending_footprint = Some(staged);
                     }
                     let updated_items = update
                         .items
@@ -5041,8 +5030,7 @@ mod tests {
                         if matches!(
                             *live_readback_fault.lock().unwrap(),
                             ReadbackFault::RollbackFailure
-                        ) || matches!(readback, ChamferReadback::RollbackFailure)
-                        {
+                        ) {
                             socket
                                 .send(nng::Message::from(
                                     kiapi::common::ApiResponse {
@@ -5059,8 +5047,11 @@ mod tests {
                                 .unwrap();
                             continue;
                         }
-                        footprint = original.clone();
-                        update_applied = false;
+                        pending_footprint = None;
+                    } else if let Some(staged) = pending_footprint.take() {
+                        // GetItems exposes only the current published footprint.
+                        footprint = staged;
+                        update_applied = true;
                     }
                     api_reply(builders::pack_any(
                         &kiapi::common::commands::EndCommitResponse {},
@@ -5234,7 +5225,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_sends_one_batch_in_one_commit() {
+    async fn staged_refresh_publishes_one_commit_and_converges_to_noop() {
         let (_temp, board, items) = plan_fixture();
         let mock = spawn_planner_mock(&board, items[2].clone(), false);
         let context = test_context(&mock.url);
@@ -5261,6 +5252,10 @@ mod tests {
         let applied = result_json(&applied);
         assert_eq!(applied["status"], "applied");
         assert_eq!(applied["coverage"]["changed"]["applied"], 1);
+        let after = handle_update_footprints_from_library(&json!({"board":board}), &context)
+            .await
+            .unwrap();
+        assert_eq!(result_json(&after)["status"], "noop", "{after:?}");
         let capture = mock.capture.lock().unwrap();
         assert_eq!(capture.begin_count, 1);
         assert_eq!(capture.update_batches, vec![1]);
