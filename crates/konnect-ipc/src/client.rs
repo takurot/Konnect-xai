@@ -4950,12 +4950,10 @@ fn build_graphic_child(
             width,
             filled,
         } => {
-            let (cx, cy) = xf(*center);
-            // The radius is rotation-invariant; keep KiCAD's center +
-            // circumference-point encoding by re-deriving it from the length.
-            let radius = ((end.0 - center.0).powi(2) + (end.1 - center.1).powi(2)).sqrt();
+            // KiCad stores a circumference point. Keep its authored direction so
+            // inverse placement rotation does not round a different local radius.
             builders::pack_any(
-                &builders::board_circle(layer, *width, cx, cy, radius, *filled)?,
+                &builders::board_circle_through(layer, *width, xf(*center), xf(*end), *filled)?,
                 SHAPE,
             )
         }
