@@ -445,44 +445,47 @@ fn append_field_layer_state(
 }
 
 fn normalize_pad_geometry(pad: &mut kiapi::board::types::Pad) -> Result<()> {
-    let stack = pad
-        .pad_stack
-        .as_mut()
-        .context("footprint readback pad has no padstack")?;
-    if let Some(angle) = stack.angle.as_mut() {
-        anyhow::ensure!(
-            angle.value_degrees.is_finite(),
-            "footprint readback pad has invalid rotation"
-        );
-        angle.value_degrees = konnect_sexp::geometry::round6(angle.value_degrees.rem_euclid(360.0));
-        if angle.value_degrees == 0.0 {
-            stack.angle = None;
+    if let Some(stack) = pad.pad_stack.as_mut() {
+        if let Some(angle) = stack.angle.as_mut() {
+            anyhow::ensure!(
+                angle.value_degrees.is_finite(),
+                "footprint readback pad has invalid rotation"
+            );
+            angle.value_degrees =
+                konnect_sexp::geometry::round6(angle.value_degrees.rem_euclid(360.0));
+            if angle.value_degrees == 0.0 {
+                stack.angle = None;
+            }
         }
-    }
-    for layer in &mut stack.copper_layers {
-        anyhow::ensure!(
-            layer.corner_rounding_ratio.is_finite() && layer.chamfer_ratio.is_finite(),
-            "footprint readback pad has an invalid corner ratio"
-        );
-        layer.corner_rounding_ratio += 0.0;
-        layer.chamfer_ratio += 0.0;
-        if layer
-            .offset
-            .as_ref()
-            .is_some_and(|offset| offset.x_nm == 0 && offset.y_nm == 0)
-        {
-            layer.offset = None;
+        for layer in &mut stack.copper_layers {
+            anyhow::ensure!(
+                layer.corner_rounding_ratio.is_finite() && layer.chamfer_ratio.is_finite(),
+                "footprint readback pad has an invalid corner ratio"
+            );
+            layer.corner_rounding_ratio += 0.0;
+            layer.chamfer_ratio += 0.0;
+            if layer
+                .offset
+                .as_ref()
+                .is_some_and(|offset| offset.x_nm == 0 && offset.y_nm == 0)
+            {
+                layer.offset = None;
+            }
         }
+        stack
+            .copper_layers
+            .sort_by_key(prost::Message::encode_to_vec);
     }
-    stack
-        .copper_layers
-        .sort_by_key(prost::Message::encode_to_vec);
     pad.parent = None;
     pad.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
     Ok(())
 }
 
 fn pad_layer_state(pad: kiapi::board::types::Pad) -> Result<LayerState> {
+    anyhow::ensure!(
+        pad.pad_stack.is_some(),
+        "footprint readback pad has no padstack"
+    );
     let definition = kiapi::board::types::Footprint {
         items: vec![konnect_ipc::builders::pack_any(
             &pad,
