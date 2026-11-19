@@ -180,7 +180,8 @@ So a value present only in a lower-priority file has no effect while a
 higher-priority file exists.
 
 1. `settings.json` at the root of a recognized KiCad PCM plugin layout. The
-   binary must be in `bin/` and match the native server action in `plugin.json`.
+   executable's resolved location must be in `bin/` and match the native
+   server action in `plugin.json`.
 2. `konnect/config.toml` under the platform configuration directory
    (`~/Library/Application Support` on macOS, `~/.config` on Linux,
    `%APPDATA%` on Windows). A relative or unavailable platform root is skipped.

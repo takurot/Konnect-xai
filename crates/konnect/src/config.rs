@@ -307,8 +307,9 @@ fn select_config_candidate(candidates: &[PathBuf]) -> (Option<PathBuf>, Vec<Path
 }
 
 /// KiCad's native PCM action invokes the executable without flags. Match
-/// the packaged layout and manifest before reading settings from its root.
+/// the packaged layout and manifest beside the real executable.
 fn pcm_settings_path(exe: &Path) -> Option<PathBuf> {
+    let exe = exe.canonicalize().ok()?;
     let bin = exe.parent()?;
     if bin.file_name()? != "bin" {
         return None;
@@ -352,11 +353,34 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let parent = directory.path();
         let exe = parent.join("bin/konnect");
+        std::fs::create_dir_all(parent.join("bin")).unwrap();
+        std::fs::write(&exe, "").unwrap();
         std::fs::write(parent.join("settings.json"), "{}").unwrap();
         assert!(pcm_settings_path(&exe).is_none());
 
         std::fs::write(parent.join("plugin.json"), r#"{"identifier":"other.plugin","runtime":{"type":"exec"},"actions":[{"identifier":"start-server","entrypoint":"bin/konnect"}]}"#).unwrap();
         assert!(pcm_settings_path(&exe).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_symlink_does_not_trust_settings_beside_the_link() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("konnect");
+        std::fs::write(&original, "").unwrap();
+
+        let plugin = directory.path().join("pcm");
+        std::fs::create_dir_all(plugin.join("bin")).unwrap();
+        std::fs::write(
+            plugin.join("plugin.json"),
+            include_str!("../../../plugin/plugin.json"),
+        )
+        .unwrap();
+        std::fs::write(plugin.join("settings.json"), r#"{"log_level":"info"}"#).unwrap();
+        let link = plugin.join("bin/konnect.exe");
+        std::os::unix::fs::symlink(original, &link).unwrap();
+
+        assert!(pcm_settings_path(&link).is_none());
     }
 
     fn write_temp(ext: &str, content: &str) -> tempfile::NamedTempFile {
