@@ -13,10 +13,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-#[derive(Debug, thiserror::Error)]
-#[error("footprint chamfer readback failed")]
-struct ChamferReadbackFailed;
-
 #[derive(Debug, Clone)]
 struct LibraryFootprint {
     library_id: String,
@@ -333,32 +329,26 @@ pub(crate) async fn handle_update_footprints_from_library(
             let presentation = konnect_ipc::FootprintPresentation::from_items(&plan.prepared_items)?;
             let expected_layers = footprint_layer_states(&plan.prepared_items)?;
             let chamfers = konnect_ipc::FootprintChamfers::from_items(&plan.prepared_items)?;
-            let mutation = client.run_commit("Update footprints from libraries", |client| {
-                client.update_items_in(document.clone(), std::mem::take(&mut plan.prepared_items))?;
-                let observed = client.get_items_in(document.clone(), ObjectType::KotPcbFootprint);
-                let observed = if chamfers.is_empty() {
-                    observed?
-                } else {
-                    observed.context(ChamferReadbackFailed)?
-                };
-                if !chamfers.is_empty() {
-                    chamfers.verify(&observed).context(ChamferReadbackFailed)?;
-                }
-                verify_footprint_layer_readback(&expected_layers, &observed)
-            });
-            if let Err(error) = mutation {
-                if error.downcast_ref::<ChamferReadbackFailed>().is_some()
-                    && error.downcast_ref::<konnect_ipc::client::IpcOutcomeUnknown>().is_none()
-                    && error.downcast_ref::<konnect_ipc::client::IpcBatchRecovered>().is_none()
-                {
-                    return Ok(CallToolResult::error_kind(
-                        crate::mcp::error::ToolErrorKind::HandlerError { reason: format!("{error:#}") },
-                        format!("Footprint library update for '{}' was rolled back after chamfer readback failed: {error:#}. Rerun dry run before retrying.", planning_board_path.display()),
-                    ));
-                }
-                return Err(error);
-            }
-            client.verify_footprint_presentation_in(document, &presentation)?;
+            // KiCad reads the published footprint while the update is staged.
+            // Check the UpdateItems acknowledgement, commit once, then verify the live result.
+            client.run_commit("Update footprints from libraries", |client| {
+                client.update_items_in(document.clone(), std::mem::take(&mut plan.prepared_items))
+            })?;
+            (|| {
+                let observed = client.get_items_in(document, ObjectType::KotPcbFootprint)?;
+                chamfers.verify(&observed).context("footprint chamfer readback")?;
+                verify_footprint_layer_readback(&expected_layers, &observed)?;
+                presentation.verify(&observed).context("footprint presentation readback")
+            })()
+            .map_err(|error: anyhow::Error| {
+                error.context(konnect_ipc::client::IpcOutcomeUnknown {
+                    command: "footprint library update post-commit readback".into(),
+                    reason: format!(
+                        "Footprint library update committed on {}; readback failed, inspect the board before retrying",
+                        planning_board_path.display()
+                    ),
+                })
+            })?;
             plan.coverage.selected.applied = plan.coverage.selected.planned;
             plan.coverage.changed.applied = update_count;
             plan.coverage.unchanged.applied = plan.coverage.unchanged.planned;
@@ -4676,7 +4666,6 @@ mod tests {
         Missing,
         Unreadable,
         Unavailable,
-        RollbackFailure,
         MissingAfterCommit,
         FieldsAfterCommit,
         StyleAfterCommit,
@@ -5266,14 +5255,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_verifies_back_side_chamfer_readback_before_committing() {
+    async fn refresh_verifies_back_side_chamfer_readback_after_committing() {
         for behavior in [
             ChamferReadback::Faithful,
             ChamferReadback::DropCorners,
             ChamferReadback::Missing,
             ChamferReadback::Unreadable,
             ChamferReadback::Unavailable,
-            ChamferReadback::RollbackFailure,
         ] {
             let (temp, board, items) = plan_fixture();
             let source = KICAD_LIBRARY_FOOTPRINT;
@@ -5284,7 +5272,6 @@ mod tests {
                 kiapi::board::types::FootprintInstance::decode(items[2].value.as_slice()).unwrap();
             instance.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
             let item = builders::pack_any(&instance, "kiapi.board.types.FootprintInstance");
-            let original = item.clone();
             let mock = spawn_planner_mock_readback(&board, item, false, behavior);
             let context = test_context(&mock.url);
             let dry_run = handle_update_footprints_from_library(&json!({"board": board}), &context)
@@ -5306,45 +5293,30 @@ mod tests {
                 assert_eq!(observed["status"], "applied", "{observed}");
             } else {
                 assert!(applied.is_error, "{observed}");
-                if matches!(behavior, ChamferReadback::RollbackFailure) {
-                    assert_eq!(
-                        crate::mcp::error::extract_error_kind(&applied).as_deref(),
-                        Some("ipc_outcome_unknown")
-                    );
-                } else {
-                    assert!(
-                        observed["message"]
-                            .as_str()
-                            .unwrap()
-                            .contains("rolled back"),
-                        "{observed}"
-                    );
-                    let client = konnect_ipc::KiCadIpcClient::new(mock.url.clone());
-                    let document = client.find_open_board(&board).unwrap();
-                    let restored = client
-                        .get_items_in(
-                            document,
-                            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
-                        )
-                        .unwrap();
-                    assert_eq!(restored, vec![original]);
-                }
+                assert_eq!(
+                    crate::mcp::error::extract_error_kind(&applied).as_deref(),
+                    Some("ipc_outcome_unknown")
+                );
+                assert_eq!(observed["error"]["retry_safe"], false, "{observed}");
+                assert!(
+                    observed["error"]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("committed"),
+                    "{observed}"
+                );
             }
             let capture = mock.capture.lock().unwrap();
             assert_eq!(capture.update_batches, vec![1]);
             assert_eq!(
                 capture.commit_actions,
-                vec![if matches!(behavior, ChamferReadback::Faithful) {
-                    kiapi::common::commands::CommitAction::CmaCommit
-                } else {
-                    kiapi::common::commands::CommitAction::CmaDrop
-                }]
+                vec![kiapi::common::commands::CommitAction::CmaCommit]
             );
         }
     }
 
     #[tokio::test]
-    async fn library_refresh_readback_failure_drops_the_commit() {
+    async fn library_refresh_readback_drift_preserves_committed_work() {
         for fault in [
             ReadbackFault::WrongLayer,
             ReadbackFault::MissingTextMirror,
@@ -5392,12 +5364,17 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(result_json(&failed)["status"], "conflict");
+            assert!(failed.is_error);
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&failed).as_deref(),
+                Some("ipc_outcome_unknown")
+            );
+            assert_eq!(result_json(&failed)["error"]["retry_safe"], false);
             let capture = mock.capture.lock().unwrap();
             assert_eq!(capture.update_batches, [1]);
             assert_eq!(
                 capture.commit_actions,
-                [kiapi::common::commands::CommitAction::CmaDrop]
+                [kiapi::common::commands::CommitAction::CmaCommit]
             );
         }
     }
@@ -5411,7 +5388,7 @@ mod tests {
         let mock = spawn_planner_mock(
             &board,
             builders::pack_any(&current, "kiapi.board.types.FootprintInstance"),
-            false,
+            true,
         );
         let context = test_context(&mock.url);
         let dry_run =
