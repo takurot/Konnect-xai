@@ -69,16 +69,18 @@ not affect these tools. Response shapes are unchanged (#791).
 
 ## Unreleased: `get_board_extents` names what KiCad will not list, and measures text boxes (minor release)
 
-KiCad 10 will not list tables or generators through `GetItems`; it answers
-`AS_BAD_REQUEST`. The live read used to skip both without a word, so an answer
-read as complete bounds when it was not. It now asks for both on every read and
-adds `unavailable_item_classes`, one entry per class it could not measure:
+KiCad 10.0.5 refuses table and generator listings through `GetItems` with
+`AS_BAD_REQUEST`. On a table-free board, KiCad 10.0.8 can return a successful
+empty table listing while still refusing generators. The live read asks for both
+on every read and adds `unavailable_item_classes`, one entry per class it could not measure:
 
 - `{"class": "tables", "reason": "refused", "kiapi_status": "AS_BAD_REQUEST",
   "message": "…"}` carries KiCad's own answer;
 - `{"class": …, "reason": "undecodable", "listed_count": n}` is for a KiCad that
   does list a class the bundled protocol has no message for, so the items
   cannot be measured.
+
+A successful empty listing has no unavailable entry.
 
 A class that Konnect does measure, if KiCad refuses it the same way, is now
 named there too, and the rest of the read still answers. It used to fail the
