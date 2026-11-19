@@ -4598,6 +4598,129 @@ mod coverage_cli_artifact_lifecycle {
     }
 
     #[tokio::test]
+    async fn named_schematic_svg_reports_each_sheet_and_safely_replaces_an_explicit_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = files_cli(
+            dir.path(),
+            5,
+            &[
+                ("design.svg", "root-svg-output"),
+                ("design-child.svg", "child-svg-output"),
+                ("diagnostic.log", "not an export"),
+            ],
+        );
+        let cli = cli.to_str().unwrap();
+        let source = dir.path().join("design.kicad_sch");
+        let options = SchematicSvgOptions::default();
+        for replace in [false, true] {
+            let folder = dir
+                .path()
+                .join(if replace { "replacement" } else { "first" });
+            std::fs::create_dir(&folder).unwrap();
+            let output = folder.join("custom.svg");
+            let child = folder.join("design-child.svg");
+            if replace {
+                std::fs::write(&output, "previous explicit root").unwrap();
+            }
+
+            let files = export_named_schematic_svg(cli, &source, &output, &options)
+                .await
+                .unwrap();
+            assert_eq!(files, [output.clone(), child.clone()]);
+            assert_eq!(
+                std::fs::read_to_string(&output).unwrap().trim(),
+                "root-svg-output"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&child).unwrap().trim(),
+                "child-svg-output"
+            );
+            assert!(!folder.join("design.svg").exists());
+            assert!(!folder.join("diagnostic.log").exists());
+
+            std::fs::write(&child, "unrelated existing child").unwrap();
+            let error = export_named_schematic_svg(cli, &source, &output, &options)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("already exists"), "{error:#}");
+            assert_eq!(
+                std::fs::read_to_string(output).unwrap().trim(),
+                "root-svg-output"
+            );
+            assert_eq!(
+                std::fs::read_to_string(child).unwrap(),
+                "unrelated existing child"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn named_schematic_svg_refuses_an_obstructed_output_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let obstruction = dir.path().join("not-a-directory");
+        std::fs::write(&obstruction, "keep this file").unwrap();
+        let error = export_named_schematic_svg(
+            "",
+            &dir.path().join("design.kicad_sch"),
+            &obstruction.join("custom.svg"),
+            &SchematicSvgOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("could not inspect root SVG destination"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(obstruction).unwrap(),
+            "keep this file"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_backup_cleanup_keeps_recovery_data_after_export_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("preview.svg");
+        std::fs::write(&destination, "previous export").unwrap();
+        let staging = export_staging_dir(&destination).unwrap();
+        let staged = staging.path().join("preview.svg");
+        std::fs::write(&staged, "verified export").unwrap();
+        let backup = staging.path().join(".konnect-previous-preview.svg");
+        let saved_backup = staging.path().join("relocated-previous.svg");
+        let relocated = saved_backup.clone();
+
+        let error = publish_verified_file_with(
+            staged,
+            destination.clone(),
+            "PCB SVG".into(),
+            staging.clone(),
+            move || std::fs::rename(backup, relocated).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        drop(staging);
+        assert!(matches!(
+            error.downcast_ref::<konnect_sexp::SexpError>(),
+            Some(konnect_sexp::SexpError::MutationOutcomeUncertain { .. })
+        ));
+        assert!(
+            error.to_string().contains("backup cleanup failed"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination).unwrap(),
+            "verified export"
+        );
+        assert_eq!(
+            std::fs::read_to_string(saved_backup).unwrap(),
+            "previous export"
+        );
+    }
+
+    #[tokio::test]
     async fn gerbers_publish_only_this_boards_verified_plots_and_job() {
         let dir = tempfile::tempdir().unwrap();
         let cli = files_cli(

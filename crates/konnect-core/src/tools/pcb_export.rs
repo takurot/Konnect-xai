@@ -1695,6 +1695,92 @@ mod export_boundary_contract_tests {
         )
     }
 
+    fn response_body(result: &CallToolResult) -> serde_json::Value {
+        let wire = serde_json::to_value(result).unwrap();
+        serde_json::from_str(wire["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn default_plot_refuses_a_board_without_enabled_front_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("back-only.kicad_pcb");
+        std::fs::write(&board, r#"(kicad_pcb (layers (31 "B.Cu" signal)))"#).unwrap();
+
+        let error = pcb_plot_layers(&board, &json!({"layers": []}))
+            .await
+            .unwrap_err();
+        let error = response_body(&error);
+        assert_eq!(error["error"]["field"], "board");
+        assert_eq!(error["error"]["reason"], "no front plot layer is enabled");
+    }
+
+    #[tokio::test]
+    async fn kicad_netlist_reads_the_schematic_and_preserves_design_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = cli::test_support::write_script(
+            dir.path(),
+            "schematic-netlist-cli",
+            r#"#!/bin/sh
+[ "$1 $2 $3 $4 $6 $7" = "sch export netlist --output --format kicadsexpr" ] || exit 3
+printf '%s' "$8" > "$5"
+"#,
+            "@echo off\r\nif not \"%~1 %~2 %~3 %~4 %~6 %~7\"==\"sch export netlist --output --format kicadsexpr\" exit /b 3\r\n<nul set /p \"=%~8\">\"%~5\"\r\nexit /b 0\r\n",
+        );
+        let mut ctx = context();
+        ctx.config.kicad_cli = executable.to_string_lossy().into_owned();
+        let schematic = dir.path().join("fixture.kicad_sch");
+        let board = schematic.with_extension("kicad_pcb");
+        let output = schematic.with_extension("net");
+        std::fs::write(&schematic, "(kicad_sch)").unwrap();
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+
+        for input in [&schematic, &board] {
+            let result = handle_export_netlist(
+                &json!({"board":input,"output":output,"format":"kicad"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error);
+            assert_eq!(response_body(&result)["source"], json!(schematic));
+            assert_eq!(
+                std::fs::read_to_string(&output).unwrap(),
+                schematic.to_str().unwrap()
+            );
+        }
+
+        for (input, output, format, field, reason) in [
+            (
+                &board,
+                &schematic,
+                "kicad",
+                "output",
+                "must differ from the design input",
+            ),
+            (&output, &board, "kicad", "board", "use a .kicad_pcb"),
+            (
+                &board.with_file_name("missing.kicad_pcb"),
+                &output,
+                "ipc",
+                "board",
+                "pass a saved PCB",
+            ),
+        ] {
+            let result = handle_export_netlist(
+                &json!({"board":input,"output":output,"format":format}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error);
+            let error = response_body(&result);
+            assert_eq!(error["error"]["field"], field);
+            assert!(error["error"]["reason"].as_str().unwrap().contains(reason));
+        }
+        assert_eq!(std::fs::read_to_string(schematic).unwrap(), "(kicad_sch)");
+        assert_eq!(std::fs::read_to_string(board).unwrap(), "(kicad_pcb)");
+    }
+
     #[tokio::test]
     async fn pcb_netlist_ipc_formats_dispatch_to_native_export() {
         let dir = tempfile::tempdir().unwrap();
