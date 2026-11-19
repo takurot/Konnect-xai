@@ -175,19 +175,39 @@ workflow remains separate because it installs KiCad and is not an ordinary
 per-PR gate. Apply the `run:e2e-kicad` label to run that same workflow for a
 pull request when KiCad-facing behavior needs hosted acceptance evidence.
 
-Before creating a release tag, dispatch `.github/workflows/release.yml` against
-the exact candidate ref. The manual entry point runs the release-profile target
-matrix, all three PCM package builds, and the reusable real-KiCad acceptance
-workflow with a synthetic `0.0.0` package version. Its publication job is
-tag-only, so this pre-tag smoke run cannot create a GitHub release.
+Before creating a release tag, dispatch the Release workflow against the exact
+candidate branch. It runs the five binary builds and launches each built binary,
+validates the three PCM packages with synthetic version `0.0.0`, calls the
+reusable Windows KiCad acceptance workflow, and exercises the native Linux npm
+compatibility matrix. The preparation job verifies and hashes the eight exact
+archives and checks the locally staged npm packages. The binary and npm versions
+come from the workspace even when PCM uses the synthetic version.
 
-On a release tag, `.github/workflows/release.yml` calls
-`.github/workflows/e2e-kicad.yml` as a reusable workflow. The called workflow
-checks out the caller's exact tag commit. The `Create Release` job depends on
-that acceptance job and both artifact-building jobs, so failed real-KiCad
-acceptance leaves the diagnostic build artifacts in the workflow run but cannot
-create a GitHub release or upload a partial release asset set. Weekly and manual
-real-KiCad runs continue to use the standalone workflow entry points.
+```sh
+gh workflow run release.yml --repo takurot/Konnect-xai --ref <candidate-branch>
+gh workflow run release.yml --repo takurot/Konnect-xai --ref <candidate-branch> -f fail_pcm=true
+```
+
+The second invocation deliberately fails the Linux PCM lane before artifact
+upload. Its preparation, attestation, npm publication, and GitHub Release jobs
+must be skipped. A successful dispatch also skips all three tag-only publication
+jobs. Check both run commit IDs before using them as evidence.
+
+A tag's version must match the workspace. The workflow checks the prepared
+assets against `SHA256SUMS`, generates GitHub attestations, and publishes npm
+platform packages before the launcher. GitHub Release publication requires npm
+success. Stable tags use npm `latest`; prereleases use npm `next` and are marked
+as prereleases on GitHub. The workflow uploads all eight archives and
+`SHA256SUMS` to a draft before publishing the GitHub Release. The reusable
+Windows KiCad workflow checks out the caller's exact tag commit.
+
+Publication can still fail between services or midway through npm. Inspect the
+failed run and published versions, then rerun failed jobs with
+`gh run rerun RUN_ID --failed` to reuse the verified build artifacts. The npm
+loop skips an existing version only when its registry integrity matches
+the staged package. A mismatch stops the workflow. Keep any matching packages
+published and continue with the missing packages. Registry metadata integrity is
+separate from tarball readback, which is tracked in #89.
 
 In the PR description, list every command run and explicitly name checks skipped
 because they require KiCad, another operating system, credentials, or release
@@ -221,8 +241,8 @@ The weekly CI dependency checks cover the root workspace and the separate
 viewer lockfile. To reproduce both gates locally:
 
 ```sh
-cargo deny --locked --all-features check advisories licenses
-cargo deny --locked --all-features --manifest-path crates/schematic-viewer/Cargo.toml check advisories licenses
+cargo deny --locked --all-features check advisories licenses bans sources
+cargo deny --locked --all-features --manifest-path crates/schematic-viewer/Cargo.toml check advisories licenses bans sources
 ```
 
 ## Packaging And Release

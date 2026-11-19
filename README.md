@@ -242,6 +242,22 @@ CLI and IPC detection, and restart guidance. A missing build commit or an
 `unknown` installation source means the available evidence was insufficient;
 it is not silently guessed from a directory name.
 
+### Verify a GitHub download
+
+Download `SHA256SUMS` with the archives. From the directory containing all eight
+archives, run `sha256sum -c SHA256SUMS` on Linux or `shasum -a 256 -c SHA256SUMS`
+on macOS to check their digests. GitHub attestation verification also checks the
+archive's signed build provenance.
+
+```sh
+gh attestation verify "./konnect-vVERSION-TARGET.tar.gz" \
+  --repo takurot/Konnect-xai \
+  --signer-workflow takurot/Konnect-xai/.github/workflows/release.yml
+```
+
+Use the downloaded archive's actual filename in the command. These verification
+files and attestations are available for releases built with the hardened workflow.
+
 ### macOS
 
 The [Releases](https://github.com/takurot/Konnect-xai/releases) page ships
