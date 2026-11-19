@@ -138,7 +138,7 @@ fn normalize_polyline(polyline: &mut common::PolyLine) {
 }
 
 impl Presentation {
-    fn of(footprint: &board::FootprintInstance) -> Result<Self> {
+    fn of(footprint: &board::FootprintInstance, expected: Option<&Self>) -> Result<Self> {
         let definition = footprint
             .definition
             .as_ref()
@@ -172,10 +172,22 @@ impl Presentation {
         ] {
             if let Some(field) = primary.as_ref().or(fallback.as_ref()) {
                 check_parent(field.text.as_ref().and_then(|text| text.parent.as_ref()))?;
-                fields.insert(
-                    name.into(),
-                    normalize_footprint_field(field)?.encode_to_vec(),
-                );
+                let normalized = normalize_footprint_field(field)?;
+                // KiCad materializes omitted empty standard fields during CreateItems.
+                // Field.visible governs the field; its nested text can still be visible.
+                if expected.is_some_and(|expected| !expected.fields.contains_key(name))
+                    && matches!(name, "Datasheet" | "Description")
+                    && field.name == name
+                    && !field.visible
+                    && field
+                        .text
+                        .as_ref()
+                        .and_then(|text| text.text.as_ref())
+                        .is_some_and(|text| text.text.is_empty())
+                {
+                    continue;
+                }
+                fields.insert(name.into(), normalized.encode_to_vec());
             }
         }
         let mut strokes = Vec::new();
@@ -271,7 +283,7 @@ impl FootprintPresentation {
             let reference = crate::client::footprint_reference(&footprint).to_string();
             if reference.is_empty()
                 || expected
-                    .insert(reference.clone(), Presentation::of(&footprint)?)
+                    .insert(reference.clone(), Presentation::of(&footprint, None)?)
                     .is_some()
             {
                 bail!("empty or duplicate footprint reference '{reference}' during presentation verification");
@@ -303,7 +315,7 @@ impl FootprintPresentation {
             let footprint = observed.get(reference).with_context(|| {
                 format!("footprint '{reference}' is missing from presentation readback")
             })?;
-            let mut actual = Presentation::of(footprint)?;
+            let mut actual = Presentation::of(footprint, Some(expected))?;
             if expected.kiid.is_none() {
                 actual.kiid = None;
             }
@@ -371,6 +383,60 @@ mod tests {
             value: "target-footprint".into(),
         });
         crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+    }
+
+    #[test]
+    fn presentation_accepts_kicad_hiding_empty_omitted_standard_fields() {
+        let wanted = item();
+        let expected = FootprintPresentation::from_items([&wanted]).unwrap();
+        let mut footprint = board::FootprintInstance::decode(wanted.value.as_slice()).unwrap();
+        for (name, slot) in [
+            ("Datasheet", &mut footprint.datasheet_field),
+            ("Description", &mut footprint.description_field),
+        ] {
+            *slot = Some(board::Field {
+                name: name.into(),
+                text: Some(board::BoardText {
+                    layer: board::BoardLayer::BlFFab as i32,
+                    parent: footprint.id.clone(),
+                    text: Some(common::Text {
+                        attributes: Some(common::TextAttributes {
+                            visible: true,
+                            line_spacing: 1.0,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        let packed = |fp: &board::FootprintInstance| {
+            crate::builders::pack_any(fp, "kiapi.board.types.FootprintInstance")
+        };
+        expected.verify(&[packed(&footprint)]).unwrap();
+
+        let explicitly_present = packed(&footprint);
+        let want_explicit = FootprintPresentation::from_items([&explicitly_present]).unwrap();
+        assert!(want_explicit.verify(&[wanted]).is_err());
+
+        let changes: [fn(&mut board::Field); 3] = [
+            |field| field.visible = true,
+            |field| {
+                field.text.as_mut().unwrap().text.as_mut().unwrap().text = "meaningful".into();
+            },
+            |field| {
+                field.text.as_mut().unwrap().parent = Some(common::Kiid {
+                    value: "unrelated".into(),
+                });
+            },
+        ];
+        for change in changes {
+            let mut differs = footprint.clone();
+            change(differs.description_field.as_mut().unwrap());
+            assert!(expected.verify(&[packed(&differs)]).is_err());
+        }
     }
 
     #[test]

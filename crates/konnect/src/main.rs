@@ -5,7 +5,7 @@ mod run_registry;
 mod transaction_cli;
 mod transport;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use config::Config;
 use konnect_core::config_resolution::ConfigSource;
 use konnect_core::mcp::handler::McpHandler;
@@ -26,7 +26,7 @@ enum Cli<'a> {
     Help(Option<&'a str>),
     Version,
     Subcommand(&'a str),
-    /// Run as an MCP server (or, on a terminal, the double-click install).
+    /// Run the configured MCP transport.
     Server,
 }
 
@@ -105,13 +105,6 @@ async fn main() -> Result<()> {
         Cli::Subcommand(_) | Cli::Server => {}
     }
 
-    // ─── Double-click detection ─────────────────────────────────────
-    // If stdin is a terminal (user double-clicked the .exe), run friendly install.
-    // If stdin is piped (Claude launched us as MCP server), start server.
-    if std::io::stdin().is_terminal() {
-        return install::run_double_click_install();
-    }
-
     // Keep accepting the public `--client` option, but MCP startup is
     // deliberately non-mutating: guidance installation requires `konnect init`.
     let _client = install::client_from_server_args(&args[1..])?;
@@ -120,10 +113,18 @@ async fn main() -> Result<()> {
     let config_path = args
         .iter()
         .position(|a| a == "--config")
-        .and_then(|pos| args.get(pos + 1))
-        .map(std::path::PathBuf::from);
+        .map(|pos| {
+            args.get(pos + 1)
+                .map(std::path::PathBuf::from)
+                .context("--config requires a path")
+        })
+        .transpose()?;
 
     let (config, ipc_source, config_resolution) = Config::load_resolved(config_path.as_deref())?;
+    if matches!(config.transport, config::TransportMode::Stdio) && std::io::stdin().is_terminal() {
+        print_help();
+        return Ok(());
+    }
 
     // ─── Initialize tracing (stderr only — stdout is MCP protocol) ──
     let filter =
@@ -298,7 +299,9 @@ fn print_help() {
     println!("Konnect v{}", env!("CARGO_PKG_VERSION"));
     println!("MCP server for KiCad EDA with embedded guidance.\n");
     println!("USAGE:");
-    println!("  konnect                  Start MCP server (pipe) or install (TTY)");
+    println!(
+        "  konnect                  Start MCP server (stdio uses a pipe, shows help on a terminal)"
+    );
     println!("  konnect [--client <client>] [--config <path>]");
     println!("  konnect init [--client <client>]");
     println!("  konnect uninstall [--client <client>]");
@@ -310,6 +313,8 @@ fn print_help() {
     println!("  konnect transaction abandon <project-dir> <id> --force");
     println!("  konnect --version        Print version");
     println!("  konnect --help           This message");
+    println!("\nHTTP and both transports also start from a terminal when configured.");
+    println!("Only `konnect init` installs guidance.");
     println!("\nCLIENTS:");
     println!("  claude (default)         Skills, agents, and hooks under ~/.claude");
     println!("  codex                    Skills under ~/.agents/skills");

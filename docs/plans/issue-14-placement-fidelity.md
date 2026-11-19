@@ -2,6 +2,21 @@
 
 Issue #14 requires live placement to preserve supported library geometry and refuse unsupported clauses before writing. File placement remains lossless and can accept library clauses that the typed IPC representation cannot carry.
 
+## Current live readback contract
+
+In the current live implementation, KiCad exposes the updated footprint to
+`GetItems` after `EndCommit`. Library refresh checks the published layer and
+mirrored-text state, chamfers, and field presentation against one observation
+of the exact board. A failed observation after publication returns
+`ipc_outcome_unknown` with `board_state: committed` and `retry_safe: false`. A
+rejected update before publication still follows the transaction's rollback
+path. The pre-commit readback and simulated rollback results below describe
+the original implementation.
+
+Rotated library circles preserve the authored radius point during IPC
+placement and refresh. KiCad uses that point when comparing the refreshed
+footprint with its library.
+
 ## Design
 
 The prepared placement owns the original board S-expression and a separate result for its typed IPC representation. An unsupported typed clause cannot prevent the guarded file path when KiCad is unreachable. Once KiCad answers, a typed refusal never permits a file fallback.

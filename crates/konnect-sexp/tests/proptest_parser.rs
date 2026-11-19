@@ -108,6 +108,23 @@ proptest! {
         let _ = parse_sexp(&input);
     }
 
+    /// Additional lists must report the first disallowed opening, independent
+    /// of how many more levels or leading whitespace are in the input.
+    #[test]
+    fn over_limit_list_depth_reports_first_disallowed_opening(
+        extra in 1usize..=16,
+        padding in "[ \t\n]{0,40}",
+    ) {
+        let depth = 256 + extra;
+        let input = format!("{padding}{}value{}", "(".repeat(depth), ")".repeat(depth));
+        let result = parse_sexp(&input);
+        prop_assert!(
+            matches!(result, Err(konnect_sexp::SexpError::Parse { offset, ref message })
+                if offset == padding.len() + 256 && message.contains("256")),
+            "expected a nesting error at the first disallowed opening"
+        );
+    }
+
     /// Every generated well-formed s-expression parses successfully.
     #[test]
     fn generated_sexp_always_parses(text in sexp_text_strategy()) {

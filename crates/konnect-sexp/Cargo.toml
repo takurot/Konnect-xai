@@ -26,5 +26,6 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+csv.workspace = true
 pretty_assertions = "1"
 proptest = "1"

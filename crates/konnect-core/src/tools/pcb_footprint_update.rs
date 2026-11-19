@@ -13,10 +13,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-#[derive(Debug, thiserror::Error)]
-#[error("footprint chamfer readback failed")]
-struct ChamferReadbackFailed;
-
 #[derive(Debug, Clone)]
 struct LibraryFootprint {
     library_id: String,
@@ -333,32 +329,26 @@ pub(crate) async fn handle_update_footprints_from_library(
             let presentation = konnect_ipc::FootprintPresentation::from_items(&plan.prepared_items)?;
             let expected_layers = footprint_layer_states(&plan.prepared_items)?;
             let chamfers = konnect_ipc::FootprintChamfers::from_items(&plan.prepared_items)?;
-            let mutation = client.run_commit("Update footprints from libraries", |client| {
-                client.update_items_in(document.clone(), std::mem::take(&mut plan.prepared_items))?;
-                let observed = client.get_items_in(document.clone(), ObjectType::KotPcbFootprint);
-                let observed = if chamfers.is_empty() {
-                    observed?
-                } else {
-                    observed.context(ChamferReadbackFailed)?
-                };
-                if !chamfers.is_empty() {
-                    chamfers.verify(&observed).context(ChamferReadbackFailed)?;
-                }
-                verify_footprint_layer_readback(&expected_layers, &observed)
-            });
-            if let Err(error) = mutation {
-                if error.downcast_ref::<ChamferReadbackFailed>().is_some()
-                    && error.downcast_ref::<konnect_ipc::client::IpcOutcomeUnknown>().is_none()
-                    && error.downcast_ref::<konnect_ipc::client::IpcBatchRecovered>().is_none()
-                {
-                    return Ok(CallToolResult::error_kind(
-                        crate::mcp::error::ToolErrorKind::HandlerError { reason: format!("{error:#}") },
-                        format!("Footprint library update for '{}' was rolled back after chamfer readback failed: {error:#}. Rerun dry run before retrying.", planning_board_path.display()),
-                    ));
-                }
-                return Err(error);
-            }
-            client.verify_footprint_presentation_in(document, &presentation)?;
+            // KiCad reads the published footprint while the update is staged.
+            // Check the UpdateItems acknowledgement, commit once, then verify the live result.
+            client.run_commit("Update footprints from libraries", |client| {
+                client.update_items_in(document.clone(), std::mem::take(&mut plan.prepared_items))
+            })?;
+            (|| {
+                let observed = client.get_items_in(document, ObjectType::KotPcbFootprint)?;
+                chamfers.verify(&observed).context("footprint chamfer readback")?;
+                verify_footprint_layer_readback(&expected_layers, &observed)?;
+                presentation.verify(&observed).context("footprint presentation readback")
+            })()
+            .map_err(|error: anyhow::Error| {
+                error.context(konnect_ipc::client::IpcOutcomeUnknown {
+                    command: "footprint library update post-commit readback".into(),
+                    reason: format!(
+                        "Footprint library update committed on {}; readback failed, inspect the board before retrying",
+                        planning_board_path.display()
+                    ),
+                })
+            })?;
             plan.coverage.selected.applied = plan.coverage.selected.planned;
             plan.coverage.changed.applied = update_count;
             plan.coverage.unchanged.applied = plan.coverage.unchanged.planned;
@@ -454,41 +444,48 @@ fn append_field_layer_state(
     Ok(())
 }
 
-fn pad_layer_state(mut pad: kiapi::board::types::Pad) -> Result<LayerState> {
-    let stack = pad
-        .pad_stack
-        .as_mut()
-        .context("footprint readback pad has no padstack")?;
-    if let Some(angle) = stack.angle.as_mut() {
-        anyhow::ensure!(
-            angle.value_degrees.is_finite(),
-            "footprint readback pad has invalid rotation"
-        );
-        angle.value_degrees = konnect_sexp::geometry::round6(angle.value_degrees.rem_euclid(360.0));
-        if angle.value_degrees == 0.0 {
-            stack.angle = None;
+fn normalize_pad_geometry(pad: &mut kiapi::board::types::Pad) -> Result<()> {
+    if let Some(stack) = pad.pad_stack.as_mut() {
+        if let Some(angle) = stack.angle.as_mut() {
+            anyhow::ensure!(
+                angle.value_degrees.is_finite(),
+                "footprint readback pad has invalid rotation"
+            );
+            angle.value_degrees =
+                konnect_sexp::geometry::round6(angle.value_degrees.rem_euclid(360.0));
+            if angle.value_degrees == 0.0 {
+                stack.angle = None;
+            }
         }
-    }
-    for layer in &mut stack.copper_layers {
-        anyhow::ensure!(
-            layer.corner_rounding_ratio.is_finite() && layer.chamfer_ratio.is_finite(),
-            "footprint readback pad has an invalid corner ratio"
-        );
-        layer.corner_rounding_ratio += 0.0;
-        layer.chamfer_ratio += 0.0;
-        if layer
-            .offset
-            .as_ref()
-            .is_some_and(|offset| offset.x_nm == 0 && offset.y_nm == 0)
-        {
-            layer.offset = None;
+        for layer in &mut stack.copper_layers {
+            anyhow::ensure!(
+                layer.corner_rounding_ratio.is_finite() && layer.chamfer_ratio.is_finite(),
+                "footprint readback pad has an invalid corner ratio"
+            );
+            layer.corner_rounding_ratio += 0.0;
+            layer.chamfer_ratio += 0.0;
+            if layer
+                .offset
+                .as_ref()
+                .is_some_and(|offset| offset.x_nm == 0 && offset.y_nm == 0)
+            {
+                layer.offset = None;
+            }
         }
+        stack
+            .copper_layers
+            .sort_by_key(prost::Message::encode_to_vec);
     }
-    stack
-        .copper_layers
-        .sort_by_key(prost::Message::encode_to_vec);
     pad.parent = None;
     pad.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
+    Ok(())
+}
+
+fn pad_layer_state(pad: kiapi::board::types::Pad) -> Result<LayerState> {
+    anyhow::ensure!(
+        pad.pad_stack.is_some(),
+        "footprint readback pad has no padstack"
+    );
     let definition = kiapi::board::types::Footprint {
         items: vec![konnect_ipc::builders::pack_any(
             &pad,
@@ -531,17 +528,7 @@ fn footprint_layer_state(
                 item.value.as_slice(),
             )?)?);
         } else if konnect_ipc::builders::any_is(item, "kiapi.board.types.BoardGraphicShape") {
-            let mut graphic =
-                kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())?;
-            graphic.parent = None;
-            if let Some(fill) = graphic
-                .shape
-                .as_mut()
-                .and_then(|shape| shape.attributes.as_mut())
-                .and_then(|attributes| attributes.fill.as_mut())
-            {
-                fill.color = None;
-            }
+            let graphic = kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())?;
             let definition = kiapi::board::types::Footprint {
                 items: vec![konnect_ipc::builders::pack_any(
                     &graphic,
@@ -1740,6 +1727,7 @@ fn normalized_items(
         .map(|item| {
             if suffix == "Pad" {
                 let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
+                normalize_pad_geometry(&mut pad)?;
                 pad.id = None;
                 pad.net = None;
                 pad.pad_to_die_length = None;
@@ -1797,9 +1785,11 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
         .filter_map(|item| {
             if item.type_url.ends_with("BoardGraphicShape") {
                 Some(
-                    kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).map(
-                        |mut shape| {
+                    kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+                        .map_err(anyhow::Error::from)
+                        .map(|mut shape| {
                             shape.id = None;
+                            shape.parent = None;
                             shape.net = None;
                             shape.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
                             if let Some(graphic) = shape.shape.as_mut() {
@@ -1819,26 +1809,29 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                                     }
                                     stroke.color = None;
                                 }
+                                if let Some(fill) = graphic
+                                    .attributes
+                                    .as_mut()
+                                    .and_then(|attributes| attributes.fill.as_mut())
+                                {
+                                    fill.color = None;
+                                }
                                 konnect_ipc::normalize_footprint_graphic_geometry(graphic);
                             }
                             shape.encode_to_vec()
-                        },
-                    ),
+                        }),
                 )
             } else if item.type_url.ends_with("BoardText") {
                 Some(
-                    kiapi::board::types::BoardText::decode(item.value.as_slice()).map(
-                        |mut text| {
-                            text.id = None;
-                            text.encode_to_vec()
-                        },
-                    ),
+                    kiapi::board::types::BoardText::decode(item.value.as_slice())
+                        .map_err(anyhow::Error::from)
+                        .and_then(|text| normalized_layer_text(&text)),
                 )
             } else {
                 None
             }
         })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>>>()?;
     graphics.sort();
     Ok(graphics)
 }
@@ -4059,12 +4052,14 @@ mod tests {
         prepared.attributes.as_mut().unwrap().mounting_style =
             kiapi::board::types::FootprintMountingStyle::FmsUnknown as i32;
 
+        let parent = roundtripped.id.clone();
         for item in &mut roundtripped.definition.as_mut().unwrap().items {
             if item.type_url.ends_with("kiapi.board.types.Pad") {
                 let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
                 pad.id = Some(kiapi::common::types::Kiid {
                     value: format!("kicad-pad-{}", pad.number),
                 });
+                pad.parent = parent.clone();
                 pad.net = Some(kiapi::board::types::Net::default());
                 pad.pad_to_die_length = Some(kiapi::common::types::Distance { value_nm: 0 });
                 pad.symbol_pin = Some(kiapi::board::types::SymbolPinInfo::default());
@@ -4099,6 +4094,7 @@ mod tests {
                 graphic.id = Some(kiapi::common::types::Kiid {
                     value: "kicad-graphic".to_string(),
                 });
+                graphic.parent = parent.clone();
                 graphic.net = Some(kiapi::board::types::Net::default());
                 graphic
                     .shape
@@ -4135,6 +4131,18 @@ mod tests {
                     rectangle.corner_radius = Some(kiapi::common::types::Distance { value_nm: 0 });
                 }
                 *item = builders::pack_any(&graphic, "kiapi.board.types.BoardGraphicShape");
+            } else if builders::any_is(item, "kiapi.board.types.BoardText") {
+                let mut text =
+                    kiapi::board::types::BoardText::decode(item.value.as_slice()).unwrap();
+                text.parent = parent.clone();
+                text.text
+                    .as_mut()
+                    .unwrap()
+                    .attributes
+                    .as_mut()
+                    .unwrap()
+                    .visible = false;
+                *item = builders::pack_any(&text, "kiapi.board.types.BoardText");
             }
         }
 
@@ -4152,6 +4160,23 @@ mod tests {
         assert!(changed_domains(&roundtripped, &prepared)
             .unwrap()
             .is_empty());
+
+        for item in &mut roundtripped.definition.as_mut().unwrap().items {
+            if builders::any_is(item, "kiapi.board.types.Pad") {
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                pad.position.as_mut().unwrap().x_nm += 1;
+                *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+            } else if builders::any_is(item, "kiapi.board.types.BoardText") {
+                let mut text =
+                    kiapi::board::types::BoardText::decode(item.value.as_slice()).unwrap();
+                text.text.as_mut().unwrap().position.as_mut().unwrap().x_nm += 1;
+                *item = builders::pack_any(&text, "kiapi.board.types.BoardText");
+            }
+        }
+        assert_eq!(
+            changed_domains(&roundtripped, &prepared).unwrap(),
+            BTreeSet::from([ChangedDomain::Pads, ChangedDomain::Graphics])
+        );
     }
 
     #[test]
@@ -4676,7 +4701,6 @@ mod tests {
         Missing,
         Unreadable,
         Unavailable,
-        RollbackFailure,
         MissingAfterCommit,
         FieldsAfterCommit,
         StyleAfterCommit,
@@ -4731,8 +4755,8 @@ mod tests {
         let readback_fault = std::sync::Arc::new(std::sync::Mutex::new(ReadbackFault::None));
         let live_readback_fault = readback_fault.clone();
         let thread = std::thread::spawn(move || {
-            let original = footprint.clone();
             let mut footprint = footprint;
+            let mut pending_footprint = None;
             let mut update_applied = false;
             while let Ok(message) = socket.recv() {
                 let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
@@ -4805,11 +4829,7 @@ mod tests {
                             .unwrap();
                         continue;
                     }
-                    let published = captured
-                        .lock()
-                        .unwrap()
-                        .commit_actions
-                        .contains(&kiapi::common::commands::CommitAction::CmaCommit);
+                    let published = update_applied;
                     let mut returned = footprint.clone();
                     if published
                         && matches!(
@@ -4873,12 +4893,7 @@ mod tests {
                             Vec::new()
                         } else {
                             let mut observed = returned;
-                            if update_applied
-                                && matches!(
-                                    fault,
-                                    ReadbackFault::WrongLayer | ReadbackFault::RollbackFailure
-                                )
-                            {
+                            if update_applied && matches!(fault, ReadbackFault::WrongLayer) {
                                 let mut decoded = kiapi::board::types::FootprintInstance::decode(
                                     observed.value.as_slice(),
                                 )
@@ -4968,16 +4983,13 @@ mod tests {
                         .update_batches
                         .push(update.items.len());
                     if !fail_update {
-                        update_applied = true;
-                        footprint = update.items[0].clone();
+                        let mut staged = update.items[0].clone();
                         if matches!(
                             readback,
-                            ChamferReadback::DropCorners
-                                | ChamferReadback::RollbackFailure
-                                | ChamferReadback::Unreadable
+                            ChamferReadback::DropCorners | ChamferReadback::Unreadable
                         ) {
                             let mut instance = kiapi::board::types::FootprintInstance::decode(
-                                footprint.value.as_slice(),
+                                staged.value.as_slice(),
                             )
                             .unwrap();
                             for child in &mut instance.definition.as_mut().unwrap().items {
@@ -5000,11 +5012,12 @@ mod tests {
                                     }
                                 }
                             }
-                            footprint = builders::pack_any(
+                            staged = builders::pack_any(
                                 &instance,
                                 "kiapi.board.types.FootprintInstance",
                             );
                         }
+                        pending_footprint = Some(staged);
                     }
                     let updated_items = update
                         .items
@@ -5041,8 +5054,7 @@ mod tests {
                         if matches!(
                             *live_readback_fault.lock().unwrap(),
                             ReadbackFault::RollbackFailure
-                        ) || matches!(readback, ChamferReadback::RollbackFailure)
-                        {
+                        ) {
                             socket
                                 .send(nng::Message::from(
                                     kiapi::common::ApiResponse {
@@ -5059,8 +5071,11 @@ mod tests {
                                 .unwrap();
                             continue;
                         }
-                        footprint = original.clone();
-                        update_applied = false;
+                        pending_footprint = None;
+                    } else if let Some(staged) = pending_footprint.take() {
+                        // GetItems exposes only the current published footprint.
+                        footprint = staged;
+                        update_applied = true;
                     }
                     api_reply(builders::pack_any(
                         &kiapi::common::commands::EndCommitResponse {},
@@ -5234,7 +5249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_sends_one_batch_in_one_commit() {
+    async fn staged_refresh_publishes_one_commit_and_converges_to_noop() {
         let (_temp, board, items) = plan_fixture();
         let mock = spawn_planner_mock(&board, items[2].clone(), false);
         let context = test_context(&mock.url);
@@ -5261,6 +5276,10 @@ mod tests {
         let applied = result_json(&applied);
         assert_eq!(applied["status"], "applied");
         assert_eq!(applied["coverage"]["changed"]["applied"], 1);
+        let after = handle_update_footprints_from_library(&json!({"board":board}), &context)
+            .await
+            .unwrap();
+        assert_eq!(result_json(&after)["status"], "noop", "{after:?}");
         let capture = mock.capture.lock().unwrap();
         assert_eq!(capture.begin_count, 1);
         assert_eq!(capture.update_batches, vec![1]);
@@ -5271,14 +5290,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_verifies_back_side_chamfer_readback_before_committing() {
+    async fn refresh_verifies_back_side_chamfer_readback_after_committing() {
         for behavior in [
             ChamferReadback::Faithful,
             ChamferReadback::DropCorners,
             ChamferReadback::Missing,
             ChamferReadback::Unreadable,
             ChamferReadback::Unavailable,
-            ChamferReadback::RollbackFailure,
         ] {
             let (temp, board, items) = plan_fixture();
             let source = KICAD_LIBRARY_FOOTPRINT;
@@ -5289,7 +5307,6 @@ mod tests {
                 kiapi::board::types::FootprintInstance::decode(items[2].value.as_slice()).unwrap();
             instance.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
             let item = builders::pack_any(&instance, "kiapi.board.types.FootprintInstance");
-            let original = item.clone();
             let mock = spawn_planner_mock_readback(&board, item, false, behavior);
             let context = test_context(&mock.url);
             let dry_run = handle_update_footprints_from_library(&json!({"board": board}), &context)
@@ -5311,45 +5328,30 @@ mod tests {
                 assert_eq!(observed["status"], "applied", "{observed}");
             } else {
                 assert!(applied.is_error, "{observed}");
-                if matches!(behavior, ChamferReadback::RollbackFailure) {
-                    assert_eq!(
-                        crate::mcp::error::extract_error_kind(&applied).as_deref(),
-                        Some("ipc_outcome_unknown")
-                    );
-                } else {
-                    assert!(
-                        observed["message"]
-                            .as_str()
-                            .unwrap()
-                            .contains("rolled back"),
-                        "{observed}"
-                    );
-                    let client = konnect_ipc::KiCadIpcClient::new(mock.url.clone());
-                    let document = client.find_open_board(&board).unwrap();
-                    let restored = client
-                        .get_items_in(
-                            document,
-                            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
-                        )
-                        .unwrap();
-                    assert_eq!(restored, vec![original]);
-                }
+                assert_eq!(
+                    crate::mcp::error::extract_error_kind(&applied).as_deref(),
+                    Some("ipc_outcome_unknown")
+                );
+                assert_eq!(observed["error"]["retry_safe"], false, "{observed}");
+                assert!(
+                    observed["error"]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("committed"),
+                    "{observed}"
+                );
             }
             let capture = mock.capture.lock().unwrap();
             assert_eq!(capture.update_batches, vec![1]);
             assert_eq!(
                 capture.commit_actions,
-                vec![if matches!(behavior, ChamferReadback::Faithful) {
-                    kiapi::common::commands::CommitAction::CmaCommit
-                } else {
-                    kiapi::common::commands::CommitAction::CmaDrop
-                }]
+                vec![kiapi::common::commands::CommitAction::CmaCommit]
             );
         }
     }
 
     #[tokio::test]
-    async fn library_refresh_readback_failure_drops_the_commit() {
+    async fn library_refresh_readback_drift_preserves_committed_work() {
         for fault in [
             ReadbackFault::WrongLayer,
             ReadbackFault::MissingTextMirror,
@@ -5397,12 +5399,17 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(result_json(&failed)["status"], "conflict");
+            assert!(failed.is_error);
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&failed).as_deref(),
+                Some("ipc_outcome_unknown")
+            );
+            assert_eq!(result_json(&failed)["error"]["retry_safe"], false);
             let capture = mock.capture.lock().unwrap();
             assert_eq!(capture.update_batches, [1]);
             assert_eq!(
                 capture.commit_actions,
-                [kiapi::common::commands::CommitAction::CmaDrop]
+                [kiapi::common::commands::CommitAction::CmaCommit]
             );
         }
     }
@@ -5416,7 +5423,7 @@ mod tests {
         let mock = spawn_planner_mock(
             &board,
             builders::pack_any(&current, "kiapi.board.types.FootprintInstance"),
-            false,
+            true,
         );
         let context = test_context(&mock.url);
         let dry_run =

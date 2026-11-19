@@ -44,6 +44,7 @@ ignore = true
 version = 2
 yanked = "warn"
 ignore = [
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error (unmaintained): viewer's Tauri 2 GTK stack requires it via glib-macros/gtk3-macros; build-time only and no compatible upstream replacement" },
     { id = "RUSTSEC-2026-0441", reason = "pin-utils (unmaintained, no vulnerability): hyper still depends on it and no replacement release exists" },
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml (unmaintained): only via konnect's serde_yaml_ng dev-dependency, which parses repository-owned workflow YAML in tests" },
 ]

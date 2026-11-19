@@ -60,7 +60,7 @@ run_case() {
 }
 ```
 
-`KICAD_CLI`だけではvariantテストに届かないため、CLIのディレクトリを`PATH`にも追加する。デモ不在のconformanceテストやCLI不在のvariantテストには、早期returnでテスト自体が`ok`になる経路がある。**終了コード0や`0 ignored`だけで合格にしない。** 各ログの`SKIP`・`skipping`、対象テスト名、実処理件数も読む。
+`KICAD_CLI`だけではvariantテストに届かないため、CLIのディレクトリを`PATH`にも追加する。デモ不在のconformanceテストには、早期returnでテスト自体が`ok`になる経路がある。C07はCLI未検出時に失敗する。**終了コード0や`0 ignored`だけで合格にしない。** 各ログの`SKIP`・`skipping`、対象テスト名、実処理件数も読む。
 
 ## A. KiCad CLIとMCPの自動評価
 
@@ -74,7 +74,7 @@ run_case() {
 | C04 | 保存互換性：`structural_scan_fixture_reloads_through_real_kicad` | 編集fixtureをKiCadでupgrade・netlist出力。成功し、R1/R3が残ること | 未実施 |
 | C05 | 配線描画：`a_written_default_netclass_still_plots_wires` | Default netclassを更新してSVG化。配線のstrokeとjunction半径が維持され、追加クラスでDefaultが壊れないこと | 未実施 |
 | C06 | デモ互換性：`conformance_test` | KiCad同梱デモを4テストでparse・構造抽出・編集往復・ラベル方向評価。デモが0件でなく、全件parseされ、SKIPがないこと | 未実施 |
-| C07 | variant：`kicad_cli_still_honors_the_variant_clause` | 専用fixtureを実CLIでBOM出力し、variant句の効果をgoldenと照合。CLI探索のskipがないこと | 未実施 |
+| C07 | variant：`kicad_cli_still_honors_the_variant_clause` | Default・Lite・LiteのDNP除外を実CLIで出力。CSVの値とR1だけが除外されることを照合し、値・DNP句を個別に壊したコピーも検出する。DNP欄の表記はKiCadの言語設定に従う | 未実施 |
 | C08 | 応答停止：`wedged_server_times_out_instead_of_hanging` | 応答しない**mock**サーバーに対して25秒以上60秒未満でエラーとなること。実KiCadのハング再現ではない | 未実施 |
 | C09 | PCMパッケージ | CIのAssemble + schema-validate PCM packageを実施し、生成ZIPがvalidatorに受理されること。GUIでのインストール・起動は別途確認する | 未実施 |
 
@@ -135,7 +135,7 @@ run_mcp_live L01 real_kicad_open_documents_resolve_to_comparable_paths
 | ID | 実行方法（上の関数にIDとテスト名を渡す） | 準備・合否基準 | このMac |
 |---|---|---|---|
 | L01 | `run_mcp_live` / `real_kicad_open_documents_resolve_to_comparable_paths` | fixtureコピーを開く。実際のopen-documentが要求したboardへ解決されること | 未実施 |
-| L02 | `run_mcp_live` / `board_extents_live_and_saved_agree_on_an_unedited_board` | 開いたコピーを保存後、未編集で実行。liveのbounds出典がIPC、savedの出典がファイルで、境界が一致すること | 未実施 |
+| L02 | `run_mcp_live` / `board_extents_live_and_saved_agree_on_an_unedited_board` | 開いたコピーを保存後、未編集で実行。liveのbounds出典がIPC、savedの出典がファイル。列挙結果（空、拒否、復号不能）と開示が一致し、savedの範囲がliveに含まれる。測定対象外がなければ境界が一致 | 未実施 |
 | L03 | `run_ipc_live` / `moving_and_rotating_footprint_preserves_child_geometry` | 新しいlive_ipcコピー。既定参照MH1を移動・回転し、子要素の幾何と保存後の内容が保持されること | 未実施 |
 | L04 | `run_ipc_live` / `adding_a_via_actually_creates_it_on_the_board`、別コピーで`adding_a_zone_creates_it_on_the_live_board` | GND/SIG1と外形を持つlive_ipcコピー。実基板のvia／zoneを再取得し、追加内容が確認されること | 未実施 |
 | L05 | `run_ipc_live` / `native_flip_round_trip_preserves_models_and_unrelated_footprint_content` | KiCad 10.0.6以降。F.Cu上にP3を用意し、3Dモデルに非ゼロのY offsetまたはX/Y rotationを設定。`KONNECT_LIVE_KICAD_REFERENCE=P3`を設定。F→B→Fでモデル・無関係な内容が戻ること。前提の詳細はテスト本体参照 | 未実施 |

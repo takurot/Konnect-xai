@@ -1156,8 +1156,8 @@ pub fn tools() -> Vec<ToolDef> {
              so unsaved edits count; 'board_source' selects that. An answer from the \
              saved file names, in 'unmeasured_item_counts', what it could not measure. \
              A live answer names, in 'unavailable_item_classes', each item class KiCad \
-             would not list, with KiCad's answer: KiCad 10 lists neither tables nor \
-             generators.",
+             refused to list or returned items for that Konnect could not decode, \
+             with the refusal or listed count.",
             json!({
                 "type": "object",
                 "properties": {

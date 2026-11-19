@@ -19,14 +19,17 @@ struct McpProcess {
 
 impl McpProcess {
     fn spawn() -> Self {
-        Self::spawn_in_dir(None)
+        Self::spawn_configured(None, false)
     }
 
-    /// Spawn with the process working directory set to `dir`, so
-    /// the config search's first path (`konnect.toml` in cwd) picks up
-    /// a test config file placed there.
-    fn spawn_in_dir(dir: Option<&std::path::Path>) -> Self {
-        Self::spawn_configured(dir, false)
+    fn spawn_with_config(dir: &std::path::Path) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+        command
+            .current_dir(dir)
+            .args(["--config", "konnect.toml"])
+            .env("HOME", dir)
+            .env("APPDATA", dir);
+        Self::spawn_command(command)
     }
 
     /// Spawn with the working directory set to `dir` and, when `isolate_home`,
@@ -61,6 +64,10 @@ impl McpProcess {
                 command.env("APPDATA", dir);
             }
         }
+        Self::spawn_command(command)
+    }
+
+    fn spawn_command(mut command: Command) -> Self {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -213,7 +220,7 @@ fn installation_info_reports_the_serving_process_without_leaking_endpoint_secret
         "ipc_address = \"ipc://diagnostic-test.sock?token=secret#fragment\"\n",
     )
     .unwrap();
-    let mut p = McpProcess::spawn_in_dir(Some(tmp.path()));
+    let mut p = McpProcess::spawn_with_config(tmp.path());
 
     let list = p.request("tools/list", json!({}));
     assert!(list["result"]["tools"]
@@ -448,7 +455,7 @@ fn auto_load_toolsets_config_loads_and_executes_on_miss() {
         "auto_load_toolsets = true\n",
     )
     .unwrap();
-    let mut p = McpProcess::spawn_in_dir(Some(tmp.path()));
+    let mut p = McpProcess::spawn_with_config(tmp.path());
 
     // route_trace is in pcb_routing, not loaded at startup. With auto-load on,
     // the toolset loads, a list_changed notification fires, and the call gets
@@ -495,6 +502,41 @@ fn canonical(path: &std::path::Path) -> String {
         .into_owned()
 }
 
+fn startup_config_under(home: &std::path::Path) -> std::path::PathBuf {
+    let root = if cfg!(target_os = "windows") {
+        home.to_path_buf()
+    } else if cfg!(target_os = "macos") {
+        home.join("Library/Application Support")
+    } else {
+        home.join(".config")
+    };
+    let parent = root.join("konnect");
+    std::fs::create_dir_all(&parent).unwrap();
+    parent.join("config.toml")
+}
+
+fn pcm_command(root: &std::path::Path) -> (Command, std::path::PathBuf) {
+    let source_binary = std::path::Path::new(env!("CARGO_BIN_EXE_konnect"));
+    let binary_name = source_binary.file_name().unwrap().to_str().unwrap();
+    let plugin = root.join("pcm/plugins");
+    let bin = plugin.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let target = bin.join(binary_name);
+    std::fs::hard_link(source_binary, &target)
+        .or_else(|_| std::fs::copy(source_binary, &target).map(|_| ()))
+        .unwrap();
+    let mut manifest: Value =
+        serde_json::from_str(include_str!("../../../plugin/plugin.json")).unwrap();
+    manifest["actions"][0]["entrypoint"] = json!(format!("bin/{binary_name}"));
+    std::fs::write(plugin.join("plugin.json"), manifest.to_string()).unwrap();
+    let mut command = Command::new(target);
+    command
+        .current_dir(root)
+        .env("HOME", root)
+        .env("APPDATA", root);
+    (command, plugin.join("settings.json"))
+}
+
 fn configuration_block(p: &mut McpProcess) -> Value {
     let result = p.call_tool("get_installation_info", json!({}));
     assert_ne!(result["isError"], json!(true), "{result:#?}");
@@ -504,7 +546,7 @@ fn configuration_block(p: &mut McpProcess) -> Value {
 #[test]
 fn installation_info_names_the_config_file_that_configured_startup() {
     let tmp = tempfile::tempdir().unwrap();
-    let selected = tmp.path().join("konnect.toml");
+    let selected = startup_config_under(tmp.path());
     std::fs::write(&selected, "log_level = \"debug\"\n").unwrap();
 
     let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
@@ -518,16 +560,18 @@ fn installation_info_names_the_config_file_that_configured_startup() {
 
 #[test]
 fn installation_info_reports_a_shadowed_later_candidate() {
-    // konnect.toml precedes settings.json, so the second exists but is not read.
-    // Naming it is the whole point: "my settings.json is ignored" was
-    // indistinguishable from "my settings.json is malformed" (#419).
+    // The native PCM server reads its own settings before the platform file.
     let tmp = tempfile::tempdir().unwrap();
-    let selected = tmp.path().join("konnect.toml");
-    let shadowed = tmp.path().join("settings.json");
-    std::fs::write(&selected, "log_level = \"debug\"\n").unwrap();
-    std::fs::write(&shadowed, "{\"log_level\": \"trace\"}").unwrap();
+    let (command, selected) = pcm_command(tmp.path());
+    let shadowed = startup_config_under(tmp.path());
+    std::fs::write(
+        &selected,
+        r#"{"log_level":"debug","native_specctra_bridge":false}"#,
+    )
+    .unwrap();
+    std::fs::write(&shadowed, "log_level = \"trace\"\n").unwrap();
 
-    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let mut p = McpProcess::spawn_command(command);
     let configuration = configuration_block(&mut p);
 
     assert_eq!(configuration["source"], "search_path");
@@ -541,21 +585,19 @@ fn installation_info_reports_a_shadowed_later_candidate() {
 
 #[test]
 fn installation_info_reports_startup_state_not_a_fresh_search() {
-    // Start with only settings.json, then create the higher-priority
-    // konnect.toml while the server runs. The answer must not change: the
-    // question is what configured this process, not what would configure a new
-    // one.
+    // Start with the platform file, then create the higher-priority PCM
+    // settings file. The answer still describes the running server.
     let tmp = tempfile::tempdir().unwrap();
-    let selected = tmp.path().join("settings.json");
-    std::fs::write(&selected, "{\"log_level\": \"debug\"}").unwrap();
+    let (command, pcm_settings) = pcm_command(tmp.path());
+    let selected = startup_config_under(tmp.path());
+    std::fs::write(&selected, "log_level = \"debug\"\n").unwrap();
 
-    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let mut p = McpProcess::spawn_command(command);
     assert_eq!(
         configuration_block(&mut p)["selected_path"],
         canonical(&selected)
     );
-
-    std::fs::write(tmp.path().join("konnect.toml"), "log_level = \"trace\"\n").unwrap();
+    std::fs::write(pcm_settings, r#"{"log_level":"trace"}"#).unwrap();
 
     let after = configuration_block(&mut p);
     assert_eq!(
@@ -585,7 +627,7 @@ fn env_fallback_applies_without_disturbing_reported_provenance() {
     // applied after file resolution (#39), and provenance must still name the
     // file that was selected -- the env var configures a value, not a source.
     let tmp = tempfile::tempdir().unwrap();
-    let selected = tmp.path().join("konnect.toml");
+    let selected = startup_config_under(tmp.path());
     std::fs::write(&selected, "ipc_address = \"\"\n").unwrap();
 
     let mut p = McpProcess::spawn_with_env(
@@ -611,11 +653,17 @@ fn env_fallback_applies_without_disturbing_reported_provenance() {
 /// Used for the cases where startup must FAIL: the MCP harness above expects a
 /// handshake, and there deliberately is not one.
 fn run_expecting_startup_failure(dir: &std::path::Path, args: &[&str]) -> (bool, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_konnect"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+    command
         .args(args)
         .current_dir(dir)
         .env("HOME", dir)
-        .env("APPDATA", dir)
+        .env("APPDATA", dir);
+    run_startup_command(command)
+}
+
+fn run_startup_command(mut command: Command) -> (bool, String) {
+    let output = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -629,19 +677,12 @@ fn run_expecting_startup_failure(dir: &std::path::Path, args: &[&str]) -> (bool,
 
 #[test]
 fn a_malformed_selected_file_stops_startup_instead_of_falling_through() {
-    // konnect.toml is selected and is broken; settings.json is valid and later.
-    // Falling through would silently run on a configuration the user never
-    // pointed at, while their real file went unreported — the failure #419 is
-    // about, in its worst form.
+    // A selected PCM file is malformed. The later platform file must not hide it.
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("konnect.toml"), "not = valid toml [[[").unwrap();
-    std::fs::write(
-        tmp.path().join("settings.json"),
-        "{\"log_level\":\"trace\"}",
-    )
-    .unwrap();
-
-    let (ok, stderr) = run_expecting_startup_failure(tmp.path(), &[]);
+    let (command, pcm_settings) = pcm_command(tmp.path());
+    std::fs::write(pcm_settings, "[").unwrap();
+    std::fs::write(startup_config_under(tmp.path()), "log_level = \"trace\"\n").unwrap();
+    let (ok, stderr) = run_startup_command(command);
 
     assert!(!ok, "a malformed selected file must not start the server");
     assert!(
@@ -652,15 +693,11 @@ fn a_malformed_selected_file_stops_startup_instead_of_falling_through() {
 
 #[test]
 fn a_malformed_explicit_config_stops_startup_instead_of_falling_back() {
-    // --config bypasses discovery, so a valid settings.json sitting next to it
-    // must not rescue a broken explicit file either.
+    // --config bypasses discovery, so a valid platform config must not
+    // rescue a broken explicit file either.
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("bad.toml"), "not = valid toml [[[").unwrap();
-    std::fs::write(
-        tmp.path().join("settings.json"),
-        "{\"log_level\":\"trace\"}",
-    )
-    .unwrap();
+    std::fs::write(startup_config_under(tmp.path()), "log_level = \"trace\"\n").unwrap();
 
     let (ok, stderr) = run_expecting_startup_failure(tmp.path(), &["--config", "bad.toml"]);
 

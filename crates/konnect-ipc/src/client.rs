@@ -4950,12 +4950,10 @@ fn build_graphic_child(
             width,
             filled,
         } => {
-            let (cx, cy) = xf(*center);
-            // The radius is rotation-invariant; keep KiCAD's center +
-            // circumference-point encoding by re-deriving it from the length.
-            let radius = ((end.0 - center.0).powi(2) + (end.1 - center.1).powi(2)).sqrt();
+            // KiCad stores a circumference point. Keep its authored direction so
+            // inverse placement rotation does not round a different local radius.
             builders::pack_any(
-                &builders::board_circle(layer, *width, cx, cy, radius, *filled)?,
+                &builders::board_circle_through(layer, *width, xf(*center), xf(*end), *filled)?,
                 SHAPE,
             )
         }
@@ -6591,11 +6589,9 @@ mod footprint_graphics_tests {
         // Center (1,0) at 90° around (10,10): (10, 9).
         assert_eq!(c.center.unwrap().x_nm, 10_000_000);
         assert_eq!(c.center.unwrap().y_nm, 9_000_000);
-        // Radius 0.5 mm regardless of rotation.
-        assert_eq!(
-            c.radius_point.unwrap().x_nm - c.center.unwrap().x_nm,
-            500_000
-        );
+        // The authored +X radius rotates onto -Y and remains 0.5 mm long.
+        assert_eq!(c.radius_point.unwrap().x_nm, 10_000_000);
+        assert_eq!(c.radius_point.unwrap().y_nm, 8_500_000);
     }
 
     /// #117 guard for the pad path: the same PST_NORMAL rule that broke
@@ -8013,6 +8009,12 @@ mod helper_tests {
         let (decoded, _) = graphic_style(&item);
         let points = geometry_points(decoded.shape.unwrap().geometry.as_ref().unwrap());
         let (center, rim) = (points[0], points[1]);
+        assert_eq!(center, (798_636, -601_815));
+        assert_eq!(
+            rim,
+            (2_002_266, 995_456),
+            "a circle retains its authored circumference point through placement"
+        );
         let radius = (((rim.0 - center.0).pow(2) + (rim.1 - center.1).pow(2)) as f64).sqrt();
         assert!(
             (radius - 2_000_000.0).abs() < 2.0,

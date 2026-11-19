@@ -355,6 +355,24 @@ async fn a_measured_class_kicad_refuses_is_named_not_dropped() {
     assert_eq!(body["sources"], json!({ "bounds": "ipc" }));
 }
 
+/// KiCad 10.0.8 can list tables successfully on an empty table inventory,
+/// while still refusing generators. Report only the unavailable class.
+#[tokio::test]
+async fn a_successfully_listed_empty_class_is_not_reported_as_unavailable() {
+    let answers = vec![
+        (Kind::KotPcbTable, ClassAnswer::ListUnknown(0)),
+        (Kind::KotPcbGenerator, ClassAnswer::Refuse),
+    ];
+    let scene =
+        Scene::build(move |board| Some(spawn_kicad(board, LIVE_ITEMS.to_vec(), answers))).await;
+    let body = scene.body(Some("live")).await;
+    assert_eq!(
+        body["unavailable_item_classes"],
+        json!([refused("generators")])
+    );
+    assert_close(extent(&body), (190.0, 140.0, 230.0, 170.0));
+}
+
 /// A KiCad that does list tables lists a type the bundled protocol cannot read,
 /// so their KIIDs cannot be measured. They are counted rather than dropped.
 #[tokio::test]

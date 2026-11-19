@@ -9,8 +9,9 @@ use nom::{
     bytes::complete::{escaped, take_while1},
     character::complete::{char, multispace0, none_of},
     combinator::{map, recognize},
+    error::{Error, ErrorKind},
     multi::many0,
-    sequence::{delimited, preceded},
+    sequence::preceded,
     IResult, Parser,
 };
 
@@ -85,52 +86,71 @@ impl SexpNode {
 
 // ─── Parser ───────────────────────────────────────────────────────────────────
 
+/// Maximum number of nested lists in a parsed KiCad expression, including its root list.
+pub const MAX_LIST_DEPTH: usize = 256;
+
 /// Parse a full KiCAD S-expression document into a `SexpNode::List`.
 pub fn parse_sexp(input: &str) -> Result<SexpNode, SexpError> {
-    match sexp(input) {
-        Ok(("", node)) => Ok(node),
-        Ok((rest, node)) => {
-            // Some remaining input is acceptable (e.g. trailing whitespace)
-            if rest.trim().is_empty() {
-                Ok(node)
-            } else {
-                // Multiple top-level nodes — wrap in implicit List
-                let rest_str = format!("{}{}", " ", rest.trim());
-                let mut nodes = vec![node];
-                let mut remaining = rest_str.as_str();
-                while !remaining.trim().is_empty() {
-                    match sexp(remaining.trim()) {
-                        Ok((r, n)) => {
-                            nodes.push(n);
-                            remaining = r;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                Ok(SexpNode::List(nodes))
+    let (rest, node) = sexp(input, 0).map_err(|error| parse_error(input, error))?;
+    let mut remaining = rest.trim_start();
+    if remaining.is_empty() {
+        return Ok(node);
+    }
+
+    // Multiple top-level nodes are wrapped in an implicit list.
+    let mut nodes = vec![node];
+    while !remaining.is_empty() {
+        match sexp(remaining, 0) {
+            Ok((rest, node)) => {
+                nodes.push(node);
+                remaining = rest.trim_start();
             }
+            // A nesting limit error must not be swallowed as a trailing fragment.
+            Err(error @ nom::Err::Failure(_)) => return Err(parse_error(input, error)),
+            Err(_) => break,
         }
-        Err(e) => Err(SexpError::Parse {
+    }
+    Ok(SexpNode::List(nodes))
+}
+
+fn parse_error(input: &str, error: nom::Err<Error<&str>>) -> SexpError {
+    match error {
+        nom::Err::Failure(Error {
+            input: remaining,
+            code: ErrorKind::TooLarge,
+        }) => SexpError::Parse {
+            offset: input.len() - remaining.len(),
+            message: format!("S-expression nesting exceeds the limit of {MAX_LIST_DEPTH} lists"),
+        },
+        error => SexpError::Parse {
             offset: 0,
-            message: format!("{}", e),
-        }),
+            message: format!("{error}"),
+        },
     }
 }
 
-fn sexp(input: &str) -> IResult<&str, SexpNode> {
+fn sexp(input: &str, depth: usize) -> IResult<&str, SexpNode> {
     preceded(
         multispace0,
-        alt((parse_list, parse_quoted_string, parse_atom)),
+        alt((
+            |input| parse_list(input, depth),
+            parse_quoted_string,
+            parse_atom,
+        )),
     )
     .parse(input)
 }
 
-fn parse_list(input: &str) -> IResult<&str, SexpNode> {
-    map(
-        delimited(char('('), many0(sexp), preceded(multispace0, char(')'))),
-        SexpNode::List,
-    )
-    .parse(input)
+fn parse_list(input: &str, depth: usize) -> IResult<&str, SexpNode> {
+    let (remaining, _) = char('(').parse(input)?;
+    if depth >= MAX_LIST_DEPTH {
+        // Failure prevents nom from treating an over-deep list as the end of
+        // the parent's children or backtracking to a scalar parser.
+        return Err(nom::Err::Failure(Error::new(input, ErrorKind::TooLarge)));
+    }
+    let (remaining, children) = many0(|input| sexp(input, depth + 1)).parse(remaining)?;
+    let (remaining, _) = preceded(multispace0, char(')')).parse(remaining)?;
+    Ok((remaining, SexpNode::List(children)))
 }
 
 fn parse_quoted_string(input: &str) -> IResult<&str, SexpNode> {
@@ -198,6 +218,37 @@ fn unescape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nesting_limit_accepts_deepest_list_and_rejects_next_opening() {
+        let prefix = " \n";
+        let allowed = format!("{prefix}{}atom{}", "(".repeat(256), ")".repeat(256));
+        assert!(parse_sexp(&allowed).is_ok());
+        let too_deep = format!("{prefix}{}atom{}", "(".repeat(257), ")".repeat(257));
+        let error = parse_sexp(&too_deep).unwrap_err();
+        assert!(matches!(error, SexpError::Parse { offset, ref message }
+            if offset == prefix.len() + 256 && message.contains("256")));
+    }
+
+    #[test]
+    fn nesting_limit_carries_byte_offset_across_top_level_forms() {
+        let prefix = "(label \"日本語\")  \n  ";
+        let too_deep = format!("{prefix}{}atom{} \n  ", "(".repeat(257), ")".repeat(257));
+        let error = parse_sexp(&too_deep).unwrap_err();
+        assert!(matches!(error, SexpError::Parse { offset, ref message }
+            if offset == prefix.len() + 256 && message.contains("256")));
+    }
+
+    #[test]
+    fn nesting_limit_ignores_parentheses_in_quoted_values() {
+        let value = "(())".repeat(257);
+        let input = format!("(label \"{value}\")");
+        let parsed = parse_sexp(&input).unwrap();
+        assert_eq!(
+            parsed.get(1).and_then(SexpNode::as_str),
+            Some(value.as_str())
+        );
+    }
 
     #[test]
     fn atom() {

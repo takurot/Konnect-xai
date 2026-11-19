@@ -135,6 +135,13 @@ package name, for example `"args": ["-y", "@konnect-xai/konnect", "--config", "/
 Do not install with `--omit=optional` or `--no-optional`: the binary lives in
 the optional platform package. KiCad itself is still installed separately.
 
+Linux x64 and arm64 packages from v0.15.0 target glibc 2.35 or newer, with
+Ubuntu 22.04 and Debian 12 checked before publication. Alpine and other musl
+systems are unsupported by these binaries. The older v0.13.1 and v0.14.0
+Linux x64 binaries require glibc 2.43. The Linux x64 PCM viewer also needs
+the distribution's GTK 3 and WebKitGTK 4.1 runtimes
+(`libgtk-3-0`, `libwebkit2gtk-4.1-0` on Ubuntu 22.04).
+
 ### From the KiCAD Plugin Manager (recommended)
 
 1. Download the package for your OS from [Releases](https://github.com/mixelpixx/Konnect/releases):
@@ -194,9 +201,12 @@ konnect status --client codex
 konnect uninstall --client codex
 ```
 
-MCP server startup never installs or restores guidance. Run `konnect init`
-explicitly when you want those files installed; after `konnect uninstall`,
-starting the server leaves them removed.
+MCP server startup never installs or restores guidance. With the default stdio
+transport, starting from a terminal displays help. Configured HTTP and both
+transports can start from a terminal with `konnect --config /path/to/config.toml`.
+Run `konnect init` to install guidance. Claude hooks assume the MCP server is
+registered as `konnect` and use the installed binary's path. Use a stable local
+binary for Claude hook installation because an npx cache can be removed.
 
 Guidance written by an older `konnect init` is not updated by upgrading the
 binary. `konnect status` compares every installed skill, agent, and hook with
@@ -378,9 +388,8 @@ See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for socket setup, tools
 that don't appear after `load_toolset`, and transaction recovery.
 
 **"kicad-cli not found"** — common install paths are auto-detected; set the path
-explicitly in the plugin settings dialog, in a `settings.json` beside the binary,
-or in a `konnect.toml` in the working directory. (A file under any other name
-works only when passed with `--config`.)
+explicitly in the plugin settings dialog or in a file passed with
+`--config /path/to/config.toml`. See the [server configuration search order](docs/KICAD_INTEGRATION.md#configuration).
 
 ## Support
 

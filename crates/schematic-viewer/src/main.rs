@@ -108,8 +108,7 @@ fn compute_watch_dirs(entries: &[SheetEntry]) -> HashSet<PathBuf> {
 /// wastes a full parallel re-render *and* can eat the debounce window right
 /// before a genuine save, silently dropping the real change.
 fn is_relevant_sch_change(path: &Path) -> bool {
-    let is_sch = path.extension().map(|e| e == "kicad_sch").unwrap_or(false);
-    if !is_sch {
+    if !is_schematic_path(path) {
         return false;
     }
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -449,16 +448,29 @@ struct SheetsUpdated {
     active_file: String,
 }
 
+fn is_schematic_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("kicad_sch"))
+}
+
+fn open_schematic_path(path: &str) -> Result<PathBuf, String> {
+    let root = PathBuf::from(path);
+    if !is_schematic_path(&root) {
+        return Err("Expected a .kicad_sch file".into());
+    }
+    if !root.is_file() {
+        return Err(format!("Schematic file not found: {}", path));
+    }
+    Ok(root)
+}
+
 #[tauri::command]
 fn open_schematic(
     app: AppHandle,
     state: tauri::State<'_, ViewerState>,
     path: String,
 ) -> Result<OpenResult, String> {
-    let root = PathBuf::from(&path);
-    if !root.exists() {
-        return Err(format!("File not found: {}", path));
-    }
+    let root = open_schematic_path(&path)?;
 
     let cli = state.kicad_cli.lock().unwrap().clone();
     let sheets = walk_sheet_tree(&root);
@@ -908,6 +920,46 @@ mod tests {
         let mut sch = Schematic::load(parent).unwrap();
         sch.add_sheet(Sheet::new(name, file, 50.0, 50.0, 80.0, 50.0));
         sch.overwrite().unwrap();
+    }
+
+    #[test]
+    fn viewer_requires_local_scripts_and_image_only_svg_rendering() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let csp = config["app"]["security"]["csp"]
+            .as_str()
+            .expect("viewer CSP");
+        assert!(csp
+            .split(';')
+            .any(|rule| rule.trim() == "default-src 'none'"));
+        assert!(csp
+            .split(';')
+            .any(|rule| rule.trim() == "script-src 'self'"));
+        assert!(csp.split(';').any(|rule| rule.trim() == "img-src data:"));
+        assert!(csp
+            .split(';')
+            .any(|rule| rule.trim() == "connect-src ipc: http://ipc.localhost"));
+        let html = include_str!("../frontend/index.html");
+        assert!(html.contains("<script src=\"main.js\" defer></script>"));
+        assert!(!html.contains(" onclick=") && !html.contains(" onchange="));
+        assert!(html.contains("<img id=\"schematic-image\""));
+        assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn open_schematic_rejects_non_schematic_paths() {
+        let tmp = TempDir::new().unwrap();
+        let text_file = tmp.path().join("notes.txt");
+        std::fs::write(&text_file, "not a schematic").unwrap();
+        assert!(open_schematic_path(text_file.to_str().unwrap()).is_err());
+        let directory = tmp.path().join("directory.kicad_sch");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(open_schematic_path(directory.to_str().unwrap()).is_err());
+        let schematic = blank_schematic(tmp.path(), "ROOT.KICAD_SCH");
+        assert_eq!(
+            open_schematic_path(schematic.to_str().unwrap()),
+            Ok(schematic)
+        );
     }
 
     #[test]

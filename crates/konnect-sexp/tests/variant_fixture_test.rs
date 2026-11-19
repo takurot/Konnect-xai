@@ -5,7 +5,9 @@
 //! re-runs the adjudication against a live kicad-cli.
 
 use konnect_sexp::parse_sexp;
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -71,42 +73,133 @@ fn goldens_pin_the_adjudicated_facts() {
     );
 }
 
-/// Live re-adjudication: kicad-cli must still honor the hand-authored clause.
-/// Skips silently when kicad-cli is absent (conformance-oracle pattern).
+/// One row's value and DNP display column. The latter is localized by KiCad.
+type Bom = BTreeMap<String, (String, String)>;
+
+fn read_bom(path: &Path) -> Bom {
+    let mut reader = csv::Reader::from_path(path).unwrap();
+    assert_eq!(
+        reader.headers().unwrap().iter().collect::<Vec<_>>(),
+        ["Reference", "Value", "DNP"],
+        "unexpected BOM columns in {path:?}"
+    );
+    let mut bom = Bom::new();
+    for row in reader.records() {
+        let row = row.unwrap_or_else(|error| panic!("invalid BOM row in {path:?}: {error}"));
+        let previous = bom.insert(row[0].to_owned(), (row[1].to_owned(), row[2].to_owned()));
+        assert!(
+            previous.is_none(),
+            "duplicate reference in {path:?}: {row:?}"
+        );
+    }
+    bom
+}
+
+fn export_bom(cli: &str, schematic: &Path, label: &str, options: &[&str]) -> Bom {
+    let output_path = schematic.with_file_name(format!("{label}.csv"));
+    let output = Command::new(cli)
+        .args(["sch", "export", "bom"])
+        .args(options)
+        .args([
+            "--fields",
+            "Reference,Value,${DNP}",
+            "--labels",
+            "Reference,Value,DNP",
+            "--output",
+        ])
+        .arg(&output_path)
+        .arg(schematic)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "kicad-cli refused {label}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bom = read_bom(&output_path);
+    println!("kicad-cli wrote {label} BOM with {} references", bom.len());
+    bom
+}
+
+fn verify_variant_bom(default: &Bom, lite: &Bom, excluded: &Bom) -> Result<(), &'static str> {
+    if !default
+        .get("R1")
+        .is_some_and(|(value, dnp)| value == "1.5K" && dnp.is_empty())
+    {
+        return Err("default R1 lost its base value or fitted state");
+    }
+    let Some((value, dnp)) = lite.get("R1") else {
+        return Err("Lite R1 is missing from the unfiltered BOM");
+    };
+    if value != "22k" {
+        return Err("Lite R1 value override was not applied");
+    }
+    if excluded.contains_key("R1") {
+        return Err("Lite --exclude-dnp did not remove R1");
+    }
+    if dnp.is_empty() {
+        return Err("Lite R1 is not marked DNP");
+    }
+    // R1 is the only overridden part; make a no-op filter or a filter that
+    // drops all rows fail independently of the translated DNP indicator.
+    let mut expected_fitted = default.clone();
+    expected_fitted.remove("R1");
+    if expected_fitted.is_empty() || *excluded != expected_fitted {
+        return Err("Lite --exclude-dnp changed unrelated BOM rows");
+    }
+    Ok(())
+}
+
+/// Live re-adjudication with KiCad's own unfiltered and population-filtered
+/// BOM exports. An explicitly requested live test must execute the CLI.
 #[test]
 #[ignore = "requires an installed kicad-cli; run via e2e-kicad or locally"]
 fn kicad_cli_still_honors_the_variant_clause() {
     let cli = ["C:/KiCad/10.0/bin/kicad-cli.exe", "kicad-cli"]
-        .iter()
-        .find(|c| {
-            std::process::Command::new(c)
+        .into_iter()
+        .find(|candidate| {
+            Command::new(candidate)
                 .arg("--version")
                 .output()
-                .is_ok()
+                .is_ok_and(|result| result.status.success())
         })
-        .copied();
-    let Some(cli) = cli else {
-        eprintln!("kicad-cli not found; skipping");
-        return;
-    };
+        .expect("kicad-cli is required for the requested variant acceptance test");
 
     let dir = tempfile::tempdir().unwrap();
     for name in ["ecc83-pp.kicad_sch", "ecc83-pp.kicad_pro"] {
         std::fs::copy(fixture(name), dir.path().join(name)).unwrap();
     }
-    let out = dir.path().join("bom.csv");
-    let status = std::process::Command::new(cli)
-        .args(["sch", "export", "bom", "--variant", "Lite", "--fields"])
-        .arg("Reference,Value,${DNP}")
-        .arg("--output")
-        .arg(&out)
-        .arg(dir.path().join("ecc83-pp.kicad_sch"))
-        .status()
-        .unwrap();
-    assert!(status.success(), "kicad-cli refused the fixture");
-    let bom = std::fs::read_to_string(&out).unwrap();
-    assert!(
-        bom.contains("\"R1\",\"22k\",\"DNP\""),
-        "variant overrides no longer honored: {bom}"
+    let schematic = dir.path().join("ecc83-pp.kicad_sch");
+    let default = export_bom(cli, &schematic, "default", &[]);
+    let lite = export_bom(cli, &schematic, "lite", &["--variant", "Lite"]);
+    let filtered = ["--variant", "Lite", "--exclude-dnp"];
+    let excluded = export_bom(cli, &schematic, "lite-exclude-dnp", &filtered);
+    verify_variant_bom(&default, &lite, &excluded).unwrap_or_else(|error| {
+        panic!("{error}: default={default:?}, Lite={lite:?}, filtered={excluded:?}")
+    });
+
+    // Change one override at a time on the disposable copy and use real CLI
+    // output to prove that each regression would fail for the expected reason.
+    let source = schematic_source();
+    let value_clause = r#"(field (name "Value") (value "22k"))"#;
+    assert_eq!(source.matches(value_clause).count(), 1);
+    std::fs::write(
+        &schematic,
+        source.replace(value_clause, r#"(field (name "Value") (value "12k"))"#),
+    )
+    .unwrap();
+    let wrong_value = export_bom(cli, &schematic, "lite-wrong-value", &["--variant", "Lite"]);
+    assert_eq!(
+        verify_variant_bom(&default, &wrong_value, &excluded),
+        Err("Lite R1 value override was not applied")
+    );
+
+    let population_clause = "(dnp yes)";
+    assert_eq!(source.matches(population_clause).count(), 1);
+    std::fs::write(&schematic, source.replace(population_clause, "(dnp no)")).unwrap();
+    let wrong_population = export_bom(cli, &schematic, "lite-wrong-population", &filtered);
+    assert_eq!(
+        verify_variant_bom(&default, &lite, &wrong_population),
+        Err("Lite --exclude-dnp did not remove R1")
     );
 }

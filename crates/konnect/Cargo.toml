@@ -22,7 +22,7 @@ konnect-sexp.workspace = true
 konnect-ipc.workspace = true
 
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
 tokio.workspace = true
 tokio-stream.workspace = true
 axum.workspace = true
@@ -40,3 +40,6 @@ fs4.workspace = true
 prost.workspace = true
 serde_yaml_ng = "0.10"
 tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

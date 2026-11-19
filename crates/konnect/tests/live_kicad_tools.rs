@@ -678,22 +678,17 @@ fn footprint_library_update_apply_then_dry_run_is_noop() {
         json!({
             "board": board,
             "severity": "info",
-            "tests": ["lib_footprint_mismatch"],
             "limit": 100
         }),
     );
     let drc: Value = serde_json::from_str(drc["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(drc["truncated"], false, "{drc}");
     assert!(
         drc["violations"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|violation| {
-                !violation["description"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("doesn't match the copy in the library")
-            }),
+            .all(|violation| violation["rule"] != "lib_footprint_mismatch"),
         "{drc}"
     );
 }
@@ -777,16 +772,16 @@ fn board_extents_live_and_saved_agree_on_an_unedited_board() {
     let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
     let ipc = KiCadIpcClient::new(&socket);
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
+    let document = loop {
         match ipc.find_open_board(&board) {
-            Ok(_) => break,
+            Ok(document) => break document,
             Err(error)
                 if error.to_string().contains("AS_NOT_READY")
                     && std::time::Instant::now() < deadline => {}
             Err(error) => panic!("KiCad did not open the board: {error:#}"),
         }
         std::thread::sleep(Duration::from_millis(250));
-    }
+    };
 
     let mut mcp = McpProcess::spawn(&socket);
     mcp.tool("load_toolset", json!({"name": "pcb_board"}));
@@ -809,20 +804,50 @@ fn board_extents_live_and_saved_agree_on_an_unedited_board() {
         "KiCad measured nothing: {live}"
     );
     assert_eq!(saved["skipped_item_count"], 0, "{saved}");
-    // KiCad 10 will not list tables or generators. The live answer names both
-    // with KiCad's own refusal instead of reading as complete (#688).
+    // Ask the same exact open document directly. A successful empty listing,
+    // a refusal, and a nonempty listing without a bundled decoder carry
+    // different evidence, even within the same KiCad minor version.
+    use kiapi::common::types::KiCadObjectType as Kind;
     let unavailable = live["unavailable_item_classes"]
         .as_array()
-        .expect("the live answer names what KiCad would not list");
-    for class in ["tables", "generators"] {
-        let named = unavailable
-            .iter()
-            .find(|entry| entry["class"] == class)
-            .unwrap_or_else(|| panic!("{class} is not named: {live}"));
-        assert_eq!(named["reason"], "refused", "{live}");
-        assert_eq!(named["kiapi_status"], "AS_BAD_REQUEST", "{live}");
+        .expect("the live answer reports classes it could not measure");
+    for (class, kind) in [
+        ("tables", Kind::KotPcbTable),
+        ("generators", Kind::KotPcbGenerator),
+    ] {
+        let expected = match ipc.get_items_in(document.clone(), kind) {
+            Ok(items) if items.is_empty() => None,
+            Ok(items) => Some(json!({
+                "class": class, "reason": "undecodable", "listed_count": items.len()
+            })),
+            Err(error) => {
+                let status = konnect_ipc::ApiStatusError::from_error(&error)
+                    .unwrap_or_else(|| panic!("unable to probe {class} listing: {error:#}"));
+                assert_eq!(
+                    status.code,
+                    kiapi::common::ApiStatusCode::AsBadRequest as i32,
+                    "unexpected failure probing {class}: {error:#}"
+                );
+                Some(json!({
+                    "class": class, "reason": "refused", "kiapi_status": "AS_BAD_REQUEST",
+                    "message": status.message
+                }))
+            }
+        };
+        let mut named = unavailable.iter().filter(|entry| entry["class"] == class);
+        assert_eq!(named.next(), expected.as_ref(), "{class}: {live}");
+        assert!(named.next().is_none(), "duplicate {class} evidence: {live}");
     }
     assert_eq!(saved["unavailable_item_classes"], json!([]), "{saved}");
+    let unmeasured = saved["unmeasured_item_counts"]
+        .as_object()
+        .expect("the saved answer reports unmeasured item counts");
+    let saved_source = std::fs::read_to_string(&board).unwrap();
+    let saved_board = parse_sexp(&saved_source).unwrap();
+    let text_count = saved_board.find_all("gr_text").len();
+    if text_count > 0 {
+        assert_eq!(unmeasured["text"], json!(text_count), "{saved}");
+    }
 
     let coordinate = |body: &Value, key: &str| body[key].as_f64().unwrap();
     let tolerance = 1e-4;
@@ -830,7 +855,7 @@ fn board_extents_live_and_saved_agree_on_an_unedited_board() {
     assert!(coordinate(&saved, "y_min") >= coordinate(&live, "y_min") - tolerance);
     assert!(coordinate(&saved, "x_max") <= coordinate(&live, "x_max") + tolerance);
     assert!(coordinate(&saved, "y_max") <= coordinate(&live, "y_max") + tolerance);
-    if saved["unmeasured_item_counts"] == json!({}) {
+    if unmeasured.is_empty() {
         for key in ["x_min", "y_min", "x_max", "y_max"] {
             let off = (coordinate(&saved, key) - coordinate(&live, key)).abs();
             assert!(

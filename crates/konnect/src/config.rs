@@ -2,7 +2,7 @@ use crate::transport::http_policy::BearerToken;
 use anyhow::Result;
 use konnect_core::config_resolution::ConfigResolution;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,7 +181,7 @@ impl Config {
     /// `get_installation_info` can say what configured the process instead of
     /// leaving the user to guess (#419).
     ///
-    /// Behaviour is unchanged: the first existing candidate wins, a malformed
+    /// The first existing trusted candidate wins, and a malformed
     /// selected file is an error rather than permission to fall through to a
     /// later one, no candidates means defaults, and the environment fallback is
     /// applied after file or default resolution.
@@ -277,22 +277,17 @@ impl Default for Config {
 /// The configuration search list, in precedence order. Only the first existing
 /// entry is loaded; the rest are shadowed, never merged.
 fn default_config_paths() -> Vec<PathBuf> {
-    let mut config_paths = vec![
-        PathBuf::from("konnect.toml"),
-        PathBuf::from("settings.json"),
-    ];
-    config_paths.extend(exe_relative_settings_paths());
-    config_paths.push(dirs_config_path());
-    config_paths
+    let pcm = std::env::current_exe()
+        .ok()
+        .and_then(|exe| pcm_settings_path(&exe));
+    pcm.into_iter().chain(dirs_config_path()).collect()
 }
 
 /// Pick the first existing candidate, and report the later ones that exist and
 /// are therefore shadowed by it.
 ///
 /// Split out from `Config::load` so precedence is testable against a supplied
-/// list: the real list depends on the process working directory and
-/// `current_exe()`, neither of which a test can change without affecting the
-/// whole process.
+/// list: the real list depends on the executable and the platform config directory.
 fn select_config_candidate(candidates: &[PathBuf]) -> (Option<PathBuf>, Vec<PathBuf>) {
     let mut selected: Option<PathBuf> = None;
     let mut skipped = Vec::new();
@@ -311,44 +306,39 @@ fn select_config_candidate(candidates: &[PathBuf]) -> (Option<PathBuf>, Vec<Path
     (selected, skipped)
 }
 
-/// settings.json next to the binary, and one dir up (covers <plugin_dir>/bin/konnect).
-fn exe_relative_settings_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            paths.push(exe_dir.join("settings.json"));
-            if let Some(parent_dir) = exe_dir.parent() {
-                paths.push(parent_dir.join("settings.json"));
-            }
-        }
+/// KiCad's native PCM action invokes the executable without flags. Match
+/// the packaged layout and manifest beside the real executable.
+fn pcm_settings_path(exe: &Path) -> Option<PathBuf> {
+    let exe = exe.canonicalize().ok()?;
+    let bin = exe.parent()?;
+    if bin.file_name()? != "bin" {
+        return None;
     }
-    paths
+    let plugin = bin.parent()?;
+    let manifest = std::fs::read_to_string(plugin.join("plugin.json")).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).ok()?;
+    let entrypoint = format!("bin/{}", exe.file_name()?.to_str()?);
+    (manifest["identifier"] == "com.github.mixelpixx.konnect"
+        && manifest["runtime"]["type"] == "exec"
+        && manifest["actions"].as_array()?.iter().any(|action| {
+            action["identifier"] == "start-server" && action["entrypoint"] == entrypoint
+        }))
+    .then(|| plugin.join("settings.json"))
 }
 
-fn dirs_config_path() -> PathBuf {
-    // Platform-specific config directory
+fn dirs_config_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
-    {
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        PathBuf::from(appdata).join("konnect").join("config.toml")
-    }
+    let path = PathBuf::from(std::env::var_os("APPDATA")?);
     #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("konnect")
-            .join("config.toml")
-    }
+    let path = PathBuf::from(std::env::var_os("HOME")?)
+        .join("Library")
+        .join("Application Support");
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home)
-            .join(".config")
-            .join("konnect")
-            .join("config.toml")
-    }
+    let path = PathBuf::from(std::env::var_os("HOME")?).join(".config");
+
+    // Missing or relative platform roots must never introduce a cwd candidate.
+    path.is_absolute()
+        .then(|| path.join("konnect").join("config.toml"))
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -357,6 +347,41 @@ fn dirs_config_path() -> PathBuf {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn generic_bin_install_cannot_discover_parent_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path();
+        let exe = parent.join("bin/konnect");
+        std::fs::create_dir_all(parent.join("bin")).unwrap();
+        std::fs::write(&exe, "").unwrap();
+        std::fs::write(parent.join("settings.json"), "{}").unwrap();
+        assert!(pcm_settings_path(&exe).is_none());
+
+        std::fs::write(parent.join("plugin.json"), r#"{"identifier":"other.plugin","runtime":{"type":"exec"},"actions":[{"identifier":"start-server","entrypoint":"bin/konnect"}]}"#).unwrap();
+        assert!(pcm_settings_path(&exe).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_symlink_does_not_trust_settings_beside_the_link() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("konnect");
+        std::fs::write(&original, "").unwrap();
+
+        let plugin = directory.path().join("pcm");
+        std::fs::create_dir_all(plugin.join("bin")).unwrap();
+        std::fs::write(
+            plugin.join("plugin.json"),
+            include_str!("../../../plugin/plugin.json"),
+        )
+        .unwrap();
+        std::fs::write(plugin.join("settings.json"), r#"{"log_level":"info"}"#).unwrap();
+        let link = plugin.join("bin/konnect.exe");
+        std::os::unix::fs::symlink(original, &link).unwrap();
+
+        assert!(pcm_settings_path(&link).is_none());
+    }
 
     fn write_temp(ext: &str, content: &str) -> tempfile::NamedTempFile {
         let mut f = tempfile::Builder::new()

@@ -179,20 +179,16 @@ which later files were shadowed.
 So a value present only in a lower-priority file has no effect while a
 higher-priority file exists.
 
-1. `konnect.toml` in the working directory;
-2. `settings.json` in the working directory;
-3. `settings.json` beside the executable;
-4. `settings.json` one directory above the executable;
-5. the platform configuration directory.
+1. `settings.json` at the root of a recognized KiCad PCM plugin layout. The
+   executable's resolved location must be in `bin/` and match the native
+   server action in `plugin.json`.
+2. `konnect/config.toml` under the platform configuration directory
+   (`~/Library/Application Support` on macOS, `~/.config` on Linux,
+   `%APPDATA%` on Windows). A relative or unavailable platform root is skipped.
 
-Two consequences worth stating outright, because both have been reported as
-missing functionality:
-
-- In the standard plugin layout a `settings.json` exists beside the binary, so
-  the platform configuration directory is never reached and any `config.toml`
-  there is inert.
-- A stray `konnect.toml` or `settings.json` in a working directory takes over the
-  entire configuration for that run.
+Konnect ignores configuration files in the project working directory during
+automatic discovery. Pass `--config <path>` to select a project configuration
+you trust. The KiCad Python ActionPlugin supplies its settings explicitly.
 
 Call **`get_installation_info`** to see which file configured the running
 process: its `configuration` block reports `source`
@@ -231,3 +227,25 @@ separate executable IPC integration that is the forward path. The standalone vie
 The PCM assembly scripts in `packaging/build-pcm.ps1` and `build-pcm.sh` stage
 only metadata, plugin files, icons, and binaries. Repository developer
 documentation under `docs/` is intentionally not part of the install zip.
+
+### Schematic Viewer acceptance
+
+The viewer passes each `kicad-cli` export to the browser image decoder and
+displays the result as an SVG image. The app CSP permits local scripts and
+styles, SVG data images, and Tauri IPC endpoints. Startup and drop requests require a
+schematic file with the `.kicad_sch` extension.
+
+On Windows, macOS, and Linux, launch a packaged viewer with a disposable copy
+of a hierarchical KiCad project. Check that the root sheet renders, a child
+sheet can be selected, and a saved change to the child updates the displayed
+image. Switch the theme, pan and zoom, use **Fit** and **Refresh**, and confirm
+**Open in KiCAD** opens the project. Record the KiCad and viewer versions with
+the result on each OS.
+
+To verify that SVG load handlers stay inert, use a debug build of the viewer.
+In its developer console, pass an SVG with a green rectangle and an `onload`
+handler that changes the rectangle to red to `setSvg`. The displayed rectangle
+must stay green in the light theme. Inspect `#schematic-image` and confirm that
+it is an HTML image and that the sheet's SVG elements are absent from the
+viewer document. The Rust viewer tests also validate the static CSP and reject
+non-schematic startup paths.
