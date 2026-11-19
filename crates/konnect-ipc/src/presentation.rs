@@ -374,6 +374,60 @@ mod tests {
     }
 
     #[test]
+    fn presentation_accepts_kicad_hiding_empty_omitted_standard_fields() {
+        let wanted = item();
+        let expected = FootprintPresentation::from_items([&wanted]).unwrap();
+        let mut footprint = board::FootprintInstance::decode(wanted.value.as_slice()).unwrap();
+        for (name, slot) in [
+            ("Datasheet", &mut footprint.datasheet_field),
+            ("Description", &mut footprint.description_field),
+        ] {
+            *slot = Some(board::Field {
+                name: name.into(),
+                text: Some(board::BoardText {
+                    layer: board::BoardLayer::BlFFab as i32,
+                    parent: footprint.id.clone(),
+                    text: Some(common::Text {
+                        attributes: Some(common::TextAttributes {
+                            visible: true,
+                            line_spacing: 1.0,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        let packed = |fp: &board::FootprintInstance| {
+            crate::builders::pack_any(fp, "kiapi.board.types.FootprintInstance")
+        };
+        expected.verify(&[packed(&footprint)]).unwrap();
+
+        let explicitly_present = packed(&footprint);
+        let want_explicit = FootprintPresentation::from_items([&explicitly_present]).unwrap();
+        assert!(want_explicit.verify(&[wanted]).is_err());
+
+        let changes: [fn(&mut board::Field); 3] = [
+            |field| field.visible = true,
+            |field| {
+                field.text.as_mut().unwrap().text.as_mut().unwrap().text = "meaningful".into();
+            },
+            |field| {
+                field.text.as_mut().unwrap().parent = Some(common::Kiid {
+                    value: "unrelated".into(),
+                });
+            },
+        ];
+        for change in changes {
+            let mut differs = footprint.clone();
+            change(differs.description_field.as_mut().unwrap());
+            assert!(expected.verify(&[packed(&differs)]).is_err());
+        }
+    }
+
+    #[test]
     fn presentation_checks_custom_effects_visibility_and_layer() {
         let wanted = item();
         let expected = FootprintPresentation::from_items([&wanted]).unwrap();

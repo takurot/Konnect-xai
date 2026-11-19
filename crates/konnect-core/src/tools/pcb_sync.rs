@@ -6775,6 +6775,7 @@ mod tests {
             let begins = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let begins_for_mock = begins.clone();
             let published = std::sync::atomic::AtomicBool::new(false);
+            let pending_items = std::sync::Mutex::new(Vec::new());
 
             let (temp, board) = project_with_stock_footprints();
             let schematic = temp.path().join("carrier.kicad_sch");
@@ -6959,7 +6960,7 @@ mod tests {
                                 "kiapi.board.types.FootprintInstance",
                             );
                         }
-                        board_items
+                        pending_items
                             .lock()
                             .unwrap()
                             .extend(request.items.iter().cloned());
@@ -7012,8 +7013,12 @@ mod tests {
                             kiapi::common::commands::EndCommit::decode(command.value.as_slice())
                                 .unwrap();
                         if request.action == kiapi::common::commands::CommitAction::CmaDrop as i32 {
-                            board_items.lock().unwrap().clear();
+                            pending_items.lock().unwrap().clear();
                         } else {
+                            board_items
+                                .lock()
+                                .unwrap()
+                                .append(&mut pending_items.lock().unwrap());
                             published.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
                         return Some(konnect_ipc::builders::pack_any(
