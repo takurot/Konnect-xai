@@ -314,6 +314,20 @@ fn release_jobs_require_native_linux_compatibility_smoke() {
         smoke["strategy"]["matrix"]["os"],
         serde_json::json!(["ubuntu-22.04", "ubuntu-22.04-arm"])
     );
+    requires(&release, "linux-compatibility", "validate-version");
+    let execution = smoke["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["name"] == "Install candidate packages and initialize MCP")
+        .unwrap();
+    assert_eq!(
+        execution["env"]["VERSION"],
+        "${{ needs.validate-version.outputs.version }}"
+    );
+    let script = execution["run"].as_str().unwrap();
+    assert!(script.contains(r#"npm/scripts/stage.js "$VERSION" artifacts"#));
+    assert!(script.contains(r#"' bash "$VERSION""#));
 }
 
 #[test]

@@ -93,7 +93,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-
       # rustup selects the checked-in toolchain. Cross targets must be
       # installed on that toolchain rather than on a second compiler.
       - name: Add matrix target to the pinned toolchain
@@ -333,14 +332,10 @@ jobs:
       - name: Install candidate packages and initialize MCP
         env:
           LINUX_IMAGE: ${{ matrix.image }}
+          VERSION: ${{ needs.validate-version.outputs.version }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            version=$(node npm/scripts/version.js)
-          else
-            version=$(node npm/scripts/version.js "${RELEASE_VERSION#v}")
-          fi
-          node npm/scripts/stage.js "$version" artifacts
+          node npm/scripts/stage.js "$VERSION" artifacts
           node_prefix=$(dirname "$(dirname "$(command -v node)")")
           docker run --rm -v "$PWD:/work:ro" -v "$node_prefix:/opt/node:ro" -w /work \
             "$LINUX_IMAGE" bash -euc '
