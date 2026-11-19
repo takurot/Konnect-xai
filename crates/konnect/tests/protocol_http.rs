@@ -308,6 +308,12 @@ fn protocol_errors_return_json_rpc_over_http() {
             200,
         ),
         (
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"list_toolboxes","arguments":null}}"#,
+            json!(11),
+            -32602,
+            200,
+        ),
+        (
             r#"[{"jsonrpc":"2.0","id":9,"method":"ping"}]"#,
             Value::Null,
             -32600,

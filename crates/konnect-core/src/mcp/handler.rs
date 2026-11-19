@@ -253,11 +253,8 @@ impl McpHandler {
                 let params = params.filter(|value| value.is_object()).ok_or_else(|| {
                     JsonRpcError::new(INVALID_PARAMS, "tools/call params must be an object")
                 })?;
-                let params: CallToolParams = serde_json::from_value(params.clone())
-                    .map_err(|error| JsonRpcError::new(INVALID_PARAMS, error.to_string()))?;
                 if params
-                    .arguments
-                    .as_ref()
+                    .get("arguments")
                     .is_some_and(|arguments| !arguments.is_object())
                 {
                     return Err(JsonRpcError::new(
@@ -266,6 +263,8 @@ impl McpHandler {
                     ));
                 }
 
+                let params: CallToolParams = serde_json::from_value(params.clone())
+                    .map_err(|error| JsonRpcError::new(INVALID_PARAMS, error.to_string()))?;
                 let call_result = self.execute_tool(&params).await;
                 serde_json::to_value(call_result).map_err(serialization_error)
             }

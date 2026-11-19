@@ -327,6 +327,11 @@ fn protocol_request_errors_have_standard_codes() {
             json!({"name": "list_toolboxes", "arguments": []}),
             -32602,
         ),
+        (
+            "tools/call",
+            json!({"name": "list_toolboxes", "arguments": null}),
+            -32602,
+        ),
         ("tools/call", json!([]), -32602),
     ] {
         let response = p.request(method, params);
