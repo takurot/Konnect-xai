@@ -202,7 +202,7 @@ def _run_server():
             _clear_pid_file(pid)
 
 
-def start_server():
+def start_server(parent=None):
     """Start the MCP server in a background thread."""
     global _server_thread
 
@@ -212,6 +212,7 @@ def start_server():
             "Please reinstall the plugin.",
             "Konnect",
             wx.OK | wx.ICON_ERROR,
+            parent=parent,
         )
         return False
 
@@ -242,6 +243,21 @@ def is_server_running():
 
 # ─── KiCAD Action Plugin entry point ─────────────────────────────────────────
 
+def _pcb_editor_window():
+    """Choose the focused PCB frame, or the only recognizable PCB frame."""
+    windows = [
+        window for window in wx.GetTopLevelWindows()
+        if "pcb editor" in window.GetTitle().casefold()
+        or window.GetName().casefold().startswith("pcbnew")
+    ]
+    focus = wx.Window.FindFocus()
+    if focus is not None:
+        active = wx.GetTopLevelParent(focus)
+        if active in windows:
+            return active
+    return windows[0] if len(windows) == 1 else None
+
+
 class KonnectPlugin(pcbnew.ActionPlugin):
     def defaults(self):
         self.name = "Konnect"
@@ -255,8 +271,7 @@ class KonnectPlugin(pcbnew.ActionPlugin):
 
     def Run(self):
         """Open the settings dialog. Server start/stop is handled via dialog buttons."""
-        # Get the KiCAD main window as parent for the dialog
-        parent = wx.GetTopLevelWindows()[0] if wx.GetTopLevelWindows() else None
+        parent = _pcb_editor_window()
 
         dlg = KonnectSettingsDialog(
             parent=parent,
@@ -271,7 +286,7 @@ class KonnectPlugin(pcbnew.ActionPlugin):
 
         if result == wx.ID_YES:
             # User clicked "Start Server"
-            start_server()
+            start_server(parent=dlg)
         elif result == wx.ID_NO:
             # User clicked "Stop Server"
             stop_server()

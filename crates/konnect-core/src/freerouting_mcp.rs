@@ -29,6 +29,15 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SES_BYTES: u64 = 512 * 1024 * 1024;
 
+pub(crate) fn java_command(jar: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("java");
+    command.arg("-Djava.awt.headless=true");
+    #[cfg(target_os = "macos")]
+    command.arg("-Dapple.awt.UIElement=true");
+    command.arg("-jar").arg(jar);
+    command
+}
+
 fn server_arguments() -> &'static [&'static str] {
     &[
         "--api_server.enabled=true",
@@ -470,10 +479,8 @@ impl LocalMcpClient {
     }
 
     fn spawn(jar: &Path) -> Result<Self> {
-        let mut command = Command::new("java");
+        let mut command = Command::from(java_command(jar));
         command
-            .arg("-jar")
-            .arg(jar)
             .args(server_arguments())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -833,6 +840,25 @@ mod tests {
         assert_eq!(first.parent(), output.parent());
         assert_ne!(first, second);
         assert!(extension_is(&first, "ses"));
+    }
+
+    #[test]
+    fn java_startup_options_precede_the_freerouting_jar() {
+        let command = java_command(Path::new("fixture.jar"));
+        let arguments: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        #[cfg(target_os = "macos")]
+        let expected = [
+            "-Djava.awt.headless=true",
+            "-Dapple.awt.UIElement=true",
+            "-jar",
+            "fixture.jar",
+        ];
+        #[cfg(not(target_os = "macos"))]
+        let expected = ["-Djava.awt.headless=true", "-jar", "fixture.jar"];
+        assert_eq!(arguments, expected);
     }
 
     #[test]
