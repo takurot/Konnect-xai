@@ -34,7 +34,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "output":    { "type": "string", "description": "Output SVG file path (directory used as output dir)" },
+                    "output":    { "type": "string", "description": "Root sheet .svg file path. Child sheets use KiCad's names in the same directory; existing child paths are refused." },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false },
                     "theme": { "type": "string", "description": "KiCad colour theme name (optional)" }
                 },
@@ -225,18 +225,13 @@ async fn handle_export_svg(
         theme: args["theme"].as_str(),
     };
 
-    // kicad-cli writes to an output directory and names the file <stem>.svg
-    let output_dir = output_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .to_path_buf();
-    std::fs::create_dir_all(&output_dir)?;
-
-    let svg_path =
-        cli::export_schematic_svg(&ctx.config.kicad_cli, &sch_path, &output_dir, &options).await?;
+    let files =
+        cli::export_named_schematic_svg(&ctx.config.kicad_cli, &sch_path, &output_path, &options)
+            .await?;
 
     Ok(CallToolResult::json(&json!({
-        "exported": svg_path.display().to_string(),
+        "exported": output_path,
+        "files": files,
         "black_and_white": options.black_and_white,
         "theme": options.theme
     })))

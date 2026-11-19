@@ -1442,27 +1442,128 @@ pub async fn export_schematic_svg(
     options: &SchematicSvgOptions<'_>,
 ) -> Result<PathBuf> {
     let staging = export_staging_dir(output_dir)?;
+    let (root, files) = stage_schematic_svg(cli, schematic, options, &staging).await?;
+    publish_verified_files(&files, output_dir, "schematic SVG", &staging).await?;
+    Ok(output_dir.join(root.file_name().context("root SVG has no file name")?))
+}
+
+async fn stage_schematic_svg(
+    cli: &str,
+    schematic: &Path,
+    options: &SchematicSvgOptions<'_>,
+    staging: &ExportStaging,
+) -> Result<(PathBuf, Vec<PathBuf>)> {
     let args = schematic_svg_args(
         staging.path().to_str().unwrap(),
         schematic.to_str().unwrap(),
         options,
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    let stem = schematic.file_stem().unwrap_or_default().to_string_lossy();
-    let staged_root = staging.path().join(format!("{}.svg", stem));
+    let stem = schematic
+        .file_stem()
+        .context("schematic has no file stem")?;
+    let mut name = stem.to_os_string();
+    name.push(".svg");
+    let root = staging.path().join(name);
+    verify_nonempty_file(&root, "schematic SVG").await?;
 
-    let mut staged_files = Vec::new();
+    let mut files = Vec::new();
     let mut entries = tokio::fs::read_dir(staging.path()).await?;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) == Some("svg") {
-            staged_files.push(path);
+        if path.extension().is_some_and(|extension| extension == "svg") {
+            files.push(path);
         }
     }
-    staged_files.sort();
-    verify_nonempty_file(&staged_root, "schematic SVG").await?;
-    publish_verified_files(&staged_files, output_dir, "schematic SVG", &staging).await?;
-    Ok(output_dir.join(format!("{}.svg", stem)))
+    files.sort();
+    Ok((root, files))
+}
+
+/// Export to an exact root path. KiCad chooses child basenames, so implicit
+/// child paths may be created but never replace an existing directory entry.
+pub(crate) async fn export_named_schematic_svg(
+    cli: &str,
+    schematic: &Path,
+    output: &Path,
+    options: &SchematicSvgOptions<'_>,
+) -> Result<Vec<PathBuf>> {
+    anyhow::ensure!(
+        output
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("svg")),
+        "schematic SVG output must have a .svg extension"
+    );
+    let root_name = output
+        .file_name()
+        .context("root SVG output has no file name")?;
+    let staging = export_staging_dir(output)?;
+    let (root, staged) = stage_schematic_svg(cli, schematic, options, &staging).await?;
+
+    let children = staged
+        .iter()
+        .filter(|path| **path != root)
+        .map(|path| {
+            let name = path.file_name().expect("staged child has a basename");
+            (path, output.with_file_name(name))
+        })
+        .collect::<Vec<_>>();
+
+    for (source, destination) in &children {
+        verify_nonempty_file(source, "schematic SVG").await?;
+        anyhow::ensure!(
+            !destination
+                .file_name()
+                .unwrap()
+                .eq_ignore_ascii_case(root_name),
+            "schematic SVG root output {} conflicts with a child sheet",
+            output.display()
+        );
+        match tokio::fs::symlink_metadata(destination).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error).context("could not inspect child SVG destination"),
+            Ok(_) => anyhow::bail!(
+                "child SVG output {} already exists; choose a directory without conflicting child names",
+                destination.display()
+            ),
+        }
+    }
+    let root_exists = match tokio::fs::symlink_metadata(output).await {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_file(),
+                "root SVG destination must be a regular file"
+            );
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("could not inspect root SVG destination"),
+    };
+
+    let mut outputs = vec![output.to_path_buf()];
+    for (source, destination) in children {
+        konnect_sexp::rename_noreplace(source, &destination).with_context(|| {
+            format!(
+                "failed to publish child SVG {} (child SVGs already published: {:?})",
+                destination.display(),
+                &outputs[1..]
+            )
+        })?;
+        outputs.push(destination);
+    }
+    let result = if root_exists {
+        publish_verified_file(&root, output, "schematic SVG", &staging)
+            .await
+            .map(|_| ())
+    } else {
+        konnect_sexp::rename_noreplace(&root, output).map_err(anyhow::Error::from)
+    };
+    result.with_context(|| {
+        format!(
+            "root SVG publication failed (child SVGs already published: {:?})",
+            &outputs[1..]
+        )
+    })?;
+    Ok(outputs)
 }
 
 #[derive(Debug, Clone)]
@@ -1836,23 +1937,7 @@ pub async fn export_pdf(
     layers: &[&str],
     black_and_white: bool,
 ) -> Result<()> {
-    let staging = export_staging_dir(output)?;
-    let staged = staging.path().join(
-        output
-            .file_name()
-            .context("PCB PDF output has no file name")?,
-    );
-    let args = single_file_pcb_export_args(
-        "pdf",
-        staged.to_str().unwrap(),
-        layers,
-        black_and_white,
-        pcb.to_str().unwrap(),
-    );
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_cli(cli, &args, LONG_TIMEOUT).await?;
-    publish_verified_file(&staged, output, "PCB PDF", &staging).await?;
-    Ok(())
+    export_single_pcb_plot(cli, "pdf", pcb, output, layers, black_and_white).await
 }
 
 /// KiCAD 10: `pcb export svg --output <path> --mode-single [--layers <a,b>]
@@ -1864,15 +1949,42 @@ pub async fn export_svg_pcb(
     layers: &[&str],
     black_and_white: bool,
 ) -> Result<()> {
+    export_single_pcb_plot(cli, "svg", pcb, output, layers, black_and_white).await
+}
+
+async fn export_single_pcb_plot(
+    cli: &str,
+    format: &str,
+    pcb: &Path,
+    output: &Path,
+    layers: &[&str],
+    black_and_white: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        !output
+            .canonicalize()
+            .ok()
+            .zip(pcb.canonicalize().ok())
+            .is_some_and(|(destination, source)| destination == source),
+        "PCB plot output must differ from the input board"
+    );
+    let staging = export_staging_dir(output)?;
+    let staged = staging.path().join(
+        output
+            .file_name()
+            .context("PCB plot output has no file name")?,
+    );
     let args = single_file_pcb_export_args(
-        "svg",
-        output.to_str().unwrap(),
+        format,
+        staged.to_str().unwrap(),
         layers,
         black_and_white,
         pcb.to_str().unwrap(),
     );
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_cli(cli, &args, LONG_TIMEOUT).await?;
+    let artifact = format!("PCB {}", format.to_ascii_uppercase());
+    publish_verified_file(&staged, output, &artifact, &staging).await?;
     Ok(())
 }
 
@@ -2007,6 +2119,28 @@ async fn export_position_file_with_options(
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     publish_verified_file(&staged, output, "position file", &staging).await?;
+    Ok(())
+}
+
+/// Publish a netlist for the PCB export tool from the appropriate native source.
+pub(crate) async fn export_native_netlist(
+    cli: &str,
+    source: &Path,
+    output: &Path,
+    schematic: bool,
+) -> Result<()> {
+    let staging = export_staging_dir(output)?;
+    let staged = staging.path().join(
+        output
+            .file_name()
+            .context("netlist output has no file name")?,
+    );
+    if schematic {
+        export_netlist(cli, source, &staged, "kicad").await?;
+    } else {
+        export_ipcd356(cli, source, &staged).await?;
+    }
+    publish_verified_file(&staged, output, "netlist", &staging).await?;
     Ok(())
 }
 

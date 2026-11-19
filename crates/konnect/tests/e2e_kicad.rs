@@ -308,9 +308,12 @@ fn selected_layer_pcb_svg_export_through_mcp() {
 #[ignore = "requires kicad-cli; run via e2e workflow"]
 fn default_front_view_pcb_exports_through_mcp() {
     let cli = find_kicad_cli().expect("KiCad CLI required");
-    let board = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../konnect-core/tests/fixtures/drc_ownership_j1.kicad_pcb");
     let dir = tempfile::tempdir().unwrap();
+    let board = dir.path().join("source.kicad_pcb");
+    std::fs::copy(fixture, &board).unwrap();
+    let original_board = std::fs::read(&board).unwrap();
     let mut mcp = Mcp::spawn(&cli);
     mcp.load("pcb_export");
     for (tool, name, magic) in [
@@ -325,6 +328,13 @@ fn default_front_view_pcb_exports_through_mcp() {
             json!(["F.Cu", "F.Paste", "F.SilkS", "F.Mask", "Edge.Cuts"])
         );
         assert!(std::fs::read(&output).unwrap().starts_with(magic));
+
+        let refused = mcp.request(
+            "tools/call",
+            json!({"name":tool,"arguments":{"board":board,"output":board}}),
+        );
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        assert_eq!(std::fs::read(&board).unwrap(), original_board);
     }
 }
 

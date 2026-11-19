@@ -57,6 +57,17 @@ pub(crate) fn optional_string_array(
         .collect()
 }
 
+const FRONT_PLOT_LAYERS: [&str; 5] = ["F.Cu", "F.Paste", "F.SilkS", "F.Mask", "Edge.Cuts"];
+
+fn pcb_plot_layers(args: &serde_json::Value) -> Result<Vec<String>, CallToolResult> {
+    let layers = optional_string_array(args, "layers")?;
+    if layers.is_empty() {
+        Ok(FRONT_PLOT_LAYERS.into_iter().map(String::from).collect())
+    } else {
+        Ok(layers)
+    }
+}
+
 /// Default Gerber selection for a fabrication package: every enabled copper
 /// layer plus solder mask, silkscreen, and the board outline. It deliberately
 /// excludes drawings, comments, adhesive, courtyard, fab, and margin layers.
@@ -143,7 +154,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Output PDF file path" },
                     "layers": {
                         "type": "array",
-                        "description": "Layer names to include (empty = all visible layers)",
+                        "description": "Layer names to include. Omit or use [] for F.Cu, F.Paste, F.SilkS, F.Mask, Edge.Cuts.",
                         "items": { "type": "string" }
                     },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false }
@@ -162,7 +173,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Output SVG file path" },
                     "layers": {
                         "type": "array",
-                        "description": "Layer names to include (empty = all visible layers)",
+                        "description": "Layer names to include. Omit or use [] for F.Cu, F.Paste, F.SilkS, F.Mask, Edge.Cuts.",
                         "items": { "type": "string" }
                     },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false }
@@ -232,15 +243,17 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "export_netlist",
-            "Export the PCB netlist to a file in KiCAD or IPC-D-356 format.",
+            "Export IPC-D-356 from the saved PCB, or export a KiCad netlist from the saved schematic. \
+             KiCad format resolves a PCB input to its same-stem schematic; source reports the file read.",
             json!({
                 "type": "object",
                 "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file (or .kicad_sch for schematic netlist)" },
+                    "board": { "type": "string", "description": "Path to .kicad_pcb, or a .kicad_sch path for kicad format" },
                     "output": { "type": "string", "description": "Output netlist file path" },
                     "format": {
                         "type": "string",
-                        "description": "Netlist format: 'kicad' or 'ipc' (IPC-D-356)",
+                        "description": "kicad uses the schematic; ipc and ipcd356 use the PCB.",
+                        "enum": ["kicad", "ipc", "ipcd356"],
                         "default": "kicad"
                     }
                 },
@@ -489,15 +502,10 @@ async fn handle_export_pdf(
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
 
-    // Collect optional layer list
-    let layers: Vec<String> = args["layers"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let layers = match pcb_plot_layers(args) {
+        Ok(layers) => layers,
+        Err(error) => return Ok(error),
+    };
     let layer_refs: Vec<&str> = layers.iter().map(|s| s.as_str()).collect();
     let black_and_white = args["black_and_white"].as_bool().unwrap_or(false);
 
@@ -508,6 +516,7 @@ async fn handle_export_pdf(
         serde_json::to_string(&json!({
             "success": true,
             "output": output.to_str().unwrap_or(""),
+            "layers_used": layers,
             "black_and_white": black_and_white
         }))
         .unwrap(),
@@ -521,14 +530,10 @@ async fn handle_export_svg(
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
 
-    let layers: Vec<String> = args["layers"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let layers = match pcb_plot_layers(args) {
+        Ok(layers) => layers,
+        Err(error) => return Ok(error),
+    };
     let layer_refs: Vec<&str> = layers.iter().map(|s| s.as_str()).collect();
     let black_and_white = args["black_and_white"].as_bool().unwrap_or(false);
 
@@ -539,6 +544,7 @@ async fn handle_export_svg(
         serde_json::to_string(&json!({
             "success": true,
             "output": output.to_str().unwrap_or(""),
+            "layers_used": layers,
             "black_and_white": black_and_white
         }))
         .unwrap(),
@@ -615,21 +621,62 @@ async fn handle_export_netlist(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
-    let format = args["format"].as_str().unwrap_or("kicad");
+    let format = match args.get("format") {
+        None => "kicad",
+        Some(value) => match value.as_str() {
+            Some(format @ ("kicad" | "ipc" | "ipcd356")) => format,
+            _ => {
+                return Ok(invalid_export_argument(
+                    "format",
+                    "must be kicad, ipc, or ipcd356",
+                ));
+            }
+        },
+    };
+    let source = match format {
+        "kicad" if extension_is(&board, "kicad_sch") => board.clone(),
+        "kicad" if extension_is(&board, "kicad_pcb") => board.with_extension("kicad_sch"),
+        "ipc" | "ipcd356" if extension_is(&board, "kicad_pcb") => board.clone(),
+        _ => {
+            return Ok(invalid_export_argument(
+                "board",
+                "use a .kicad_pcb for IPC-D-356 or a .kicad_pcb/.kicad_sch for kicad",
+            ));
+        }
+    };
+    if !source.is_file() {
+        let detail = if format == "kicad" {
+            "pass a saved schematic explicitly or call generate_netlist with the schematic path"
+        } else {
+            "pass a saved PCB"
+        };
+        return Ok(invalid_export_argument(
+            "board",
+            format!("export source {} is not a file; {detail}", source.display()),
+        ));
+    }
+    if [&board, &source].into_iter().any(|input| {
+        output == *input
+            || output.canonicalize().is_ok_and(|destination| {
+                input
+                    .canonicalize()
+                    .is_ok_and(|source| source == destination)
+            })
+    }) {
+        return Ok(invalid_export_argument(
+            "output",
+            "must differ from the design input",
+        ));
+    }
 
-    let cli = &ctx.config.kicad_cli;
-    // kicad-cli `sch export netlist` works on both .kicad_sch and .kicad_pcb paths.
-    // For PCB-specific netlist formats (IPC-D-356), delegate same way.
-    cli::export_netlist(cli, &board, &output, format).await?;
+    cli::export_native_netlist(&ctx.config.kicad_cli, &source, &output, format == "kicad").await?;
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "format": format,
-            "output": output.to_str().unwrap_or("")
-        }))
-        .unwrap(),
-    ))
+    Ok(CallToolResult::json(&json!({
+        "success": true,
+        "format": format,
+        "output": output,
+        "source": source,
+    })))
 }
 
 fn extension_is(path: &Path, expected: &str) -> bool {
@@ -1577,6 +1624,15 @@ printf '%s' "$6" > "$5"
 
     #[tokio::test]
     async fn malformed_pcb_netlist_requests_refuse_before_running_cli() {
+        let schema = tools()
+            .into_iter()
+            .find(|tool| tool.name == "export_netlist")
+            .unwrap()
+            .input_schema;
+        assert_eq!(
+            schema["properties"]["format"]["enum"],
+            json!(["kicad", "ipc", "ipcd356"])
+        );
         let dir = tempfile::tempdir().unwrap();
         let fake = cli::test_support::write_script(
             dir.path(),

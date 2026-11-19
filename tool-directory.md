@@ -196,7 +196,7 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `export_schematic_svg` | Export a schematic sheet to SVG using kicad-cli, with optional monochrome rendering and colour theme. |
+| `export_schematic_svg` | Export a schematic as SVG at the requested root `.svg` path. Return all sheet paths in `files`. Implicit child file paths must be available. Supports monochrome rendering and colour themes. |
 | `render_schematic_png` | Render a sheet to PNG: kicad-cli SVG rasterized in-process with deterministic stroke-font rendering. Returns the path and actual pixel dimensions; `inline` adds base64 content so the caller can inspect its own output. |
 | `set_visual_baseline` | Capture the current render of a sheet as its visual baseline under the project's `.konnect/baselines/`, recording the source hash and renderer identity. |
 | `compare_visual_baseline` | Re-render at the baseline's width and report pixel drift vs a 2% threshold, with the changed region's bounding box; "no baseline stored" is an explicit result, and a stale-renderer baseline is flagged, never silently trusted. |
@@ -322,11 +322,11 @@ and Windows servers do not.
 | Tool | Description |
 |------|-------------|
 | `export_gerber` | Export Gerber production files for all copper/mask layers using kicad-cli. |
-| `export_pdf` | Export selected PCB layers to one PDF file using kicad-cli, optionally in black and white. |
-| `export_svg` | Export selected PCB layers to one SVG file using kicad-cli, optionally in black and white. |
+| `export_pdf` | Export PCB layers to one PDF, optionally in black and white. Omitted or empty `layers` selects F.Cu, F.Paste, F.SilkS, F.Mask, and Edge.Cuts. The response includes `layers_used`. |
+| `export_svg` | Export PCB layers to one SVG, optionally in black and white. Uses the same front-view defaults as `export_pdf` and returns `layers_used`. |
 | `export_3d` | Export the PCB as a 3D model using kicad-cli, with explicit control over unspecified footprint models. |
 | `export_bom` | Generate KiCad 10's CSV Bill of Materials from schematic fields. |
-| `export_netlist` | Export the PCB netlist in KiCAD or IPC-D-356 format. |
+| `export_netlist` | Export IPC-D-356 (`ipc` or `ipcd356`) from a saved PCB, or a KiCad netlist (`kicad`, default) from the explicit schematic or same-stem schematic sibling. The response identifies the file read in `source`. |
 | `export_specctra_dsn` | Export a deterministic, revision-bound Specctra DSN plus reverse manifest from a supported live KiCad board. The Rust exporter is the default. On KiCad 10, explicitly set `native_bridge_mode` to `prefer` or `require` for the optional authenticated ActionPlugin native exporter. Preserves locked straight tracks and through vias as fixed wiring; refuses unlocked routing, arcs, unsupported geometry, or incomplete rules. |
 | `export_position_file` | Generate a component placement (pick-and-place) position file for SMT assembly. |
 | `export_dxf` | Export the PCB to DXF, one file per requested layer, using kicad-cli. `layers` is required — there is no all-layers default. For mechanical CAD interchange. |
