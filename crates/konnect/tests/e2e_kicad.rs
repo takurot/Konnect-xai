@@ -1093,6 +1093,19 @@ fn builtin_templates_place_with_complete_guides_on_stock_kicad() {
             );
         }
 
+        let netlist = project.join(format!("{id}.net"));
+        let exported = Command::new(&cli)
+            .args(["sch", "export", "netlist", "--output"])
+            .arg(&netlist)
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            exported.status.success() && netlist.is_file(),
+            "{id}: native KiCad could not read the saved placement: {}",
+            String::from_utf8_lossy(&exported.stderr)
+        );
+
         let mut pins = HashSet::new();
         let mut passive_pins = HashSet::new();
         for item in placed {
