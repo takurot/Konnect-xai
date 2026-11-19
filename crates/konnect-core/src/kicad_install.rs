@@ -103,7 +103,7 @@ tokio::task_local! {
 pub(crate) fn config_dir() -> PathBuf {
     REQUEST_CONFIG_DIR
         .try_with(Clone::clone)
-        .unwrap_or_else(|| select_config_dir(&config_base(), None))
+        .unwrap_or_else(|_| select_config_dir(&config_base(), None))
 }
 
 pub(crate) async fn resolve_config_dir(configured_cli: &str) -> PathBuf {
