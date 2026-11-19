@@ -66,47 +66,58 @@ async fn pcb_plot_layers(
     use konnect_ipc::builders::{layer_from_name, layer_name};
 
     let requested = optional_string_array(args, "layers")?;
+    let source = tokio::fs::read_to_string(board).await.map_err(|error| {
+        invalid_export_argument("board", format!("cannot read its plot layers: {error}"))
+    })?;
+    let parsed = konnect_sexp::parse_sexp(&source).map_err(|error| {
+        invalid_export_argument("board", format!("cannot read its plot layers: {error}"))
+    })?;
+    let board_layers = konnect_sexp::layers::layers(&parsed);
+    let enabled = |canonical: &str| board_layers.iter().any(|layer| layer.name == canonical);
     if requested.is_empty() {
-        return Ok(FRONT_PLOT_LAYERS.into_iter().map(String::from).collect());
+        let selected: Vec<_> = FRONT_PLOT_LAYERS
+            .into_iter()
+            .filter(|name| enabled(name))
+            .map(String::from)
+            .collect();
+        if selected.is_empty() {
+            return Err(invalid_export_argument(
+                "board",
+                "no front plot layer is enabled",
+            ));
+        }
+        return Ok(selected);
     }
 
-    let mut board_layers = None;
     let mut selected = Vec::with_capacity(requested.len());
     for (index, name) in requested.iter().enumerate() {
         let canonical = if let Some(layer) = layer_name(layer_from_name(name.trim())) {
-            layer.to_owned()
-        } else {
-            // The CLI also accepts user-facing layer names. Resolve those from
-            // the saved board's layer table rather than letting KiCad silently
-            // drop an unrecognized name from the selection.
-            if board_layers.is_none() {
-                let source = tokio::fs::read_to_string(board).await.map_err(|error| {
-                    invalid_export_argument("board", format!("cannot read layer aliases: {error}"))
-                })?;
-                let parsed = konnect_sexp::parse_sexp(&source).map_err(|error| {
-                    invalid_export_argument("board", format!("cannot read layer aliases: {error}"))
-                })?;
-                board_layers = Some(konnect_sexp::layers::layers(&parsed));
+            if !enabled(layer) {
+                return Err(invalid_export_argument(
+                    &format!("layers[{index}]"),
+                    format!("'{name}' is not enabled on the board"),
+                ));
             }
-            let mut matches = board_layers
-                .as_deref()
-                .unwrap_or_default()
+            layer
+        } else {
+            // Resolve user-facing names from the saved layer table. KiCad can
+            // silently drop unknown or disabled names in a mixed selection.
+            let mut matching = board_layers
                 .iter()
                 .filter(|layer| layer.user_name.as_deref() == Some(name.as_str()));
-            let selected = matches
+            matching
                 .next()
-                .filter(|_| matches.next().is_none())
+                .filter(|_| matching.next().is_none())
                 .and_then(|layer| layer_name(layer_from_name(&layer.name)))
                 .ok_or_else(|| {
                     invalid_export_argument(
                         &format!("layers[{index}]"),
                         format!("'{name}' is not an unambiguous KiCad layer or board layer alias"),
                     )
-                })?;
-            selected.to_owned()
+                })?
         };
-        if !selected.contains(&canonical) {
-            selected.push(canonical);
+        if !selected.iter().any(|name| name == canonical) {
+            selected.push(canonical.to_owned());
         }
     }
     Ok(selected)
@@ -1513,6 +1524,40 @@ mod required_layers_tests {
 
     /// The neighbouring exporters read `layers` the same way but do not require
     /// it. Requiring it there would break every caller that omits it today.
+    #[tokio::test]
+    async fn plots_only_claim_enabled_standard_or_custom_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("two-layer.kicad_pcb");
+        tokio::fs::write(
+            &board,
+            r#"(kicad_pcb (layers
+            (0 "F.Cu" signal) (31 "B.Cu" signal)
+            (37 "F.SilkS" user "Custom legend"))) "#,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            pcb_plot_layers(&board, &json!({})).await.unwrap(),
+            ["F.Cu", "F.SilkS"]
+        );
+        assert_eq!(
+            pcb_plot_layers(
+                &board,
+                &json!({"layers":["F.Cu","Custom legend","F.SilkS"]})
+            )
+            .await
+            .unwrap(),
+            ["F.Cu", "F.SilkS"]
+        );
+        for layer in ["not-a-layer", "In1.Cu"] {
+            let result = pcb_plot_layers(&board, &json!({"layers":["F.Cu",layer]}))
+                .await
+                .unwrap_err();
+            assert!(result.is_error);
+        }
+    }
+
     #[test]
     fn export_pdf_and_svg_keep_layers_optional() {
         for tool_name in ["export_pdf", "export_svg", "export_gerber"] {

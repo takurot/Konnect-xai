@@ -343,6 +343,7 @@ fn default_front_view_pcb_exports_through_mcp() {
         for args in [
             json!({"board":board,"output":library}),
             json!({"board":board,"output":output,"layers":["F.Cu", "not-a-layer"]}),
+            json!({"board":board,"output":output,"layers":["F.Cu", "In1.Cu"]}),
         ] {
             let refused = mcp.request("tools/call", json!({"name":tool,"arguments":args}));
             assert_eq!(refused["result"]["isError"], true, "{refused}");
