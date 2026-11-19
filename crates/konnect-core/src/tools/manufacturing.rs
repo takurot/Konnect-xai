@@ -1320,6 +1320,56 @@ mod package_export_option_tests {
     }
 
     #[tokio::test]
+    async fn issue6_quote_uses_catalog_quantity_and_unique_extended_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, r#"(kicad_pcb (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+            (footprint "Pkg" (property "Reference" "U1") (property "LCSC" "C100"))
+            (footprint "Pkg" (property "Reference" "U2") (property "LCSC" "C100"))
+            (footprint "Pkg" (property "Reference" "R1") (property "LCSC" "C101"))
+            (footprint "Pkg" (property "Reference" "R2") (attr smd dnp) (property "LCSC" "C100")))"#).unwrap();
+        let db = dir.path().join("catalog.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE components(LCSC TEXT PRIMARY KEY, Price REAL, Library_Type TEXT);
+             INSERT INTO components VALUES ('C100', 5.62, 'Extended'), ('C101', NULL, 'Basic');",
+        )
+        .unwrap();
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: Some(db),
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let body = result_json(
+            &handle_estimate_cost(&json!({"board":board,"quantity":5}), &ctx)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(body["cost_estimate"]["components_estimate"], "$56.45");
+        assert_eq!(
+            body["component_pricing"]["priced_from_catalog"],
+            json!(["U1", "U2"])
+        );
+        assert_eq!(body["component_pricing"]["fallback_average"], json!(["R1"]));
+        assert_eq!(
+            body["component_pricing"]["extended_part_ids"],
+            json!(["C100"])
+        );
+        assert_eq!(body["component_pricing"]["extended_feeder_fee_usd"], 3.0);
+        let notes = body["notes"].as_array().unwrap();
+        assert!(notes
+            .iter()
+            .all(|note| !note.as_str().unwrap().contains("generate_bom")));
+    }
+
+    #[tokio::test]
     async fn package_is_an_error_when_cli_success_produces_no_artifacts() {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("live_ipc.kicad_pcb");
@@ -1679,6 +1729,17 @@ mod jlcpcb_assembly_tests {
             .map(str::to_string)
             .collect();
         assert_eq!(jlcpcb_designator_mismatch(&cpl_refs, &bom_refs), None);
+    }
+
+    #[test]
+    fn issue8_bom_and_cpl_match_a_single_hyphenated_designator() {
+        let bom = jlcpcb_bom_designators("Designator,Comment\nSMB-19-A1,Connector\n").unwrap();
+        let cpl = jlcpcb_cpl_from_kicad_csv(
+            "Ref,Val,Package,PosX,PosY,Rot,Side\nSMB-19-A1,Connector,Pkg,1,2,0,top\n",
+            &built_in_policies(),
+        )
+        .unwrap();
+        assert_eq!(jlcpcb_designator_mismatch(&cpl.designators, &bom), None);
     }
 
     #[test]

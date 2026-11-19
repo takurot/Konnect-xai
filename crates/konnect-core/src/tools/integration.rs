@@ -3610,6 +3610,54 @@ mod jlcpcb_cache_tests {
         assert!(search_lcsc_ids(&db_path, "%").await.len() == 1);
     }
 
+    #[tokio::test]
+    async fn issue34_values_categories_and_unknown_columns() {
+        let (_dir, path) = seed_test_db();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(
+            "INSERT INTO components VALUES
+              ('C7201', NULL, '0402', NULL, NULL, '220pF ceramic', NULL, NULL, NULL, 'A_B'),
+              ('C7202', NULL, '0402', NULL, NULL, '20pF ceramic', NULL, NULL, NULL, 'A_B'),
+              ('C7203', NULL, '0402', NULL, NULL, '20pF ceramic', NULL, NULL, 0, 'ACB'),
+              ('C7204', NULL, '0402', NULL, NULL, '4.7kΩ resistor', NULL, NULL, NULL, 'Resistors'),
+              ('C7205', NULL, '0402', NULL, NULL, '2.2µF ceramic', NULL, NULL, NULL, 'A_B');",
+        )
+        .unwrap();
+        let ctx = test_ctx();
+        for (query, id) in [
+            ("20pF 0402", "C7202"),
+            ("4k7 0402", "C7204"),
+            ("2.2uF 0402", "C7205"),
+        ] {
+            let result = handle_search_jlcpcb_parts(
+                &json!({"query":query,"output_path":path,"in_stock":false,"limit":1}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let body = response_json(&result);
+            assert_eq!(body["results"][0]["lcsc"], id, "{body}");
+            assert!(body["results"][0]["price"].is_null());
+            assert!(body["results"][0]["stock"].is_null());
+            assert!(body["results"][0]["mpn"].is_null());
+        }
+        let filtered = handle_search_jlcpcb_parts(
+            &json!({"query":"ceramic","output_path":path,"in_stock":false,"category":"A_B"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let body = response_json(&filtered);
+        assert_eq!(body["count"], 3);
+        assert_eq!(body["categories"], json!(["A_B"]));
+        let part = handle_get_jlcpcb_part(&json!({"lcsc_id":"C7203","output_path":path}), &ctx)
+            .await
+            .unwrap();
+        let part = response_json(&part);
+        assert!(part["price"].is_null());
+        assert_eq!(part["stock"], 0);
+    }
+
     fn response_json(result: &CallToolResult) -> serde_json::Value {
         match &result.content[0] {
             crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
