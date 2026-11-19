@@ -326,25 +326,27 @@ fn sibling_custom_rules_path(board: &Path) -> PathBuf {
 
 /// KiCad 10 board_design_settings.cpp PARAM_SCALED load ranges, in mm.
 /// Entries map (tool field, project key, minimum, maximum).
-const DESIGN_RULE_FIELDS: [(&str, &str, f64, f64); 11] = [
-    ("min_clearance", "min_clearance", 0.0, 25.0),
-    ("min_trace_width", "min_track_width", 0.0, 25.0),
-    ("min_via_drill", "min_through_hole_diameter", 0.0, 25.0),
-    ("min_via_size", "min_via_diameter", 0.0, 25.0),
-    ("min_hole_to_hole", "min_hole_to_hole", 0.0, 10.0),
-    ("min_via_annular_width", "min_via_annular_width", 0.0, 25.0),
-    ("min_hole_clearance", "min_hole_clearance", 0.0, 100.0),
-    ("min_text_height", "min_text_height", 0.0, 100.0),
-    ("min_text_thickness", "min_text_thickness", 0.0, 25.0),
-    ("min_silk_clearance", "min_silk_clearance", -10.0, 100.0),
-    // -0.01 retains KiCad's legacy clearance calculation.
-    (
-        "min_copper_edge_clearance",
-        "min_copper_edge_clearance",
-        -0.01,
-        25.0,
-    ),
-];
+const fn design_rule_fields() -> &'static [(&'static str, &'static str, f64, f64)] {
+    &[
+        ("min_clearance", "min_clearance", 0.0, 25.0),
+        ("min_trace_width", "min_track_width", 0.0, 25.0),
+        ("min_via_drill", "min_through_hole_diameter", 0.0, 25.0),
+        ("min_via_size", "min_via_diameter", 0.0, 25.0),
+        ("min_hole_to_hole", "min_hole_to_hole", 0.0, 10.0),
+        ("min_via_annular_width", "min_via_annular_width", 0.0, 25.0),
+        ("min_hole_clearance", "min_hole_clearance", 0.0, 100.0),
+        ("min_text_height", "min_text_height", 0.0, 100.0),
+        ("min_text_thickness", "min_text_thickness", 0.0, 25.0),
+        ("min_silk_clearance", "min_silk_clearance", -10.0, 100.0),
+        // -0.01 retains KiCad's legacy clearance calculation.
+        (
+            "min_copper_edge_clearance",
+            "min_copper_edge_clearance",
+            -0.01,
+            25.0,
+        ),
+    ]
+}
 
 fn design_rules_schema() -> Value {
     let mut properties = serde_json::Map::new();
@@ -354,7 +356,7 @@ fn design_rules_schema() -> Value {
             "type": "string", "description": "Path to .kicad_pcb file",
         }),
     );
-    for (arg, _, lower, upper) in DESIGN_RULE_FIELDS {
+    for &(arg, _, lower, upper) in design_rule_fields() {
         properties.insert(
             arg.into(),
             json!({
@@ -368,9 +370,9 @@ fn design_rules_schema() -> Value {
 
 fn design_rule_values(project: &Value) -> Value {
     Value::Object(
-        DESIGN_RULE_FIELDS
+        design_rule_fields()
             .iter()
-            .map(|(arg, key, _, _)| ((*arg).to_owned(), json!(project_rule_value(project, key))))
+            .map(|&(arg, key, _, _)| (arg.to_owned(), json!(project_rule_value(project, key))))
             .collect(),
     )
 }
@@ -470,7 +472,7 @@ async fn handle_set_design_rules(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let mut requested = Vec::new();
-    for (arg, storage_key, lower, upper) in DESIGN_RULE_FIELDS {
+    for &(arg, storage_key, lower, upper) in design_rule_fields() {
         if args.get(arg).is_none() {
             continue;
         }
