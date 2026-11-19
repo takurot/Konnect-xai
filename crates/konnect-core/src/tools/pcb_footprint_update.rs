@@ -4049,12 +4049,14 @@ mod tests {
         prepared.attributes.as_mut().unwrap().mounting_style =
             kiapi::board::types::FootprintMountingStyle::FmsUnknown as i32;
 
+        let parent = roundtripped.id.clone();
         for item in &mut roundtripped.definition.as_mut().unwrap().items {
             if item.type_url.ends_with("kiapi.board.types.Pad") {
                 let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
                 pad.id = Some(kiapi::common::types::Kiid {
                     value: format!("kicad-pad-{}", pad.number),
                 });
+                pad.parent = parent.clone();
                 pad.net = Some(kiapi::board::types::Net::default());
                 pad.pad_to_die_length = Some(kiapi::common::types::Distance { value_nm: 0 });
                 pad.symbol_pin = Some(kiapi::board::types::SymbolPinInfo::default());
@@ -4089,6 +4091,7 @@ mod tests {
                 graphic.id = Some(kiapi::common::types::Kiid {
                     value: "kicad-graphic".to_string(),
                 });
+                graphic.parent = parent.clone();
                 graphic.net = Some(kiapi::board::types::Net::default());
                 graphic
                     .shape
@@ -4125,6 +4128,18 @@ mod tests {
                     rectangle.corner_radius = Some(kiapi::common::types::Distance { value_nm: 0 });
                 }
                 *item = builders::pack_any(&graphic, "kiapi.board.types.BoardGraphicShape");
+            } else if builders::any_is(item, "kiapi.board.types.BoardText") {
+                let mut text =
+                    kiapi::board::types::BoardText::decode(item.value.as_slice()).unwrap();
+                text.parent = parent.clone();
+                text.text
+                    .as_mut()
+                    .unwrap()
+                    .attributes
+                    .as_mut()
+                    .unwrap()
+                    .visible = false;
+                *item = builders::pack_any(&text, "kiapi.board.types.BoardText");
             }
         }
 
@@ -4142,6 +4157,23 @@ mod tests {
         assert!(changed_domains(&roundtripped, &prepared)
             .unwrap()
             .is_empty());
+
+        for item in &mut roundtripped.definition.as_mut().unwrap().items {
+            if builders::any_is(item, "kiapi.board.types.Pad") {
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                pad.position.as_mut().unwrap().x_nm += 1;
+                *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+            } else if builders::any_is(item, "kiapi.board.types.BoardText") {
+                let mut text =
+                    kiapi::board::types::BoardText::decode(item.value.as_slice()).unwrap();
+                text.text.as_mut().unwrap().position.as_mut().unwrap().x_nm += 1;
+                *item = builders::pack_any(&text, "kiapi.board.types.BoardText");
+            }
+        }
+        assert_eq!(
+            changed_domains(&roundtripped, &prepared).unwrap(),
+            BTreeSet::from([ChangedDomain::Pads, ChangedDomain::Graphics])
+        );
     }
 
     #[test]
