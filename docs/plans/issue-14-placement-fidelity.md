@@ -13,6 +13,10 @@ rejected update before publication still follows the transaction's rollback
 path. The pre-commit readback and simulated rollback results below describe
 the original implementation.
 
+Rotated library circles preserve the authored radius point during IPC
+placement and refresh. KiCad uses that point when comparing the refreshed
+footprint with its library.
+
 ## Design
 
 The prepared placement owns the original board S-expression and a separate result for its typed IPC representation. An unsupported typed clause cannot prevent the guarded file path when KiCad is unreachable. Once KiCad answers, a typed refusal never permits a file fallback.
