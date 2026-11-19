@@ -1818,6 +1818,81 @@ mod tests {
         assert!(!plan.tracks.is_empty() || !plan.vias.is_empty());
     }
 
+    const ROTATED_SOIC: &str = include_str!("../tests/fixtures/specctra_soic8_roundrect.kicad_pcb");
+    const ROTATED_SOIC_NATIVE: &str =
+        include_str!("../tests/fixtures/specctra_soic8_roundrect.native-kicad-10.dsn");
+
+    fn stock_soic_rules() -> IpcEffectiveRoutingRules {
+        let rule = native_fixture_rules()["GND"].clone();
+        (1..=8)
+            .map(|pin| (format!("SIG{pin}"), rule.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn rotated_stock_soic_exports_roundrect_without_double_rotation() {
+        let exported = export_dsn(
+            Path::new("soic8.kicad_pcb"),
+            ROTATED_SOIC,
+            &stock_soic_rules(),
+        )
+        .unwrap();
+        let tree = parse_dsn_sexp(&exported.dsn).unwrap();
+        let library = tree.find("library").unwrap();
+        let image = library
+            .find_all("image")
+            .into_iter()
+            .find(|image| image.get(1).and_then(SexpNode::as_str) == Some("konnect_image_U1"))
+            .unwrap();
+        assert_eq!(image.find_all("pin").len(), 8);
+        assert!(image
+            .find_all("pin")
+            .iter()
+            .all(|pin| pin.find("rotate").is_none()));
+        let shape = library.find("padstack").unwrap().find("shape").unwrap();
+        assert_eq!(shape.get(1).unwrap().head(), Some("polygon"));
+        assert!(adopt_native_dsn(exported, ROTATED_SOIC_NATIVE.to_string()).is_ok());
+    }
+
+    #[test]
+    fn oval_uses_its_minor_axis_as_path_width() {
+        let board = coverage_routing_board(
+            &COVERAGE_ROUTING_PAD
+                .replace("smd rect", "smd oval")
+                .replace("(size 2 2)", "(size 3 2)"),
+            "",
+            "",
+        );
+        let exported = export_dsn(Path::new("board.kicad_pcb"), &board, &rules()).unwrap();
+        let tree = parse_dsn_sexp(&exported.dsn).unwrap();
+        let shape = tree
+            .find("library")
+            .unwrap()
+            .find("padstack")
+            .unwrap()
+            .find("shape")
+            .unwrap();
+        let path = shape.get(1).unwrap();
+        assert_eq!(path.head(), Some("path"));
+        assert_eq!(path.get_f64(2), Some(2000.0));
+        assert_eq!(
+            (path.get_f64(3), path.get_f64(5)),
+            (Some(-500.0), Some(500.0))
+        );
+    }
+
+    #[test]
+    fn differing_copper_padstack_is_refused_with_pad_identity() {
+        let pad = COVERAGE_ROUTING_PAD.replace(
+            "(size 2 2)",
+            r#"(size 2 2) (padstack (mode custom) (layer "B.Cu" (shape rect) (size 3 2)))"#,
+        );
+        let board = coverage_routing_board(&pad, "", "");
+        let error = export_dsn(Path::new("board.kicad_pcb"), &board, &rules()).unwrap_err();
+        assert!(error.to_string().contains("pad U1-1"));
+        assert!(error.to_string().contains("padstack"));
+    }
+
     #[test]
     fn incomplete_effective_rules_are_refused() {
         let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb");
