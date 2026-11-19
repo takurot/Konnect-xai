@@ -64,6 +64,27 @@ variant tests; a skipped CLI lookup is not execution evidence. Record the exact
 head, four normal Rust gates, measured line/branch coverage, hosted checks, and
 any remaining host-specific limits in the terminal PR.
 
+### KiCad 10.0.8 follow-up acceptance
+
+- L02 observes which item classes the exact board's IPC session can list.
+  A successful empty tables list and an explicit refusal of generators are
+  distinct responses. Keep the comparison with saved board bounds.
+- L06 and L07 require uniquely placed stock footprints and saved geometry.
+  L09 independently verifies library refresh through apply, convergence and
+  saved readback.
+- L08 and the full geometry workflow verify a fresh PCB sync through
+  `ready → applied → noop`. Sync and library refresh compare the published
+  board after the single KiCad commit. A post-commit verification failure
+  reports the acknowledged commit and prevents automatic retries.
+- Run the variant CLI test under the English and Japanese locales through the
+  real BOM export. The wrong-value and population controls must fail semantic
+  comparison in both locales.
+- For a manufacturing workflow, compare the two nets in the schematic
+  netlist and placed pads, inspect the routed tracks, and require zero DRC
+  errors, warnings, unconnected items and schematic differences. Validate
+  the Gerber layers and drill positions; an unrouted control must stop before
+  export.
+
 ## Measuring Coverage
 
 Workspace line and branch coverage (stable toolchain needs `RUSTC_BOOTSTRAP=1`

@@ -4,6 +4,17 @@ Issue #17 makes closed-board footprint flips and back-side library refresh use
 KiCad's copper-stack mapping. On eight copper layers, `In2.Cu` becomes `In5.Cu`.
 A second flip restores the original layer.
 
+## Current live readback contract
+
+In the current live implementation, KiCad exposes the updated footprint to
+`GetItems` after `EndCommit`. Library refresh checks the published layer and
+mirrored-text state, chamfers, and field presentation against one observation
+of the exact board. A failed observation after publication returns
+`ipc_outcome_unknown` with `board_state: committed` and `retry_safe: false`. A
+rejected update before publication still follows the transaction's rollback
+path. The pre-commit readback and simulated rollback results below describe
+the original implementation.
+
 ## Scope and design
 
 `konnect_ipc::builders::flip_layer` owns layer mirroring. The function accepts a
