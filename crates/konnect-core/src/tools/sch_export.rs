@@ -1318,10 +1318,12 @@ mod netlist_summary_tests {
     #[tokio::test]
     async fn project_summary_matches_both_frozen_hierarchy_netlists_offline() {
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-        let context = ToolContext::new(
-            ServerConfig::default(),
-            Arc::new(crate::router::ToolRouter::new()),
-        );
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            auto_load_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
         for (file, oracle) in [
             (
                 "netlist_pic_programmer/pic_programmer.kicad_sch",
@@ -1332,21 +1334,23 @@ mod netlist_summary_tests {
                 include_str!("../../tests/fixtures/project_ownership/native-nets.tsv"),
             ),
         ] {
-            let (result, path) = {
-                let path = fixtures.join(file);
-                let result = handle_export_netlist_summary(
-                    &json!({"schematic": path, "scope": "project"}),
-                    &context,
-                )
+            let path = fixtures.join(file);
+            let result = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "export_netlist_summary", "arguments": {
+                        "schematic": path, "scope": "project"
+                    }}
+                }))
                 .await
+                .unwrap()
+                .result
                 .unwrap();
-                (result, path)
-            };
-            assert!(!result.is_error, "{}: {result:?}", path.display());
-            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
-                panic!("expected text content");
-            };
-            assert_native_membership(serde_json::from_str(text).unwrap(), oracle);
+            assert_eq!(result["isError"], false, "{}: {result}", path.display());
+            let text = result["content"][0]["text"].as_str().unwrap();
+            let body: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["scope"], "project");
+            assert_native_membership(body, oracle);
         }
     }
 
