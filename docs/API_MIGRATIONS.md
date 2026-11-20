@@ -36,6 +36,19 @@ settings file, or other document returns `invalid_argument` with
 different kind of file to `.kicad_sch` does not make it a schematic.
 `create_schematic` also requires a `.kicad_sch` output path.
 
+## Unreleased: library writes validate document types and identifiers
+
+`create_symbol` and `delete_symbol` use `.kicad_sym` symbol libraries.
+`create_footprint` and `edit_footprint_pad` use `.kicad_mod` footprints.
+Existing files must also contain the corresponding KiCad document type.
+Convert a pre-6.0 footprint with `kicad-cli fp upgrade` before editing it.
+
+Symbol names and new library nicknames must be nonempty and cannot contain
+a colon or double quote. `delete_symbol` refuses to remove a symbol that
+another symbol extends and reports the direct dependents. Footprint creation
+accepts the documented pad types and shapes. New pad sizes and supplied
+drill diameters must remain positive at KiCad's nanometre precision.
+
 ## v0.14.0: conditional-write failures distinguish committed uncertainty
 
 A stale source revision returns `conflict`. If the replacement has committed

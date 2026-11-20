@@ -9,13 +9,18 @@ use crate::tool;
 use crate::tools::{get_path, require_array, require_str, ToolContext, ToolDef};
 use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::geometry::round6;
-use konnect_sexp::parser::{parse_sexp, SexpNode};
+use konnect_sexp::parser::{has_bare_list_root, parse_sexp, SexpNode};
+use konnect_sexp::paths::has_document_extension;
 use konnect_sexp::writer::{
-    apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks, read_consistent,
-    write_atomic_if_unchanged, write_new_atomic, SexpEdit,
+    apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks,
+    find_direct_child_blocks_at, read_consistent, write_atomic_if_unchanged, write_new_atomic,
+    SexpEdit,
 };
 use serde_json::json;
 use std::path::{Path, PathBuf};
+
+const PAD_TYPES: &[&str] = &["smd", "thru_hole", "np_thru_hole"];
+const PAD_SHAPES: &[&str] = &["rect", "oval", "circle", "roundrect"];
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -105,13 +110,13 @@ pub fn tools() -> Vec<ToolDef> {
                             "type": "object",
                             "properties": {
                                 "number": { "type": "string" },
-                                "type": { "type": "string", "description": "'smd', 'thru_hole', 'np_thru_hole'" },
-                                "shape": { "type": "string", "description": "'rect', 'oval', 'circle', 'roundrect'" },
+                                "type": { "type": "string", "enum": PAD_TYPES },
+                                "shape": { "type": "string", "enum": PAD_SHAPES },
                                 "x": { "type": "number" },
                                 "y": { "type": "number" },
-                                "width": { "type": "number" },
-                                "height": { "type": "number" },
-                                "drill": { "type": "number", "description": "Drill diameter for thru-hole pads" },
+                                "width": { "type": "number", "exclusiveMinimum": 0 },
+                                "height": { "type": "number", "exclusiveMinimum": 0 },
+                                "drill": { "type": "number", "exclusiveMinimum": 0, "description": "Drill diameter for thru-hole pads" },
                                 "layers": {
                                     "type": "array",
                                     "items": { "type": "string" },
@@ -163,14 +168,14 @@ pub fn tools() -> Vec<ToolDef> {
                     "match_all": { "type": "boolean", "description": "Edit every direct-child pad with pad_number instead of only the first match", "default": false },
                     "x": { "type": "number", "description": "New X position in mm (optional)" },
                     "y": { "type": "number", "description": "New Y position in mm (optional)" },
-                    "width": { "type": "number", "description": "New pad width in mm (optional)" },
-                    "height": { "type": "number", "description": "New pad height in mm (optional)" },
+                    "width": { "type": "number", "exclusiveMinimum": 0, "description": "New pad width in mm (optional)" },
+                    "height": { "type": "number", "exclusiveMinimum": 0, "description": "New pad height in mm (optional)" },
                     "shape": {
                         "type": "string",
-                        "enum": ["circle", "rect", "oval", "roundrect"],
+                        "enum": PAD_SHAPES,
                         "description": "New standard pad shape (optional). roundrect gets a valid default corner ratio when needed."
                     },
-                    "drill": { "type": "number", "description": "New drill diameter in mm (optional)" },
+                    "drill": { "type": "number", "exclusiveMinimum": 0, "description": "New drill diameter in mm (optional)" },
                     "zone_connect": {
                         "type": "string",
                         "enum": ["inherited", "solid", "thermal", "none"],
@@ -734,6 +739,9 @@ async fn handle_create_footprint(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let output = get_path(args, "output")?;
+    if let Err(error) = require_library_extension(&output, "kicad_mod", "output") {
+        return Ok(error);
+    }
     // Both are schema-required. Defaulting them meant a call with neither
     // wrote `(footprint "Footprint" …)` with no pads, no courtyard, no
     // silkscreen and no fab outline — through `write_atomic`, which replaces
@@ -874,7 +882,9 @@ async fn handle_create_footprint(
         konnect_sexp::escaped_string(name), konnect_sexp::escaped_string(description), attr, pad_sexp, graphics, model_sexp
     );
 
-    parse_sexp(&content)?;
+    if let Err(error) = parse_library_document(&content, "footprint", "output") {
+        return Ok(error);
+    }
     let expected = match std::fs::read_to_string(&output) {
         Ok(content) if overwrite => Some(content),
         Ok(_) => {
@@ -885,6 +895,11 @@ async fn handle_create_footprint(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
+    if let Some(expected) = &expected {
+        if let Err(error) = parse_library_document(expected, "footprint", "output") {
+            return Ok(error);
+        }
+    }
     // Creating a directory is deferred until the input and overwrite policy pass.
     if let Some(parent) = output.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -892,7 +907,7 @@ async fn handle_create_footprint(
     if let Some(expected) = expected {
         write_atomic_if_unchanged(&output, &expected, &content)?;
     } else {
-        write_new_atomic(&output, &content)?;
+        write_new_library_document(&output, &content)?;
     }
 
     Ok(CallToolResult::text(
@@ -909,9 +924,17 @@ async fn handle_create_footprint(
     ))
 }
 
-/// Enforce the nested `pads.items.required` schema before any output file is
-/// created or replaced. Top-level MCP validation is deliberately shallow, so
-/// handlers that own nested objects must preserve this invariant themselves.
+fn checked_pad_dimension(value: f64, field: &str) -> Result<(), CallToolResult> {
+    if crate::tools::checked_mm(value, field)? <= 0.0 {
+        return Err(invalid_library_argument(
+            field,
+            "must remain greater than zero at KiCad's nanometre precision",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate nested pad arguments before formatting their KiCad representation.
 fn validate_footprint_pad_items(pads: &[serde_json::Value]) -> Result<(), CallToolResult> {
     for (index, pad) in pads.iter().enumerate() {
         if !pad.is_object() {
@@ -928,13 +951,30 @@ fn validate_footprint_pad_items(pads: &[serde_json::Value]) -> Result<(), CallTo
                 ));
             }
         }
-        for field in ["x", "y", "width", "height"] {
-            if pad[field].as_f64().is_none() {
+        for (field, allowed) in [("type", PAD_TYPES), ("shape", PAD_SHAPES)] {
+            let value = pad[field].as_str().expect("validated");
+            if !allowed.contains(&value) {
                 return Err(invalid_library_argument(
                     &format!("pads[{index}].{field}"),
-                    "missing or not a number",
+                    format!("expected one of {}", allowed.join(", ")),
                 ));
             }
+        }
+        for field in ["x", "y", "width", "height"] {
+            let key = format!("pads[{index}].{field}");
+            let value = pad[field]
+                .as_f64()
+                .ok_or_else(|| invalid_library_argument(&key, "missing or not a number"))?;
+            if matches!(field, "width" | "height") {
+                checked_pad_dimension(value, &key)?;
+            }
+        }
+        if let Some(drill) = pad.get("drill") {
+            let field = format!("pads[{index}].drill");
+            let value = drill
+                .as_f64()
+                .ok_or_else(|| invalid_library_argument(&field, "must be a number"))?;
+            checked_pad_dimension(value, &field)?;
         }
     }
     Ok(())
@@ -945,6 +985,20 @@ async fn handle_edit_footprint_pad(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let path = get_path(args, "footprint_path")?;
+    if let Err(error) = require_library_extension(&path, "kicad_mod", "footprint_path") {
+        return Ok(error);
+    }
+    for field in ["width", "height", "drill"] {
+        let dimension = match crate::tools::opt_positive_f64(args, field) {
+            Ok(dimension) => dimension,
+            Err(error) => return Ok(error),
+        };
+        if let Some(dimension) = dimension {
+            if let Err(error) = checked_pad_dimension(dimension, field) {
+                return Ok(error);
+            }
+        }
+    }
     let pad_number = match require_str(args, "pad_number") {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -976,9 +1030,7 @@ async fn handle_edit_footprint_pad(
     let shape = match args.get("shape") {
         None | Some(serde_json::Value::Null) => None,
         Some(value) => match value.as_str() {
-            Some(shape) if matches!(shape, "circle" | "rect" | "oval" | "roundrect") => {
-                Some(shape)
-            }
+            Some(shape) if PAD_SHAPES.contains(&shape) => Some(shape),
             Some(shape) => {
                 return Ok(invalid_library_argument(
                     "shape",
@@ -1020,26 +1072,16 @@ async fn handle_edit_footprint_pad(
     };
 
     let content = read_consistent(&path)?;
-    match parse_sexp(&content) {
-        Ok(root) if root.head() == Some("footprint") => {}
-        Ok(root) => {
-            return Ok(invalid_library_argument(
-                "footprint_path",
-                crate::tools::footprint_root_reason(root.head()),
-            ))
-        }
-        Err(error) => {
-            return Ok(invalid_library_argument(
-                "footprint_path",
-                format!("footprint is malformed: {error}"),
-            ))
-        }
-    }
+    let (_, document_start) = match parse_library_document(&content, "footprint", "footprint_path")
+    {
+        Ok(document) => document,
+        Err(error) => return Ok(error),
+    };
 
     let mut edits = Vec::new();
     let mut matched_count = 0usize;
     let mut observed_zone_connects = Vec::new();
-    for (start, end) in find_direct_child_blocks(&content, "footprint") {
+    for (start, end) in find_direct_child_blocks_at(&content, document_start) {
         let block = &content[start..end];
         let Ok(node) = parse_sexp(block) else {
             return Ok(invalid_library_argument(
@@ -1077,6 +1119,9 @@ async fn handle_edit_footprint_pad(
     }
 
     let new_content = apply_edits(content.clone(), edits);
+    if let Err(error) = parse_library_document(&new_content, "footprint", "footprint_path") {
+        return Ok(error);
+    }
     write_atomic_if_unchanged(&path, &content, &new_content)?;
 
     let mut response = json!({
@@ -1242,6 +1287,79 @@ fn set_pad_zone_connect(pad_block: String, zone_connect: PadZoneConnect) -> Stri
         }
     }
     apply_edits(pad_block, edits)
+}
+
+fn require_library_extension(
+    path: &Path,
+    extension: &str,
+    field: &str,
+) -> Result<(), CallToolResult> {
+    if !has_document_extension(path, extension) {
+        return Err(invalid_library_argument(
+            field,
+            format!("must end in .{extension}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Recognize and parse exactly one document before using either its structure
+/// or byte ranges for an edit, including on replacement candidates.
+fn parse_library_document(
+    source: &str,
+    expected_root: &str,
+    field: &str,
+) -> Result<(SexpNode, usize), CallToolResult> {
+    let root_error =
+        || invalid_library_argument(field, format!("expected a {expected_root} document"));
+    if !has_bare_list_root(source.as_bytes(), expected_root).unwrap_or(false) {
+        if expected_root == "footprint"
+            && has_bare_list_root(source.as_bytes(), "module").unwrap_or(false)
+        {
+            return Err(invalid_library_argument(
+                field,
+                crate::tools::footprint_root_reason(Some("module")),
+            ));
+        }
+        return Err(root_error());
+    }
+    let start = source.len() - source.trim_start().len();
+    let (_, end) = find_balanced_block(source, start)
+        .filter(|(_, end)| source[*end..].trim().is_empty())
+        .ok_or_else(|| {
+            invalid_library_argument(
+                field,
+                format!("malformed {expected_root} document or trailing data"),
+            )
+        })?;
+    let tree = parse_sexp(&source[start..end]).map_err(|error| {
+        invalid_library_argument(
+            field,
+            format!("malformed {expected_root} document: {error}"),
+        )
+    })?;
+    Ok((tree, start))
+}
+
+fn valid_library_identifier(name: &str) -> bool {
+    !name.trim().is_empty() && !name.contains([':', '"'])
+}
+
+const LIBRARY_IDENTIFIER_REQUIREMENT: &str = "must not be empty or contain a colon or double quote";
+
+/// Atomic create already refuses an existing destination. Verify the bytes
+/// after publication so a concurrent replacement cannot appear successful.
+fn write_new_library_document(path: &Path, source: &str) -> Result<(), konnect_sexp::SexpError> {
+    write_new_atomic(path, source)?;
+    let reason = match std::fs::read_to_string(path) {
+        Ok(observed) if observed == source => return Ok(()),
+        Ok(_) => "created library bytes changed before readback".to_string(),
+        Err(error) => format!("could not read the created library: {error}"),
+    };
+    Err(konnect_sexp::SexpError::MutationOutcomeUncertain {
+        path: path.to_path_buf(),
+        reason,
+    })
 }
 
 fn invalid_library_argument(field: &str, reason: impl Into<String>) -> CallToolResult {
@@ -2430,6 +2548,12 @@ async fn register_in_lib_table_with_policy(
     lib_type: &str,
     replace_existing: bool,
 ) -> anyhow::Result<Result<LibTableRegistration, LibTableRegistrationError>> {
+    if !valid_library_identifier(nickname) {
+        return Ok(Err(LibTableRegistrationError {
+            field: "nickname".to_string(),
+            reason: LIBRARY_IDENTIFIER_REQUIREMENT.to_string(),
+        }));
+    }
     let root = table_root_element(table_path);
     let existing = table_path.exists();
     let source = if existing {
@@ -2462,7 +2586,7 @@ async fn register_in_lib_table_with_policy(
         if existing {
             persist_lib_table_registration(table_path, &source, &prepared.content)?;
         } else {
-            write_new_atomic(table_path, &prepared.content)?;
+            write_new_library_document(table_path, &prepared.content)?;
         }
     }
     Ok(Ok(prepared.registration))
@@ -4250,6 +4374,9 @@ async fn handle_create_symbol(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
+    if let Err(error) = require_library_extension(&lib_path, "kicad_sym", "library_path") {
+        return Ok(error);
+    }
     // Schema-required. Defaulting them appended `(symbol "Symbol" …)` with
     // reference `U` to the library — and there is no duplicate-name guard, so
     // repeated calls stacked identically-named entries in one file (#218).
@@ -4261,6 +4388,12 @@ async fn handle_create_symbol(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    if !valid_library_identifier(name) {
+        return Ok(invalid_library_argument(
+            "name",
+            LIBRARY_IDENTIFIER_REQUIREMENT,
+        ));
+    }
     let value_str = args["value"].as_str().unwrap_or(name);
     // `~` is KiCAD's legacy "no datasheet" placeholder. Its library loader
     // normalises it to the empty string and its schematic lib_symbols loader
@@ -4580,10 +4713,15 @@ async fn handle_create_symbol(
         Err(error) => return Err(error.into()),
     };
     if let Some(source) = &expected {
+        let (root, _) = match parse_library_document(source, "kicad_symbol_lib", "library_path") {
+            Ok(document) => document,
+            Err(error) => return Ok(error),
+        };
         anyhow::ensure!(
-            !top_level_symbol_names(source)?
+            !root
+                .find_all("symbol")
                 .iter()
-                .any(|existing| existing == name),
+                .any(|symbol| symbol.get(1).and_then(SexpNode::as_str) == Some(name)),
             "Symbol '{name}' already exists in library"
         );
     }
@@ -4606,18 +4744,24 @@ async fn handle_create_symbol(
             .to_string()
     };
 
-    // Insert before closing paren of root expression
-    let insert_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = format!("{}{}\n)", &content[..insert_pos], symbol_sexp);
-
+    // The existing or generated root was validated above. Locate its
+    // closing delimiter after updating the format metadata.
+    let (_, end) = find_balanced_block(&content, 0)
+        .ok_or_else(|| anyhow::anyhow!("unbalanced symbol library root"))?;
+    let new_content = apply_edits(
+        content,
+        vec![SexpEdit::insert(end - 1, format!("{symbol_sexp}\n"))],
+    );
+    if let Err(error) = parse_library_document(&new_content, "kicad_symbol_lib", "library_path") {
+        return Ok(error);
+    }
     if let Some(parent) = lib_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    parse_sexp(&new_content)?;
     if let Some(expected) = expected {
         write_atomic_if_unchanged(&lib_path, &expected, &new_content)?;
     } else {
-        write_new_atomic(&lib_path, &new_content)?;
+        write_new_library_document(&lib_path, &new_content)?;
     }
 
     let mut result = json!({
@@ -4642,6 +4786,9 @@ async fn handle_delete_symbol(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
+    if let Err(error) = require_library_extension(&lib_path, "kicad_sym", "library_path") {
+        return Ok(error);
+    }
     let symbol_name = match require_str(args, "symbol_name") {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -4649,12 +4796,11 @@ async fn handle_delete_symbol(
 
     let content = tokio::fs::read_to_string(&lib_path).await?;
 
-    let root = parse_sexp(&content)?;
-    anyhow::ensure!(
-        root.head() == Some("kicad_symbol_lib"),
-        "Expected a KiCad symbol library"
-    );
-    let matches = find_direct_child_blocks(&content, "kicad_symbol_lib")
+    let (root, start) = match parse_library_document(&content, "kicad_symbol_lib", "library_path") {
+        Ok(document) => document,
+        Err(error) => return Ok(error),
+    };
+    let matches = find_direct_child_blocks_at(&content, start)
         .into_iter()
         .filter(|&(start, end)| {
             parse_sexp(&content[start..end]).ok().is_some_and(|node| {
@@ -4667,8 +4813,26 @@ async fn handle_delete_symbol(
         matches.len() == 1,
         "Symbol '{symbol_name}' not found or ambiguous in library"
     );
+    let dependents: std::collections::BTreeSet<_> = root
+        .find_all("symbol")
+        .into_iter()
+        .filter(|symbol| symbol.find_str("extends") == Some(symbol_name))
+        .filter_map(|symbol| symbol.get(1).and_then(SexpNode::as_str))
+        .collect();
+    if !dependents.is_empty() {
+        return Ok(invalid_library_argument(
+            "symbol_name",
+            format!(
+                "cannot delete '{symbol_name}'; derived symbols: {}",
+                dependents.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        ));
+    }
     let (start, end) = matches[0];
     let new_content = apply_edits(content.clone(), vec![SexpEdit::delete(start, end)]);
+    if let Err(error) = parse_library_document(&new_content, "kicad_symbol_lib", "library_path") {
+        return Ok(error);
+    }
     write_atomic_if_unchanged(&lib_path, &content, &new_content)?;
 
     Ok(CallToolResult::text(
@@ -10536,7 +10700,7 @@ mod library_write_contract_tests {
 mod quoted_symbol_readback_tests {
     use super::*;
     #[tokio::test]
-    async fn symbol_names_properties_and_pin_text_roundtrip_escaping() {
+    async fn symbol_properties_and_pin_text_roundtrip_escaping() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("quoted.kicad_sym");
         let value = "a\"b\\c";
@@ -10544,12 +10708,12 @@ mod quoted_symbol_readback_tests {
             Default::default(),
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         );
-        let result=handle_create_symbol(&json!({"library_path":path,"name":value,"value":value,"datasheet":value,"reference_prefix":"U","pins":[{"number":"1","name":value,"type":"input","x":-5.08,"y":0,"angle":0,"length":2.54}]}),&ctx).await.unwrap();
+        let result=handle_create_symbol(&json!({"library_path":path,"name":"TestSymbol","value":value,"datasheet":value,"reference_prefix":"U","pins":[{"number":"1","name":value,"type":"input","x":-5.08,"y":0,"angle":0,"length":2.54}]}),&ctx).await.unwrap();
         assert!(!result.is_error);
         let text = std::fs::read_to_string(path).unwrap();
         let root = parse_sexp(&text).unwrap();
         let sym = root.find("symbol").unwrap();
-        assert_eq!(sym.get(1).unwrap().as_str(), Some(value));
+        assert_eq!(sym.get(1).unwrap().as_str(), Some("TestSymbol"));
         for name in ["Value", "Datasheet"] {
             let prop = sym
                 .find_all("property")

@@ -14,6 +14,7 @@ use nom::{
     sequence::preceded,
     IResult, Parser,
 };
+use std::io::{self, BufRead};
 
 // ─── AST ─────────────────────────────────────────────────────────────────────
 
@@ -88,6 +89,34 @@ impl SexpNode {
 
 /// Maximum number of nested lists in a parsed KiCad expression, including its root list.
 pub const MAX_LIST_DEPTH: usize = 256;
+
+/// Recognize a document's bare root token without loading or parsing its body.
+pub fn has_bare_list_root(source: impl BufRead, expected: &str) -> io::Result<bool> {
+    fn next_non_whitespace(
+        bytes: &mut impl Iterator<Item = io::Result<u8>>,
+    ) -> io::Result<Option<u8>> {
+        bytes
+            .find(|byte| !matches!(byte, Ok(byte) if byte.is_ascii_whitespace()))
+            .transpose()
+    }
+
+    let mut bytes = source.bytes();
+    let mut name = expected.as_bytes().iter().copied();
+    if next_non_whitespace(&mut bytes)? != Some(b'(')
+        || next_non_whitespace(&mut bytes)? != name.next()
+    {
+        return Ok(false);
+    }
+    for expected in name {
+        if bytes.next().transpose()? != Some(expected) {
+            return Ok(false);
+        }
+    }
+    Ok(bytes
+        .next()
+        .transpose()?
+        .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'(' | b')')))
+}
 
 /// Parse a full KiCAD S-expression document into a `SexpNode::List`.
 pub fn parse_sexp(input: &str) -> Result<SexpNode, SexpError> {

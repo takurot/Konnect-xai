@@ -31,36 +31,12 @@ pub fn format_blank_schematic_with_paper(size: &str, portrait: bool) -> String {
 /// Check the extension used for a KiCad schematic.
 #[must_use]
 pub fn has_schematic_extension(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_sch"))
+    crate::paths::has_document_extension(path, "kicad_sch")
 }
 
 /// Recognize the bare root token without loading or parsing the file body.
 pub fn has_schematic_root(source: impl BufRead) -> io::Result<bool> {
-    fn next_non_whitespace(
-        bytes: &mut impl Iterator<Item = io::Result<u8>>,
-    ) -> io::Result<Option<u8>> {
-        bytes
-            .find(|byte| !matches!(byte, Ok(byte) if byte.is_ascii_whitespace()))
-            .transpose()
-    }
-
-    let mut bytes = source.bytes();
-    let mut name = b"kicad_sch".iter().copied();
-    if next_non_whitespace(&mut bytes)? != Some(b'(')
-        || next_non_whitespace(&mut bytes)? != name.next()
-    {
-        return Ok(false);
-    }
-    for expected in name {
-        if bytes.next().transpose()? != Some(expected) {
-            return Ok(false);
-        }
-    }
-    Ok(bytes
-        .next()
-        .transpose()?
-        .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'(' | b')')))
+    crate::parser::has_bare_list_root(source, "kicad_sch")
 }
 
 /// Replace text only when both revisions are schematic sources and the
