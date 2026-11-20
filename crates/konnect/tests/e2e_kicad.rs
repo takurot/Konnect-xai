@@ -151,6 +151,58 @@ fn body(result: &Value) -> Value {
 
 #[test]
 #[ignore = "requires kicad-cli; run via e2e workflow"]
+fn repeated_project_snapshots_publish_distinct_native_pdfs() {
+    let cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
+    let directory = tempfile::tempdir().unwrap();
+    let fixture_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../konnect-core/tests/fixtures");
+    let schematic = directory.path().join("snapshot.kicad_sch");
+    let board = directory.path().join("snapshot.kicad_pcb");
+    std::fs::copy(fixture_dir.join("ecc83_multiunit.kicad_sch"), &schematic).unwrap();
+    std::fs::copy(
+        fixture_dir.join("specctra_soic8_roundrect.kicad_pcb"),
+        &board,
+    )
+    .unwrap();
+    let output = directory.path().join("checkpoints");
+    let mut mcp = Mcp::spawn(&cli);
+    let mut artifacts = std::collections::BTreeSet::new();
+    for _ in 0..2 {
+        let result = body(&mcp.tool(
+            "snapshot_project",
+            json!({
+                "schematic": schematic, "pcb": board, "output_dir": output, "label": "board-v1"
+            }),
+        ));
+        for field in ["snapshot", "pcb_snapshot"] {
+            let pdf = std::path::PathBuf::from(result[field].as_str().expect(field));
+            assert_eq!(
+                pdf.parent().unwrap().canonicalize().unwrap(),
+                output.canonicalize().unwrap()
+            );
+            assert!(
+                std::fs::read(&pdf).unwrap().starts_with(b"%PDF-"),
+                "{pdf:?}"
+            );
+            assert!(artifacts.insert(pdf));
+        }
+    }
+    let partial = mcp.request(
+        "tools/call",
+        json!({"name": "snapshot_project", "arguments": {
+            "schematic": schematic, "pcb": directory.path().join("missing.kicad_pcb"),
+            "output_dir": output, "label": "board-v1"
+        }}),
+    );
+    assert_eq!(partial["result"]["isError"], true, "{partial}");
+    let report = body(&partial["result"]);
+    assert_eq!(report["artifacts_written"], json!([report["snapshot"]]));
+    let pdf = std::path::PathBuf::from(report["snapshot"].as_str().unwrap());
+    assert!(std::fs::read(pdf).unwrap().starts_with(b"%PDF-"));
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
 fn fabrication_and_document_exports_through_mcp() {
     let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
     let dir = tempfile::tempdir().unwrap();
