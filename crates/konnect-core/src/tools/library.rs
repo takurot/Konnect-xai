@@ -204,7 +204,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["library_path", "nickname"]
             }),
             |args, ctx| async move { handle_register_footprint_library(args, ctx).await }
-        ),
+        )
+        .with_kicad_config(),
         tool!(
             "list_footprint_libraries",
             "List all registered footprint libraries (global and optionally project-level).",
@@ -221,7 +222,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": []
             }),
             |args, ctx| async move { handle_list_footprint_libraries(args, ctx).await }
-        ),
+        )
+        .with_kicad_config(),
         tool!(
             "create_symbol",
             "Create a new KiCAD schematic symbol and append it to a .kicad_sym library file. \
@@ -336,7 +338,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["library_path", "nickname"]
             }),
             |args, ctx| async move { handle_register_symbol_library(args, ctx).await }
-        ),
+        )
+        .with_kicad_config(),
         tool!(
             "list_symbol_libraries",
             "List all registered symbol libraries (global and optionally project-level).",
@@ -353,7 +356,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": []
             }),
             |args, ctx| async move { handle_list_symbol_libraries(args, ctx).await }
-        ),
+        )
+        .with_kicad_config(),
         tool!(
             "search_symbols",
             "Search for symbols across all registered libraries by name or keyword.",
@@ -367,7 +371,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["query"]
             }),
             |args, ctx| async move { handle_search_symbols(args, ctx).await }
-        ),
+        )
+        .with_kicad_config(),
         tool!(
             "list_library_footprints",
             "List all footprints in a specific registered footprint library (.pretty directory).",
@@ -396,7 +401,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["footprint_path"]
             }),
             |args, ctx| async move { handle_get_footprint_info(args, ctx).await }
-        ),
+        )
+        .with_kicad_config(),
         tool!(
             "search_footprints",
             "Search for footprints across all registered libraries by name or keyword.",
@@ -409,7 +415,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["query"]
             }),
             |args, ctx| async move { handle_search_footprints(args, ctx).await }
-        ),
+        )
+        .with_kicad_config(),
         tool!(
             "get_symbol_info",
             "Return detailed information about a schematic symbol: pins, properties, description.",
@@ -422,7 +429,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["lib_id"]
             }),
             |args, ctx| async move { handle_get_symbol_info(args, ctx).await }
-        ),
+        )
+        .with_kicad_config(),
     ];
     // Grouped after `create_footprint` so the footprint-editing tools read as
     // one family in `tools/list`. Anchored on that tool's name rather than a

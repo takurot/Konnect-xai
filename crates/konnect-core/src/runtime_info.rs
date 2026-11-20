@@ -270,6 +270,12 @@ fn without_deleted_suffix(path: PathBuf) -> PathBuf {
     }
 }
 
+pub(crate) async fn probe_kicad_version(path: &Path) -> Option<String> {
+    probe_command_version(path, VersionCommand::KiCad)
+        .await
+        .version
+}
+
 /// Probe a Konnect executable for the version it reports. Reload validation
 /// uses the same parser and timeout as installation diagnostics so the two
 /// paths cannot disagree about whether a candidate is runnable.

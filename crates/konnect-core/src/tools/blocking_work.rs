@@ -76,9 +76,14 @@ where
     R: Send + 'static,
 {
     let guard = track_current_work();
+    let config_scope = &crate::kicad_install::REQUEST_CONFIG_DIR;
+    let config_dir = config_scope.try_with(Clone::clone).ok();
     tokio::task::spawn_blocking(move || {
         let _guard = guard;
-        work()
+        match config_dir {
+            Some(path) => config_scope.sync_scope(path, work),
+            None => work(),
+        }
     })
 }
 
@@ -96,6 +101,19 @@ where
 mod tests {
     use super::*;
     use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn blocking_library_lookups_keep_the_request_config() {
+        let path = std::path::PathBuf::from("request-specific-ki-cad-settings");
+        let actual = crate::kicad_install::REQUEST_CONFIG_DIR
+            .scope(path.clone(), async {
+                spawn_tracked_blocking(crate::kicad_install::config_dir)
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert_eq!(actual, path);
+    }
 
     #[tokio::test]
     async fn worker_panic_releases_the_request_barrier() {

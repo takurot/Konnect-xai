@@ -170,11 +170,12 @@ where
                         continue;
                     }
                 };
-                let method = message.get("method").and_then(Value::as_str);
+                let method = request_method(&message);
                 if method == Some("notifications/cancelled") && message.get("id").is_none() {
                     if let Some(id) = message
                         .get("params")
                         .and_then(|params| params.get("requestId"))
+                        .filter(|id| is_request_id(id))
                     {
                         calls.retain(|call| !call.has_id(id));
                         if let Some(call) = active.as_mut().filter(|call| call.has_id(id)) {
@@ -184,20 +185,16 @@ where
                     }
                     continue;
                 }
-                if method == Some("tools/call") {
-                    if let Some(id) = message.get("id") {
-                        let duplicate = active.as_ref().is_some_and(|call| call.has_id(id))
-                            || calls.iter().any(|call| call.has_id(id));
-                        if duplicate || calls.len() >= MAX_QUEUED_CALLS {
-                            let reason = if duplicate {
-                                "Request id is already in flight"
-                            } else {
-                                "Too many queued tool calls"
-                            };
-                            write_response(&mut output, &request_error(id.clone(), reason)).await?;
-                            continue;
-                        }
-                    } else if calls.len() >= MAX_QUEUED_CALLS {
+                if let Some(id) = message.get("id").filter(|_| method == Some("tools/call")) {
+                    let duplicate = active.as_ref().is_some_and(|call| call.has_id(id))
+                        || calls.iter().any(|call| call.has_id(id));
+                    if duplicate || calls.len() >= MAX_QUEUED_CALLS {
+                        let reason = if duplicate {
+                            "Request id is already in flight"
+                        } else {
+                            "Too many queued tool calls"
+                        };
+                        write_response(&mut output, &request_error(id.clone(), reason)).await?;
                         continue;
                     }
                     calls.push_back(PendingCall {
@@ -208,8 +205,7 @@ where
                     continue;
                 }
                 // Lifecycle and cheap protocol requests never wait behind tools.
-                let expects_response = message.get("id").is_some();
-                if let Some(response) = dispatch(message).await.filter(|_| expects_response) {
+                if let Some(response) = dispatch(message).await {
                     write_response(&mut output, &response).await?;
                 }
                 if active.is_none() {

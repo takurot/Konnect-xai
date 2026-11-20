@@ -133,7 +133,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "components"]
             }),
             |args, ctx| async move { handle_batch_place_components(args, ctx).await }
-        ),
+        )
+        .with_kicad_config(),
         tool!(
             "batch_connect_pins",
             "Connect multiple component pin pairs by reference and pin number, in a single \

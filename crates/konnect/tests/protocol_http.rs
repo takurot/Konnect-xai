@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 struct HttpServer {
     child: Child,
     addr: String,
-    _config: tempfile::NamedTempFile,
+    _state: tempfile::TempDir,
 }
 
 /// Spawn the binary against a temp JSON config, with `KONNECT_HTTP_TOKEN`
@@ -25,15 +25,17 @@ fn spawn_konnect(
     config_json: &str,
     env_token: Option<&str>,
     stderr: Stdio,
-) -> (Child, tempfile::NamedTempFile) {
-    let mut config = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+) -> (Child, tempfile::TempDir) {
+    let state = tempfile::tempdir().unwrap();
+    let mut config = std::fs::File::create(state.path().join("config.json")).unwrap();
     config.write_all(config_json.as_bytes()).unwrap();
     config.flush().unwrap();
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
     command
         .arg("--config")
-        .arg(config.path())
+        .arg(state.path().join("config.json"))
+        .env("KONNECT_STATE_DIR", state.path().join("state"))
         .stdin(Stdio::piped()) // piped stdin so it doesn't detect a TTY
         .stdout(Stdio::null())
         .stderr(stderr);
@@ -42,7 +44,7 @@ fn spawn_konnect(
         None => command.env_remove("KONNECT_HTTP_TOKEN"),
     };
     let child = command.spawn().expect("failed to spawn konnect binary");
-    (child, config)
+    (child, state)
 }
 
 fn free_port() -> u16 {
@@ -80,13 +82,13 @@ impl HttpServer {
         let port = free_port();
         let config_json =
             format!(r#"{{"transport":"http","http_address":"{bind_ip}:{port}"{extra_config}}}"#);
-        let (child, config) = spawn_konnect(&config_json, env_token, Stdio::null());
+        let (child, state) = spawn_konnect(&config_json, env_token, Stdio::null());
         let addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer {
             child,
             addr,
-            _config: config,
+            _state: state,
         };
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
@@ -128,7 +130,11 @@ impl HttpServer {
         {
             req.push_str(&format!("Host: {}\r\n", self.addr));
         }
-        if body.starts_with('{') {
+        if !body.is_empty()
+            && !extra_headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        {
             req.push_str("Content-Type: application/json\r\n");
         }
         for (k, v) in extra_headers {
@@ -234,6 +240,118 @@ fn streamable_http_conformance() {
         )
         .unwrap();
     assert_eq!(status, 200);
+}
+
+#[test]
+fn protocol_notifications_have_empty_http_bodies() {
+    let server = HttpServer::spawn();
+    for method in [
+        "notifications/roots/list_changed",
+        "notifications/cancelled",
+        "ping",
+    ] {
+        let (status, _, body) = server
+            .raw_request(
+                "POST",
+                "/mcp",
+                &[],
+                Some(&json!({"jsonrpc":"2.0","method":method}).to_string()),
+            )
+            .unwrap();
+        assert_eq!(status, 202, "{method}: {body}");
+        assert!(body.is_empty(), "{method}: {body}");
+    }
+}
+
+#[test]
+fn protocol_errors_return_json_rpc_over_http() {
+    let server = HttpServer::spawn();
+    for (message, id, code, expected_status) in [
+        (
+            r#"{"jsonrpc":"2.0","id":2,"method":"resources/templates/list"}"#,
+            json!(2),
+            -32601,
+            200,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":3,"method":"logging/setLevel"}"#,
+            json!(3),
+            -32601,
+            200,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":4,"method":"completion/complete"}"#,
+            json!(4),
+            -32601,
+            200,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"file:///example"}}"#,
+            json!(5),
+            -32601,
+            200,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"arguments":{}}}"#,
+            json!(6),
+            -32602,
+            200,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":[]}"#,
+            json!(7),
+            -32602,
+            200,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"list_toolboxes","arguments":[]}}"#,
+            json!(8),
+            -32602,
+            200,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"list_toolboxes","arguments":null}}"#,
+            json!(11),
+            -32602,
+            200,
+        ),
+        (
+            r#"[{"jsonrpc":"2.0","id":9,"method":"ping"}]"#,
+            Value::Null,
+            -32600,
+            200,
+        ),
+        ("[]", Value::Null, -32600, 200),
+        (r#"{"id":10,"method":"ping"}"#, json!(10), -32600, 200),
+        (
+            r#"{"jsonrpc":"1.0","id":"wrong-version","method":"ping"}"#,
+            json!("wrong-version"),
+            -32600,
+            200,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+            Value::Null,
+            -32600,
+            200,
+        ),
+        (r#"{"jsonrpc":"2.0"}"#, Value::Null, -32600, 200),
+        ("{", Value::Null, -32700, 400),
+    ] {
+        let (status, headers, body) = server
+            .raw_request("POST", "/mcp", &[], Some(message))
+            .unwrap();
+        assert_eq!(status, expected_status, "{message}: {body}");
+        assert!(
+            headers.to_lowercase().contains("application/json"),
+            "{message}: {headers}"
+        );
+        let response: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(response["jsonrpc"], "2.0", "{message}: {response}");
+        assert_eq!(response.get("id"), Some(&id), "{message}: {response}");
+        assert_eq!(response["error"]["code"], code, "{message}: {response}");
+        assert!(response.get("result").is_none());
+    }
 }
 
 #[test]
@@ -409,7 +527,7 @@ fn refused_startup(extra_config: &str) -> (std::process::ExitStatus, String) {
         r#"{{"transport":"http","http_address":"0.0.0.0:{}"{extra_config}}}"#,
         free_port()
     );
-    let (mut child, _config) = spawn_konnect(&config_json, None, Stdio::piped());
+    let (mut child, _state) = spawn_konnect(&config_json, None, Stdio::piped());
     let deadline = Instant::now() + Duration::from_secs(15);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {

@@ -170,25 +170,28 @@ pub fn tools() -> Vec<ToolDef> {
 
 // ─── JLCPCB database path helper ─────────────────────────────────────────────
 
-fn default_jlcpcb_db_path() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        PathBuf::from(appdata).join("konnect").join("jlcpcb.db")
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".konnect").join("jlcpcb.db")
-    }
+fn default_jlcpcb_db_path() -> anyhow::Result<PathBuf> {
+    use konnect_sexp::state::{self, StateDir};
+
+    let state = StateDir::resolve().map_err(anyhow::Error::msg)?;
+    Ok(state.existing_or_default("jlcpcb.db", || {
+        #[cfg(windows)]
+        let old = state::legacy_roaming_dir();
+        #[cfg(not(windows))]
+        let old = state::legacy_home_dir();
+        old.map(|dir| dir.join("jlcpcb.db"))
+    }))
 }
 
-pub(super) fn resolve_db_path(args: &serde_json::Value, ctx: &ToolContext) -> PathBuf {
+pub(super) fn resolve_db_path(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<PathBuf> {
     if let Some(p) = args["output_path"].as_str() {
-        return PathBuf::from(p);
+        return Ok(PathBuf::from(p));
     }
     if let Some(p) = &ctx.config.jlcpcb_db_path {
-        return p.clone();
+        return Ok(p.clone());
     }
     default_jlcpcb_db_path()
 }
@@ -212,6 +215,7 @@ mod configured_db_path_tests {
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
+                .env("KONNECT_STATE_DIR", dir.path().join("state"))
                 .env("APPDATA", dir.path())
                 .env("HOME", dir.path())
                 .output()
@@ -225,7 +229,7 @@ mod configured_db_path_tests {
             return;
         }
 
-        let default = default_jlcpcb_db_path();
+        let default = default_jlcpcb_db_path().unwrap();
         std::fs::create_dir_all(default.parent().unwrap()).unwrap();
         let configured = default.with_file_name(" configured.db");
         let override_path = default.with_file_name("override.db");
@@ -250,7 +254,7 @@ mod configured_db_path_tests {
                 config.clone(),
                 std::sync::Arc::new(crate::router::ToolRouter::new()),
             );
-            assert_eq!(resolve_db_path(&json!({}), &direct), expected);
+            assert_eq!(resolve_db_path(&json!({}), &direct).unwrap(), expected);
             let handler = McpHandler::new(config).await.unwrap();
             for selected in [&expected, &override_path] {
                 for (name, mut arguments) in [
@@ -695,7 +699,7 @@ async fn handle_download_jlcpcb(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let db_path = resolve_db_path(args, ctx);
+    let db_path = resolve_db_path(args, ctx)?;
     let force = args["force"].as_bool().unwrap_or(false);
 
     if db_path.exists() && !force {
@@ -861,7 +865,7 @@ async fn handle_search_jlcpcb_parts(
         Err(e) => return Ok(e),
     };
 
-    let db_path = resolve_db_path(args, ctx);
+    let db_path = resolve_db_path(args, ctx)?;
     if !db_path.exists() {
         return Ok(CallToolResult::error(
             "JLCPCB database not found. Run download_jlcpcb_database first.",
@@ -1008,7 +1012,7 @@ async fn handle_get_jlcpcb_part(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let db_path = resolve_db_path(args, ctx);
+    let db_path = resolve_db_path(args, ctx)?;
     if !db_path.exists() {
         return Ok(CallToolResult::error(
             "JLCPCB database not found. Run download_jlcpcb_database first.",
@@ -1264,7 +1268,7 @@ async fn handle_suggest_alternatives(
         ));
     };
 
-    let db_path = resolve_db_path(args, ctx);
+    let db_path = resolve_db_path(args, ctx)?;
     if !db_path.exists() {
         return Ok(CallToolResult::error(
             "JLCPCB database not found. Run download_jlcpcb_database first.",
@@ -1344,7 +1348,7 @@ async fn handle_jlcpcb_stats(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let db_path = resolve_db_path(args, ctx);
+    let db_path = resolve_db_path(args, ctx)?;
     if !db_path.exists() {
         return Ok(CallToolResult::text(
             serde_json::to_string(&json!({
@@ -1820,7 +1824,7 @@ async fn datasheet_from_catalog(
     lcsc_id: Option<&str>,
     mpn: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
-    let db_path = resolve_db_path(args, ctx);
+    let db_path = resolve_db_path(args, ctx)?;
     if !db_path.exists() {
         return Ok(None);
     }
@@ -1912,7 +1916,7 @@ async fn handle_get_datasheet_url(
     // Both sources missed — say which were tried, not just that the answer
     // is null (#255).
     let mut tried = vec![];
-    if resolve_db_path(&serde_json::Value::Null, ctx).exists() {
+    if resolve_db_path(&serde_json::Value::Null, ctx).is_ok_and(|path| path.exists()) {
         tried.push("local catalog");
     } else {
         tried.push("local catalog (database not downloaded)");
@@ -1989,28 +1993,12 @@ enum FreeroutingLocation {
     PathDirectory,
 }
 
-/// The variables naming a KiCad third-party directory, newest KiCad first.
-const FREEROUTING_THIRD_PARTY_VARIABLES: [&str; 3] =
-    ["KICAD10_3RD_PARTY", "KICAD9_3RD_PARTY", "KICAD8_3RD_PARTY"];
-
-/// The KiCad versions whose plugin folders are searched, newest first.
-const FREEROUTING_KICAD_VERSIONS: [&str; 3] = ["10.0", "9.0", "8.0"];
-
-/// Plugin folders below a home directory: the variable naming the home, the
-/// folder below it (`<version>` stands for each version), and whether it is
-/// searched on Windows only.
-const FREEROUTING_PLUGIN_FOLDERS: [(&str, &str, bool); 3] = [
-    ("HOME", "Documents/KiCad/<version>/3rdparty/plugins", false),
-    (
-        "HOME",
-        ".local/share/kicad/<version>/3rdparty/plugins",
-        false,
-    ),
-    (
-        "USERPROFILE",
-        "Documents/KiCad/<version>/3rdparty/plugins",
-        true,
-    ),
+/// Environment roots and their versioned KiCad documents directories.
+const FREEROUTING_PLUGIN_FOLDERS: [(&str, &str, bool); 4] = [
+    ("KICAD_DOCUMENTS_HOME", "", false),
+    ("HOME", "Documents/KiCad", false),
+    ("HOME", ".local/share/kicad", false),
+    ("USERPROFILE", "Documents/KiCad", true),
 ];
 
 /// The JAR looked for in the server's working directory.
@@ -2055,20 +2043,19 @@ impl FreeroutingLocation {
 
     fn description(self) -> String {
         match self {
-            Self::KicadThirdPartyVariable => format!(
-                "the directories named by {}",
-                english_list(
-                    FREEROUTING_THIRD_PARTY_VARIABLES
-                        .iter()
-                        .map(|v| v.to_string())
-                )
-            ),
+            Self::KicadThirdPartyVariable => {
+                "the directories named by KICAD<major>_3RD_PARTY, newest major first".to_string()
+            }
             Self::KicadPluginFolder => format!(
-                "the KiCad {} plugin folders {}",
-                english_list(FREEROUTING_KICAD_VERSIONS.iter().map(|v| v.to_string())),
+                "existing KiCad <major>.<minor> plugin folders (newest first) {}",
                 english_list(FREEROUTING_PLUGIN_FOLDERS.iter().map(
                     |(home, folder, windows_only)| {
-                        let place = format!("${home}/{folder}");
+                        let base = if folder.is_empty() {
+                            format!("${home}")
+                        } else {
+                            format!("${home}/{folder}")
+                        };
+                        let place = format!("{base}/<version>/3rdparty/plugins");
                         if *windows_only {
                             format!("{place} (Windows only)")
                         } else {
@@ -2134,7 +2121,7 @@ impl FreeroutingSearchRoot {
 
 fn freerouting_search_roots() -> Vec<FreeroutingSearchRoot> {
     freerouting_search_roots_from(
-        |name| std::env::var_os(name),
+        &std::env::vars_os().collect(),
         &std::env::current_dir().unwrap_or_default(),
     )
 }
@@ -2142,9 +2129,21 @@ fn freerouting_search_roots() -> Vec<FreeroutingSearchRoot> {
 /// The search roots for a given environment, so a test can supply one without
 /// touching the process's own.
 fn freerouting_search_roots_from(
-    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    env: &std::collections::HashMap<std::ffi::OsString, std::ffi::OsString>,
     working_directory: &Path,
 ) -> Vec<FreeroutingSearchRoot> {
+    let var = |name: &str| {
+        let name = std::ffi::OsStr::new(name);
+        env.get(name).or_else(|| {
+            if cfg!(windows) {
+                env.iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value)
+            } else {
+                None
+            }
+        })
+    };
     let mut roots: Vec<FreeroutingSearchRoot> = Vec::new();
     let mut push = |location: FreeroutingLocation, path: PathBuf| {
         let path = if path.is_absolute() {
@@ -2163,37 +2162,30 @@ fn freerouting_search_roots_from(
             })
         }
     };
-    let below = |base: PathBuf, folder: &str| folder.split('/').fold(base, |p, part| p.join(part));
-
-    for variable in FREEROUTING_THIRD_PARTY_VARIABLES {
-        if let Some(path) = var(variable) {
-            push(
-                FreeroutingLocation::KicadThirdPartyVariable,
-                PathBuf::from(path),
-            );
-        }
+    for (_, path) in crate::kicad_install::versioned_environment(
+        env.iter().map(|(key, value)| (key.clone(), value.clone())),
+        "3RD_PARTY",
+    ) {
+        push(
+            FreeroutingLocation::KicadThirdPartyVariable,
+            PathBuf::from(path),
+        );
     }
 
-    let mut homes: Vec<&str> = FREEROUTING_PLUGIN_FOLDERS
-        .iter()
-        .map(|(home, _, _)| *home)
-        .collect();
-    homes.dedup();
-    for home_variable in homes {
-        let Some(home) = var(home_variable).map(PathBuf::from) else {
+    let mut plugin_bases = Vec::new();
+    for (variable, folder, windows_only) in FREEROUTING_PLUGIN_FOLDERS {
+        if windows_only && !cfg!(target_os = "windows") {
             continue;
-        };
-        for version in FREEROUTING_KICAD_VERSIONS {
-            for (variable, folder, windows_only) in FREEROUTING_PLUGIN_FOLDERS {
-                if variable != home_variable || (windows_only && !cfg!(target_os = "windows")) {
-                    continue;
-                }
-                push(
-                    FreeroutingLocation::KicadPluginFolder,
-                    below(home.clone(), &folder.replace("<version>", version)),
-                );
-            }
         }
+        if let Some(home) = var(variable).filter(|value| !value.is_empty()) {
+            plugin_bases.push(working_directory.join(home).join(folder));
+        }
+    }
+    for directory in crate::kicad_install::version_directories_in(&plugin_bases) {
+        push(
+            FreeroutingLocation::KicadPluginFolder,
+            directory.join("3rdparty").join("plugins"),
+        );
     }
 
     push(
@@ -2207,7 +2199,7 @@ fn freerouting_search_roots_from(
         );
     }
     if let Some(path) = var(FREEROUTING_PATH_VARIABLE) {
-        for directory in std::env::split_paths(&path) {
+        for directory in std::env::split_paths(path) {
             push(FreeroutingLocation::PathDirectory, directory);
         }
     }
@@ -2680,16 +2672,30 @@ mod freerouting_tests {
     }
 
     /// A full environment, so every location the search can visit is present.
-    fn every_location_environment(root: &Path) -> HashMap<&'static str, std::ffi::OsString> {
+    fn every_location_environment(root: &Path) -> HashMap<std::ffi::OsString, std::ffi::OsString> {
         let path = std::env::join_paths([root.join("bin-a"), root.join("bin-b")]).unwrap();
-        HashMap::from([
+        let env = HashMap::from([
+            ("KICAD11_3RD_PARTY", root.join("k11").into_os_string()),
             ("KICAD10_3RD_PARTY", root.join("k10").into_os_string()),
             ("KICAD9_3RD_PARTY", root.join("k9").into_os_string()),
             ("KICAD8_3RD_PARTY", root.join("k8").into_os_string()),
             ("HOME", root.join("home").into_os_string()),
             ("USERPROFILE", root.join("profile").into_os_string()),
+            (
+                "KICAD_DOCUMENTS_HOME",
+                root.join("documents").into_os_string(),
+            ),
             ("PATH", path),
-        ])
+        ]);
+        for (home, folder, _) in FREEROUTING_PLUGIN_FOLDERS {
+            for version in ["11.0", "10.99", "9.0"] {
+                std::fs::create_dir_all(PathBuf::from(&env[home]).join(folder).join(version))
+                    .unwrap();
+            }
+        }
+        env.into_iter()
+            .map(|(key, value)| (key.into(), value))
+            .collect()
     }
 
     /// #787: the `jar_path` description is the documentation of the search.
@@ -2700,8 +2706,7 @@ mod freerouting_tests {
     fn the_search_visits_the_documented_locations_in_the_documented_order() {
         let temp = tempfile::tempdir().unwrap();
         let env = every_location_environment(temp.path());
-        let roots =
-            freerouting_search_roots_from(|name| env.get(name).cloned(), &temp.path().join("cwd"));
+        let roots = freerouting_search_roots_from(&env, &temp.path().join("cwd"));
 
         let visited: Vec<FreeroutingLocation> = roots.iter().map(|root| root.location).collect();
         assert!(
@@ -2745,57 +2750,66 @@ mod freerouting_tests {
         );
     }
 
-    /// The tables name concrete places, not only their categories: every
-    /// variable, KiCad version, plugin folder, file and directory the search
-    /// visits is named in the description, and the search visits each one.
     #[test]
-    fn the_description_names_every_concrete_place_the_search_visits() {
+    fn future_third_party_variables_and_plugin_versions_are_discovered_newest_first() {
         let temp = tempfile::tempdir().unwrap();
         let env = every_location_environment(temp.path());
-        let cwd = temp.path().join("cwd");
-        let roots = freerouting_search_roots_from(|name| env.get(name).cloned(), &cwd);
-        let searched = |path: PathBuf| roots.iter().any(|root| root.path == path);
-        let description = freerouting_jar_path_description();
-        let named = |text: &str| {
-            assert!(
-                description.contains(text),
-                "{text} is not named: {description}"
-            )
+        let roots = freerouting_search_roots_from(&env, temp.path());
+        let observed = |location| {
+            roots
+                .iter()
+                .filter(move |root| root.location == location)
+                .map(|root| &root.path)
         };
+        assert_eq!(
+            observed(FreeroutingLocation::KicadThirdPartyVariable)
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>(),
+            [temp.path().join("k11"), temp.path().join("k10")]
+        );
+        let plugin_paths: Vec<_> = observed(FreeroutingLocation::KicadPluginFolder)
+            .cloned()
+            .collect();
+        let plugin_path = |base: &str, version: &str| {
+            temp.path()
+                .join(base)
+                .join(version)
+                .join("3rdparty/plugins")
+        };
+        assert_eq!(plugin_paths[0], plugin_path("documents", "11.0"));
+        assert_eq!(plugin_paths[1], plugin_path("home/Documents/KiCad", "11.0"));
+        let position = |path| {
+            plugin_paths
+                .iter()
+                .position(|candidate| *candidate == path)
+                .unwrap()
+        };
+        assert!(
+            position(plugin_path("home/.local/share/kicad", "11.0"))
+                < position(plugin_path("documents", "10.99"))
+        );
+    }
 
-        for variable in FREEROUTING_THIRD_PARTY_VARIABLES {
-            named(variable);
-            assert!(
-                searched(PathBuf::from(&env[variable])),
-                "{variable}: {roots:?}"
-            );
-        }
-        for version in FREEROUTING_KICAD_VERSIONS {
-            named(version);
-        }
-        for (home, folder, windows_only) in FREEROUTING_PLUGIN_FOLDERS {
-            named(&format!("${home}/{folder}"));
-            if windows_only && !cfg!(target_os = "windows") {
-                continue;
-            }
-            for version in FREEROUTING_KICAD_VERSIONS {
-                let place = folder
-                    .replace("<version>", version)
-                    .split('/')
-                    .fold(PathBuf::from(&env[home]), |p, part| p.join(part));
-                assert!(searched(place.clone()), "{place:?}: {roots:?}");
-            }
-        }
-        named(FREEROUTING_WORKING_DIRECTORY_JAR);
-        assert!(searched(cwd.join(FREEROUTING_WORKING_DIRECTORY_JAR)));
-        for directory in FREEROUTING_SYSTEM_DIRECTORIES {
-            named(directory);
-            assert!(searched(cwd.join(directory)), "{directory}: {roots:?}");
-        }
-        named(FREEROUTING_PATH_VARIABLE);
-        for directory in std::env::split_paths(&env[FREEROUTING_PATH_VARIABLE]) {
-            assert!(searched(directory.clone()), "{directory:?}: {roots:?}");
-        }
+    #[cfg(windows)]
+    #[test]
+    fn windows_discovery_matches_environment_names_case_insensitively() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bin");
+        let third_party = temp.path().join("third-party");
+        let env = HashMap::from([
+            ("Path".into(), std::env::join_paths([&path]).unwrap()),
+            (
+                "kicad11_3rd_party".into(),
+                third_party.clone().into_os_string(),
+            ),
+        ]);
+        let roots = freerouting_search_roots_from(&env, temp.path());
+        assert!(roots
+            .iter()
+            .any(|root| root.path == path && root.location == FreeroutingLocation::PathDirectory));
+        assert!(roots.iter().any(|root| root.path == third_party
+            && root.location == FreeroutingLocation::KicadThirdPartyVariable));
     }
 
     /// Every searched location is reported as an absolute path. A relative value
@@ -2814,7 +2828,11 @@ mod freerouting_tests {
                 std::env::join_paths([PathBuf::from("bin"), PathBuf::from(".")]).unwrap(),
             ),
         ]);
-        let roots = freerouting_search_roots_from(|name| env.get(name).cloned(), &cwd);
+        let env = env
+            .into_iter()
+            .map(|(key, value)| (key.into(), value))
+            .collect();
+        let roots = freerouting_search_roots_from(&env, &cwd);
         for root in &roots {
             assert!(root.path.is_absolute(), "{root:?}");
         }
@@ -2887,7 +2905,11 @@ mod freerouting_tests {
             ("KICAD9_3RD_PARTY", shared.clone()),
             ("PATH", path),
         ]);
-        let roots = freerouting_search_roots_from(|name| env.get(name).cloned(), temp.path());
+        let env = env
+            .into_iter()
+            .map(|(key, value)| (key.into(), value))
+            .collect();
+        let roots = freerouting_search_roots_from(&env, temp.path());
 
         let mut paths: Vec<&PathBuf> = roots.iter().map(|root| &root.path).collect();
         let total = paths.len();

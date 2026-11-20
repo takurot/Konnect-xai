@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **229 registered tools** + **7 always-visible meta-tools** = **236 total**
+- **230 registered tools** + **7 always-visible meta-tools** = **237 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -158,8 +158,8 @@ and Windows servers do not.
 | `list_schematic_wires` | List all wire segments with start/end coordinates and UUIDs. |
 | `list_schematic_nets` | List all distinct net names from net labels, global labels, and power symbols. |
 | `list_schematic_labels` | List all label instances (net/global/hierarchical) with positions, names, and types. |
-| `get_net_connections` | Get all pins and labels connected to a named net. |
-| `get_net_connectivity` | Build the full connectivity graph for a net using union-find. Returns wires, labels, and T-junction locations. |
+| `get_net_connections` | Get the component pins and labels for an exact net name on the requested schematic sheet. |
+| `get_net_connectivity` | Get the wires, labels, and T-junction locations for an exact net name on the requested schematic sheet. |
 | `get_pin_connections` | Get the net connected to a specific pin by tracing wires from the pin endpoint. |
 | `get_pin_net_name` | Return just the net name for a specific pin on a component. |
 | `get_component_nets` | Get all nets connected to every pin of a component. |
@@ -169,7 +169,7 @@ and Windows servers do not.
 | `find_shorted_nets` | Detect accidentally merged nets — distinct net names that KiCad nets together, through a wire path they share or through a name that joins their segments. |
 | `find_single_pin_nets` | Find nets that reach at most one pin — often a missing counterpart, an orphan label, or a stub left by a deleted component. Component pins and hierarchical sheet pins count; a power symbol's own pin names the rail rather than consuming it and does not. Reports the pin and label counts, and every label kind that named the net. Read per sheet: a net a global, hierarchical or power label can carry off this one is flagged cross_sheet_unverified. |
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
-| `check_schematic_overlaps` | Find collisions using transformed symbol drawings and pins (excluding free text), with a reported origin fallback when geometry is unavailable. |
+| `check_schematic_overlaps` | Find collisions among placed symbol bodies, pins, visible schematic text, and text over wires. |
 
 ### `sch_batch` · 12 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call.
@@ -207,7 +207,7 @@ and Windows servers do not.
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. |
 
-### `sch_hierarchy` · 14 tools
+### `sch_hierarchy` · 15 tools
 **Purpose:** Sheet files and hierarchical sheets: create a schematic file and set its page size, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
 **Source:** [`crates/konnect-core/src/tools/sch_hierarchy.rs`](crates/konnect-core/src/tools/sch_hierarchy.rs)
 
@@ -215,13 +215,14 @@ and Windows servers do not.
 |------|-------------|
 | `create_schematic` | Create a new blank `.kicad_sch` schematic file, on A4 unless another paper size is given. Use `set_schematic_page` to change it later. |
 | `set_schematic_page` | Set the sheet's paper size (A0–A5, A–E, US Letter/Legal/Ledger) and orientation. Returns the size in mm — content outside the frame still exports and still nets up, so a too-small page is a silent defect. |
-| `add_hierarchical_sheet` | Insert a hierarchical sheet into a parent schematic, linking it to a child `.kicad_sch` file. Creates the child file if it doesn't exist, or links to an existing one (multi-instance reuse). Patches existing symbols' instance paths if the linked file already has components. |
-| `edit_sheet` | Rename, resize, reposition, or repoint (`Sheetfile`) an existing sheet. |
+| `add_hierarchical_sheet` | Insert a hierarchical sheet into a parent schematic, linking it to a child `.kicad_sch` file. Creates the child file if it doesn't exist, or links to an existing one (multi-instance reuse). Updates symbol and nested sheet instances and allocates pages above the highest recorded number across the project roots. |
+| `edit_sheet` | Rename, resize, reposition, or repoint (`Sheetfile`) an existing sheet. Repointing reconciles paths in the old and new subtrees in one transaction. |
 | `move_sheet` | Reposition a sheet on the parent canvas without touching any other field. |
-| `delete_sheet` | Remove a sheet reference from the parent schematic. Does not delete the child file. |
+| `delete_sheet` | Remove a sheet reference from the parent schematic. Prunes removed instance paths while preserving the child schematic file. |
 | `duplicate_sheet` | Copy an existing sheet and its child file under a new name/file, offset from the source, with an independent internal UUID. |
 | `get_sheet_hierarchy` | Recursively walk the sheet tree, returning nested JSON with each sheet's name/file/uuid/position/size/page/pins and its own children. |
-| `renumber_sheet_pages` | Walk the whole sheet tree and reassign sequential page numbers in depth-first order, fixing gaps left by delete/duplicate. |
+| `renumber_sheet_pages` | Renumber child pages in depth-first order across all roots of the owning project, preserving top-level pages and the automatic allocation history. |
+| `repair_sheet_instances` | Compare the selected schematic to its saved hierarchy and report proposed symbol and sheet instance fixes. Apply them with `apply=true`. |
 | `import_sheet_pins` | Scan the child sheet's hierarchical_labels and auto-generate matching pins on the parent sheet block, skipping names that already have a pin — the primary way pins get created. Optional `side` (`right`, `left`, `top`, `bottom`, default `right`) picks the edge and sets each pin's rotation, which is what KiCad reads the edge from; a `right`/`left` stack runs down the edge, a `top`/`bottom` one across it. Pins stack after the pin that reaches furthest along that edge, so an existing gap is left alone rather than filled — one pin on the last slot therefore fills the edge, and the refusal says so rather than suggesting a resize. An occupied slot is never written over, including one held by a pin whose rotation names no edge or one the sheet shrank away from. The whole import is planned and validated before anything is written, and refused entire — nothing written — if it would run past a corner, because KiCad clamps such a pin back onto the box. |
 | `add_sheet_pin` | Manually add a single pin to an existing sheet block. Optional `side` (`right`, `left`, `top`, `bottom`) selects the edge by writing the rotation KiCad reads it from, and makes the call validate `x`/`y` against that edge on both axes, corners included — an off-edge position is refused rather than written and then relocated by KiCad on load. Omitting `side` keeps the previous behavior: rotation `0` and no position check. `x`, `y`, and `side` in the response are read back off the saved pin. |
 | `edit_sheet_pin` | Rename a pin, change its electrical type, reposition it along the sheet border, or move it to another edge with the optional `side` (`right`, `left`, `top`, `bottom`). `side` is judged against the position the pin ends up with, so `side` and `x`+`y` in one call are checked together. `changed_fields` names only what actually differs — restating the side a pin already has is an honest no-op that writes nothing — alongside `requested_fields` and the `pin` read back off the file. |
@@ -458,7 +459,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 |------|-------------|
 | `search_templates` | Search the reference circuit template library. Returns matches for common subcircuits; templates have verified component values. |
 | `get_template` | Get full details for a template: components, connections, design notes. Use the template ID from `search_templates`. |
-| `apply_template` | Instantiate a template into the current schematic. Places all components and wires per the connection map; `net_mappings` re-binds template nets to project nets. |
+| `apply_template` | Place template components in the schematic and return a connection guide. No wires or labels are added. `net_mappings` renames nets in the guide. |
 | `list_template_categories` | List all available template categories and the number of templates in each. |
 
 **Built-in templates** (loaded by `load_all_templates` in `templates.rs`):

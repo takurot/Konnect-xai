@@ -279,9 +279,29 @@ pub fn commit_file_transaction(
     journal_directory: impl AsRef<Path>,
     transitions: Vec<FileTransition>,
 ) -> Result<TransactionCommit, SexpError> {
+    commit_file_transaction_with_dependencies(journal_directory, transitions, Vec::new())
+}
+
+/// Commit file changes while also checking unchanged project inputs.
+/// Input paths and write targets are locked together in a consistent order.
+/// Only the actual changes are written to the recovery journal.
+///
+/// # Errors
+///
+/// Returns a conflict if a checked input or target diverges, or any of the
+/// errors documented by [commit_file_transaction].
+pub fn commit_file_transaction_with_dependencies(
+    journal_directory: impl AsRef<Path>,
+    transitions: Vec<FileTransition>,
+    dependencies: Vec<(PathBuf, String)>,
+) -> Result<TransactionCommit, SexpError> {
     let root = canonical_directory(journal_directory.as_ref())?;
     recover_file_transactions(&root)?;
     let entries = normalize_transitions(&root, transitions)?;
+    let dependencies = dependencies
+        .into_iter()
+        .map(|(path, expected)| Ok((root.join(path).canonicalize()?, expected)))
+        .collect::<Result<Vec<_>, SexpError>>()?;
     let id = uuid::Uuid::new_v4().to_string();
     let journal = Journal {
         version: JOURNAL_VERSION,
@@ -289,9 +309,20 @@ pub fn commit_file_transaction(
         entries,
     };
     let journal_path = journal_path(&root, &id);
-    let _locks = lock_entries(&root, &journal.entries)?;
+    let _locks = lock_paths(
+        journal
+            .entries
+            .iter()
+            .map(|entry| root.join(&entry.path))
+            .chain(dependencies.iter().map(|(path, _)| path.clone())),
+    )?;
     ensure_entries_are_closed(&root, &journal.entries)?;
     verify_before_images(&root, &journal_path, &journal.entries)?;
+    for (path, expected) in dependencies {
+        if current_content(&path)?.as_deref() != Some(expected.as_str()) {
+            return Err(SexpError::Conflict { path });
+        }
+    }
     persist_journal(&journal_path, &journal)?;
 
     for entry in &journal.entries {
@@ -642,9 +673,14 @@ fn normalize_target(root: &Path, path: &Path) -> Result<PathBuf, SexpError> {
 }
 
 fn lock_entries(root: &Path, entries: &[JournalEntry]) -> Result<Vec<std::fs::File>, SexpError> {
-    let mut locks = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let lock = open_document_lock(&root.join(&entry.path))?;
+    lock_paths(entries.iter().map(|entry| root.join(&entry.path)))
+}
+
+fn lock_paths(paths: impl Iterator<Item = PathBuf>) -> Result<Vec<std::fs::File>, SexpError> {
+    let paths = paths.collect::<std::collections::BTreeSet<_>>();
+    let mut locks = Vec::with_capacity(paths.len());
+    for path in paths {
+        let lock = open_document_lock(&path)?;
         <std::fs::File as FileExt>::lock(&lock)?;
         locks.push(lock);
     }
@@ -995,6 +1031,38 @@ mod tests {
         assert_eq!(std::fs::read_to_string(parent).unwrap(), "parent after");
         assert_eq!(std::fs::read_to_string(child).unwrap(), "child after");
         assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn recovery_completes_a_page_allocation_with_the_schematic() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let parent = root.join("root.kicad_sch");
+        let history = root.join(".konnect-sheet-pages.json");
+        let replacement = r#"{"version":1,"allocations":[]}"#;
+        std::fs::write(&parent, "before").unwrap();
+        std::fs::write(&history, replacement).unwrap();
+        let journal = Journal {
+            version: JOURNAL_VERSION,
+            id: "page-allocation".to_owned(),
+            entries: normalize_transitions(
+                &root,
+                vec![
+                    FileTransition::create(&history, replacement),
+                    FileTransition::replace(&parent, "before", "after"),
+                ],
+            )
+            .unwrap(),
+        };
+        let active_journal = journal_path(&root, &journal.id);
+        persist_journal(&active_journal, &journal).unwrap();
+
+        let outcomes = recover_file_transactions(&root).unwrap();
+
+        assert_eq!(outcomes[0].completed_files, 1);
+        assert_eq!(std::fs::read_to_string(parent).unwrap(), "after");
+        assert_eq!(std::fs::read_to_string(history).unwrap(), replacement);
+        assert!(!active_journal.exists());
     }
 
     #[test]
@@ -1355,5 +1423,36 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(parent).unwrap(), parent_before);
         assert_eq!(std::fs::read_to_string(child).unwrap(), child_before);
+    }
+}
+
+#[cfg(test)]
+mod dependency_tests {
+    use super::*;
+
+    #[test]
+    fn a_changed_project_input_blocks_every_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("project.kicad_pro");
+        let parent = directory.path().join("project.kicad_sch");
+        let child = directory.path().join("child.kicad_sch");
+        std::fs::write(&config, "changed configuration").unwrap();
+        std::fs::write(&parent, "parent before").unwrap();
+        std::fs::write(&child, "child before").unwrap();
+
+        let result = commit_file_transaction_with_dependencies(
+            directory.path(),
+            vec![
+                FileTransition::replace(&parent, "parent before", "parent after"),
+                FileTransition::replace(&child, "child before", "child after"),
+            ],
+            vec![(config, "observed configuration".to_owned())],
+        );
+        assert!(matches!(result, Err(SexpError::Conflict { .. })));
+        assert_eq!(std::fs::read_to_string(parent).unwrap(), "parent before");
+        assert_eq!(std::fs::read_to_string(child).unwrap(), "child before");
+        assert!(inspect_file_transactions(directory.path())
+            .unwrap()
+            .is_empty());
     }
 }

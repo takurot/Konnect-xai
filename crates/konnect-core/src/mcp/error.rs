@@ -49,6 +49,11 @@ pub enum ToolErrorKind {
     InvalidArgument { field: String, reason: String },
     /// A referenced file or discovery directory doesn't exist or can't be read.
     FileNotFound { path: String },
+    /// No item on the queried schematic sheet names the requested net.
+    NotFound {
+        net: String,
+        suggestions: Vec<String>,
+    },
     /// A mutation conflicts with filesystem state, or schematic ownership
     /// cannot be proven uniquely. Paths identify the conflicting evidence.
     Conflict { paths: Vec<String> },
@@ -165,6 +170,7 @@ impl ToolErrorKind {
             Self::UnknownTool { .. } => "unknown_tool",
             Self::InvalidArgument { .. } => "invalid_argument",
             Self::FileNotFound { .. } => "file_not_found",
+            Self::NotFound { .. } => "not_found",
             Self::Conflict { .. } => "conflict",
             Self::WouldJoinNets { .. } => "would_join_nets",
             Self::AmbiguousReference { .. } => "ambiguous_reference",
@@ -304,6 +310,10 @@ mod tests {
                 reason: "r".into(),
             },
             ToolErrorKind::FileNotFound { path: "p".into() },
+            ToolErrorKind::NotFound {
+                net: "gnd".into(),
+                suggestions: vec!["GND".into()],
+            },
             ToolErrorKind::Conflict {
                 paths: vec!["p".into()],
             },

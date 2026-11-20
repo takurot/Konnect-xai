@@ -6,8 +6,7 @@
 //! introspect via the `get_recent_calls` and `server_stats` meta-tools.
 //!
 //! Goals:
-//! - Zero cost on the hot path: recording is lock-then-push-then-write, no
-//!   serialization overhead beyond the single JSON line.
+//! - Optional disk I/O runs on a blocking worker outside the async data locks.
 //! - Failure isolation: if the log file can't be opened or written, the tool
 //!   call still succeeds; we `tracing::warn!` and move on.
 //! - Bounded memory: ring buffer caps at `MAX_RECENT_CALLS`.
@@ -16,7 +15,7 @@ use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -25,6 +24,7 @@ use tracing::warn;
 
 /// Keep the last N calls in memory for `get_recent_calls`.
 pub const MAX_RECENT_CALLS: usize = 100;
+const MAX_CALL_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -113,28 +113,12 @@ struct Inner {
     started_at_ms: u64,
     started_instant: Instant,
     log_path: Option<PathBuf>,
-    log_handle: Mutex<Option<std::fs::File>>,
 }
 
 impl CallObserver {
-    /// Create a new observer. If `log_path` is provided and its parent directory
-    /// can be created, new records are also appended as JSONL; otherwise records
-    /// are in-memory only.
+    /// Create an observer with in-memory counters and optional bounded JSONL.
     pub fn new(log_path: Option<PathBuf>) -> Self {
         let now_ms = unix_ms();
-
-        // Best-effort directory setup. If this fails we fall back to in-memory only.
-        let resolved_log_path = log_path.and_then(|p| match p.parent() {
-            Some(dir) if std::fs::create_dir_all(dir).is_ok() => Some(p),
-            Some(dir) => {
-                warn!(
-                    "[observability] could not create log directory '{}' — JSONL logging disabled",
-                    dir.display()
-                );
-                None
-            }
-            None => None,
-        });
 
         CallObserver {
             inner: Arc::new(Inner {
@@ -146,8 +130,7 @@ impl CallObserver {
                 uncertain_calls: AtomicU64::new(0),
                 started_at_ms: now_ms,
                 started_instant: Instant::now(),
-                log_path: resolved_log_path,
-                log_handle: Mutex::new(None),
+                log_path,
             }),
         }
     }
@@ -194,26 +177,17 @@ impl CallObserver {
             ring.push_back(rec.clone());
         }
 
-        // Append to JSONL (best effort).
-        if let Some(path) = self.inner.log_path.as_ref() {
-            if let Err(e) = self.append_jsonl(path, &rec).await {
-                warn!("[observability] JSONL write failed: {}", e);
+        if let Some(path) = self.inner.log_path.clone() {
+            let written = crate::tools::blocking_work::spawn_tracked_blocking(move || {
+                append_jsonl(&path, &rec, MAX_CALL_LOG_BYTES)
+            })
+            .await;
+            match written {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(%error, "JSONL write failed"),
+                Err(error) => warn!(%error, "JSONL writer stopped"),
             }
         }
-    }
-
-    async fn append_jsonl(&self, path: &std::path::Path, rec: &CallRecord) -> std::io::Result<()> {
-        let line = serde_json::to_string(rec)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let mut guard = self.inner.log_handle.lock().await;
-        if guard.is_none() {
-            *guard = Some(OpenOptions::new().create(true).append(true).open(path)?);
-        }
-        if let Some(file) = guard.as_mut() {
-            writeln!(file, "{}", line)?;
-            file.flush()?;
-        }
-        Ok(())
     }
 
     /// Return up to `limit` most-recent calls (newest first). `limit == 0` means
@@ -264,32 +238,84 @@ pub struct StatsSnapshot {
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
 
-/// Platform-specific path for konnect state files (config, logs, cache).
-/// Matches the convention in `tools/config.rs::user_config_dir`.
-pub fn konnect_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        PathBuf::from(appdata).join("konnect")
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("konnect")
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".konnect")
-    }
+/// Default JSONL path for standalone and embedded servers with logging enabled.
+pub fn default_calls_log_path() -> Option<PathBuf> {
+    let state = match konnect_sexp::state::StateDir::resolve() {
+        Ok(state) => state,
+        Err(error) => {
+            warn!(error, "call log unavailable");
+            return None;
+        }
+    };
+    Some(state.root().join("logs/calls.jsonl"))
 }
 
-/// Default JSONL path for per-call logs.
-pub fn default_calls_log_path() -> PathBuf {
-    konnect_dir().join("logs").join("calls.jsonl")
+fn append_jsonl(path: &Path, record: &CallRecord, limit: u64) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+
+    let mut line =
+        serde_json::to_vec(record).map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+    line.push(b'\n');
+    let size = line.len() as u64;
+    if size > limit {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "call log record exceeds the size limit",
+        ));
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Rotate by name while holding a stable lock shared by all Konnect processes.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("jsonl.lock"))?;
+    lock.lock()?;
+    let archived = path.with_extension("jsonl.1");
+    if log_size(&archived)? > limit {
+        retire_oversized(&archived)?;
+    }
+    let current_size = log_size(path)?;
+    if current_size > limit {
+        retire_oversized(path)?;
+    } else if current_size > limit - size {
+        match std::fs::remove_file(&archived) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        std::fs::rename(path, &archived)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let start = file.metadata()?.len();
+    if let Err(error) = file.write_all(&line).and_then(|()| file.flush()) {
+        // Windows append handles cannot truncate; reopen while holding the sidecar lock.
+        drop(file);
+        OpenOptions::new().write(true).open(path)?.set_len(start)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn retire_oversized(path: &Path) -> std::io::Result<()> {
+    let dir = tempfile::Builder::new()
+        .prefix("calls-legacy-")
+        .tempdir_in(path.parent().unwrap_or(Path::new(".")))?;
+    std::fs::rename(path, dir.path().join("calls.jsonl"))?;
+    let kept = dir.keep();
+    warn!(path = %kept.display(), "preserved unbounded call log outside rotation");
+    Ok(())
+}
+
+fn log_size(path: &Path) -> std::io::Result<u64> {
+    match std::fs::metadata(path) {
+        Ok(info) => Ok(info.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error),
+    }
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
@@ -412,6 +438,87 @@ mod tests {
         assert!(lines[0].contains("\"status\":\"ok\""));
         assert!(lines[1].contains("\"status\":\"error\""));
         assert!(lines[1].contains("\"error_kind\":\"boom\""));
+    }
+
+    #[test]
+    fn call_log_rotation_caps_both_files_and_preserves_oversized_legacy_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("calls.jsonl");
+        let archived = active.with_extension("jsonl.1");
+        let record = sample_record("rotate", CallStatus::Ok);
+        let limit = serde_json::to_vec(&record).unwrap().len() as u64 + 1;
+        for path in [&active, &archived] {
+            std::fs::write(path, vec![b'x'; (limit + 1) as usize]).unwrap();
+        }
+        append_jsonl(&active, &record, limit).unwrap();
+        assert!(!archived.exists());
+        let legacy = dir
+            .path()
+            .read_dir()
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("calls-legacy-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(legacy.len(), 2);
+        for entry in legacy {
+            assert_eq!(
+                log_size(&entry.path().join("calls.jsonl")).unwrap(),
+                limit + 1
+            );
+        }
+        append_jsonl(&active, &record, limit).unwrap();
+        for path in [&active, &archived] {
+            assert_eq!(log_size(path).unwrap(), limit);
+            let data = std::fs::read_to_string(path).unwrap();
+            assert_eq!(data.lines().count(), 1);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&data).unwrap()["tool"],
+                "rotate"
+            );
+        }
+        assert!(append_jsonl(&active, &record, limit - 1).is_err());
+        assert_eq!(log_size(&active).unwrap(), limit);
+    }
+
+    #[test]
+    fn concurrent_processes_share_the_call_log_rotation_lock() {
+        const CHILD_PATH: &str = "KONNECT_TEST_CALL_LOG_PROCESS_PATH";
+        let record = sample_record("shared", CallStatus::Ok);
+        let limit = 4 * (serde_json::to_vec(&record).unwrap().len() as u64 + 1);
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            for _ in 0..12 {
+                append_jsonl(Path::new(&path), &record, limit).unwrap();
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("calls.jsonl");
+        let mut children = (0..2).map(|_| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "observability::tests::concurrent_processes_share_the_call_log_rotation_lock"])
+                .env(CHILD_PATH, &active)
+                .stdout(std::process::Stdio::null())
+                .spawn().unwrap()
+        }).collect::<Vec<_>>();
+        for child in &mut children {
+            assert!(child.wait().unwrap().success());
+        }
+        for path in [active.clone(), active.with_extension("jsonl.1")] {
+            assert_eq!(log_size(&path).unwrap(), limit);
+            let data = std::fs::read_to_string(path).unwrap();
+            assert_eq!(data.lines().count(), 4);
+            for line in data.lines() {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["tool"],
+                    "shared"
+                );
+            }
+        }
     }
 
     #[test]

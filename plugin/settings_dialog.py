@@ -9,6 +9,7 @@ Settings persist to settings.json in the plugin directory.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -55,64 +56,84 @@ def save_settings(settings_path, settings):
 
 # ─── KiCAD CLI auto-detection ────────────────────────────────────────────────
 
+def _install_version(value, *, directory=False):
+    if not isinstance(value, str):
+        return None
+    suffix = "" if directory else r"(?:\.[0-9]+(?:[-+]\S+)?)?"
+    match = re.fullmatch(r"([0-9]+)\.([0-9]+)" + suffix, value)
+    return tuple(map(int, match.groups())) if match else None
+
+
+def _windows_kicad_cli():
+    registry_matches = []
+    try:
+        import winreg
+        uninstall = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+        for hive in [winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE]:
+            for view in [winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY]:
+                try:
+                    with winreg.OpenKey(hive, uninstall, 0, winreg.KEY_READ | view) as parent:
+                        for index in range(winreg.QueryInfoKey(parent)[0]):
+                            try:
+                                with winreg.OpenKey(parent, winreg.EnumKey(parent, index)) as child:
+                                    name = winreg.QueryValueEx(child, "DisplayName")[0]
+                                    if not isinstance(name, str) or not name.lower().startswith("kicad "):
+                                        continue
+                                    install_dir = winreg.QueryValueEx(child, "InstallLocation")[0]
+                                    try:
+                                        reported = winreg.QueryValueEx(child, "DisplayVersion")[0]
+                                    except OSError:
+                                        reported = ""
+                                    version = _install_version(reported) or _install_version(name[6:].split(" ", 1)[0])
+                                    if version and install_dir:
+                                        cli = os.path.join(install_dir, "bin", "kicad-cli.exe")
+                                        if os.path.isfile(cli):
+                                            registry_matches.append((version, cli))
+                            except OSError:
+                                continue
+                except OSError:
+                    continue
+    except ImportError:
+        pass
+    if registry_matches:
+        return max(registry_matches, key=lambda entry: entry[0])[1]
+
+    roots = [
+        os.environ.get("ProgramFiles", "C:\\Program Files"),
+        os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+        "C:\\", "D:\\", "D:\\Program Files",
+    ]
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        roots.insert(0, os.path.join(local, "Programs"))
+
+    candidates, unversioned = [], []
+    for root in roots:
+        base = os.path.join(root, "KiCad")
+        unversioned.append(os.path.join(base, "bin", "kicad-cli.exe"))
+        try:
+            names = os.listdir(base)
+        except OSError:
+            continue
+        for name in names:
+            version = _install_version(name, directory=True)
+            if version:
+                cli = os.path.join(base, name, "bin", "kicad-cli.exe")
+                if os.path.isfile(cli):
+                    candidates.append((version, cli))
+    if candidates:
+        return max(candidates, key=lambda entry: entry[0])[1]
+    return next((cli for cli in unversioned if os.path.isfile(cli)), "")
+
+
 def detect_kicad_cli():
     """Try to find kicad-cli by scanning common locations, registry, and PATH."""
     binary = "kicad-cli.exe" if sys.platform == "win32" else "kicad-cli"
 
     if sys.platform == "win32":
-        # Check both per-user and machine-wide uninstall records. Current-user
-        # installs are KiCad's normal result when machine-wide installation is
-        # declined, and are recorded under HKCU rather than HKLM.
-        try:
-            import winreg
-            uninstall = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
-            for version in ["10.0", "9.0", "8.0"]:
-                for hive in [winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE]:
-                    for view in [winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY]:
-                        try:
-                            with winreg.OpenKey(
-                                    hive, uninstall, 0, winreg.KEY_READ | view) as parent:
-                                for index in range(winreg.QueryInfoKey(parent)[0]):
-                                    with winreg.OpenKey(
-                                            parent, winreg.EnumKey(parent, index)) as child:
-                                        try:
-                                            display_name = winreg.QueryValueEx(
-                                                child, "DisplayName")[0]
-                                            display_version = winreg.QueryValueEx(
-                                                child, "DisplayVersion")[0]
-                                            install_dir = winreg.QueryValueEx(
-                                                child, "InstallLocation")[0]
-                                        except (FileNotFoundError, OSError):
-                                            continue
-                                        if (display_name.lower().startswith("kicad ") and
-                                                (display_version.startswith(version) or
-                                                 version in display_name)):
-                                            cli = os.path.join(
-                                                install_dir, "bin", "kicad-cli.exe")
-                                            if os.path.isfile(cli):
-                                                return cli
-                        except (FileNotFoundError, OSError):
-                            pass
-        except ImportError:
-            pass
-
-        # Scan common root directories for KiCad installations
-        versions = ["10.0", "9.0", "8.0"]
-        roots = [
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"),
-            os.environ.get("ProgramFiles", "C:\\Program Files"),
-            os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
-            "C:\\", "D:\\", "D:\\Program Files",
-        ]
-        for root in roots:
-            for ver in versions:
-                cli = os.path.join(root, "KiCad", ver, "bin", "kicad-cli.exe")
-                if os.path.isfile(cli):
-                    return cli
-            # Also check without version subdir
-            cli = os.path.join(root, "KiCad", "bin", "kicad-cli.exe")
-            if os.path.isfile(cli):
-                return cli
+        cli = _windows_kicad_cli()
+        if cli:
+            return cli
 
     elif sys.platform == "darwin":
         candidates = [

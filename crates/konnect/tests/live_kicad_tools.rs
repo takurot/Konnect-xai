@@ -17,22 +17,24 @@ struct McpProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    _state: tempfile::TempDir,
     next_id: u64,
 }
 
 impl McpProcess {
     fn spawn(socket: &str) -> Self {
-        let config = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let config_path = state.path().join("server.json");
         let kicad_cli = std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string());
         std::fs::write(
-            config.path(),
+            &config_path,
             serde_json::to_vec(&json!({"ipc_address": socket, "kicad_cli": kicad_cli})).unwrap(),
         )
         .unwrap();
-        let (_, config_path) = config.keep().unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_konnect"))
             .arg("--config")
             .arg(config_path)
+            .env("KONNECT_STATE_DIR", state.path().join("state"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -44,6 +46,7 @@ impl McpProcess {
             child,
             stdin,
             stdout,
+            _state: state,
             next_id: 1,
         };
         process.request(

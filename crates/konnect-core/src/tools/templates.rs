@@ -15,6 +15,66 @@ use tracing::{debug, info, warn};
 // ─── Embedded starter templates ──────────────────────────────────────────────
 
 fn builtin_templates() -> Vec<serde_json::Value> {
+    // Serialize the large STM32 map one row at a time to keep json! expansion shallow.
+    let stm32_connections: Vec<_> = [
+        ("U1.1", "VCC_3V3"),
+        ("U1.9", "VCC_3V3"),
+        ("U1.24", "VCC_3V3"),
+        ("U1.36", "VCC_3V3"),
+        ("U1.48", "VCC_3V3"),
+        ("J1.1", "VCC_3V3"),
+        ("C3.1", "VCC_3V3"),
+        ("C4.1", "VCC_3V3"),
+        ("C5.1", "VCC_3V3"),
+        ("C6.1", "VCC_3V3"),
+        ("C7.1", "VCC_3V3"),
+        ("R1.1", "VCC_3V3"),
+        ("U1.8", "GND"),
+        ("U1.23", "GND"),
+        ("U1.35", "GND"),
+        ("U1.47", "GND"),
+        ("U1.49", "GND"),
+        ("J1.3", "GND"),
+        ("J1.5", "GND"),
+        ("J1.9", "GND"),
+        ("C1.2", "GND"),
+        ("C2.2", "GND"),
+        ("C3.2", "GND"),
+        ("C4.2", "GND"),
+        ("C5.2", "GND"),
+        ("C6.2", "GND"),
+        ("C7.2", "GND"),
+        ("C8.2", "GND"),
+        ("C9.2", "GND"),
+        ("R2.2", "GND"),
+        ("R3.2", "GND"),
+        ("U1.5", "HSE_IN"),
+        ("Y1.1", "HSE_IN"),
+        ("C1.1", "HSE_IN"),
+        ("U1.6", "HSE_OUT"),
+        ("Y1.2", "HSE_OUT"),
+        ("C2.1", "HSE_OUT"),
+        ("U1.22", "VCAP"),
+        ("C8.1", "VCAP"),
+        ("U1.7", "NRST"),
+        ("J1.10", "NRST"),
+        ("R1.2", "NRST"),
+        ("C9.1", "NRST"),
+        ("U1.34", "SWDIO"),
+        ("J1.2", "SWDIO"),
+        ("U1.37", "SWCLK"),
+        ("J1.4", "SWCLK"),
+        ("U1.39", "SWO"),
+        ("J1.6", "SWO"),
+        ("U1.44", "BOOT0"),
+        ("R2.1", "BOOT0"),
+        ("U1.20", "BOOT1"),
+        ("R3.1", "BOOT1"),
+    ]
+    .into_iter()
+    .map(|(pin, net)| json!({"from": pin, "to_net": net}))
+    .collect();
+
     vec![
         json!({
             "id": "usb_c_5v_sink",
@@ -23,41 +83,64 @@ fn builtin_templates() -> Vec<serde_json::Value> {
             "category": "connectivity/usb",
             "tags": ["usb-c", "power", "5v", "sink"],
             "components": [
-                {"ref_prefix": "J", "lib_id": "Connector:USB_C_Receptacle_USB2.0", "value": "USB_C", "notes": "USB-C receptacle, 16-pin or 6-pin mid-mount"},
+                {"ref_prefix": "J", "lib_id": "Connector:USB_C_Receptacle_USB2.0_16P", "value": "USB_C", "notes": "USB 2.0 16-pin receptacle"},
                 {"ref_prefix": "R", "lib_id": "Device:R", "value": "5.1k", "quantity": 2, "package": "0402", "notes": "CC1 and CC2 pull-down — required for 5V default current"},
-                {"ref_prefix": "D", "lib_id": "Device:D_TVS", "value": "PRTR5V0U2X", "quantity": 1, "notes": "ESD protection on D+/D-"},
+                {"ref_prefix": "D", "lib_id": "Power_Protection:PRTR5V0U2X", "value": "PRTR5V0U2X", "quantity": 1, "notes": "ESD protection on D+/D-"},
                 {"ref_prefix": "C", "lib_id": "Device:C", "value": "100nF", "quantity": 1, "package": "0402", "notes": "VBUS decoupling"}
             ],
             "connections": [
-                {"from": "J.VBUS", "to_net": "VUSB", "notes": "5V power from USB host"},
-                {"from": "J.CC1", "via": "R1", "to_net": "GND", "notes": "5.1k pull-down identifies as UFP sink"},
-                {"from": "J.CC2", "via": "R2", "to_net": "GND", "notes": "5.1k pull-down"},
-                {"from": "J.D+", "to_net": "USB_DP", "notes": "USB data positive"},
-                {"from": "J.D-", "to_net": "USB_DN", "notes": "USB data negative"},
-                {"from": "J.GND", "to_net": "GND", "notes": "Ground"}
+                {"from": "J1.A4", "to_net": "VUSB"},
+                {"from": "J1.A9", "to_net": "VUSB"},
+                {"from": "J1.B4", "to_net": "VUSB"},
+                {"from": "J1.B9", "to_net": "VUSB"},
+                {"from": "D1.4", "to_net": "VUSB"},
+                {"from": "C1.1", "to_net": "VUSB"},
+                {"from": "J1.A1", "to_net": "GND"},
+                {"from": "J1.A12", "to_net": "GND"},
+                {"from": "J1.B1", "to_net": "GND"},
+                {"from": "J1.B12", "to_net": "GND"},
+                {"from": "R1.2", "to_net": "GND"},
+                {"from": "R2.2", "to_net": "GND"},
+                {"from": "D1.1", "to_net": "GND"},
+                {"from": "C1.2", "to_net": "GND"},
+                {"from": "J1.A5", "to_net": "CC1"},
+                {"from": "R1.1", "to_net": "CC1"},
+                {"from": "J1.B5", "to_net": "CC2"},
+                {"from": "R2.1", "to_net": "CC2"},
+                {"from": "J1.A6", "to_net": "USB_DP"},
+                {"from": "J1.B6", "to_net": "USB_DP"},
+                {"from": "D1.2", "to_net": "USB_DP"},
+                {"from": "J1.A7", "to_net": "USB_DN"},
+                {"from": "J1.B7", "to_net": "USB_DN"},
+                {"from": "D1.3", "to_net": "USB_DN"},
+                {"from": "J1.SH", "to_net": "USB_SHIELD"}
             ],
-            "design_notes": "CC resistor value is critical: 5.1k ±1% for default 5V/900mA. For USB 2.0 only, connect D+/D- directly to MCU. For USB 3.x, route TX/RX as controlled impedance pairs.",
+            "design_notes": "Use one 5.1k pull-down per CC pin and follow the source's advertised current. SBU pins A8 and B8 are unused. Terminate USB_SHIELD according to the enclosure and EMC design.",
             "references": ["USB Type-C Spec Rev 2.0, Table 4-25"]
         }),
         json!({
             "id": "ldo_3v3",
             "name": "3.3V LDO Regulator",
-            "description": "Low-dropout 3.3V regulator with input/output capacitors. Generic topology, adapt MPN to your needs.",
+            "description": "AP2112K-3.3 regulator with input and output ceramic capacitors.",
             "category": "power/regulator",
             "tags": ["ldo", "3v3", "regulator", "power"],
             "components": [
-                {"ref_prefix": "U", "lib_id": "Regulator_Linear:AMS1117-3.3", "value": "AMS1117-3.3", "notes": "3.3V 1A LDO — substitute AP2112, MCP1700, etc."},
-                {"ref_prefix": "C", "lib_id": "Device:C", "value": "10uF", "quantity": 1, "package": "0805", "notes": "Input capacitor — ceramic X5R or X7R"},
-                {"ref_prefix": "C", "lib_id": "Device:C", "value": "10uF", "quantity": 1, "package": "0805", "notes": "Output capacitor — ceramic, check ESR requirements in datasheet"},
-                {"ref_prefix": "C", "lib_id": "Device:C", "value": "100nF", "quantity": 2, "package": "0402", "notes": "Bypass caps on input and output"}
+                {"ref_prefix": "U", "lib_id": "Regulator_Linear:AP2112K-3.3", "value": "AP2112K-3.3", "notes": "3.3V 600mA LDO"},
+                {"ref_prefix": "C", "lib_id": "Device:C", "value": "1uF", "quantity": 1, "package": "0603", "notes": "Input ceramic capacitor, X5R or X7R"},
+                {"ref_prefix": "C", "lib_id": "Device:C", "value": "1uF", "quantity": 1, "package": "0603", "notes": "Output ceramic capacitor, X5R or X7R"}
             ],
             "connections": [
-                {"from": "U.VIN", "to_net": "VIN", "notes": "Input voltage (check max Vin for chosen LDO)"},
-                {"from": "U.VOUT", "to_net": "VCC_3V3", "notes": "3.3V regulated output"},
-                {"from": "U.GND", "to_net": "GND", "notes": "Ground — ensure low-impedance path"}
+                {"from": "U1.1", "to_net": "VIN"},
+                {"from": "U1.3", "to_net": "VIN"},
+                {"from": "C1.1", "to_net": "VIN"},
+                {"from": "U1.2", "to_net": "GND"},
+                {"from": "C1.2", "to_net": "GND"},
+                {"from": "C2.2", "to_net": "GND"},
+                {"from": "U1.5", "to_net": "VCC_3V3"},
+                {"from": "C2.1", "to_net": "VCC_3V3"}
             ],
-            "design_notes": "Place input and output caps within 5mm of regulator pins. AMS1117 needs >10uF output for stability. For low-noise applications, consider ADP151 or TPS7A20.",
-            "references": ["AMS1117 datasheet, Section 8.2"]
+            "design_notes": "Place the 1uF input and output ceramic capacitors near the regulator. EN is tied to VIN for always-on operation; pin 4 is NC. Verify effective capacitance, dropout headroom and thermal limits for the load.",
+            "references": ["Diodes Incorporated AP2112 datasheet DS39724"]
         }),
         json!({
             "id": "stm32_minimal",
@@ -66,27 +149,19 @@ fn builtin_templates() -> Vec<serde_json::Value> {
             "category": "mcu/stm32",
             "tags": ["stm32", "mcu", "minimal", "crystal", "swd"],
             "components": [
-                {"ref_prefix": "U", "lib_id": "MCU_ST_STM32F4:STM32F411CEUx", "value": "STM32F411CEU6", "notes": "48-pin UFQFPN — substitute any STM32 in same package"},
+                {"ref_prefix": "U", "lib_id": "MCU_ST_STM32F4:STM32F411CEUx", "value": "STM32F411CEU6", "notes": "48-pin UFQFPN STM32F411; re-check the pinout before substituting"},
                 {"ref_prefix": "Y", "lib_id": "Device:Crystal", "value": "8MHz", "quantity": 1, "notes": "HSE crystal — check MCU datasheet for supported range"},
                 {"ref_prefix": "C", "lib_id": "Device:C", "value": "20pF", "quantity": 2, "package": "0402", "notes": "Crystal load caps — calculate from datasheet CL spec"},
-                {"ref_prefix": "C", "lib_id": "Device:C", "value": "100nF", "quantity": 5, "package": "0402", "notes": "Decoupling caps — one per VDD/VDDA pin"},
+                {"ref_prefix": "C", "lib_id": "Device:C", "value": "100nF", "quantity": 4, "package": "0402", "notes": "Decoupling caps — one per VDD/VDDA pin"},
                 {"ref_prefix": "C", "lib_id": "Device:C", "value": "4.7uF", "quantity": 1, "package": "0402", "notes": "Bulk decoupling on VDD"},
-                {"ref_prefix": "C", "lib_id": "Device:C", "value": "1uF", "quantity": 1, "package": "0402", "notes": "VCAP pin — required for internal regulator"},
+                {"ref_prefix": "C", "lib_id": "Device:C", "value": "4.7uF", "quantity": 1, "notes": "VCAP1 capacitor, ESR below 1 ohm"},
                 {"ref_prefix": "R", "lib_id": "Device:R", "value": "10k", "quantity": 1, "package": "0402", "notes": "NRST pull-up"},
                 {"ref_prefix": "C", "lib_id": "Device:C", "value": "100nF", "quantity": 1, "package": "0402", "notes": "NRST filter cap to GND"},
-                {"ref_prefix": "J", "lib_id": "Connector:Conn_ARM_SWD_10", "value": "SWD", "notes": "10-pin ARM SWD debug header"}
+                {"ref_prefix": "R", "lib_id": "Device:R", "value": "10k", "quantity": 2, "package": "0402", "notes": "BOOT0 and PB2/BOOT1 pull-downs"},
+                {"ref_prefix": "J", "lib_id": "Connector:Conn_ARM_JTAG_SWD_10", "value": "SWD", "notes": "10-pin ARM SWD debug header"}
             ],
-            "connections": [
-                {"from": "U.VDD", "to_net": "VCC_3V3", "notes": "All VDD pins to 3.3V"},
-                {"from": "U.VDDA", "to_net": "VCC_3V3", "notes": "Analog supply — add ferrite bead for sensitive analog work"},
-                {"from": "U.VSS", "to_net": "GND", "notes": "All VSS pins to ground"},
-                {"from": "U.NRST", "to_net": "NRST", "notes": "Reset with 10k pull-up + 100nF cap"},
-                {"from": "U.OSC_IN", "to_net": "HSE_IN", "notes": "Crystal input"},
-                {"from": "U.OSC_OUT", "to_net": "HSE_OUT", "notes": "Crystal output"},
-                {"from": "U.SWDIO", "to_net": "SWDIO", "notes": "SWD data to debug header"},
-                {"from": "U.SWCLK", "to_net": "SWCLK", "notes": "SWD clock to debug header"}
-            ],
-            "design_notes": "Crystal load cap formula: CL = (C1*C2)/(C1+C2) + Cstray, where Cstray ≈ 3-5pF. Place all decoupling caps within 3mm of their VDD pin. VCAP capacitor value is critical — check your specific STM32 variant's datasheet.",
+            "connections": stm32_connections,
+            "design_notes": "Size the HSE load capacitors for the selected crystal. ST estimates 10pF combined pin and board capacitance for sizing. Put the four 100nF caps near the three VDD pins and VDDA. VBAT ties to VDD in this circuit without a backup battery. Use 4.7uF with ESR below 1 ohm on VCAP1. Leave SWD header key pin 7 and JTAG-only pin 8 unused.",
             "references": ["AN4488: Getting started with STM32F4 MCU hardware development"]
         }),
         json!({
@@ -118,9 +193,10 @@ fn builtin_templates() -> Vec<serde_json::Value> {
                 {"ref_prefix": "R", "lib_id": "Device:R", "value": "1k", "quantity": 1, "package": "0402", "notes": "Current limiter: R = (Vcc - Vf) / If. For 3.3V, green Vf≈2.1V, If=1.2mA → 1k"}
             ],
             "connections": [
-                {"from": "GPIO", "to": "R1.1", "notes": "GPIO output drives LED through resistor"},
-                {"from": "R1.2", "to": "D1.A", "notes": "Resistor to LED anode"},
-                {"from": "D1.K", "to_net": "GND", "notes": "LED cathode to ground"}
+                {"from": "R1.1", "to_net": "GPIO"},
+                {"from": "R1.2", "to_net": "LED_A"},
+                {"from": "D1.2", "to_net": "LED_A"},
+                {"from": "D1.1", "to_net": "GND"}
             ],
             "design_notes": "R = (VCC - Vf) / If. For 3.3V GPIO: green (Vf=2.1V) → 1k gives 1.2mA. Red (Vf=1.8V) → 680R gives 2.2mA. Bright LEDs may only need 0.5mA. Check your LED's datasheet for Vf and recommended If.",
             "references": []
@@ -137,44 +213,64 @@ fn builtin_templates() -> Vec<serde_json::Value> {
                 {"ref_prefix": "C", "lib_id": "Device:C", "value": "10uF", "quantity": 2, "package": "0805", "notes": "Input capacitors — X5R/X7R ceramic, voltage rating > Vin*1.5"},
                 {"ref_prefix": "C", "lib_id": "Device:C", "value": "22uF", "quantity": 2, "package": "0805", "notes": "Output capacitors — low ESR ceramic"},
                 {"ref_prefix": "C", "lib_id": "Device:C", "value": "100nF", "quantity": 1, "package": "0402", "notes": "Boot cap"},
-                {"ref_prefix": "R", "lib_id": "Device:R", "value": "100k", "quantity": 1, "package": "0402", "notes": "Feedback upper resistor — adjust for target Vout"},
-                {"ref_prefix": "R", "lib_id": "Device:R", "value": "49.9k", "quantity": 1, "package": "0402", "notes": "Feedback lower resistor — Vout = Vref * (1 + Rtop/Rbot)"}
+                {"ref_prefix": "R", "lib_id": "Device:R", "value": "73.2k", "quantity": 1, "package": "0402", "notes": "Feedback upper resistor — adjust for target Vout"},
+                {"ref_prefix": "R", "lib_id": "Device:R", "value": "22.1k", "quantity": 1, "package": "0402", "notes": "Feedback lower resistor — Vout = Vref * (1 + Rtop/Rbot)"}
             ],
             "connections": [
-                {"from": "U.VIN", "to_net": "VIN", "notes": "Input power"},
-                {"from": "U.SW", "to": "L1.1", "notes": "Switch node to inductor"},
-                {"from": "L1.2", "to_net": "VOUT", "notes": "Inductor output"},
-                {"from": "U.FB", "via": "voltage divider R_top/R_bot", "to_net": "VOUT", "notes": "Feedback voltage divider"},
-                {"from": "U.BOOT", "notes": "Bootstrap cap from BOOT to SW"},
-                {"from": "U.GND", "to_net": "GND", "notes": "Power ground — kelvin sense to output cap GND"}
+                {"from": "U1.3", "to_net": "VIN"},
+                {"from": "U1.5", "to_net": "VIN"},
+                {"from": "C1.1", "to_net": "VIN"},
+                {"from": "C2.1", "to_net": "VIN"},
+                {"from": "U1.1", "to_net": "GND"},
+                {"from": "C1.2", "to_net": "GND"},
+                {"from": "C2.2", "to_net": "GND"},
+                {"from": "C3.2", "to_net": "GND"},
+                {"from": "C4.2", "to_net": "GND"},
+                {"from": "R2.2", "to_net": "GND"},
+                {"from": "U1.2", "to_net": "SW"},
+                {"from": "L1.1", "to_net": "SW"},
+                {"from": "C5.2", "to_net": "SW"},
+                {"from": "L1.2", "to_net": "VOUT"},
+                {"from": "C3.1", "to_net": "VOUT"},
+                {"from": "C4.1", "to_net": "VOUT"},
+                {"from": "R1.1", "to_net": "VOUT"},
+                {"from": "U1.4", "to_net": "FB"},
+                {"from": "R1.2", "to_net": "FB"},
+                {"from": "R2.1", "to_net": "FB"},
+                {"from": "U1.6", "to_net": "BOOT"},
+                {"from": "C5.1", "to_net": "BOOT"}
             ],
-            "design_notes": "Layout is critical: keep input caps close to VIN/GND pins, keep SW trace short and wide (high di/dt), keep feedback divider close to FB pin away from SW node. Ground plane under inductor improves EMI. Calculate passives from datasheet — do NOT guess values.",
-            "references": ["TI SLVA477: Application Note for TPS563200"]
+            "design_notes": "The divider gives approximately 3.3V at the 0.765V feedback reference. Recalculate the divider, inductor and capacitors for other output targets. Place the input capacitors by VIN/GND and the divider by VFB away from the SW node.",
+            "references": ["TI TPS563200 datasheet SLVSCB0E"]
         }),
     ]
 }
 
 // ─── Template storage paths ──────────────────────────────────────────────────
 
-fn user_templates_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        PathBuf::from(appdata).join("konnect").join("templates")
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".konnect").join("templates")
-    }
+fn user_templates_dir() -> Option<PathBuf> {
+    use konnect_sexp::state::{self, StateDir};
+
+    let state = StateDir::resolve().ok()?;
+    Some(state.existing_or_default("templates", || {
+        #[cfg(windows)]
+        let old = state::legacy_roaming_dir();
+        #[cfg(not(windows))]
+        let old = state::legacy_home_dir();
+        old.map(|dir| dir.join("templates"))
+    }))
 }
 
 /// Load all templates: builtins + any user-created ones from disk.
 async fn load_all_templates() -> Vec<serde_json::Value> {
     let mut templates = builtin_templates();
+    templates.extend(load_user_templates().await);
+    templates
+}
 
-    let user_dir = user_templates_dir();
-    if user_dir.is_dir() {
+async fn load_user_templates() -> Vec<serde_json::Value> {
+    let mut templates = Vec::new();
+    if let Some(user_dir) = user_templates_dir() {
         if let Ok(mut rd) = tokio::fs::read_dir(&user_dir).await {
             while let Ok(Some(entry)) = rd.next_entry().await {
                 let path = entry.path();
@@ -241,9 +337,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "apply_template",
-            "Instantiate a reference circuit template into the current schematic. Places all \
-             components and wires them according to the template's connection map. Use net_mappings \
-             to connect template nets to your project's existing nets.",
+            "Apply a reference circuit template. This places components in the schematic and \
+             returns a connection guide. It does not wire pins or add labels. Use net_mappings \
+             to rename nets in the guide.",
             json!({
                 "type": "object",
                 "properties": {
@@ -254,7 +350,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "net_mappings": {
                         "type": "object",
                         "additionalProperties": true,
-                        "description": "Map template net names to your project's net names. E.g. {\"VUSB\": \"VCC_5V\", \"GND\": \"GND\"}"
+                        "description": "Rename nets in the returned guide. E.g. {\"VUSB\": \"VCC_5V\", \"GND\": \"GND\"}"
                     },
                     "ref_start": {
                         "type": "integer",
@@ -264,7 +360,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "template_id"]
             }),
             |args, ctx| async move { handle_apply_template(args, ctx).await }
-        ),
+        )
+        .with_kicad_config(),
         tool!(
             "list_template_categories",
             "List all available template categories and the number of templates in each.",
@@ -400,12 +497,16 @@ async fn handle_apply_template(
         "Applying template"
     );
 
-    let templates = load_all_templates().await;
-    let tmpl = match templates
-        .iter()
-        .find(|t| t["id"].as_str() == Some(&template_id))
-    {
-        Some(t) => t.clone(),
+    let find_template =
+        |template: &serde_json::Value| template["id"].as_str() == Some(&template_id);
+    let builtin = builtin_templates().into_iter().find(find_template);
+    let is_builtin = builtin.is_some();
+    let template = match builtin {
+        Some(template) => Some(template),
+        None => load_user_templates().await.into_iter().find(find_template),
+    };
+    let tmpl = match template {
+        Some(template) => template,
         None => {
             warn!(template_id = %template_id, "Template not found for apply");
             return Ok(CallToolResult::error(format!(
@@ -444,6 +545,7 @@ async fn handle_apply_template(
     let components = tmpl["components"].as_array().cloned().unwrap_or_default();
     let mut placed = Vec::new();
     let mut placed_targets = Vec::new();
+    let mut placed_by_template_ref = std::collections::HashMap::new();
     let mut ref_counters: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
 
@@ -461,6 +563,10 @@ async fn handle_apply_template(
                 .entry(ref_prefix.to_string())
                 .or_insert(ref_start);
             let reference = format!("{}{}", ref_prefix, counter);
+            if is_builtin {
+                let template_ref = format!("{}{}", ref_prefix, *counter - ref_start + 1);
+                placed_by_template_ref.insert(template_ref, reference.clone());
+            }
             *counter += 1;
 
             let x = base_x;
@@ -552,6 +658,19 @@ async fn handle_apply_template(
         .iter()
         .map(|conn| {
             let mut c = conn.clone();
+            for side in ["from", "to"] {
+                let placed_pin = c[side]
+                    .as_str()
+                    .and_then(|endpoint| endpoint.split_once('.'))
+                    .and_then(|(reference, pin)| {
+                        placed_by_template_ref
+                            .get(reference)
+                            .map(|placed| format!("{placed}.{pin}"))
+                    });
+                if let Some(placed_pin) = placed_pin {
+                    c[side] = json!(placed_pin);
+                }
+            }
             let original_net = c["to_net"].as_str().map(String::from);
             if let Some(net) = original_net {
                 if let Some(mapped) = net_mappings.get(&net) {
@@ -567,9 +686,10 @@ async fn handle_apply_template(
         serde_json::to_string(&json!({
             "template": template_id,
             "components_placed": placed,
+            "wired": false,
             "connections_to_wire": mapped_connections,
             "design_notes": tmpl["design_notes"],
-            "next_steps": "Use connect_to_net or connect_pins to wire the placed components according to the connections list above."
+            "next_steps": "No wires or labels were added. Review the guide, then use connect_to_net or connect_pins to wire the placed components."
         }))
         .unwrap(),
     ))
@@ -636,28 +756,8 @@ fn find_next_ref_number(content: &str) -> usize {
 mod tests {
     use super::*;
     use crate::router::ToolRouter;
-    use crate::tools::{ServerConfig, KICAD_ENV_LOCK};
+    use crate::tools::ServerConfig;
     use std::sync::Arc;
-
-    struct TemplateEnvironment {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        old_appdata: Option<std::ffi::OsString>,
-        old_home: Option<std::ffi::OsString>,
-    }
-
-    impl Drop for TemplateEnvironment {
-        fn drop(&mut self) {
-            restore_env("APPDATA", self.old_appdata.take());
-            restore_env("HOME", self.old_home.take());
-        }
-    }
-
-    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
-        match value {
-            Some(value) => std::env::set_var(name, value),
-            None => std::env::remove_var(name),
-        }
-    }
 
     fn test_ctx() -> Arc<ToolContext> {
         Arc::new(ToolContext::new(
@@ -674,19 +774,28 @@ mod tests {
         ))
     }
 
-    fn template_fixture() -> (tempfile::TempDir, std::path::PathBuf, TemplateEnvironment) {
-        let guard = KICAD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("config");
-        let old_appdata = std::env::var_os("APPDATA");
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("APPDATA", &config);
-        std::env::set_var("HOME", &config);
-        let template_dir = if cfg!(target_os = "windows") {
-            config.join("konnect").join("templates")
-        } else {
-            config.join(".konnect").join("templates")
+    fn template_fixture(test_name: &str) -> Option<std::path::PathBuf> {
+        const FIXTURE_ROOT: &str = "KONNECT_TEST_TEMPLATE_ROOT";
+        let root = match std::env::var_os(FIXTURE_ROOT) {
+            Some(root) => std::path::PathBuf::from(root),
+            None => {
+                let dir = tempfile::tempdir().unwrap();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", &format!("tools::templates::tests::{test_name}")])
+                    .env(FIXTURE_ROOT, dir.path())
+                    .env("KONNECT_STATE_DIR", dir.path().join("state"))
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return None;
+            }
         };
+        let template_dir = root.join("state/templates");
         std::fs::create_dir_all(&template_dir).unwrap();
         std::fs::write(
             template_dir.join("one_resistor.json"),
@@ -698,7 +807,7 @@ mod tests {
                 "components": [
                     {"ref_prefix": "R", "lib_id": "Device:R", "value": "4.7k"}
                 ],
-                "connections": [],
+                "connections": [{"from": "R1.1", "to_net": "USER_NET"}],
                 "design_notes": "test"
             }))
             .unwrap(),
@@ -707,7 +816,7 @@ mod tests {
 
         // A real KiCad schematic fixture, including a fully embedded
         // Device:R definition, makes this independent of a KiCad installation.
-        let schematic = dir.path().join("derived_lib_name.kicad_sch");
+        let schematic = root.join("derived_lib_name.kicad_sch");
         std::fs::copy(
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -716,14 +825,9 @@ mod tests {
             &schematic,
         )
         .unwrap();
-        std::fs::write(dir.path().join("derived_lib_name.kicad_pro"), "{}\n").unwrap();
+        std::fs::write(root.join("derived_lib_name.kicad_pro"), "{}\n").unwrap();
 
-        let environment = TemplateEnvironment {
-            _guard: guard,
-            old_appdata,
-            old_home,
-        };
-        (dir, schematic, environment)
+        Some(schematic)
     }
 
     async fn call_registered(
@@ -741,7 +845,11 @@ mod tests {
 
     #[tokio::test]
     async fn apply_template_uses_project_identity_and_leaves_batch_writes_usable() {
-        let (_dir, schematic, _environment) = template_fixture();
+        let Some(schematic) =
+            template_fixture("apply_template_uses_project_identity_and_leaves_batch_writes_usable")
+        else {
+            return;
+        };
         let ctx = test_ctx();
 
         let applied = call_registered(
@@ -750,6 +858,7 @@ mod tests {
             json!({
                 "schematic": schematic.display().to_string(),
                 "template_id": "test_one_resistor",
+                "net_mappings": { "USER_NET": "PROJECT_NET" },
                 "position_x": 180.0,
                 "position_y": 100.0
             }),
@@ -757,6 +866,16 @@ mod tests {
         )
         .await;
         assert!(!applied.is_error, "{applied:?}");
+
+        let crate::mcp::protocol::ToolContent::Text { text } = &applied.content[0] else {
+            panic!("expected template placement result");
+        };
+        let result: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            result["connections_to_wire"],
+            json!([{"from": "R1.1", "to_net": "PROJECT_NET", "mapped_from": "USER_NET"}]),
+            "user-defined endpoints keep their original meaning"
+        );
 
         let saved = konnect_schematic_editor::Schematic::load(&schematic).unwrap();
         let placed = saved
@@ -802,7 +921,11 @@ mod tests {
 
     #[tokio::test]
     async fn apply_template_refuses_malformed_instance_metadata_without_writing() {
-        let (_dir, schematic, _environment) = template_fixture();
+        let Some(schematic) =
+            template_fixture("apply_template_refuses_malformed_instance_metadata_without_writing")
+        else {
+            return;
+        };
         let malformed = std::fs::read_to_string(&schematic).unwrap().replacen(
             "(project \"derived_lib_name\"",
             "(project \"\"",

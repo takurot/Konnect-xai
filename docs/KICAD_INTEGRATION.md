@@ -182,6 +182,23 @@ through Python.
 
 ## Configuration
 
+The optional `kicad_config_dir` setting is the absolute path to the directory
+containing KiCad's global `sym-lib-table`, `fp-lib-table`, and `kicad_common.json`.
+Set it when the KiCad instance whose libraries you want to use has a different
+configuration directory from the CLI that Konnect runs.
+
+By default, Konnect selects the settings directory using the major and minor
+version reported by `kicad-cli --version`. For instance, KiCad 10.99 uses the
+`10.99` directory even if an older `10.0` directory exists. The base is
+`KICAD_CONFIG_HOME` when set, or the platform KiCad settings base otherwise.
+If the CLI version is unavailable, Konnect uses the numerically newest existing
+`<major>.<minor>` directory, falling back to `10.0` when there are none.
+On Windows, the standard install roots also discover versioned KiCad installs,
+including nightlies. Stock-library path discovery considers exported
+`KICAD<major>_SYMBOL_DIR`, `KICAD<major>_FOOTPRINT_DIR`, and
+`KICAD<major>_3DMODEL_DIR` variables in descending major version order.
+
+
 Konnect selects the first existing server configuration file in the order below
 and loads only that file. It does not merge settings from later locations. Call
 `get_installation_info` to see which file configured the running process and
@@ -193,9 +210,9 @@ higher-priority file exists.
 1. `settings.json` at the root of a recognized KiCad PCM plugin layout. The
    executable's resolved location must be in `bin/` and match the native
    server action in `plugin.json`.
-2. `konnect/config.toml` under the platform configuration directory
-   (`~/Library/Application Support` on macOS, `~/.config` on Linux,
-   `%APPDATA%` on Windows). A relative or unavailable platform root is skipped.
+2. `config.toml` in the [Konnect state directory](#konnect-state-directory).
+3. When `KONNECT_STATE_DIR` is unset, the previous `konnect/config.toml` under
+   `~/.config` on Linux or `%APPDATA%` on Windows. macOS kept the same default.
 
 Konnect ignores configuration files in the project working directory during
 automatic discovery. Pass `--config <path>` to select a project configuration
@@ -226,6 +243,44 @@ on Windows, `$HOME/.konnect/jlcpcb.db` elsewhere) unless a nonblank configured
 path is supplied. Nonblank configured paths are preserved without trimming;
 the download tool's per-call `output_path` takes precedence. This normalization does not rewrite
 your settings file or download a database at startup.
+
+## Konnect state directory
+
+An absolute `KONNECT_STATE_DIR` selects the state root for the server and
+plugin. If unset, Konnect uses the platform's local data directory.
+A relative override disables optional persistent state and explicit operations
+that need state return an error. Files are never resolved against the project cwd.
+
+| Platform | Default state root |
+| --- | --- |
+| Linux | `$XDG_DATA_HOME/konnect` or `~/.local/share/konnect` |
+| macOS | `~/Library/Application Support/konnect` |
+| Windows | Local AppData Known Folder, typically `%LOCALAPPDATA%\konnect` |
+
+| State | Path within the root |
+| --- | --- |
+| Startup config and user design preferences | `config.toml`, `config.json` |
+| JLCPCB catalog and user templates | `jlcpcb.db`, `templates/` |
+| Cooperative document locks and running server records | `locks/`, `run/` |
+| Install markers and guidance checks | `.installed-*`, `.guidance-checked-*` |
+| Call diagnostics | `logs/calls.jsonl`, `logs/calls.jsonl.1` |
+| Native bridge registration | `native-bridge/`, subject to an absolute `KONNECT_BRIDGE_DIR` |
+| Python plugin cache and PID | `cache/` with the override or on Windows, `~/.cache/konnect/cache/` otherwise |
+
+A valid state override isolates both reads and writes. The explicit `--config`
+option, PCM `settings.json`, and `jlcpcb_db_path` take precedence for their
+respective settings. Without a state override, Konnect keeps using existing
+legacy preferences, catalogs, templates and markers when no file exists at the
+new location. Claude and Codex keep their own home directories for guidance.
+Project preferences stay in the project's `.konnect/project.json`.
+
+The standalone and embedded servers rotate their JSONL call log at 5 MiB per
+file. Stop older Konnect processes that share the same log path before
+upgrading so all writers honor the rotation lock. Oversized historical logs
+found at those paths are preserved in sibling
+`calls-legacy-*` directories. Add `call_log = false` to server TOML to keep only
+in-memory counters and recent calls. Rotating and disabling the log do not
+remove existing historical files.
 
 ## Plugin, Viewer, And Packaging
 

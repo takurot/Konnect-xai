@@ -1,6 +1,7 @@
 use crate::transport::http_policy::BearerToken;
 use anyhow::Result;
 use konnect_core::config_resolution::ConfigResolution;
+use konnect_sexp::state::StateDir;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -10,6 +11,10 @@ pub struct Config {
     /// Path to the kicad-cli binary
     #[serde(default = "default_kicad_cli")]
     pub kicad_cli: String,
+
+    /// Exact directory containing KiCad's global library tables and settings.
+    #[serde(default, deserialize_with = "absolute_kicad_config_dir")]
+    pub kicad_config_dir: Option<PathBuf>,
 
     /// Path to the KiCAD binary (for launching the UI)
     #[serde(default = "default_kicad_binary")]
@@ -46,6 +51,10 @@ pub struct Config {
     /// JLCPCB database cache path
     #[serde(default)]
     pub jlcpcb_db_path: Option<PathBuf>,
+
+    /// Persist bounded per-call JSONL diagnostics. In-memory counters stay available.
+    #[serde(default = "default_call_log")]
+    pub call_log: bool,
 
     /// Log level (error, warn, info, debug, trace)
     #[serde(default = "default_log_level")]
@@ -128,6 +137,19 @@ impl IpcAddressSource {
             konnect_ipc::redact_endpoint(address)
         ))
     }
+}
+
+fn absolute_kicad_config_dir<'de, D>(deserializer: D) -> Result<Option<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let path = Option::<PathBuf>::deserialize(deserializer)?;
+    if path.as_ref().is_some_and(|path| !path.is_absolute()) {
+        return Err(serde::de::Error::custom(
+            "kicad_config_dir must be an absolute path",
+        ));
+    }
+    Ok(path)
 }
 
 fn default_kicad_cli() -> String {
@@ -254,10 +276,15 @@ impl Config {
     }
 }
 
+fn default_call_log() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
             kicad_cli: default_kicad_cli(),
+            kicad_config_dir: None,
             kicad_binary: default_kicad_binary(),
             project_dir: None,
             // Blank until `resolve_ipc_address` fills it in.
@@ -267,6 +294,7 @@ impl Default for Config {
             http_allow_remote: false,
             http_token: None,
             jlcpcb_db_path: None,
+            call_log: default_call_log(),
             log_level: default_log_level(),
             auto_load_toolsets: false,
             eager_toolsets: false,
@@ -280,7 +308,15 @@ fn default_config_paths() -> Vec<PathBuf> {
     let pcm = std::env::current_exe()
         .ok()
         .and_then(|exe| pcm_settings_path(&exe));
-    pcm.into_iter().chain(dirs_config_path()).collect()
+    let Ok(state) = StateDir::resolve() else {
+        return pcm.into_iter().collect();
+    };
+    let current = state.root().join("config.toml");
+    let legacy = (!state.is_overridden())
+        .then(dirs_config_path)
+        .flatten()
+        .filter(|old| old != &current);
+    pcm.into_iter().chain([current]).chain(legacy).collect()
 }
 
 /// Pick the first existing candidate, and report the later ones that exist and
@@ -347,6 +383,18 @@ fn dirs_config_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn kicad_config_dir_requires_an_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = format!("kicad_config_dir = '{}'", dir.path().display());
+        let configured: Config = toml::from_str(&input).unwrap();
+        assert_eq!(configured.kicad_config_dir.as_deref(), Some(dir.path()));
+        for path in ["", "relative"] {
+            let input = format!("kicad_config_dir = '{path}'");
+            assert!(toml::from_str::<Config>(&input).is_err());
+        }
+    }
 
     #[test]
     fn generic_bin_install_cannot_discover_parent_settings() {

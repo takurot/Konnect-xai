@@ -28,7 +28,8 @@ mkdir -p "$E2E_ROOT/logs" "$E2E_ROOT/tmp" "$E2E_ROOT/artifacts"
 export TMPDIR="$E2E_ROOT/tmp"
 export CARGO_TARGET_DIR="$E2E_ROOT/cargo-target"
 export KICAD_CLI="/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"
-export KICAD_DEMOS="/Applications/KiCad/KiCad.app/Contents/SharedSupport/demos"
+export KICAD_DEMOS="/Applications/KiCad/demos"
+export KONNECT_REQUIRE_DEMOS=1
 test -x "$KICAD_CLI"
 export PATH="$(dirname "$KICAD_CLI"):$PATH"
 command -v kicad-cli
@@ -60,7 +61,7 @@ run_case() {
 }
 ```
 
-`KICAD_CLI`だけではvariantテストに届かないため、CLIのディレクトリを`PATH`にも追加する。デモ不在のconformanceテストには、早期returnでテスト自体が`ok`になる経路がある。C07はCLI未検出時に失敗する。**終了コード0や`0 ignored`だけで合格にしない。** 各ログの`SKIP`・`skipping`、対象テスト名、実処理件数も読む。
+`KICAD_CLI`だけではvariantテストに届かないため、CLIのディレクトリを`PATH`にも追加する。`KONNECT_REQUIRE_DEMOS=1`を設定すると、conformanceテストはデモの不在・空ディレクトリを失敗として扱う。Homebrew caskで`/Applications/KiCad/demos`が無い場合は、`/Library/Application Support/kicad/demos`を確認する。C07はCLI未検出時に失敗する。**終了コード0や`0 ignored`だけで合格にしない。** 各ログの`SKIP`・`skipping`、対象テスト名、実処理件数も読む。
 
 ## A. KiCad CLIとMCPの自動評価
 
@@ -104,6 +105,12 @@ gh run view <run-id> --repo takurot/Konnect-xai --log > "$E2E_ROOT/logs/hosted-e
 ```
 
 PRでは`run:e2e-kicad`ラベルを**付けるイベント**でも起動できる。既に付いているだけでは新しいpushの検証にならない。CIは失敗時のみ`dist/`と`e2e-artifacts/`をuploadするため、成功runでもログを保存する。C08が成功していてもGUIテストが実行されたことにはならない。
+
+[macOS・Linuxの実KiCad CI](../.github/workflows/e2e-kicad-unix.yml) は同じラベルまたは
+`gh workflow run e2e-kicad-unix.yml --repo takurot/Konnect-xai --ref <評価ブランチまたはタグ>`
+で起動できる。KiCad 10.0.8でC01〜C07を検証する。macOSでDMGにデモが含まれない場合は、
+同じバージョンのKiCadソースから取得する。成功ログで全デモの解析件数と4件のデモ実行結果を確認する。
+リリースゲートへの追加判断は週次スケジュールの3回連続成功を得た後に行う。
 
 配線済み基板の製造出力と未配線時の停止を併せて検証する場合は、[総合ワークフローの実機回帰テスト](KICAD_DESIGN_TO_GERBER_WORKFLOW.md#実機回帰テスト) を実行する。実CLIとPCB Editorが必要な独立した受け入れテスト。
 

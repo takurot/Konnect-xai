@@ -4,9 +4,7 @@
 use super::error::{extract_error_kind, ToolErrorKind};
 use super::protocol::*;
 use super::server::McpServerState;
-use crate::observability::{
-    default_calls_log_path, new_call_id, unix_ms, CallObserver, CallRecord, CallStatus,
-};
+use crate::observability::{new_call_id, unix_ms, CallObserver, CallRecord, CallStatus};
 use crate::outcome::OutcomeStatus;
 use crate::router::{meta_tools, ToolRouter};
 use axum::response::sse::Event;
@@ -71,6 +69,16 @@ impl McpHandler {
         config: crate::tools::ServerConfig,
         config_resolution: crate::config_resolution::ConfigResolution,
     ) -> anyhow::Result<Self> {
+        Self::new_configured(config, config_resolution, None, None).await
+    }
+
+    /// Build a handler with a KiCad settings override and an optional call log.
+    pub async fn new_configured(
+        config: crate::tools::ServerConfig,
+        config_resolution: crate::config_resolution::ConfigResolution,
+        kicad_config_dir: Option<std::path::PathBuf>,
+        call_log: Option<std::path::PathBuf>,
+    ) -> anyhow::Result<Self> {
         let router = Arc::new(ToolRouter::new());
 
         // Load only the starter kit at startup so baseline `tools/list` stays small
@@ -86,7 +94,7 @@ impl McpHandler {
             router.load_starter_kit().await;
         }
 
-        let observer = CallObserver::new(Some(default_calls_log_path()));
+        let observer = CallObserver::new(call_log);
         let meta_input_validators = meta_tools::meta_tool_descriptions_for(cfg!(unix))
             .into_iter()
             .map(|tool| {
@@ -95,10 +103,17 @@ impl McpHandler {
                 (tool.name, validator)
             })
             .collect();
-        let ctx = Arc::new(
+        let mut ctx =
             crate::tools::ToolContext::new_with_observer(config, router, observer.clone())
-                .with_config_resolution(config_resolution),
-        );
+                .with_config_resolution(config_resolution);
+        if let Some(path) = kicad_config_dir {
+            anyhow::ensure!(
+                path.is_absolute(),
+                "kicad_config_dir must be an absolute path"
+            );
+            ctx.kicad_config_dir = tokio::sync::OnceCell::new_with(Some(path));
+        }
+        let ctx = Arc::new(ctx);
 
         Ok(McpHandler {
             ctx,
@@ -148,42 +163,47 @@ impl McpHandler {
     }
 
     /// Process one JSON-RPC message and return an optional response.
-    /// Returns `None` for notifications (no response required).
+    /// Returns `None` for notifications and incoming responses.
     pub async fn handle_message(&self, msg: Value) -> Option<JsonRpcResponse> {
-        // Distinguish request (has "method") from response (has "result"/"error")
-        msg.get("method")?;
-
-        let req: JsonRpcRequest = match serde_json::from_value(msg) {
-            Ok(r) => r,
-            Err(e) => {
-                return Some(JsonRpcResponse::error(
-                    Value::Null,
-                    JsonRpcError {
-                        code: INVALID_REQUEST,
-                        message: format!("Invalid request: {}", e),
-                        data: None,
-                    },
-                ));
+        let id = msg.get("id").filter(|id| is_request_id(id));
+        let Some(method) = request_method(&msg) else {
+            // Client responses have no method. No server request is pending
+            // here, so a response envelope has nothing to dispatch.
+            if msg.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+                && msg.get("method").is_none()
+                && msg
+                    .get("id")
+                    .is_some_and(|id| id.is_null() || is_request_id(id))
+                && (msg.get("result").is_some() ^ msg.get("error").is_some())
+            {
+                return None;
             }
+
+            let message = if msg.is_array() {
+                "JSON-RPC batching is not supported"
+            } else {
+                "Invalid JSON-RPC request"
+            };
+            return Some(JsonRpcResponse::error(
+                id.cloned().unwrap_or(Value::Null),
+                JsonRpcError::new(INVALID_REQUEST, message),
+            ));
         };
 
-        let id = req.id.clone().unwrap_or(Value::Null);
-        debug!("Handling method: {}", req.method);
+        let Some(id) = id else {
+            // STDIO consumes cancellation before dispatch; initialized and
+            // the remaining client notifications require no handler work.
+            debug!(method, "Ignoring MCP notification");
+            return None;
+        };
 
-        let result = self.dispatch(&req).await;
-
-        match result {
-            Ok(None) => None, // notification — no response
-            Ok(Some(val)) => Some(JsonRpcResponse::success(id, val)),
-            Err(e) => Some(JsonRpcResponse::error(
-                id,
-                JsonRpcError {
-                    code: INTERNAL_ERROR,
-                    message: e.to_string(),
-                    data: None,
-                },
-            )),
-        }
+        debug!(method, "Handling MCP request");
+        let result = self.dispatch(method, msg.get("params")).await;
+        let id = id.clone();
+        Some(match result {
+            Ok(result) => JsonRpcResponse::success(id, result),
+            Err(error) => JsonRpcResponse::error(id, error),
+        })
     }
 
     /// At `initialize`, look at who is on the other end. A client that caches
@@ -213,21 +233,21 @@ impl McpHandler {
         }
     }
 
-    async fn dispatch(&self, req: &JsonRpcRequest) -> anyhow::Result<Option<Value>> {
-        match req.method.as_str() {
+    async fn dispatch(&self, method: &str, params: Option<&Value>) -> Result<Value, JsonRpcError> {
+        let serialization_error = |_| JsonRpcError::new(INTERNAL_ERROR, "Failed to encode result");
+        match method {
             // ── Lifecycle ──────────────────────────────────────────────────
             "initialize" => {
-                self.adapt_to_client(req.params.as_ref()).await;
+                self.adapt_to_client(params).await;
                 let notice = self
                     .ctx
                     .guidance
                     .get()
                     .and_then(|probe| probe.take_notice());
                 let result = McpServerState::build_initialize_result(notice);
-                Ok(Some(serde_json::to_value(result)?))
+                serde_json::to_value(result).map_err(serialization_error)
             }
-            "notifications/initialized" => Ok(None),
-            "ping" => Ok(Some(json!({}))),
+            "ping" => Ok(json!({})),
 
             // ── Tool listing ───────────────────────────────────────────────
             "tools/list" => {
@@ -240,26 +260,38 @@ impl McpHandler {
                     tools,
                     next_cursor: None,
                 };
-                Ok(Some(serde_json::to_value(result)?))
+                serde_json::to_value(result).map_err(serialization_error)
             }
 
             // ── Tool execution ─────────────────────────────────────────────
             "tools/call" => {
-                let params: CallToolParams =
-                    serde_json::from_value(req.params.clone().unwrap_or(Value::Null))?;
+                let params = params.filter(|value| value.is_object()).ok_or_else(|| {
+                    JsonRpcError::new(INVALID_PARAMS, "tools/call params must be an object")
+                })?;
+                if params
+                    .get("arguments")
+                    .is_some_and(|arguments| !arguments.is_object())
+                {
+                    return Err(JsonRpcError::new(
+                        INVALID_PARAMS,
+                        "tools/call arguments must be an object",
+                    ));
+                }
 
+                let params: CallToolParams = serde_json::from_value(params.clone())
+                    .map_err(|error| JsonRpcError::new(INVALID_PARAMS, error.to_string()))?;
                 let call_result = self.execute_tool(&params).await;
-                Ok(Some(serde_json::to_value(call_result)?))
+                serde_json::to_value(call_result).map_err(serialization_error)
             }
 
-            // ── Unimplemented MCP methods ──────────────────────────────────
-            "resources/list" | "resources/read" => Ok(Some(json!({ "resources": [] }))),
-            "prompts/list" => Ok(Some(json!({ "prompts": [] }))),
+            // Empty list responses retained for existing clients.
+            "resources/list" => Ok(json!({ "resources": [] })),
+            "prompts/list" => Ok(json!({ "prompts": [] })),
 
-            method => {
-                warn!("Unknown method: {}", method);
-                Err(anyhow::anyhow!("Method not found: {}", method))
-            }
+            method => Err(JsonRpcError::new(
+                METHOD_NOT_FOUND,
+                format!("Method not found: {method}"),
+            )),
         }
     }
 
@@ -378,7 +410,22 @@ impl McpHandler {
             if let Err(error) = tool_def.input_validator.validate(args) {
                 return schema_argument_error(&error);
             }
-            return match (tool_def.handler)(args, self.ctx.clone()).await {
+            let call = async { (tool_def.handler)(args, self.ctx.clone()).await };
+            let result = if tool_def.uses_kicad_config {
+                let dir = self
+                    .ctx
+                    .kicad_config_dir
+                    .get_or_init(|| {
+                        crate::kicad_install::resolve_config_dir(&self.ctx.config.kicad_cli)
+                    })
+                    .await;
+                crate::kicad_install::REQUEST_CONFIG_DIR
+                    .scope(dir.clone(), call)
+                    .await
+            } else {
+                call.await
+            };
+            return match result {
                 Ok(result) => {
                     let status = call_status(&result);
                     // Structured errors carry their own kind in the body; plain-text
@@ -2376,21 +2423,11 @@ mod client_adaptation_tests {
         .expect("handler builds")
     }
 
-    fn request(method: &str, params: Value) -> JsonRpcRequest {
-        JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(json!(1)),
-            method: method.to_string(),
-            params: Some(params),
-        }
-    }
-
     async fn listed_tool_count(handler: &McpHandler) -> usize {
         let out = handler
-            .dispatch(&request("tools/list", json!({})))
+            .dispatch("tools/list", None)
             .await
-            .expect("tools/list dispatches")
-            .expect("tools/list returns a result");
+            .expect("tools/list dispatches");
         out["tools"].as_array().expect("tools array").len()
     }
 
@@ -2416,7 +2453,7 @@ mod client_adaptation_tests {
         let handler = lazy_handler().await;
         let starter = listed_tool_count(&handler).await;
         handler
-            .dispatch(&request("initialize", initialize_from("claude-ai")))
+            .dispatch("initialize", Some(&initialize_from("claude-ai")))
             .await
             .expect("initialize dispatches");
         let after = listed_tool_count(&handler).await;
@@ -2438,7 +2475,7 @@ mod client_adaptation_tests {
         let handler = lazy_handler().await;
         let starter = listed_tool_count(&handler).await;
         handler
-            .dispatch(&request("initialize", initialize_from("some-other-client")))
+            .dispatch("initialize", Some(&initialize_from("some-other-client")))
             .await
             .expect("initialize dispatches");
         assert_eq!(listed_tool_count(&handler).await, starter);
@@ -2450,7 +2487,7 @@ mod client_adaptation_tests {
         let handler = lazy_handler().await;
         let starter = listed_tool_count(&handler).await;
         handler
-            .dispatch(&request("initialize", json!({})))
+            .dispatch("initialize", Some(&json!({})))
             .await
             .expect("initialize dispatches");
         assert_eq!(listed_tool_count(&handler).await, starter);
@@ -2470,10 +2507,9 @@ mod client_adaptation_tests {
 
     async fn initialize_result(handler: &McpHandler) -> Value {
         handler
-            .dispatch(&request("initialize", initialize_from("claude-code")))
+            .dispatch("initialize", Some(&initialize_from("claude-code")))
             .await
             .expect("initialize dispatches")
-            .expect("initialize returns a result")
     }
 
     /// Drift reaches the model through `instructions` (#728); with nothing
@@ -3297,5 +3333,55 @@ mod v015_dispatch_contract_tests {
         let unrelated = anyhow::anyhow!("not an editor lock");
         assert_eq!(kicad_editor_locked_path(&unrelated), None);
         assert_eq!(kicad_editor_lock_file(&unrelated), None);
+    }
+}
+
+#[cfg(test)]
+mod kicad_config_scope_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn simultaneous_handlers_keep_their_ki_cad_config_directories_separate() {
+        let root = tempfile::tempdir().unwrap();
+        let mut handlers = Vec::new();
+        for name in ["First", "Second"] {
+            let config_dir = root.path().join(name);
+            let footprints = config_dir.join("parts.pretty");
+            std::fs::create_dir_all(&footprints).unwrap();
+            std::fs::write(footprints.join("Scoped.kicad_mod"), "").unwrap();
+            std::fs::write(
+                config_dir.join("fp-lib-table"),
+                format!(
+                    r#"(fp_lib_table (lib (name "{name}") (type "KiCad") (uri "{}") (options "") (descr "")))"#,
+                    footprints.to_string_lossy().replace('\\', "/")
+                ),
+            )
+            .unwrap();
+            handlers.push(
+                McpHandler::new_configured(
+                    crate::tools::ServerConfig {
+                        auto_load_toolsets: true,
+                        ..Default::default()
+                    },
+                    crate::config_resolution::ConfigResolution::unavailable(),
+                    Some(config_dir),
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let arguments = json!({"query":"Scoped"});
+        let (first, second) = tokio::join!(
+            handlers[0].dispatch_tool("search_footprints", &arguments),
+            handlers[1].dispatch_tool("search_footprints", &arguments),
+        );
+        for ((result, _, _), expected) in [(first, "First:Scoped"), (second, "Second:Scoped")] {
+            let ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected search result text");
+            };
+            let result: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(result["results"][0]["id"], expected, "{result}");
+        }
     }
 }

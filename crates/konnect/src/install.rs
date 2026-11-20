@@ -224,17 +224,44 @@ fn is_npx_cached_binary(exe: &Path) -> bool {
 #[derive(Debug)]
 struct InstallPaths {
     home: PathBuf,
+    state: PathBuf,
+    use_legacy_state: bool,
 }
 
 impl InstallPaths {
     fn for_current_user() -> Result<Self> {
+        let home = dirs::home_dir()
+            .filter(|path| path.is_absolute())
+            .context("could not locate home directory")?;
+        let state = konnect_sexp::state::StateDir::resolve().map_err(anyhow::Error::msg)?;
         Ok(Self {
-            home: dirs::home_dir().context("could not locate home directory")?,
+            home,
+            state: state.root().to_owned(),
+            use_legacy_state: !state.is_overridden(),
         })
     }
 
-    fn data_dir(&self) -> PathBuf {
-        self.home.join(".konnect")
+    fn data_dir(&self) -> &Path {
+        &self.state
+    }
+
+    fn state_file(&self, name: &str) -> PathBuf {
+        let current = self.data_dir().join(name);
+        if self.use_legacy_state && !current.exists() {
+            let old = self.home.join(".konnect").join(name);
+            if old.exists() {
+                return old;
+            }
+        }
+        current
+    }
+
+    fn remove_state_file(&self, name: &str) -> Result<()> {
+        remove_if_present(&self.data_dir().join(name))?;
+        if self.use_legacy_state {
+            remove_if_present(&self.home.join(".konnect").join(name))?;
+        }
+        Ok(())
     }
 
     fn skills_dir(&self, client: InstallClient) -> PathBuf {
@@ -253,15 +280,15 @@ impl InstallPaths {
     }
 
     fn marker(&self, client: InstallClient) -> PathBuf {
-        self.data_dir().join(client.marker_name())
+        self.state_file(client.marker_name())
     }
 
     fn legacy_marker(&self) -> PathBuf {
-        self.data_dir().join(".installed")
+        self.state_file(".installed")
     }
 
     fn guidance_checked(&self, client: InstallClient) -> PathBuf {
-        self.data_dir().join(client.checked_name())
+        self.state_file(client.checked_name())
     }
 }
 
@@ -325,7 +352,7 @@ fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
     fs::write(paths.marker(client), env!("CARGO_PKG_VERSION"))?;
     // The recorded check described the guidance this install just replaced;
     // a same-version re-init leaves the marker unchanged, so drop it.
-    remove_if_present(&paths.guidance_checked(client))?;
+    paths.remove_state_file(client.checked_name())?;
 
     if verbose {
         match client {
@@ -446,11 +473,11 @@ fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) 
         if verbose {
             println!("  [-] Removed hook entries from settings.json");
         }
-        remove_if_present(&paths.legacy_marker())?;
+        paths.remove_state_file(".installed")?;
     }
 
-    remove_if_present(&paths.marker(client))?;
-    remove_if_present(&paths.guidance_checked(client))?;
+    paths.remove_state_file(client.marker_name())?;
+    paths.remove_state_file(client.checked_name())?;
     if verbose {
         println!("\nDone.");
     }
@@ -885,7 +912,7 @@ fn is_konnect_executable(path: &str) -> bool {
 /// The executable is captured at startup, before an update can replace it.
 ///
 /// Each installed guidance version is scanned once: the first process to see
-/// a new install marker scans, records the result under `~/.konnect`, and
+/// a new install marker scans, records the result under the Konnect state directory, and
 /// offers one notice. Later processes read the record, even after a binary
 /// update, so guidance the user chose to keep is not reported on every start.
 /// `konnect status` still scans on demand.
@@ -1388,9 +1415,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn uninstall_removes_default_and_legacy_markers_without_crossing_an_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = test_paths(&temp);
+        paths.state = temp.path().join("state");
+        let old = paths.home.join(".konnect");
+        let marker = InstallClient::Codex.marker_name();
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(paths.data_dir()).unwrap();
+        for dir in [&old, &paths.state] {
+            fs::write(dir.join(marker), "0.16.0").unwrap();
+        }
+        run_uninstall_at(InstallClient::Codex, &paths, false).unwrap();
+        assert!(old.join(marker).exists());
+        assert!(!paths.state.join(marker).exists());
+        fs::write(paths.state.join(marker), "0.16.0").unwrap();
+        paths.use_legacy_state = true;
+        run_uninstall_at(InstallClient::Codex, &paths, false).unwrap();
+        assert!(install_marker(InstallClient::Codex, &paths).is_none());
+    }
+
     fn test_paths(temp: &TempDir) -> InstallPaths {
         InstallPaths {
             home: temp.path().to_path_buf(),
+            state: temp.path().join(".konnect"),
+            use_legacy_state: false,
         }
     }
 

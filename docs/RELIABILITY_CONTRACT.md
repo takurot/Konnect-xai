@@ -141,9 +141,9 @@ not model selection.
 
 ## Maintainer references
 
-- [Governance](https://github.com/mixelpixx/Konnect/blob/main/GOVERNANCE.md)
-- [Contributing](https://github.com/mixelpixx/Konnect/blob/main/CONTRIBUTING.md)
-- [Branch workflow](https://github.com/mixelpixx/Konnect/blob/main/docs/BRANCH_AND_PULL_REQUEST_WORKFLOW.md)
+- [Governance](https://github.com/takurot/Konnect-xai/blob/main/GOVERNANCE.md)
+- [Contributing](https://github.com/takurot/Konnect-xai/blob/main/CONTRIBUTING.md)
+- [Branch workflow](https://github.com/takurot/Konnect-xai/blob/main/docs/BRANCH_AND_PULL_REQUEST_WORKFLOW.md)
 
 The canonical source is `docs/RELIABILITY_CONTRACT.md`. The installer embeds these
 same bytes as the konnect skill's `references/reliability-contract.md`, so

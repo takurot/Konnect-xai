@@ -1451,7 +1451,7 @@ async fn handle_estimate_cost(
         }
         let db_path = integration::resolve_db_path(&json!({}), ctx);
         let (estimate, warning) = super::blocking_work::spawn_tracked_blocking(move || {
-            match jlcpcb_component_pricing(&db_path, &parts, quantity) {
+            match db_path.and_then(|path| jlcpcb_component_pricing(&path, &parts, quantity)) {
                 Ok(pricing) => (pricing, None),
                 Err(error) => (price_parts(&parts, &BTreeMap::new(), quantity), Some(format!(
                     "Could not read local JLCPCB catalog ({error:#}); all references use the fallback average"
