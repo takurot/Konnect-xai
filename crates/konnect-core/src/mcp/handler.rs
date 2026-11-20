@@ -71,6 +71,15 @@ impl McpHandler {
         config: crate::tools::ServerConfig,
         config_resolution: crate::config_resolution::ConfigResolution,
     ) -> anyhow::Result<Self> {
+        Self::new_configured(config, config_resolution, None).await
+    }
+
+    /// Build a handler with a startup KiCad settings directory override.
+    pub async fn new_configured(
+        config: crate::tools::ServerConfig,
+        config_resolution: crate::config_resolution::ConfigResolution,
+        kicad_config_dir: Option<std::path::PathBuf>,
+    ) -> anyhow::Result<Self> {
         let router = Arc::new(ToolRouter::new());
 
         // Load only the starter kit at startup so baseline `tools/list` stays small
@@ -95,10 +104,17 @@ impl McpHandler {
                 (tool.name, validator)
             })
             .collect();
-        let ctx = Arc::new(
+        let mut ctx =
             crate::tools::ToolContext::new_with_observer(config, router, observer.clone())
-                .with_config_resolution(config_resolution),
-        );
+                .with_config_resolution(config_resolution);
+        if let Some(path) = kicad_config_dir {
+            anyhow::ensure!(
+                path.is_absolute(),
+                "kicad_config_dir must be an absolute path"
+            );
+            ctx.kicad_config_dir = tokio::sync::OnceCell::new_with(Some(path));
+        }
+        let ctx = Arc::new(ctx);
 
         Ok(McpHandler {
             ctx,
@@ -395,7 +411,22 @@ impl McpHandler {
             if let Err(error) = tool_def.input_validator.validate(args) {
                 return schema_argument_error(&error);
             }
-            return match (tool_def.handler)(args, self.ctx.clone()).await {
+            let call = async { (tool_def.handler)(args, self.ctx.clone()).await };
+            let result = if tool_def.uses_kicad_config {
+                let dir = self
+                    .ctx
+                    .kicad_config_dir
+                    .get_or_init(|| {
+                        crate::kicad_install::resolve_config_dir(&self.ctx.config.kicad_cli)
+                    })
+                    .await;
+                crate::kicad_install::REQUEST_CONFIG_DIR
+                    .scope(dir.clone(), call)
+                    .await
+            } else {
+                call.await
+            };
+            return match result {
                 Ok(result) => {
                     let status = call_status(&result);
                     // Structured errors carry their own kind in the body; plain-text
@@ -3303,5 +3334,54 @@ mod v015_dispatch_contract_tests {
         let unrelated = anyhow::anyhow!("not an editor lock");
         assert_eq!(kicad_editor_locked_path(&unrelated), None);
         assert_eq!(kicad_editor_lock_file(&unrelated), None);
+    }
+}
+
+#[cfg(test)]
+mod kicad_config_scope_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn simultaneous_handlers_keep_their_ki_cad_config_directories_separate() {
+        let root = tempfile::tempdir().unwrap();
+        let mut handlers = Vec::new();
+        for name in ["First", "Second"] {
+            let config_dir = root.path().join(name);
+            let footprints = config_dir.join("parts.pretty");
+            std::fs::create_dir_all(&footprints).unwrap();
+            std::fs::write(footprints.join("Scoped.kicad_mod"), "").unwrap();
+            std::fs::write(
+                config_dir.join("fp-lib-table"),
+                format!(
+                    r#"(fp_lib_table (lib (name "{name}") (type "KiCad") (uri "{}") (options "") (descr "")))"#,
+                    footprints.to_string_lossy().replace('\\', "/")
+                ),
+            )
+            .unwrap();
+            handlers.push(
+                McpHandler::new_configured(
+                    crate::tools::ServerConfig {
+                        auto_load_toolsets: true,
+                        ..Default::default()
+                    },
+                    crate::config_resolution::ConfigResolution::unavailable(),
+                    Some(config_dir),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let arguments = json!({"query":"Scoped"});
+        let (first, second) = tokio::join!(
+            handlers[0].dispatch_tool("search_footprints", &arguments),
+            handlers[1].dispatch_tool("search_footprints", &arguments),
+        );
+        for ((result, _, _), expected) in [(first, "First:Scoped"), (second, "Second:Scoped")] {
+            let ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected search result text");
+            };
+            let result: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(result["results"][0]["id"], expected, "{result}");
+        }
     }
 }

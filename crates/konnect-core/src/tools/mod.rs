@@ -84,6 +84,7 @@ pub struct ToolDef {
     /// The schema shown to clients is therefore the schema the server enforces.
     pub input_validator: Arc<jsonschema::Validator>,
     pub handler: ToolHandlerFn,
+    pub(crate) uses_kicad_config: bool,
     /// How the tool interacts with a board held by KiCad. Client guidance can
     /// derive warnings from this runtime contract instead of maintaining a
     /// second list of tool names.
@@ -124,8 +125,15 @@ impl ToolDef {
             input_schema,
             input_validator,
             handler,
+            uses_kicad_config: false,
             board_access: BoardAccess::None,
         }
+    }
+
+    /// This tool resolves registered KiCad libraries or edits their tables.
+    pub(crate) fn with_kicad_config(mut self) -> Self {
+        self.uses_kicad_config = true;
+        self
     }
 
     pub fn with_board_access(mut self, board_access: BoardAccess) -> Self {
@@ -257,6 +265,7 @@ impl std::fmt::Debug for ToolDef {
 /// per-call observer (used by `get_recent_calls` / `server_stats` meta-tools).
 pub struct ToolContext {
     pub config: ServerConfig,
+    pub(crate) kicad_config_dir: tokio::sync::OnceCell<std::path::PathBuf>,
     pub router: Arc<ToolRouter>,
     pub observer: crate::observability::CallObserver,
     /// In-memory TTL cache for repeated JLCPCB parts-database queries.
@@ -280,6 +289,7 @@ impl ToolContext {
     pub fn new(config: ServerConfig, router: Arc<ToolRouter>) -> Self {
         ToolContext {
             config: config.normalized(),
+            kicad_config_dir: tokio::sync::OnceCell::new(),
             router,
             observer: crate::observability::CallObserver::new(None),
             jlcpcb_cache: QueryCache::default(),
@@ -298,6 +308,7 @@ impl ToolContext {
     ) -> Self {
         ToolContext {
             config: config.normalized(),
+            kicad_config_dir: tokio::sync::OnceCell::new(),
             router,
             observer,
             jlcpcb_cache: QueryCache::default(),
@@ -1640,41 +1651,9 @@ mod arg_helper_tests {
 
 // ─── KiCAD config directory detection ────────────────────────────────────────
 
-/// Find the KiCAD user config directory by probing for installed version directories.
-/// Checks versions in descending order: 10.0, 9.0, 8.0, then bare "kicad".
+/// The KiCad user config directory selected for this request.
 pub fn kicad_config_dir() -> std::path::PathBuf {
-    let base = kicad_config_base();
-    let versions = ["10.0", "9.0", "8.0"];
-    for ver in &versions {
-        let dir = base.join(ver);
-        if dir.is_dir() {
-            return dir;
-        }
-    }
-    // Fallback: bare kicad dir or 10.0 (will be created on first use)
-    base.join("10.0")
-}
-
-/// Platform-specific base directory for KiCAD configs.
-fn kicad_config_base() -> std::path::PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        std::path::PathBuf::from(appdata).join("kicad")
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        std::path::PathBuf::from(home)
-            .join("Library")
-            .join("Preferences")
-            .join("kicad")
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        std::path::PathBuf::from(home).join(".config").join("kicad")
-    }
+    crate::kicad_install::config_dir()
 }
 
 // ─── lib_symbols embedding ──────────────────────────────────────────────────
@@ -1967,15 +1946,8 @@ pub(crate) fn find_kicad_library_dirs(kind: &str) -> Vec<std::path::PathBuf> {
     };
 
     if let Some(suffix) = kicad_env_suffix(kind) {
-        for major in ["10", "9", "8"] {
-            // var_os, not var: a directory whose name is not valid Unicode is
-            // still a directory KiCad may have pointed us at, and `var` reports
-            // those as absent — silently falling back to the install roots, or
-            // to nothing, on exactly the machines where the variable was the
-            // only correct answer.
-            if let Some(dir) = std::env::var_os(format!("KICAD{major}_{suffix}")) {
-                push(std::path::PathBuf::from(dir));
-            }
+        for (_, dir) in crate::kicad_install::versioned_environment(std::env::vars_os(), suffix) {
+            push(std::path::PathBuf::from(dir));
         }
     }
     for root in kicad_share_roots() {

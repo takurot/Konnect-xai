@@ -1956,6 +1956,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_place_component(args, ctx).await }
         )
+        .with_kicad_config()
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "move_component",
@@ -2099,6 +2100,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_repair_corrupted_footprints(args, ctx).await }
         )
+        .with_kicad_config()
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "find_component",
@@ -2228,6 +2230,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_place_array(args, ctx).await }
         )
+        .with_kicad_config()
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "align_components",
@@ -2261,6 +2264,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_duplicate_component(args, ctx).await }
         )
+        .with_kicad_config()
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "get_board_2d_view",

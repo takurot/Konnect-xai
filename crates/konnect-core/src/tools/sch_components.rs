@@ -68,7 +68,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "lib_id", "x", "y"]
             }),
             |args, ctx| async move { handle_add_schematic_component(args, ctx).await }
-        ),
+        )
+        .with_kicad_config(),
         tool!(
             "delete_schematic_component",
             "Remove a component by reference designator, including every placed unit of a multi-unit symbol.",
@@ -362,7 +363,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "reference", "new_lib_id"]
             }),
             |args, ctx| async move { handle_replace_component(args, ctx).await }
-        ),
+        )
+        .with_kicad_config(),
         tool!(
             "update_symbols_from_library",
             "Re-embed placed symbols' definitions from their libraries, like KiCad's \
@@ -388,7 +390,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic"]
             }),
             |args, ctx| async move { handle_update_symbols_from_library(args, ctx).await }
-        ),
+        )
+        .with_kicad_config(),
         tool!(
             "reset_schematic_field_positions",
             "Move each placed symbol's Reference and Value text back to the position its \
