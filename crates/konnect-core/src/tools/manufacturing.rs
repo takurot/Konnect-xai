@@ -512,7 +512,7 @@ fn midpoint_failure(error: konnect_ipc::IpcFailure) -> CallToolResult {
     }
 }
 
-pub(super) async fn export_generic_positions(
+async fn export_generic_positions(
     cli_path: &str,
     board: &Path,
     schematic: Option<&Path>,
@@ -622,7 +622,7 @@ fn exclude_position_references(
     Ok(filtered)
 }
 
-async fn export_jlcpcb_cpl(
+pub(super) async fn export_jlcpcb_cpl(
     cli_path: &str,
     board: &Path,
     output: &Path,
