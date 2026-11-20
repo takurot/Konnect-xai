@@ -1325,17 +1325,29 @@ mod netlist_summary_tests {
         })
         .await
         .unwrap();
-        for (file, oracle) in [
+        for (fixture, root, child, oracle) in [
             (
-                "netlist_pic_programmer/pic_programmer.kicad_sch",
+                "netlist_pic_programmer",
+                "pic_programmer.kicad_sch",
+                "pic_sockets.kicad_sch",
                 include_str!("../../tests/fixtures/netlist_pic_programmer/native-nets.tsv"),
             ),
             (
-                "project_ownership/complex_hierarchy.kicad_sch",
+                "project_ownership",
+                "complex_hierarchy.kicad_sch",
+                "ampli_ht.kicad_sch",
                 include_str!("../../tests/fixtures/project_ownership/native-nets.tsv"),
             ),
         ] {
-            let path = fixtures.join(file);
+            // Each saved demo owns its own directory. The fixture tree also
+            // contains other projects used by independent tests.
+            let isolated = tempfile::tempdir().unwrap();
+            let fixture = fixtures.join(fixture);
+            let project = Path::new(root).with_extension("kicad_pro");
+            for name in [Path::new(root), Path::new(child), &project] {
+                std::fs::copy(fixture.join(name), isolated.path().join(name)).unwrap();
+            }
+            let path = isolated.path().join(root);
             let result = handler
                 .handle_message(json!({
                     "jsonrpc": "2.0", "id": 1, "method": "tools/call",
