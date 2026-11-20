@@ -1678,8 +1678,11 @@ mod net_query_tests {
         // convention instead of a power symbol annotation.
         let schematic = r#"(kicad_sch
           (lib_symbols
-            (symbol "Test:Invisible" (symbol "Invisible_1_1"
-              (pin power_in line (at 0 0 0) (hide yes) (name "VPP") (number "1"))))
+            (symbol "Test:Invisible"
+              (symbol "Invisible_1_1"
+                (pin power_in line (at 0 0 0) (hide yes) (name "VPP") (number "1")))
+              (symbol "Invisible_1_2"
+                (pin power_in line (at 0 0 0) (hide yes) (name "ALT_VPP") (number "1"))))
             (symbol "Test:Visible" (symbol "Visible_1_1"
               (pin power_in line (at 0 0 0) (hide no) (name "VPP") (number "1"))))
             (symbol "Test:Passive" (symbol "Passive_1_1"
@@ -1692,9 +1695,11 @@ mod net_query_tests {
             (property "Reference" "U3") (property "Value" "three"))
           (symbol (lib_id "Test:Passive") (at 70 20 0) (unit 1) (uuid "d")
             (property "Reference" "U4") (property "Value" "four"))
+          (symbol (lib_id "Test:Invisible") (at 90 20 0) (unit 1) (convert 2) (uuid "e")
+            (property "Reference" "U5") (property "Value" "five"))
         )"#;
         let listed = call(schematic, "list_schematic_nets", json!({})).await;
-        assert_eq!(listed["nets"], json!(["VPP"]));
+        assert_eq!(listed["nets"], json!(["ALT_VPP", "VPP"]));
         let pin = call(
             schematic,
             "get_pin_connections",
@@ -1710,6 +1715,14 @@ mod net_query_tests {
             .map(|p| p["reference"].as_str().unwrap())
             .collect();
         assert_eq!(references, BTreeSet::from(["U1", "U2"]));
+        let alternate = call(schematic, "get_net_connections", json!({"net": "ALT_VPP"})).await;
+        let references: BTreeSet<_> = alternate["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["reference"].as_str().unwrap())
+            .collect();
+        assert_eq!(references, BTreeSet::from(["U5"]));
     }
 
     #[tokio::test]
