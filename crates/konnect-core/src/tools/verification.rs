@@ -1409,7 +1409,7 @@ async fn handle_set_layer_constraints(
     );
     let clearance = args["min_clearance"].as_f64();
     let trace_width = args["min_trace_width"].as_f64();
-    if clearance.is_some() || trace_width.is_some() {
+    let expected_board = if clearance.is_some() || trace_width.is_some() {
         let source = match tokio::fs::read_to_string(&board).await {
             Ok(source) => source,
             Err(error) => {
@@ -1455,7 +1455,10 @@ async fn handle_set_layer_constraints(
                 ),
             ));
         }
-    }
+        Some(source)
+    } else {
+        None
+    };
     let rules_path = sibling_custom_rules_path(&board);
     let source = match tokio::fs::read_to_string(&rules_path).await {
         Ok(content) => Some(content),
@@ -1487,7 +1490,20 @@ async fn handle_set_layer_constraints(
         changed.push(format!("min_trace_width = {} on {}", trace_width, layer));
     }
 
-    if !changed.is_empty() {
+    if let Some(expected_board) = expected_board {
+        let unchanged = match tokio::fs::read(&board).await {
+            Ok(current) => current == expected_board.as_bytes(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if !unchanged {
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::Conflict {
+                    paths: vec![board.display().to_string()],
+                },
+                "The saved PCB changed during layer validation; retry against the current board",
+            ));
+        }
         if let Some(source) = &source {
             write_atomic_if_unchanged(&rules_path, source, &content)?;
         } else {
@@ -2358,7 +2374,7 @@ mod tests {
 
         let with_inner = blank_board().replace(
             "(31 \"B.Cu\" signal)",
-            "(4 \"In1.Cu\" power) (31 \"B.Cu\" signal)",
+            "(4 \"In1.Cu\" power) (6 \"In2.Cu\" signal) (31 \"B.Cu\" signal)",
         );
         tokio::fs::write(&board, with_inner).await.unwrap();
         let result = handle_set_layer_constraints(
