@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info};
 
-use super::{cli, integration, jlcpcb_midpoints, pcb_export, pcb_sync};
+use super::{cli, design_review, integration, jlcpcb_midpoints, pcb_export, pcb_sync};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -80,18 +80,17 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "validate_for_manufacturing",
-            "Pre-flight check before ordering: verifies the design is ready for the target \
-             fab house. Runs KiCad's DRC and checks board outline, design rules, footprints, \
-             and routing evidence. Returns NOT READY — never READY — if \
-             DRC reports errors or could not be run, so a READY verdict always rests on \
-             evidence rather than on an absence of findings.",
+            "Check the saved board outline, project minimum track width, footprints, and \
+             native KiCad DRC before ordering. Unconnected items block readiness and \
+             schematic-parity findings require review.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "fab_house": {
                         "type": "string",
-                        "description": "Target manufacturer: 'jlcpcb', 'pcbway', 'oshpark'",
+                        "enum": ["jlcpcb", "pcbway", "oshpark"],
+                        "description": "Target manufacturer",
                         "default": "jlcpcb"
                     }
                 },
@@ -1000,7 +999,10 @@ async fn handle_validate_for_manufacturing(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let fab_house = args["fab_house"].as_str().unwrap_or("jlcpcb");
+    let (fab_house, min_trace) = match design_review::fab_track_width(args) {
+        Ok(fab) => fab,
+        Err(error) => return Ok(error),
+    };
 
     info!(
         board = %board.display(),
@@ -1014,7 +1016,7 @@ async fn handle_validate_for_manufacturing(
     let mut issues = Vec::new();
 
     // Check board outline
-    let has_outline = content.contains("Edge.Cuts");
+    let has_outline = konnect_sexp::board::board_outline_bbox(&tree).is_some();
     if !has_outline {
         issues.push(json!({
             "severity": "error",
@@ -1042,49 +1044,44 @@ async fn handle_validate_for_manufacturing(
         "[BETA] Detected copper layers"
     );
 
-    // Fab-specific checks
-    let (min_trace, _min_drill, _max_layers) = match fab_house {
-        "jlcpcb" => (0.127, 0.3, 32),
-        "oshpark" => (0.152, 0.254, 4),
-        "pcbway" => (0.1, 0.2, 32),
-        _ => (0.15, 0.3, 32),
-    };
-
-    // Check design rules
-    if let Some(min_tw) = find_setup_value(&content, "min_trace_width") {
-        if min_tw < min_trace {
-            issues.push(json!({
-                "severity": "error",
-                "issue": format!("Trace width {:.3}mm is below {}'s minimum ({:.3}mm)", min_tw, fab_house, min_trace),
-                "fix": format!("Increase minimum trace width to {:.3}mm in design rules", min_trace)
-            }));
-        }
-    }
-
-    // Check for unrouted nets (ratsnest)
-    let (net_count, track_count) = count_nets_and_tracks(&tree);
-    if net_count > 3 && track_count == 0 {
-        issues.push(json!({
+    match design_review::saved_project_min_track_width(&board).await {
+        Ok(min_tw) if min_tw < min_trace => issues.push(json!({
             "severity": "error",
-            "issue": format!("{} nets defined but no traces routed", net_count),
-            "fix": "Route traces using route_trace before manufacturing"
-        }));
+            "issue": format!("Trace width {min_tw:.3}mm is below {fab_house}'s minimum ({min_trace:.3}mm)"),
+            "fix": format!("Increase minimum trace width to {min_trace:.3}mm in design rules")
+        })),
+        Ok(_) => {}
+        Err(error) => issues.push(json!({
+            "severity": "warning",
+            "issue": format!("Project minimum track width could not be checked: {error:#}"),
+            "fix": "Save the project's Board Setup rules beside the board and re-run"
+        })),
     }
 
-    // That heuristic only fires on a board with *zero* tracks, so a board
-    // routed except for one net sailed past it — and nothing here had ever
-    // consulted DRC, which is the only thing that actually knows. This tool
-    // returned READY on a board with 25 DRC errors and an unrouted item
-    // (#247). A readiness verdict now requires the evidence.
+    let (net_count, track_count) = count_nets_and_tracks(&tree);
     let drc = cli::run_drc(&ctx.config.kicad_cli, &board, false).await;
     let drc_summary = match &drc {
         Ok(report) => {
-            for violation in report.all().filter(|v| v.severity == "error") {
+            for violation in report.violations.iter().filter(|v| v.severity == "error") {
                 issues.push(json!({
                     "severity": "error",
                     "issue": format!("DRC [{}]: {}", violation.rule, violation.description),
                     "fix": "Fix in the PCB editor, or waive the rule deliberately; \
                             run_drc lists every violation with its location"
+                }));
+            }
+            for violation in report.unconnected_items.iter().flatten() {
+                issues.push(json!({
+                    "severity": "error",
+                    "issue": format!("DRC unconnected [{}]: {}", violation.rule, violation.description),
+                    "fix": "Route the connection and re-run DRC"
+                }));
+            }
+            for violation in report.schematic_parity.iter().flatten() {
+                issues.push(json!({
+                    "severity": if violation.severity == "error" { "error" } else { "warning" },
+                    "issue": format!("DRC schematic parity [{}]: {}", violation.rule, violation.description),
+                    "fix": "Compare the saved PCB and schematic in KiCad before ordering"
                 }));
             }
             for missing in report.missing_categories() {
@@ -2300,14 +2297,6 @@ fn count_nets_and_tracks(tree: &konnect_sexp::SexpNode) -> (usize, usize) {
     (net_count, track_count)
 }
 
-fn find_setup_value(content: &str, key: &str) -> Option<f64> {
-    let pat = format!("({} ", key);
-    let pos = content.find(&pat)?;
-    let after = &content[pos + pat.len()..];
-    let end = after.find(')')?;
-    after[..end].trim().parse().ok()
-}
-
 fn estimate_board_dimensions(tree: &konnect_sexp::SexpNode) -> (f64, f64) {
     konnect_sexp::board::board_outline_bbox(tree)
         .map(|(min_x, min_y, max_x, max_y)| (max_x - min_x, max_y - min_y))
@@ -2419,37 +2408,6 @@ mod net_track_count_tests {
         assert_eq!(report["board_info"]["net_count"], json!(2));
         assert_eq!(report["board_info"]["track_count"], json!(4));
     }
-
-    /// The symptom that surfaced this: an unrouted board came back READY on the
-    /// routing check because both counts read zero, so the `net_count > 3 &&
-    /// track_count == 0` guard could never fire.
-    #[tokio::test]
-    async fn an_unrouted_kicad_10_board_is_flagged_not_ready() {
-        let board = "(kicad_pcb\n\
-            \t(version 20260206)\n\
-            \t(gr_line (start 0 0) (end 10 0) (layer \"Edge.Cuts\"))\n\
-            \t(footprint \"R:R_0402\"\n\
-            \t\t(pad \"1\" smd rect (at 0 0) (size 1 1) (net \"GND\"))\n\
-            \t\t(pad \"2\" smd rect (at 1 0) (size 1 1) (net \"VCC\"))\n\
-            \t)\n\
-            \t(footprint \"R:R_0402\"\n\
-            \t\t(pad \"1\" smd rect (at 5 0) (size 1 1) (net \"SDA\"))\n\
-            \t\t(pad \"2\" smd rect (at 6 0) (size 1 1) (net \"SCL\"))\n\
-            \t)\n\
-            )\n";
-        let report = validate(board).await;
-        assert_eq!(report["board_info"]["net_count"], json!(4));
-        assert_eq!(report["board_info"]["track_count"], json!(0));
-        assert_eq!(report["verdict"], json!("NOT READY"));
-        let issues = report["issues"].as_array().unwrap();
-        assert!(
-            issues.iter().any(|i| i["issue"]
-                .as_str()
-                .unwrap_or("")
-                .contains("no traces routed")),
-            "{issues:?}"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -2502,6 +2460,64 @@ mod readiness_evidence_tests {
         \t)\n\
         \t(segment (start 0 0) (end 5 0) (width 0.25) (layer \"F.Cu\") (net \"SDA\"))\n\
         )\n";
+
+    #[tokio::test]
+    async fn readiness_gates_on_drc_categories_even_when_they_are_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, CLEAN_LOOKING_BOARD).unwrap();
+        std::fs::write(
+            board.with_extension("kicad_pro"),
+            r#"{"board":{"design_settings":{"rules":{"min_track_width":0.2}}}}"#,
+        )
+        .unwrap();
+        let script = cli::test_support::write_script(
+            dir.path(),
+            "drc",
+            "#!/bin/sh\n[ \"$1 $2\" = 'pcb drc' ] || exit 1\ncp \"$0.report\" \"$4\"\n",
+            "@echo off\r\nif not \"%~1 %~2\"==\"pcb drc\" exit /b 1\r\ncopy /y \"%~f0.report\" \"%~4\" >nul\r\n",
+        );
+        let report_path = dir.path().join(format!(
+            "{}.report",
+            script.file_name().unwrap().to_str().unwrap()
+        ));
+        let mut ctx = ctx_without_kicad_cli();
+        ctx.config.kicad_cli = script.to_str().unwrap().to_string();
+        let args = json!({"board": board});
+        let unconnected = json!({"type": "unconnected_items", "severity": "warning", "description": "Open connection", "items": []});
+        let parity = json!({"type": "missing_footprint", "severity": "warning", "description": "Missing footprint", "items": []});
+        for (unconnected_items, schematic_parity, verdict) in [
+            (json!([]), json!([]), "READY"),
+            (json!([]), json!([parity.clone()]), "NEEDS REVIEW"),
+            (json!([unconnected]), json!([parity]), "NOT READY"),
+        ] {
+            std::fs::write(
+                &report_path,
+                json!({"violations": [], "unconnected_items": unconnected_items, "schematic_parity": schematic_parity}).to_string(),
+            )
+            .unwrap();
+            let result = handle_validate_for_manufacturing(&args, &ctx)
+                .await
+                .unwrap();
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected readiness JSON");
+            };
+            let report: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(report["verdict"], verdict, "{report}");
+            assert_eq!(report["drc"]["errors"], 0);
+            assert_eq!(
+                report["issues"].as_array().unwrap().len(),
+                unconnected_items.as_array().unwrap().len()
+                    + schematic_parity.as_array().unwrap().len(),
+            );
+        }
+
+        let invalid =
+            handle_validate_for_manufacturing(&json!({"board": board, "fab_house": "other"}), &ctx)
+                .await
+                .unwrap();
+        assert!(invalid.is_error);
+    }
 
     /// #247. This tool returned `READY` with zero issues on a board carrying
     /// 25 DRC errors and an unrouted item, because it never asked DRC —
@@ -2840,21 +2856,6 @@ mod board_evidence_contract_tests {
             r#"(kicad_pcb (gr_rect (start -1e308 0) (end 1e308 20) (layer "Edge.Cuts")))"#,
         ] {
             assert_eq!(dimensions(source), (0.0, 0.0), "{source}");
-        }
-    }
-
-    #[test]
-    fn setup_value_extraction_returns_no_evidence_for_bad_fields() {
-        assert_eq!(
-            find_setup_value("(setup (min_trace_width 0.127))", "min_trace_width"),
-            Some(0.127)
-        );
-        for source in [
-            "(setup)",
-            "(setup (min_trace_width nope))",
-            "(setup (min_trace_width 0.127",
-        ] {
-            assert_eq!(find_setup_value(source, "min_trace_width"), None);
         }
     }
 }
