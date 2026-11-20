@@ -7,6 +7,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, ToolContext, ToolDef};
 use anyhow::{bail, Context};
+use konnect_sexp::geometry::round6;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1518,8 +1519,8 @@ async fn handle_estimate_cost(
             "fab_house": fab_house,
             "quantity": quantity,
             "board": {
-                "width_mm": width_mm,
-                "height_mm": height_mm,
+                "width_mm": round6(width_mm),
+                "height_mm": round6(height_mm),
                 // What this estimate was priced at, and what the board itself
                 // declares. They differ only when the caller passed `layers`.
                 "copper_layers": copper_layers,
