@@ -2262,7 +2262,15 @@ mod rename_boundary_tests {
             .await
             .unwrap();
         assert_eq!(body(&same)["renamed"], false);
-        for new_name in ["nested/new", "nested\\new"] {
+        for new_name in [
+            "",
+            ".",
+            "..",
+            "new.KICAD_PRO",
+            "new\tname",
+            "nested/new",
+            "nested\\new",
+        ] {
             let result = rename_project_with(&json!({"project":pro,"new_name":new_name}), || {})
                 .await
                 .unwrap();
@@ -2290,6 +2298,127 @@ mod rename_boundary_tests {
             "other project"
         );
         assert!(tmp.path().join("old-backups/marker").exists());
+    }
+
+    #[tokio::test]
+    async fn rename_only_updates_owned_project_and_local_settings_fields() {
+        for old in ["board", "net_settings", "Default"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let pro = tmp.path().join(format!("{old}.kicad_pro"));
+            let prl = tmp.path().join(format!("{old}.kicad_prl"));
+            let root = "5b9623a5-6d01-41fc-9865-e1bc779418c8";
+            let child = "00000000-0000-0000-0000-00004b3a1333";
+            let second_root = "f5d7a48d-4587-4550-a504-c505ca11d375";
+            let settings = json!({
+                "meta": {"filename": format!("{old}.kicad_pro")},
+                "board": {"design_settings": {"minimum_edge_clearance": 0.07}},
+                "net_settings": {"classes": [{"name": "Default"}]},
+                "text_variables": {"value": old, "filename": format!("{old}.kicad_sch")},
+                "schematic": {"top_level_sheets": [
+                    {"filename": format!("{old}.kicad_sch"), "name": old, "uuid": root},
+                    {"filename": "secondary.kicad_sch", "name": old, "uuid": second_root}
+                ]},
+                "sheets": [[root, old], [child, old], [second_root, old]]
+            });
+            let local = json!({
+                "meta": {"filename": format!("{old}.kicad_prl")},
+                "board": {"visible_layers": old, "saved_alias": format!("{old}.kicad_prl")}
+            });
+            std::fs::write(&pro, settings.to_string()).unwrap();
+            std::fs::write(&prl, local.to_string()).unwrap();
+            std::fs::write(
+                tmp.path().join(format!("{old}.kicad_sch")),
+                format!(r#"(kicad_sch (uuid "{root}"))"#),
+            )
+            .unwrap();
+
+            let result =
+                rename_project_with(&json!({"project": pro, "new_name": "renamed"}), || {})
+                    .await
+                    .unwrap();
+            assert!(!result.is_error, "{result:?}");
+            let load = |filename| -> serde_json::Value {
+                serde_json::from_slice(&std::fs::read(tmp.path().join(filename)).unwrap()).unwrap()
+            };
+            let mut expected = settings;
+            expected["meta"]["filename"] = json!("renamed.kicad_pro");
+            expected["schematic"]["top_level_sheets"][0]["filename"] = json!("renamed.kicad_sch");
+            expected["schematic"]["top_level_sheets"][0]["name"] = json!("renamed");
+            expected["sheets"][0][1] = json!("renamed");
+            assert_eq!(load("renamed.kicad_pro"), expected, "old project: {old}");
+            let mut expected = local;
+            expected["meta"]["filename"] = json!("renamed.kicad_prl");
+            assert_eq!(load("renamed.kicad_prl"), expected, "old project: {old}");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_settings_refuse_before_any_project_files_move() {
+        for malformed in ["old.kicad_pro", "old.kicad_prl"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let pro = fixture(tmp.path());
+            let corrupted = tmp.path().join(malformed);
+            std::fs::write(&corrupted, "{").unwrap();
+            for dry_run in [true, false] {
+                let result = rename_project_with(
+                    &json!({"project": pro, "new_name": "new", "dry_run": dry_run}),
+                    || {},
+                )
+                .await
+                .unwrap();
+                assert!(result.is_error, "{result:?}");
+                assert_eq!(std::fs::read_to_string(&corrupted).unwrap(), "{");
+                assert!(pro.exists() && tmp.path().join("old.kicad_sch").exists());
+                assert!(tmp.path().join("old-backups").is_dir());
+                for ext in PROJECT_EXTS {
+                    assert!(!tmp.path().join(format!("new.{ext}")).exists());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_preview_and_apply_rewrite_only_the_moved_pcb_sheetfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pro = fixture(tmp.path());
+        let board = tmp.path().join("old.kicad_pcb");
+        let before = r#"(kicad_pcb
+            (footprint "Device:R" (sheetfile "old.kicad_sch") (property "Value" "old.kicad_sch"))
+            (footprint "Device:R" (sheetfile "child.kicad_sch"))
+            (footprint "Device:R" (sheetfile "other/old.kicad_sch"))
+        )"#;
+        std::fs::write(&board, before).unwrap();
+
+        for dry_run in [true, false] {
+            let result = rename_project_with(
+                &json!({"project": pro, "new_name": "new", "dry_run": dry_run}),
+                || {},
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{result:?}");
+            assert!(
+                body(&result)["content_rewrites"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["file"] == "new.kicad_pcb" && item["references_updated"] == 1),
+                "{result:?}"
+            );
+            if dry_run {
+                assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+                assert!(!tmp.path().join("new.kicad_pcb").exists());
+            }
+        }
+        assert!(!board.exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("new.kicad_pcb")).unwrap(),
+            before.replacen(
+                r#"(sheetfile "old.kicad_sch")"#,
+                r#"(sheetfile "new.kicad_sch")"#,
+                1
+            )
+        );
     }
 
     #[tokio::test]
