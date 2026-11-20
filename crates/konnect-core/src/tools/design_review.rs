@@ -1516,7 +1516,8 @@ async fn handle_check_bom_health_file(
     let sch_path = get_path(args, "schematic")?;
     info!(schematic = %sch_path.display(), "[BETA] Running BOM health check");
 
-    let (_, tree) = read_schematic(&sch_path)?;
+    let (_, tree) = read_schematic(&sch_path)
+        .map_err(|error| anyhow::anyhow!("Failed to load schematic: {error}"))?;
     check_bom_health_tree(&tree, check_passive_mpn(args))
 }
 
