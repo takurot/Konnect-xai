@@ -953,7 +953,8 @@ fn check_freerouting_reports_every_location_it_searched_over_stdio() {
         assert_eq!(root["exists"], true, "{root}");
     }
     for (root, path) in searched[3..3 + plugin_folders].iter().zip(&plugin_dirs) {
-        assert_eq!(root["location_path"], json!(path), "{root}");
+        let actual = std::path::Path::new(root["location_path"].as_str().unwrap());
+        assert_eq!(actual, path, "{root}");
         assert_eq!(root["exists"], true, "{root}");
     }
     let working = std::path::PathBuf::from(
