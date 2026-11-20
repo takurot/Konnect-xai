@@ -563,18 +563,34 @@ impl NetGraph {
                     .insert((symbol.reference.clone(), pin.number.clone()), name);
             }
         }
-        for (root, pins) in candidates {
-            if pins.len() < 2 {
-                continue;
-            }
-            if let Some(name) = pins.into_values().min_by(|a, b| {
-                a.contains("-Pad")
-                    .cmp(&b.contains("-Pad"))
-                    .then_with(|| a.cmp(b))
-            }) {
-                self.root_names.insert(root, name.clone());
-                self.root_aliases.entry(root).or_default().insert(name);
-            }
+        let mut generated: Vec<_> = candidates
+            .into_iter()
+            .filter(|(_, pins)| pins.len() >= 2)
+            .filter_map(|(root, pins)| {
+                let name = pins.into_values().min_by(|a, b| {
+                    a.contains("-Pad")
+                        .cmp(&b.contains("-Pad"))
+                        .then_with(|| a.cmp(b))
+                })?;
+                Some((analysis_net_name(&name), root))
+            })
+            .collect();
+        generated.sort_unstable();
+
+        // Real aliases keep their established saved-sheet spelling. Give an
+        // occupied generated name a unique query key to keep roots separate.
+        let mut occupied = self.names();
+        for (base, root) in generated {
+            let name = if occupied.insert(base.clone()) {
+                base
+            } else {
+                (2u64..)
+                    .map(|index| format!("{base}#{index}"))
+                    .find(|name| occupied.insert(name.clone()))
+                    .expect("finitely many names are occupied")
+            };
+            self.root_names.insert(root, name.clone());
+            self.root_aliases.entry(root).or_default().insert(name);
         }
     }
 
