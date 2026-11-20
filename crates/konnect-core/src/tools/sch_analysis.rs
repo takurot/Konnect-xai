@@ -1682,7 +1682,7 @@ mod net_query_tests {
               (symbol "Invisible_1_1"
                 (pin power_in line (at 0 0 0) (hide yes) (name "VPP") (number "1")))
               (symbol "Invisible_1_2"
-                (pin power_in line (at 0 0 0) (hide yes) (name "ALT_VPP") (number "1"))))
+                (pin power_in line (at 2.54 0 0) (hide yes) (name "ALT_VPP") (number "1"))))
             (symbol "Test:Visible" (symbol "Visible_1_1"
               (pin power_in line (at 0 0 0) (hide no) (name "VPP") (number "1"))))
             (symbol "Test:Passive" (symbol "Passive_1_1"
@@ -1715,6 +1715,14 @@ mod net_query_tests {
             .map(|p| p["reference"].as_str().unwrap())
             .collect();
         assert_eq!(references, BTreeSet::from(["U1", "U2"]));
+        let alt_pin = call(
+            schematic,
+            "get_pin_connections",
+            json!({"reference": "U5", "pin_number": "1"}),
+        )
+        .await;
+        assert_eq!(alt_pin["net"], "ALT_VPP");
+        assert_eq!(alt_pin["pin_x"], 92.54);
         let alternate = call(schematic, "get_net_connections", json!({"net": "ALT_VPP"})).await;
         let references: BTreeSet<_> = alternate["pins"]
             .as_array()
@@ -1723,6 +1731,9 @@ mod net_query_tests {
             .map(|p| p["reference"].as_str().unwrap())
             .collect();
         assert_eq!(references, BTreeSet::from(["U5"]));
+        let pins = alternate["pins"].as_array().unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0]["pin_name"], "ALT_VPP");
     }
 
     #[tokio::test]
