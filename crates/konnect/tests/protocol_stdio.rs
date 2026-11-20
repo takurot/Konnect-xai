@@ -924,6 +924,134 @@ fn a_malformed_user_configuration_is_refused_and_never_overwritten_over_stdio() 
     }
 }
 
+#[test]
+fn effective_configuration_combines_rules_with_scope_and_keeps_override_precedence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let mut p = McpProcess::spawn_with_env(Some(tmp.path()), true, &[]);
+
+    let result = p.call_tool("add_design_rule", json!({"rule": "User rule", "scope": "user"}));
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let result = p.call_tool(
+        "save_user_config",
+        json!({"key_path": "sourcing.avl", "value": ["TDK"]}),
+    );
+    assert_ne!(result["isError"], json!(true), "{result}");
+
+    for (args, source) in [(json!({}), "not_configured"), (json!({"project_dir": project}), "defaults")] {
+        let result = p.call_tool("get_effective_config", args);
+        let body = McpProcess::tool_body(&result);
+        assert_eq!(body["sources"]["project"], source, "{body}");
+        assert_eq!(body["effective_config"]["design_rules"], json!(["User rule"]), "{body}");
+        assert_eq!(body["design_rule_sources"], json!([{"rule":"User rule","source":"user"}]));
+    }
+    assert!(!project.join(".konnect").exists());
+
+    let result = p.call_tool(
+        "add_design_rule",
+        json!({"project_dir": project, "rule": "Project rule"}),
+    );
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let result = p.call_tool(
+        "save_project_config",
+        json!({"project_dir": project, "key_path": "sourcing.avl", "value": ["Murata"]}),
+    );
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let result = p.call_tool("get_effective_config", json!({"project_dir": project}));
+    let body = McpProcess::tool_body(&result);
+    assert_eq!(body["sources"]["project"], "file");
+    assert_eq!(body["effective_config"]["design_rules"], json!(["User rule", "Project rule"]));
+    assert_eq!(
+        body["design_rule_sources"],
+        json!([{"rule":"User rule","source":"user"},{"rule":"Project rule","source":"project"}])
+    );
+    assert_eq!(body["effective_config"]["sourcing"]["avl"], json!(["Murata"]));
+}
+
+#[test]
+fn configuration_mutations_refuse_invalid_requests_without_writing_and_accept_explicit_unset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    let project_config = project.join(".konnect/project.json");
+    let user_config = user_config_under(tmp.path());
+    let absent = tmp.path().join("absent");
+    std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+    let original = r#"{"legacy":{"keep":1},"fab_constraints":{"min_clearance_mm":0.15,"fab_house":"JLCPCB"},"design_rules":["Already stored"]}"#;
+    std::fs::write(&project_config, original).unwrap();
+    std::fs::write(&user_config, original).unwrap();
+    let mut p = McpProcess::spawn_with_env(Some(tmp.path()), true, &[]);
+
+    let invalid = [
+        ("fab_constraints.min_trace_width_mm", json!("abc")),
+        ("fab_constraints.layer_count", json!(-3)),
+        ("fab_constraints.layer_count", json!(2.5)),
+        ("fab_constraints.fab_hosue", json!("JLCPCB")),
+        ("", json!(1)),
+        ("a..b.", json!(1)),
+        ("fab_constraints.min_clearance_mm.value", json!(0.2)),
+        ("sourcing.avl", json!(["Murata", 1])),
+        ("sourcing.derating.capacitor", json!({"voltage":1.2})),
+        ("design_rules", json!(["", "Valid"])),
+        ("design_rules", json!(["Same", " Same "])),
+        ("legacy.keep", json!(null)),
+    ];
+    for (key_path, value) in invalid {
+        for (tool, args) in [
+            ("save_user_config", json!({"key_path":key_path,"value":value})),
+            ("save_project_config", json!({"project_dir":project,"key_path":key_path,"value":value})),
+        ] {
+            let result = p.call_tool(tool, args);
+            assert_eq!(result["isError"], json!(true), "{tool}: {key_path}: {result}");
+            let body = McpProcess::tool_body(&result);
+            assert_eq!(body["error"]["kind"], "invalid_argument", "{tool}: {key_path}: {body}");
+            if key_path == "fab_constraints.fab_hosue" {
+                let reason = body["error"]["reason"].as_str().unwrap();
+                assert!(reason.contains("fab_house"), "{reason}");
+            }
+            assert_eq!(std::fs::read_to_string(&project_config).unwrap(), original);
+            assert_eq!(std::fs::read_to_string(&user_config).unwrap(), original);
+        }
+    }
+
+    for args in [
+        json!({"project_dir":project,"scope":"global","rule":"Unknown scope"}),
+        json!({"project_dir":project,"rule":" "}),
+        json!({"project_dir":project,"rule":" Already stored "}),
+        json!({"scope":"user","rule":"Already stored"}),
+    ] {
+        let result = p.call_tool("add_design_rule", args);
+        assert_eq!(result["isError"], json!(true), "{result}");
+        assert_eq!(McpProcess::tool_body(&result)["error"]["kind"], "invalid_argument");
+        assert_eq!(std::fs::read_to_string(&project_config).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&user_config).unwrap(), original);
+    }
+
+    for (tool, args) in [
+        ("save_project_config", json!({"project_dir":absent,"key_path":"fab_constraints.fab_house","value":"JLCPCB"})),
+        ("add_design_rule", json!({"project_dir":absent,"rule":"Missing directory"})),
+        ("save_project_config", json!({"project_dir":project,"key_path":"fab_constraints.layer_count","value":null})),
+    ] {
+        let result = p.call_tool(tool, args);
+        assert_eq!(result["isError"], json!(true), "{result}");
+        assert!(!absent.exists());
+        assert_eq!(std::fs::read_to_string(&project_config).unwrap(), original);
+    }
+
+    let result = p.call_tool(
+        "save_project_config",
+        json!({"project_dir":project,"key_path":"fab_constraints.fab_house","value":null}),
+    );
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&project_config).unwrap()).unwrap();
+    assert_eq!(stored["legacy"]["keep"], 1);
+    assert_eq!(stored["fab_constraints"]["min_clearance_mm"], 0.15);
+    assert!(!stored["fab_constraints"].as_object().unwrap().contains_key("fab_house"));
+    let result = p.call_tool("get_effective_config", json!({"project_dir": project}));
+    assert_eq!(McpProcess::tool_body(&result)["effective_config"]["fab_constraints"]["fab_house"], "JLCPCB");
+}
+
 /// The other half: with no preferences file the load says it answered with
 /// the defaults, leaves them on disk, and the next load reads that file.
 #[test]
