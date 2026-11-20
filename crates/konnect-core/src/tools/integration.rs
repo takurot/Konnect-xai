@@ -1419,29 +1419,17 @@ async fn handle_enrich_datasheets(
         ));
     }
 
-    // Query LCSC API for datasheet URLs
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-
     let mut urls = HashMap::new();
+    let mut lookups = std::collections::BTreeMap::new();
 
     for lcsc_id in &lcsc_ids {
-        let url = format!(
-            "https://wmsc.lcsc.com/ftps/wm/product/detail?productCode={}",
-            lcsc_id
-        );
-        if let Ok(resp) = get_with_backoff(&client, &url).await {
-            if resp.status().is_success() {
-                if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
-                    if let Some(datasheet_url) = json_resp
-                        .pointer("/result/dataManualUrl")
-                        .and_then(|v| v.as_str())
-                    {
-                        urls.insert(lcsc_id.clone(), datasheet_url.to_owned());
-                    }
-                }
-            }
+        let lookup = fetch_lcsc_datasheet(&client, LCSC_PRODUCT_ENDPOINT, lcsc_id).await;
+        lookups.insert(lcsc_id, datasheet_lookup_evidence("lcsc_api", &lookup));
+        if let Ok(Some(url)) = lookup {
+            urls.insert(lcsc_id.clone(), url);
         }
     }
 
@@ -1470,7 +1458,8 @@ async fn handle_enrich_datasheets(
         serde_json::to_string(&json!({
             "lcsc_ids_found": lcsc_ids.len(),
             "datasheets_enriched": observed_updates.len(),
-            "schematic": sch_path.to_str().unwrap_or("")
+            "schematic": sch_path.to_str().unwrap_or(""),
+            "lookups": lookups
         }))
         .unwrap(),
     ))
@@ -1856,9 +1845,106 @@ async fn datasheet_from_catalog(
     .await?
 }
 
+const LCSC_PRODUCT_ENDPOINT: &str = "https://wmsc.lcsc.com/ftps/wm/product/detail";
+
+async fn fetch_lcsc_datasheet(
+    client: &reqwest::Client,
+    endpoint: &str,
+    lcsc_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut url = reqwest::Url::parse(endpoint)?;
+    url.query_pairs_mut().append_pair("productCode", lcsc_id);
+    let response = get_with_backoff(client, url.as_str())
+        .await
+        .map_err(|_| anyhow::anyhow!("LCSC request failed"))?;
+    let status = response.status();
+    anyhow::ensure!(
+        status.is_success(),
+        "LCSC returned HTTP {}",
+        status.as_u16()
+    );
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| anyhow::anyhow!("LCSC returned invalid JSON"))?;
+    parse_lcsc_datasheet(&payload, lcsc_id)
+}
+
+fn parse_lcsc_datasheet(
+    payload: &serde_json::Value,
+    lcsc_id: &str,
+) -> anyhow::Result<Option<String>> {
+    anyhow::ensure!(
+        payload["code"].as_u64() == Some(200) && payload["ok"].as_bool() == Some(true),
+        "LCSC returned an invalid or unsuccessful product envelope"
+    );
+    if payload
+        .get("result")
+        .is_some_and(serde_json::Value::is_null)
+    {
+        return Ok(None);
+    }
+    let product = payload["result"]
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("LCSC returned invalid product details"))?;
+    if let Some(product_code) = product.get("productCode") {
+        anyhow::ensure!(
+            product_code
+                .as_str()
+                .is_some_and(|code| code.eq_ignore_ascii_case(lcsc_id)),
+            "LCSC returned details for a different or invalid product code"
+        );
+    }
+
+    for field in ["pdfUrl", "dataManualUrl"] {
+        let Some(value) = product.get(field).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let link = value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("LCSC returned a non-text datasheet link"))?
+            .trim();
+        if link.is_empty() {
+            continue;
+        }
+        let url = reqwest::Url::parse(link)
+            .map_err(|_| anyhow::anyhow!("LCSC returned an invalid datasheet URL"))?;
+        anyhow::ensure!(
+            matches!(url.scheme(), "http" | "https") && url.has_host(),
+            "LCSC returned an unsupported datasheet URL"
+        );
+        return Ok(Some(link.to_owned()));
+    }
+    anyhow::ensure!(
+        product.contains_key("productCode"),
+        "LCSC returned incomplete product details"
+    );
+    Ok(None)
+}
+
+fn datasheet_lookup_evidence(
+    source: &str,
+    lookup: &anyhow::Result<Option<String>>,
+) -> serde_json::Value {
+    let (status, error) = match lookup {
+        Ok(Some(_)) => ("found", None),
+        Ok(None) => ("not_found", None),
+        Err(error) => ("error", Some(error.to_string())),
+    };
+    json!({ "source": source, "status": status, "error": error })
+}
+
 async fn handle_get_datasheet_url(
     args: &serde_json::Value,
     ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    get_datasheet_url_at(args, ctx, LCSC_PRODUCT_ENDPOINT).await
+}
+
+async fn get_datasheet_url_at(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    endpoint: &str,
 ) -> anyhow::Result<CallToolResult> {
     let mpn = args["mpn"].as_str();
     let lcsc_id = args["lcsc_id"].as_str();
@@ -1867,72 +1953,50 @@ async fn handle_get_datasheet_url(
         return Ok(CallToolResult::error("Provide either 'mpn' or 'lcsc_id'"));
     }
 
-    // The local catalog first: it already holds exact URLs, so a hit saves a
-    // network round trip and works offline. Only a miss falls through to the
-    // live LCSC API.
-    if let Ok(Some(url)) = datasheet_from_catalog(args, ctx, lcsc_id, mpn).await {
-        return Ok(CallToolResult::text(
-            serde_json::to_string(&json!({
-                "mpn": mpn,
-                "lcsc_id": lcsc_id,
-                "datasheet_url": url,
-                "source": "local_catalog"
-            }))
-            .unwrap(),
-        ));
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-
-    // Try LCSC API with lcsc_id first
-    if let Some(id) = lcsc_id {
-        let url = format!(
-            "https://wmsc.lcsc.com/ftps/wm/product/detail?productCode={}",
-            id
-        );
-        if let Ok(resp) = get_with_backoff(&client, &url).await {
-            if resp.status().is_success() {
-                if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
-                    if let Some(ds_url) = json_resp
-                        .pointer("/result/dataManualUrl")
-                        .and_then(|v| v.as_str())
-                    {
-                        return Ok(CallToolResult::text(
-                            serde_json::to_string(&json!({
-                                "lcsc_id": id,
-                                "datasheet_url": ds_url,
-                                "source": "lcsc_api"
-                            }))
-                            .unwrap(),
-                        ));
-                    }
-                }
-            }
+    // A local hit needs no network access. An LCSC ID can still be resolved
+    // online when the local catalog misses or is unavailable.
+    let from_catalog = datasheet_from_catalog(args, ctx, lcsc_id, mpn)
+        .await
+        .map_err(|_| anyhow::anyhow!("local catalog lookup failed"));
+    let (source, lookup) = match (from_catalog, lcsc_id) {
+        (result @ Ok(Some(_)), _) | (result, None) => ("local_catalog", result),
+        (_, Some(id)) => {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()?;
+            (
+                "lcsc_api",
+                fetch_lcsc_datasheet(&client, endpoint, id).await,
+            )
         }
-    }
+    };
 
-    // Both sources missed — say which were tried, not just that the answer
-    // is null (#255).
-    let mut tried = vec![];
-    if resolve_db_path(&serde_json::Value::Null, ctx).is_ok_and(|path| path.exists()) {
-        tried.push("local catalog");
-    } else {
-        tried.push("local catalog (database not downloaded)");
+    let url = lookup.as_ref().ok().and_then(Option::as_deref);
+    let mut response = json!({
+        "mpn": mpn,
+        "lcsc_id": lcsc_id,
+        "datasheet_url": url,
+        "lookup": datasheet_lookup_evidence(source, &lookup)
+    });
+    match lookup {
+        Ok(Some(_)) => response["source"] = json!(source),
+        Ok(None) => {
+            // Keep the established source note for a genuine miss (#255).
+            let local = if resolve_db_path(args, ctx).is_ok_and(|path| path.exists()) {
+                "local catalog"
+            } else {
+                "local catalog (database not downloaded)"
+            };
+            let tried = if lcsc_id.is_some() {
+                format!("{local} or LCSC API")
+            } else {
+                local.to_owned()
+            };
+            response["note"] = json!(format!("Datasheet not found via {tried}"));
+        }
+        Err(_) => response["note"] = json!("Datasheet lookup failed; see lookup.error"),
     }
-    if lcsc_id.is_some() {
-        tried.push("LCSC API");
-    }
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "mpn": mpn,
-            "lcsc_id": lcsc_id,
-            "datasheet_url": null,
-            "note": format!("Datasheet not found via {}", tried.join(" or "))
-        }))
-        .unwrap(),
-    ))
+    Ok(CallToolResult::json(&response))
 }
 
 // ─── Freerouting ──────────────────────────────────────────────────────────────
@@ -4130,20 +4194,103 @@ mod jlcpcb_cache_tests {
         assert!(url.contains(".pdf"));
     }
 
-    /// With no database at all the tool degrades to its old behaviour — web
-    // lookup (unreachable in tests), then null with a note naming what was
-    // tried rather than blaming only the API (#255).
-    #[tokio::test]
-    async fn a_catalog_miss_falls_through_and_the_note_names_the_sources() {
-        let ctx = test_ctx(); // jlcpcb_db_path: None → default path absent
+    #[test]
+    fn lcsc_product_envelope_distinguishes_pdf_fallback_missing_and_malformed() {
+        let observed: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/lcsc_product_c25804.json"
+        ))
+        .unwrap();
+        let url = observed["result"]["pdfUrl"].as_str().unwrap();
+        assert_eq!(
+            parse_lcsc_datasheet(&observed, "C25804")
+                .unwrap()
+                .as_deref(),
+            Some(url)
+        );
 
-        let result = handle_get_datasheet_url(&json!({ "lcsc_id": "C99999999" }), &ctx)
-            .await
-            .unwrap();
-        let body = response_json(&result);
-        assert_eq!(body["datasheet_url"], serde_json::Value::Null);
-        let note = body["note"].as_str().unwrap();
-        assert!(note.contains("local catalog"), "{note}");
+        let success = |result| json!({ "code": 200, "ok": true, "result": result });
+        let fallback = success(json!({
+            "productCode": "C25804", "pdfUrl": "", "dataManualUrl": url,
+        }));
+        assert_eq!(
+            parse_lcsc_datasheet(&fallback, "C25804")
+                .unwrap()
+                .as_deref(),
+            Some(url)
+        );
+        for product in [
+            json!(null),
+            json!({"productCode": "C25804", "pdfUrl": null}),
+        ] {
+            assert_eq!(
+                parse_lcsc_datasheet(&success(product), "C25804").unwrap(),
+                None
+            );
+        }
+
+        for malformed in [
+            json!({"code": 200, "ok": true}),
+            json!({"code": 500, "ok": false, "result": null}),
+            success(json!({})),
+            success(json!({"productCode": "C123", "pdfUrl": url})),
+            success(json!({"productCode": "C25804", "pdfUrl": 42})),
+            success(json!({"productCode": "C25804", "pdfUrl": "/no-host.pdf"})),
+        ] {
+            assert!(
+                parse_lcsc_datasheet(&malformed, "C25804").is_err(),
+                "{malformed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lcsc_lookup_distinguishes_a_catalog_miss_from_http_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx();
+        ctx.config.jlcpcb_db_path = Some(dir.path().join("absent.db"));
+        let args = json!({"lcsc_id": "C99999999"});
+        let cases = [
+            (
+                "200 OK",
+                r#"{"code":200,"ok":true,"result":null}"#,
+                1,
+                "not_found",
+            ),
+            ("500 Internal Server Error", "", RETRY_MAX_ATTEMPTS, "error"),
+        ];
+        for (status, payload, attempts, outcome) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/product/detail", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                for _ in 0..attempts {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 1024];
+                    assert!(socket.read(&mut request).await.unwrap() > 0);
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let result = get_datasheet_url_at(&args, &ctx, &endpoint).await.unwrap();
+            let body = response_json(&result);
+            assert_eq!(body["datasheet_url"], serde_json::Value::Null);
+            assert_eq!(body["lookup"]["source"], "lcsc_api");
+            assert_eq!(body["lookup"]["status"], outcome, "{body}");
+            if outcome == "error" {
+                assert_eq!(body["lookup"]["error"], "LCSC returned HTTP 500");
+            } else {
+                assert!(body["note"].as_str().unwrap().contains("local catalog"));
+                assert!(body["lookup"]["error"].is_null());
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 }
 

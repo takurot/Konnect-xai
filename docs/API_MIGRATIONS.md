@@ -302,6 +302,15 @@ known price, and `max_price_usd` excludes it. The response adds
 and `exclusions`, which counts the parts the stock floor and the price limit
 removed (#785).
 
+## Unreleased: LCSC datasheet lookups report their outcome
+
+`get_datasheet_url` still prefers the local catalog. Online lookups read LCSC's
+`pdfUrl` and fall back to the older `dataManualUrl` when the primary value is
+absent. Its `lookup` object records the source and status (`found`, `not_found`,
+or `error`), with a diagnostic for failures. `enrich_datasheets` exposes the same
+information in `lookups`, keyed by part number. A failed lookup does not write a
+Datasheet field for that part. Existing fields still follow `overwrite_existing`.
+
 ## Unreleased: `konnect init` refreshes stale Claude hook matchers (patch release)
 
 A hook's `matcher` is built from the tool registry, so it changes when a board
