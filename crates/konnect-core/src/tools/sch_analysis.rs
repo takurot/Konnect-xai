@@ -10,8 +10,8 @@ use crate::tools::sch_connectivity::{
     label_roots, schematic_point, ConnectivityIndex,
 };
 use crate::tools::{
-    get_path, is_power_symbol_reference, opt_f64, opt_positive_f64, placed_pins_by_reference,
-    require_f64, require_str, ToolContext, ToolDef,
+    analysis_placed_pins_by_reference, get_path, is_power_symbol_reference, opt_f64,
+    opt_positive_f64, require_f64, require_str, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -315,7 +315,7 @@ async fn handle_get_net_connections(
     };
     let matching = net_query_labels(&labels, &net);
     let mut pins = Vec::new();
-    for (instance, placed_pins) in placed_pins_by_reference(&tree) {
+    for (instance, placed_pins) in analysis_placed_pins_by_reference(&tree) {
         if is_power_symbol_reference(&instance.reference) {
             continue;
         }
@@ -396,7 +396,7 @@ async fn handle_get_pin_connections(
     {
         return Err(anyhow::anyhow!("Component '{}' not found", reference));
     }
-    let pin_ep = placed_pins_by_reference(&tree)
+    let pin_ep = analysis_placed_pins_by_reference(&tree)
         .into_iter()
         .filter(|(instance, _)| instance.reference == reference)
         .flat_map(|(_, pins)| pins)
@@ -437,7 +437,7 @@ async fn handle_get_component_nets(
         return Err(anyhow::anyhow!("Component '{}' not found", reference));
     }
     let mut g = analysis_net_graph(&tree, &wires, &labels);
-    let pins: Vec<serde_json::Value> = placed_pins_by_reference(&tree)
+    let pins: Vec<serde_json::Value> = analysis_placed_pins_by_reference(&tree)
         .into_iter()
         .filter(|(instance, _)| instance.reference == reference)
         .flat_map(|(_, pins)| pins)
@@ -468,7 +468,7 @@ async fn handle_get_net_components(
         .points_on_net(&analysis_net_name(&net))
         .into_iter()
         .collect();
-    let result: Vec<serde_json::Value> = placed_pins_by_reference(&tree)
+    let result: Vec<serde_json::Value> = analysis_placed_pins_by_reference(&tree)
         .into_iter()
         .filter_map(|(instance, pins)| {
             let connected: Vec<_> = pins
@@ -538,7 +538,7 @@ async fn handle_trace_from_point(
     // second scan here is exactly how the connectivity tools drifted apart
     // before, and the index is also unit-aware, so a multi-unit symbol
     // contributes only the unit actually placed (#35).
-    let index = ConnectivityIndex::build(&tree, &wires, &buses, &labels, tol);
+    let index = ConnectivityIndex::for_analysis_proximity(&tree, &wires, &buses, &labels, tol);
     let detail = index.point_detail(x, y);
     let at_pin: Vec<_> = detail
         .pins
@@ -587,7 +587,8 @@ async fn handle_find_orphan_items(
     let buses = extract_buses(&tree);
     let labels = analysis_net_labels(&tree);
     let index = ConnectivityIndex::for_electrical_analysis(&tree, &wires, &buses, &labels);
-    let proximity = ConnectivityIndex::build(&tree, &wires, &buses, &labels, tolerance);
+    let proximity =
+        ConnectivityIndex::for_analysis_proximity(&tree, &wires, &buses, &labels, tolerance);
     let mut near_misses = Vec::new();
     let mut all = Vec::new();
     let mut report = |item: serde_json::Value, is_near: bool| {
@@ -806,7 +807,7 @@ async fn handle_find_single_pin_nets(
     // Every connection point, under the graph root that carries it. A sheet
     // holds hundreds and reports a handful, so nothing is rendered until a net
     // qualifies.
-    let placed = placed_pins_by_reference(&tree);
+    let placed = analysis_placed_pins_by_reference(&tree);
     let mut pins_by_root: HashMap<(i64, i64), Vec<Connection>> = HashMap::new();
     for (instance, pins) in &placed {
         if is_power_symbol_reference(&instance.reference) {
@@ -922,7 +923,7 @@ async fn handle_get_connected_items(
             reference
         )));
     }
-    let placed_pins = placed_pins_by_reference(&tree);
+    let placed_pins = analysis_placed_pins_by_reference(&tree);
     let mut g = analysis_net_graph(&tree, &wires, &labels);
 
     // The nets this component's pins are on, held by identity: a net can carry

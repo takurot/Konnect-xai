@@ -6,7 +6,9 @@
 
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
-use crate::tools::{get_path, placed_pins, placed_pins_by_reference, ToolContext, ToolDef};
+use crate::tools::{
+    analysis_placed_pins_by_reference, get_path, placed_pins, ToolContext, ToolDef,
+};
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident, round6},
     parser::{parse_sexp, SexpNode},
@@ -540,7 +542,7 @@ async fn handle_export_netlist_summary(
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
     let labels = analysis_net_labels(&tree);
-    let placed = placed_pins_by_reference(&tree);
+    let placed = analysis_placed_pins_by_reference(&tree);
 
     let mut g = analysis_net_graph(&tree, &wires, &labels);
     let net_names = g.names();

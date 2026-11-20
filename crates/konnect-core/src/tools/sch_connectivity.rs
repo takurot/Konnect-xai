@@ -34,7 +34,7 @@
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_all_net_labels, extract_bus_entries, extract_junctions,
+        extract_active_power_symbol_labels, extract_bus_entries, extract_junctions, extract_labels,
         extract_legacy_power_pin_labels, extract_no_connects, extract_sheet_pins, pin_endpoint,
         Label, LabelKind, LibPin, Wire,
     },
@@ -540,7 +540,7 @@ impl NetGraph {
             .map(|(x, y)| schematic_point(x, y))
             .collect();
         let mut candidates: HashMap<NetRoot, HashMap<(String, String), String>> = HashMap::new();
-        for (symbol, pins) in crate::tools::placed_pins_by_reference(tree) {
+        for (symbol, pins) in crate::tools::analysis_placed_pins_by_reference(tree) {
             if symbol.reference.is_empty()
                 || symbol.reference.ends_with('?')
                 || symbol.reference.starts_with('#')
@@ -734,8 +734,9 @@ pub(crate) fn analysis_net_name(name: &str) -> String {
 }
 
 pub(crate) fn analysis_net_labels(tree: &SexpNode) -> Vec<Label> {
-    extract_all_net_labels(tree)
+    extract_labels(tree)
         .into_iter()
+        .chain(extract_active_power_symbol_labels(tree))
         .chain(extract_legacy_power_pin_labels(tree))
         .map(|mut label| {
             label.net = analysis_net_name(&label.net);
@@ -810,7 +811,14 @@ impl<'a> ConnectivityIndex<'a> {
         labels: &'a [Label],
         tolerance: f64,
     ) -> Self {
-        Self::build_with_precision(tree, wires, buses, labels, Precision::Proximity(tolerance))
+        Self::build_with_precision(
+            tree,
+            wires,
+            buses,
+            labels,
+            Precision::Proximity(tolerance),
+            crate::tools::placed_pins_by_reference(tree),
+        )
     }
 
     pub(crate) fn for_electrical_analysis(
@@ -819,7 +827,31 @@ impl<'a> ConnectivityIndex<'a> {
         buses: &'a [Wire],
         labels: &'a [Label],
     ) -> Self {
-        Self::build_with_precision(tree, wires, buses, labels, Precision::Electrical)
+        Self::build_with_precision(
+            tree,
+            wires,
+            buses,
+            labels,
+            Precision::Electrical,
+            crate::tools::analysis_placed_pins_by_reference(tree),
+        )
+    }
+
+    pub(crate) fn for_analysis_proximity(
+        tree: &SexpNode,
+        wires: &'a [Wire],
+        buses: &'a [Wire],
+        labels: &'a [Label],
+        tolerance: f64,
+    ) -> Self {
+        Self::build_with_precision(
+            tree,
+            wires,
+            buses,
+            labels,
+            Precision::Proximity(tolerance),
+            crate::tools::analysis_placed_pins_by_reference(tree),
+        )
     }
 
     fn build_with_precision(
@@ -828,8 +860,9 @@ impl<'a> ConnectivityIndex<'a> {
         buses: &'a [Wire],
         labels: &'a [Label],
         precision: Precision,
+        placed_pins: super::PlacedPinsByReference,
     ) -> Self {
-        let placed_pins: Vec<PlacedPin> = crate::tools::placed_pins_by_reference(tree)
+        let placed_pins: Vec<PlacedPin> = placed_pins
             .into_iter()
             .flat_map(|(inst, pins)| {
                 pins.into_iter().map(move |(pin, transform)| PlacedPin {

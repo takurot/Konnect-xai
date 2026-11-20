@@ -818,13 +818,25 @@ pub fn extract_all_net_labels(tree: &SexpNode) -> Vec<Label> {
 /// it flags. Symbols whose definition is not embedded in `lib_symbols` are
 /// skipped: without it there is no pin to place the label on.
 pub fn extract_power_symbol_labels(tree: &SexpNode) -> Vec<Label> {
+    power_symbol_labels(tree, false)
+}
+
+/// Explicit power labels on the active saved presentation of each symbol.
+pub fn extract_active_power_symbol_labels(tree: &SexpNode) -> Vec<Label> {
+    power_symbol_labels(tree, true)
+}
+
+fn power_symbol_labels(tree: &SexpNode, active_body_only: bool) -> Vec<Label> {
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
 
     let mut labels = Vec::new();
-    for inst in extract_symbol_instances(tree) {
+    for placement in tree.find_all("symbol") {
+        let Some(inst) = extract_symbol_instance(placement) else {
+            continue;
+        };
         if inst.value.is_empty() {
             continue;
         }
@@ -837,7 +849,12 @@ pub fn extract_power_symbol_labels(tree: &SexpNode) -> Vec<Label> {
             continue;
         }
         let t = inst.pin_transform();
-        for pin in extract_lib_pins_for_unit(sym, inst.unit) {
+        let pins = if active_body_only {
+            extract_lib_pins_for_placement(sym, placement, inst.unit)
+        } else {
+            extract_lib_pins_for_unit(sym, inst.unit)
+        };
+        for pin in pins {
             if pin.electrical_type != "power_in" {
                 continue;
             }
@@ -874,12 +891,8 @@ pub fn extract_legacy_power_pin_labels(tree: &SexpNode) -> Vec<Label> {
         if symbol.find("power").is_some() {
             continue;
         }
-        let body_style = placement
-            .find_str("body_style")
-            .or_else(|| placement.find_str("convert"))
-            .and_then(|style| style.parse().ok())
-            .unwrap_or(1);
-        visit_unit_pin_nodes(symbol, instance.unit, Some(body_style), &mut |node| {
+        let style = symbol_body_style(placement);
+        visit_unit_pin_nodes(symbol, instance.unit, Some(style), &mut |node| {
             let hidden = node.find_str("hide").map_or_else(
                 || {
                     node.children().is_some_and(|fields| {
@@ -954,6 +967,28 @@ pub fn extract_lib_pins_for_unit(sym_node: &SexpNode, unit: u32) -> Vec<LibPin> 
         out.extend(parse_lib_pin(node))
     });
     out
+}
+
+/// Pins belonging to the active unit and body style of a saved placement.
+pub fn extract_lib_pins_for_placement(
+    definition: &SexpNode,
+    placement: &SexpNode,
+    unit: u32,
+) -> Vec<LibPin> {
+    let mut out = Vec::new();
+    let style = symbol_body_style(placement);
+    visit_unit_pin_nodes(definition, unit, Some(style), &mut |node| {
+        out.extend(parse_lib_pin(node));
+    });
+    out
+}
+
+fn symbol_body_style(placement: &SexpNode) -> u32 {
+    placement
+        .find_str("body_style")
+        .or_else(|| placement.find_str("convert"))
+        .and_then(|style| style.parse().ok())
+        .unwrap_or(1)
 }
 
 fn visit_unit_pin_nodes(
