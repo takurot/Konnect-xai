@@ -1902,8 +1902,12 @@ fn parse_lcsc_datasheet(
         };
         let link = value
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("LCSC returned a non-text datasheet link"))?
-            .trim();
+            .ok_or_else(|| anyhow::anyhow!("LCSC returned a non-text datasheet link"))?;
+        anyhow::ensure!(
+            !link.chars().any(char::is_control),
+            "LCSC returned control characters in a datasheet link"
+        );
+        let link = link.trim();
         if link.is_empty() {
             continue;
         }
@@ -1938,13 +1942,15 @@ async fn handle_get_datasheet_url(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    get_datasheet_url_at(args, ctx, LCSC_PRODUCT_ENDPOINT).await
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15));
+    get_datasheet_url_at(args, ctx, LCSC_PRODUCT_ENDPOINT, client).await
 }
 
 async fn get_datasheet_url_at(
     args: &serde_json::Value,
     ctx: &ToolContext,
     endpoint: &str,
+    client: reqwest::ClientBuilder,
 ) -> anyhow::Result<CallToolResult> {
     let mpn = args["mpn"].as_str();
     let lcsc_id = args["lcsc_id"].as_str();
@@ -1961,9 +1967,7 @@ async fn get_datasheet_url_at(
     let (source, lookup) = match (from_catalog, lcsc_id) {
         (result @ Ok(Some(_)), _) | (result, None) => ("local_catalog", result),
         (_, Some(id)) => {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
-                .build()?;
+            let client = client.build()?;
             (
                 "lcsc_api",
                 fetch_lcsc_datasheet(&client, endpoint, id).await,
@@ -4235,6 +4239,9 @@ mod jlcpcb_cache_tests {
             success(json!({"productCode": "C123", "pdfUrl": url})),
             success(json!({"productCode": "C25804", "pdfUrl": 42})),
             success(json!({"productCode": "C25804", "pdfUrl": "/no-host.pdf"})),
+            success(
+                json!({"productCode": "C25804", "pdfUrl": "https://datasheet.lcsc.com/a\n.pdf"}),
+            ),
         ] {
             assert!(
                 parse_lcsc_datasheet(&malformed, "C25804").is_err(),
@@ -4275,7 +4282,12 @@ mod jlcpcb_cache_tests {
                     socket.write_all(response.as_bytes()).await.unwrap();
                 }
             });
-            let result = get_datasheet_url_at(&args, &ctx, &endpoint).await.unwrap();
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(5));
+            let result = get_datasheet_url_at(&args, &ctx, &endpoint, client)
+                .await
+                .unwrap();
             let body = response_json(&result);
             assert_eq!(body["datasheet_url"], serde_json::Value::Null);
             assert_eq!(body["lookup"]["source"], "lcsc_api");
