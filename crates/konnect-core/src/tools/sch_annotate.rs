@@ -1487,7 +1487,7 @@ pub(crate) fn rename_instance_reference(
     if let Err(error) = commit_file_transaction_with_dependencies(
         directory,
         vec![konnect_sexp::FileTransition::replace(
-            target,
+            &target,
             content,
             prospective,
         )],
