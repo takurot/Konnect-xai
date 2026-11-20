@@ -29,9 +29,9 @@ struct Placement {
 
 pub(super) struct ReferenceInventory {
     path: PathBuf,
+    directory: PathBuf,
     project: String,
     paths: BTreeSet<String>,
-    standalone: bool,
     own: Groups,
     others: Groups,
     dependencies: Vec<(PathBuf, String)>,
@@ -80,24 +80,26 @@ impl ReferenceInventory {
                 "The sheet's project or hierarchy instances changed during planning"
             );
         }
-        let standalone = sources.project.is_none();
-        let own = collect(&path, &source, &sources.project_name, &paths, standalone)?;
+        let journal_anchor = sources.project.as_ref().map_or(&path, |(file, _)| file);
+        let directory = journal_anchor
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Missing journal directory for {}", path.display()))?
+            .to_path_buf();
+        let own = collect(&path, &source, &sources.project_name, &paths)?;
         let mut others = Groups::new();
         let mut dependencies = Vec::new();
         dependencies.extend(sources.project);
         for (document, (source, paths)) in sources.documents {
-            for (key, placements) in
-                collect(&document, &source, &sources.project_name, &paths, false)?
-            {
+            for (key, placements) in collect(&document, &source, &sources.project_name, &paths)? {
                 others.entry(key).or_default().extend(placements);
             }
             dependencies.push((document, source));
         }
         Ok(Self {
             path,
+            directory,
             project: sources.project_name,
             paths,
-            standalone,
             own,
             others,
             dependencies,
@@ -105,14 +107,8 @@ impl ReferenceInventory {
     }
 
     pub(super) fn validate(&self, candidate: &str) -> Result<(), CallToolResult> {
-        let projected = collect(
-            &self.path,
-            candidate,
-            &self.project,
-            &self.paths,
-            self.standalone,
-        )
-        .map_err(|error| CallToolResult::error(error.to_string()))?;
+        let projected = collect(&self.path, candidate, &self.project, &self.paths)
+            .map_err(|error| CallToolResult::error(error.to_string()))?;
         for key in self
             .own
             .keys()
@@ -128,7 +124,7 @@ impl ReferenceInventory {
             let previous = before.iter().chain(elsewhere).collect::<Vec<_>>();
             let proposed = after.iter().chain(elsewhere).collect::<Vec<_>>();
             if proposed.len() > 1 && !same_package(&proposed) {
-                return Err(self.conflict(key, &proposed, &projected));
+                return Err(self.conflict(key, &proposed, &projected, false));
             }
             if !before.is_empty()
                 && !proposed.is_empty()
@@ -136,7 +132,7 @@ impl ReferenceInventory {
                 && same_package(&previous)
                 && before.len() > after.len()
             {
-                return Err(self.conflict(key, &previous, &projected));
+                return Err(self.conflict(key, &previous, &projected, true));
             }
         }
         Ok(())
@@ -147,13 +143,16 @@ impl ReferenceInventory {
         key: &Reference,
         placements: &[&Placement],
         projected: &Groups,
+        split_package: bool,
     ) -> CallToolResult {
         let reference = format_designator(&key.0, key.1);
         let mut physical = BTreeSet::new();
         let repeated_instance = placements
             .iter()
             .any(|placement| !physical.insert((&placement.document, &placement.symbol.uuid)));
-        let suggested_reference = if repeated_instance {
+        let suggested_reference = if split_package {
+            None
+        } else if repeated_instance {
             Some(format!("{}?", key.0))
         } else {
             self.next_free(&key.0, 1, projected)
@@ -174,10 +173,14 @@ impl ReferenceInventory {
                 placements: details,
                 suggested_reference,
             },
-            format!(
-                "'{reference}' conflicts with placed references in project '{}'",
-                self.project
-            ),
+            if split_package {
+                format!("'{reference}' is a shared package; update its units together")
+            } else {
+                format!(
+                    "'{reference}' conflicts with placed references in project '{}'",
+                    self.project
+                )
+            },
         )
     }
 
@@ -209,14 +212,8 @@ impl ReferenceInventory {
         if self.dependencies.is_empty() {
             return write_atomic_if_unchanged(&self.path, before, candidate);
         }
-        let directory = self.path.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Missing schematic directory",
-            )
-        })?;
         commit_file_transaction_with_dependencies(
-            directory,
+            &self.directory,
             vec![FileTransition::replace(&self.path, before, candidate)],
             self.dependencies,
         )?;
@@ -238,32 +235,32 @@ fn collect(
     source: &str,
     project: &str,
     paths: &BTreeSet<String>,
-    standalone: bool,
 ) -> anyhow::Result<Groups> {
     let mut groups = Groups::new();
     let tree = parse_sexp(source)?;
     let symbols =
         placed_symbols(&tree).map_err(|reason| anyhow::anyhow!("{}: {reason}", path.display()))?;
     for symbol in symbols {
-        let mut saved = symbol
-            .paths
-            .iter()
-            .filter(|instance| instance.project == project && paths.contains(&instance.path))
-            .peekable();
-        // Old standalone documents can lack matching project records. Their
-        // visible designators still reserve numbers in this physical file.
-        if standalone && saved.peek().is_none() {
-            let instance = paths.first().map_or("", String::as_str);
-            add_placement(
-                &mut groups,
-                path,
-                instance,
-                &symbol.property_reference,
-                &symbol,
-            );
-        }
-        for entry in saved {
-            add_placement(&mut groups, path, &entry.path, &entry.reference, &symbol);
+        for instance in paths {
+            let mut saved = symbol
+                .paths
+                .iter()
+                .filter(|entry| entry.project == project && entry.path == *instance)
+                .peekable();
+            // KiCad exports the displayed Reference for an instance without
+            // its own saved row, including in an owned project.
+            if saved.peek().is_none() {
+                add_placement(
+                    &mut groups,
+                    path,
+                    instance,
+                    &symbol.property_reference,
+                    &symbol,
+                );
+            }
+            for entry in saved {
+                add_placement(&mut groups, path, instance, &entry.reference, &symbol);
+            }
         }
     }
     Ok(groups)

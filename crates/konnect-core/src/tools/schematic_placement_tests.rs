@@ -214,6 +214,31 @@ async fn occupied_number_across_sheets_refuses_add_and_rename_without_writing() 
 }
 
 #[tokio::test]
+async fn numbered_legacy_property_on_a_sibling_remains_reserved() {
+    let (_directory, root, child) = fixture(false);
+    let mut root_candidate = resistor("R901", 100.0);
+    root_candidate["lib_id"] = json!("complex_hierarchy:CP");
+    let root_ref = add_native_component(&root, root_candidate).await;
+    assert!(!root_ref.is_error, "{root_ref:?}");
+    let mut saved = Schematic::load(&root).unwrap();
+    let symbol = saved
+        .symbols
+        .iter_mut()
+        .find(|symbol| symbol.reference() == Some("R901"))
+        .unwrap();
+    symbol
+        .raw_sub_nodes
+        .retain(|node| node.tag() != Some("instances"));
+    saved.overwrite().unwrap();
+
+    let before = std::fs::read(&child).unwrap();
+    let rejected = add_native_component(&child, resistor("R901", 110.0)).await;
+    assert!(rejected.is_error, "{rejected:?}");
+    assert_eq!(body(&rejected)["error"]["kind"], "reference_conflict");
+    assert_eq!(std::fs::read(&child).unwrap(), before);
+}
+
+#[tokio::test]
 async fn batch_keeps_first_number_and_rejects_duplicate_item() {
     let (_directory, _root, child) = fixture(false);
     let result = call_schematic_tool(
@@ -339,6 +364,35 @@ fn numbered_reference_commit_refuses_a_sibling_revision_race() {
     );
     assert_eq!(std::fs::read_to_string(&child).unwrap(), before);
     assert_eq!(std::fs::read_to_string(&root).unwrap(), other_revision);
+}
+
+#[test]
+fn nested_reference_commit_recovers_pending_project_journal() {
+    let (_directory, root, child) = fixture(false);
+    let before = std::fs::read_to_string(&child).unwrap();
+    let inventory =
+        sch_references::ReferenceInventory::load(&child, &before, &before, None).unwrap();
+    let root_before = std::fs::read_to_string(&root).unwrap();
+    let root_after = format!("{root_before}\n");
+    let journal_path = root.with_file_name(".konnect-transaction-reference-test.json");
+    let journal = json!({
+        "version": 1, "id": "reference-test",
+        "entries": [{
+            "path": root.file_name().unwrap().to_str().unwrap(),
+            "expected": root_before, "replacement": root_after
+        }]
+    });
+    std::fs::write(&journal_path, journal.to_string()).unwrap();
+
+    let candidate = format!("{before}\n");
+    let error = inventory.commit(&before, &candidate).unwrap_err();
+    assert!(
+        matches!(error, konnect_sexp::SexpError::Conflict { .. }),
+        "{error:?}"
+    );
+    assert!(!journal_path.exists());
+    assert_eq!(std::fs::read_to_string(&child).unwrap(), before);
+    assert_eq!(std::fs::read_to_string(&root).unwrap(), root_after);
 }
 
 fn body(result: &CallToolResult) -> Value {
