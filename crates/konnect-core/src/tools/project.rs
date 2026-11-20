@@ -72,8 +72,8 @@ pub fn tools() -> Vec<ToolDef> {
             "Rename a KiCAD project: renames the .kicad_pro/.kicad_sch/.kicad_pcb/.kicad_prl \
              files and rewrites the internal references that carry the old name. Renaming the \
              files alone is NOT enough — every symbol instance stores (project \"name\"), and \
-             a mismatch there makes KiCAD treat the design as unannotated, losing every \
-             reference designator. Equivalent to eeschema's File > Save As. Use dry_run first.",
+             a mismatch there makes KiCAD treat the design as unannotated. Also updates project \
+             settings and PCB footprint references to the renamed root schematic. Use dry_run first.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1282,110 +1282,267 @@ fn sibling_sheets(
     Ok(sheets)
 }
 
-/// Rewrite the project name only where it is structurally meaningful.
-///
-/// A blind `text.replace(old, new)` corrupts unrelated content, and the blast
-/// radius scales with how ordinary the name is: a project called `led` would
-/// rewrite the footprint `LED_THT:LED_D3.0mm`, a net named `LED_LIGHT` and
-/// every value containing the substring, silently, across the whole board and
-/// schematic.
-///
-/// Every real occurrence is quoted, and the two file families need different
-/// care:
-///
-/// - `.kicad_sch` / `.kicad_pcb` hold user content, so only `(project "NAME"`
-///   is touched — the key symbol instances hang their annotation off. Getting
-///   this wrong is what makes KiCad treat the design as unannotated.
-/// - `.kicad_pro` / `.kicad_prl` are settings/metadata with no netlist in
-///   them, so quoted whole-string matches and `NAME.kicad_*` filenames are
-///   safe there.
-fn rewrite_project_references(text: &str, old: &str, new: &str, sexp: bool) -> (String, usize) {
-    let mut out = text.to_string();
-    let mut hits = 0usize;
+struct RootSheetRename<'a> {
+    before: &'a Path,
+    after: &'a Path,
+    directory: &'a Path,
+    source: String,
+    uuid: Option<uuid::Uuid>,
+}
 
-    let swap = |out: &mut String, hits: &mut usize, from: &str, to: &str| {
-        if from != to {
-            let n = out.matches(from).count();
-            if n > 0 {
-                *hits += n;
-                *out = out.replace(from, to);
-            }
-        }
-    };
+fn relocated_filename<'a>(
+    value: &str,
+    before: &Path,
+    after: &'a Path,
+    directory: &Path,
+) -> Option<&'a str> {
+    let path = Path::new(value);
+    if path.file_name()? != before.file_name()? {
+        return None;
+    }
+    let parent = path.parent()?;
+    if !parent.as_os_str().is_empty() && directory.join(parent).canonicalize().ok()? != directory {
+        return None;
+    }
+    // The renamed file lives beside its owner. Relative references keep
+    // working if the containing directory moves as well.
+    after.file_name()?.to_str()
+}
 
-    if sexp {
-        let mut edits = Vec::new();
-        for start in konnect_sexp::writer::find_block_starts(text, "project") {
-            let Some((_, end)) = konnect_sexp::writer::find_balanced_block(text, start) else {
-                continue;
-            };
-            let Ok(node) = konnect_sexp::parse_sexp(&text[start..end]) else {
-                continue;
-            };
-            if node.get(1).and_then(|n| n.as_str()) != Some(old) || old == new {
-                continue;
-            }
-            // Replace only the name argument. The block scanner skips quoted
-            // user text and recognizes tabs/newlines around the project head.
-            let mut cursor = start + 1;
-            while cursor < end
-                && !text.as_bytes()[cursor].is_ascii_whitespace()
-                && text.as_bytes()[cursor] != b')'
-            {
-                cursor += 1;
-            }
-            while cursor < end && text.as_bytes()[cursor].is_ascii_whitespace() {
-                cursor += 1;
-            }
-            let name_start = cursor;
-            if text.as_bytes().get(cursor) == Some(&b'"') {
-                cursor += 1;
-                let mut escaped = false;
-                while cursor < end {
-                    let byte = text.as_bytes()[cursor];
-                    cursor += 1;
-                    if escaped {
-                        escaped = false;
-                    } else if byte == b'\\' {
-                        escaped = true;
-                    } else if byte == b'"' {
-                        break;
-                    }
-                }
-            } else {
-                while cursor < end
-                    && !text.as_bytes()[cursor].is_ascii_whitespace()
-                    && text.as_bytes()[cursor] != b')'
-                {
-                    cursor += 1;
-                }
-            }
-            edits.push(konnect_sexp::writer::SexpEdit::replace(
-                name_start,
-                cursor,
-                konnect_sexp::quoted(new),
-            ));
-        }
-        hits = edits.len();
-        out = konnect_sexp::writer::apply_edits(out, edits);
+impl RootSheetRename<'_> {
+    fn matching_filename(&self, value: &str) -> Option<&str> {
+        relocated_filename(value, self.before, self.after, self.directory)
+    }
+}
+
+fn validate_project_name(name: &str) -> Result<(), &'static str> {
+    if name.trim().is_empty() || matches!(name, "." | "..") {
+        return Err("must contain a project name");
+    }
+    if name.contains(['/', '\\']) || name.chars().any(char::is_control) {
+        return Err("must be a bare name without path separators or control characters");
+    }
+    if cfg!(windows) && name.contains(['<', '>', ':', '"', '|', '?', '*']) {
+        return Err("contains a character that Windows filenames cannot use");
+    }
+    if name
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.to_ascii_lowercase().starts_with("kicad_"))
+    {
+        return Err("must not end in a KiCad file extension");
+    }
+    Ok(())
+}
+
+fn rewrite_setting(value: Option<&mut serde_json::Value>, old: &str, new: &str) -> usize {
+    if let Some(value) = value.filter(|value| value.as_str() == Some(old)) {
+        *value = json!(new);
+        1
     } else {
-        for ext in PROJECT_EXTS {
-            swap(
-                &mut out,
-                &mut hits,
-                &serde_json::to_string(&format!("{old}.{ext}")).expect("JSON string"),
-                &serde_json::to_string(&format!("{new}.{ext}")).expect("JSON string"),
-            );
+        0
+    }
+}
+
+/// Rewrite the settings document's own metadata and entries that identify
+/// the moved root sheet. Display names elsewhere are user data, even when
+/// they happen to equal the project's name or filename.
+fn rewrite_project_settings(
+    text: &str,
+    before: &Path,
+    after: &Path,
+    root: Option<&RootSheetRename<'_>>,
+    moves: &[(PathBuf, PathBuf)],
+    directory: &Path,
+) -> anyhow::Result<(String, usize)> {
+    use serde_json::Value;
+
+    let mut settings: Value = serde_json::from_str(text)?;
+    anyhow::ensure!(settings.is_object(), "settings must be a JSON object");
+    let mut hits = rewrite_setting(
+        settings.pointer_mut("/meta/filename"),
+        &before.file_name().unwrap_or_default().to_string_lossy(),
+        &after.file_name().unwrap_or_default().to_string_lossy(),
+    );
+
+    let extension = before.extension().and_then(|ext| ext.to_str());
+    if let Some(root) = root.filter(|_| extension == Some("kicad_pro")) {
+        let old = before.file_stem().unwrap_or_default().to_string_lossy();
+        let new = after.file_stem().unwrap_or_default().to_string_lossy();
+        let mut root_ids = Vec::new();
+        match settings
+            .pointer_mut("/schematic/top_level_sheets")
+            .and_then(Value::as_array_mut)
+        {
+            Some(entries) if !entries.is_empty() => {
+                for entry in entries {
+                    let Some(filename) = entry.get_mut("filename") else {
+                        continue;
+                    };
+                    let Some(updated) = filename
+                        .as_str()
+                        .and_then(|value| root.matching_filename(value))
+                    else {
+                        continue;
+                    };
+                    *filename = json!(updated);
+                    hits += 1 + rewrite_setting(entry.get_mut("name"), &old, &new);
+                    let uuid = entry
+                        .get("uuid")
+                        .and_then(Value::as_str)
+                        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                        .filter(|id| !id.is_nil())
+                        .or(root.uuid);
+                    root_ids.extend(uuid);
+                }
+            }
+            _ => root_ids.extend(root.uuid),
         }
-        swap(
-            &mut out,
-            &mut hits,
-            &serde_json::to_string(old).expect("JSON string"),
-            &serde_json::to_string(new).expect("JSON string"),
-        );
+
+        if let Some(sheets) = settings.get_mut("sheets").and_then(Value::as_array_mut) {
+            for entry in sheets {
+                let Some(entry) = entry.as_array_mut() else {
+                    continue;
+                };
+                let uuid = entry
+                    .first()
+                    .and_then(Value::as_str)
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok());
+                if uuid.is_some_and(|id| root_ids.contains(&id)) {
+                    hits += rewrite_setting(entry.get_mut(1), &old, &new);
+                }
+            }
+        }
     }
 
-    (out, hits)
+    if extension == Some("kicad_prl") {
+        if let Some(files) = settings
+            .pointer_mut("/project/files")
+            .and_then(Value::as_array_mut)
+        {
+            for entry in files {
+                let Some(name) = entry.get_mut("name") else {
+                    continue;
+                };
+                if let Some(updated) = name.as_str().and_then(|value| {
+                    moves.iter().find_map(|(before, after)| {
+                        relocated_filename(value, before, after, directory)
+                    })
+                }) {
+                    *name = json!(updated);
+                    hits += 1;
+                }
+            }
+        }
+    }
+
+    if hits == 0 {
+        return Ok((text.to_owned(), 0));
+    }
+    let mut updated = serde_json::to_string_pretty(&settings)?;
+    if text.ends_with('\n') {
+        updated.push('\n');
+    }
+    Ok((updated, hits))
+}
+
+fn replace_sexp_argument(
+    text: &str,
+    start: usize,
+    end: usize,
+    tag: &str,
+    replacement: &str,
+) -> konnect_sexp::writer::SexpEdit {
+    let mut cursor = start + 1 + tag.len();
+    while cursor < end && text.as_bytes()[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    let argument_start = cursor;
+    if text.as_bytes().get(cursor) == Some(&b'"') {
+        cursor += 1;
+        let mut escaped = false;
+        while cursor < end {
+            let byte = text.as_bytes()[cursor];
+            cursor += 1;
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                break;
+            }
+        }
+    } else {
+        while cursor < end
+            && !text.as_bytes()[cursor].is_ascii_whitespace()
+            && text.as_bytes()[cursor] != b')'
+        {
+            cursor += 1;
+        }
+    }
+    konnect_sexp::writer::SexpEdit::replace(
+        argument_start,
+        cursor,
+        konnect_sexp::quoted(replacement),
+    )
+}
+
+fn rewrite_project_references(
+    text: &str,
+    old: &str,
+    new: &str,
+    board_root: Option<&RootSheetRename<'_>>,
+) -> (String, usize) {
+    use konnect_sexp::writer::{
+        apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks,
+    };
+
+    let mut edits = Vec::new();
+    for start in find_block_starts(text, "project") {
+        let Some((_, end)) = find_balanced_block(text, start) else {
+            continue;
+        };
+        let Ok(node) = konnect_sexp::parse_sexp(&text[start..end]) else {
+            continue;
+        };
+        if old != new && node.get(1).and_then(|node| node.as_str()) == Some(old) {
+            edits.push(replace_sexp_argument(text, start, end, "project", new));
+        }
+    }
+    if let Some(root) = board_root {
+        for start in find_block_starts(text, "footprint") {
+            let Some((_, end)) = find_balanced_block(text, start) else {
+                continue;
+            };
+            let footprint = &text[start..end];
+            for (child_start, child_end) in find_direct_child_blocks(footprint, "footprint") {
+                let block = &footprint[child_start..child_end];
+                if !block.starts_with("(sheetfile") {
+                    continue;
+                }
+                let Ok(node) = konnect_sexp::parse_sexp(block) else {
+                    continue;
+                };
+                if node.head() != Some("sheetfile") {
+                    continue;
+                }
+                if let Some(filename) = node
+                    .get(1)
+                    .and_then(|node| node.as_str())
+                    .and_then(|value| root.matching_filename(value))
+                {
+                    edits.push(replace_sexp_argument(
+                        text,
+                        start + child_start,
+                        start + child_end,
+                        "sheetfile",
+                        filename,
+                    ));
+                }
+            }
+        }
+    }
+    let hits = edits.len();
+    (apply_edits(text.to_owned(), edits), hits)
 }
 
 fn rename_uncertain_result(
@@ -1460,22 +1617,14 @@ async fn rename_project_with_moves(
     };
     let old_name = old_name.to_string();
 
+    if let Err(reason) = validate_project_name(&new_name) {
+        return Ok(invalid_arg("new_name", reason));
+    }
     if new_name == old_name {
         return Ok(CallToolResult::json(&json!({
             "renamed": false, "note": "new_name matches the current name"
         })));
     }
-    // A name with a path separator would move the project, not rename it.
-    if new_name.contains('/') || new_name.contains('\\') {
-        return Ok(CallToolResult::error_kind(
-            crate::mcp::error::ToolErrorKind::InvalidArgument {
-                field: "new_name".to_string(),
-                reason: "must be a bare name, not a path".to_string(),
-            },
-            "new_name must not contain a path separator.",
-        ));
-    }
-
     let mut planned_files = Vec::new();
     let mut collisions = Vec::new();
     for ext in PROJECT_EXTS {
@@ -1496,19 +1645,13 @@ async fn rename_project_with_moves(
         )));
     }
 
-    // Rewriting content is what keeps annotations attached: each symbol
-    // instance in the schematic stores `(project "NAME"`, and the .kicad_pro
-    // and .kicad_prl embed their own filenames.
-    let mut rewritten = Vec::new();
-    let mut completed_renames: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let sources = planned_files
+        .iter()
+        .map(|(from, _)| from.clone())
+        .collect::<Vec<_>>();
+    let children = sibling_sheets(&dir, &sources)?;
     if !dry_run {
-        let sources = planned_files
-            .iter()
-            .map(|(from, _)| from.clone())
-            .collect::<Vec<_>>();
-        let children = sibling_sheets(&dir, &sources)?;
-        // All known editor ownership must be checked before the first rename.
-        // Checking only the new filenames would bypass locks on the originals.
+        // Check all known editor ownership before the first rename.
         for (from, to) in &planned_files {
             konnect_sexp::writer::ensure_kicad_design_document_is_closed(from)?;
             konnect_sexp::writer::ensure_kicad_design_document_is_closed(to)?;
@@ -1516,7 +1659,69 @@ async fn rename_project_with_moves(
         for child in &children {
             konnect_sexp::writer::ensure_kicad_design_document_is_closed(child)?;
         }
+    }
 
+    // Capture the root identity while its original path still exists. Keep
+    // the source alongside it so post-move edits cannot use stale identity.
+    let directory_path = dir.canonicalize()?;
+    let mut root = None;
+    if let Some((before, after)) = planned_files
+        .iter()
+        .find(|(file, _)| file.extension().is_some_and(|ext| ext == "kicad_sch"))
+    {
+        let source = std::fs::read_to_string(before)?;
+        let uuid = konnect_sexp::parse_sexp(&source).ok().and_then(|node| {
+            node.find_str("uuid")
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        });
+        root = Some(RootSheetRename {
+            before,
+            after,
+            directory: &directory_path,
+            source,
+            uuid,
+        });
+    }
+
+    // Prepare both JSON rewrites before any files move. A malformed settings
+    // document must fail the preview and apply with no filenames changed.
+    let mut settings = std::collections::BTreeMap::new();
+    for (before, after) in &planned_files {
+        if !before
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| matches!(extension, "kicad_pro" | "kicad_prl"))
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(before)?;
+        match rewrite_project_settings(
+            &text,
+            before,
+            after,
+            root.as_ref(),
+            &planned_files,
+            &directory_path,
+        ) {
+            Ok((updated, hits)) => {
+                settings.insert(after, (text, updated, hits));
+            }
+            Err(error) => {
+                let reason = format!("Invalid project settings {}: {error}", before.display());
+                return Ok(CallToolResult::error_kind(
+                    ToolErrorKind::PlanBlocked {
+                        operation: "rename_project".to_string(),
+                        reasons: vec![reason.clone()],
+                    },
+                    reason,
+                ));
+            }
+        }
+    }
+
+    let mut rewritten = Vec::new();
+    let mut completed_renames: Vec<(PathBuf, PathBuf)> = Vec::new();
+    if !dry_run {
         // Rename the set, undoing what landed if one fails: a half-renamed
         // project is one KiCad cannot open at all.
         for (from, to) in &planned_files {
@@ -1570,10 +1775,6 @@ async fn rename_project_with_moves(
         to_rewrite.extend(children);
 
         for target in &to_rewrite {
-            let sexp = matches!(
-                target.extension().and_then(|s| s.to_str()),
-                Some("kicad_sch" | "kicad_pcb")
-            );
             let source = konnect_sexp::writer::ensure_kicad_design_document_is_closed(target)
                 .and_then(|()| konnect_sexp::writer::read_consistent(target));
             let text = match source {
@@ -1588,7 +1789,35 @@ async fn rename_project_with_moves(
                     ))
                 }
             };
-            let (updated, hits) = rewrite_project_references(&text, &old_name, &new_name, sexp);
+            if root
+                .as_ref()
+                .is_some_and(|root| root.after == target && root.source != text)
+            {
+                return Ok(rename_uncertain_result(
+                    target,
+                    "Root schematic changed since rename planning.",
+                    &completed_renames,
+                    &rewritten,
+                    &[],
+                ));
+            }
+            let (updated, hits) = if let Some((original, updated, hits)) = settings.remove(target) {
+                if text != original {
+                    return Ok(rename_uncertain_result(
+                        target,
+                        "Project settings changed since rename planning.",
+                        &completed_renames,
+                        &rewritten,
+                        &[],
+                    ));
+                }
+                (updated, hits)
+            } else {
+                let board_root = root
+                    .as_ref()
+                    .filter(|_| target.extension().is_some_and(|ext| ext == "kicad_pcb"));
+                rewrite_project_references(&text, &old_name, &new_name, board_root)
+            };
             if hits > 0 {
                 if let Err(error) =
                     konnect_sexp::writer::write_atomic_if_unchanged(target, &text, &updated)
@@ -1608,39 +1837,22 @@ async fn rename_project_with_moves(
             }
         }
     } else {
-        let sources: Vec<std::path::PathBuf> =
-            planned_files.iter().map(|(from, _)| from.clone()).collect();
-        let mut previewed: Vec<(std::path::PathBuf, String)> = planned_files
+        for (source, target) in planned_files
             .iter()
-            .map(|(from, to)| {
-                (
-                    from.clone(),
-                    to.file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                )
-            })
-            .collect();
-        // Child sheets keep their names, so the reported name is their own.
-        for sheet in sibling_sheets(&dir, &sources)? {
-            let name = sheet
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_string();
-            previewed.push((sheet, name));
-        }
-
-        for (source, reported_name) in &previewed {
-            let sexp = matches!(
-                source.extension().and_then(|s| s.to_str()),
-                Some("kicad_sch" | "kicad_pcb")
-            );
-            let text = std::fs::read_to_string(source)?;
-            let (_, hits) = rewrite_project_references(&text, &old_name, &new_name, sexp);
+            .map(|(from, to)| (from, to))
+            .chain(children.iter().map(|sheet| (sheet, sheet)))
+        {
+            let hits = if let Some((_, _, hits)) = settings.get(target) {
+                *hits
+            } else {
+                let text = std::fs::read_to_string(source)?;
+                let board_root = root
+                    .as_ref()
+                    .filter(|_| source.extension().is_some_and(|ext| ext == "kicad_pcb"));
+                rewrite_project_references(&text, &old_name, &new_name, board_root).1
+            };
             rewritten.push(json!({
-                "file": reported_name,
+                "file": target.file_name().and_then(|s| s.to_str()),
                 "references_updated": hits,
             }));
         }
@@ -1726,7 +1938,7 @@ mod rename_rewrite_tests {
 	)
 )
 "#;
-        let (out, hits) = rewrite_project_references(sch, "led", "dro", true);
+        let (out, hits) = rewrite_project_references(sch, "led", "dro", None);
         assert_eq!(hits, 1, "only the (project …) key should match");
         assert!(out.contains(r#"(project "dro""#));
         // Everything else survives untouched.
@@ -1739,36 +1951,30 @@ mod rename_rewrite_tests {
     #[test]
     fn sexp_files_rewrite_the_annotation_key() {
         let sch = "(instances\n\t(project \"old name\"\n\t\t(path \"/x\")\n\t)\n)\n";
-        let (out, hits) = rewrite_project_references(sch, "old name", "new name", true);
+        let (out, hits) = rewrite_project_references(sch, "old name", "new name", None);
         assert_eq!(hits, 1);
         assert!(out.contains("(project \"new name\""));
         assert!(!out.contains("old name"));
     }
 
-    /// Settings files carry the name as a bare quoted string and inside
-    /// `NAME.kicad_*` filenames; both must move or KiCad reopens the old paths.
     #[test]
-    fn settings_files_rewrite_names_and_filenames() {
+    fn settings_without_owned_references_stay_byte_identical() {
         let pro = r#"{
-  "meta": { "filename": "old.kicad_pro" },
-  "sheets": [ [ "uuid-1", "old" ] ],
-  "schematic": { "filename": "old.kicad_sch" },
-  "board": { "filename": "old.kicad_pcb" },
-  "name": "old"
+  "board": { "name": "old", "filename": "old.kicad_pro" },
+  "text_variables": { "PROJECT_NAME": "old" }
 }
 "#;
-        let (out, hits) = rewrite_project_references(pro, "old", "new", false);
-        assert!(hits >= 5, "expected every quoted form to move, got {hits}");
-        for want in [
-            "\"new.kicad_pro\"",
-            "\"new.kicad_sch\"",
-            "\"new.kicad_pcb\"",
-            "\"uuid-1\", \"new\"",
-            "\"name\": \"new\"",
-        ] {
-            assert!(out.contains(want), "missing {want} in:\n{out}");
-        }
-        assert!(!out.contains("\"old"), "an old reference survived:\n{out}");
+        let (updated, hits) = super::rewrite_project_settings(
+            pro,
+            std::path::Path::new("old.kicad_pro"),
+            std::path::Path::new("new.kicad_pro"),
+            None,
+            &[],
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(hits, 0);
+        assert_eq!(updated, pro);
     }
 
     /// A settings file must not have unrelated *unquoted* text touched, and a
@@ -1776,7 +1982,7 @@ mod rename_rewrite_tests {
     #[test]
     fn no_partial_word_matches() {
         let sch = "(property \"Value\" \"prototype\")\n(project \"proto\")\n";
-        let (out, hits) = rewrite_project_references(sch, "proto", "final", true);
+        let (out, hits) = rewrite_project_references(sch, "proto", "final", None);
         assert_eq!(hits, 1);
         assert!(out.contains("\"prototype\""), "substring was eaten: {out}");
         assert!(out.contains("(project \"final\""));
@@ -1785,7 +1991,7 @@ mod rename_rewrite_tests {
     #[test]
     fn a_no_op_rename_changes_nothing() {
         let sch = "(project \"same\"\n";
-        let (out, hits) = rewrite_project_references(sch, "same", "same", true);
+        let (out, hits) = rewrite_project_references(sch, "same", "same", None);
         assert_eq!(hits, 0);
         assert_eq!(out, sch);
     }
@@ -2100,6 +2306,22 @@ mod rename_recovery_tests {
         assert!(std::fs::read_to_string(child).unwrap().contains("old"));
         assert!(lock.exists());
     }
+    #[tokio::test]
+    async fn late_settings_change_is_preserved_and_reports_an_uncertain_rename() {
+        let (dir, pro, _) = fixture();
+        let moved = dir.path().join("new.kicad_pro");
+        let external = r#"{"meta":{"filename":"old.kicad_pro"},"editor_value":"old"}"#;
+        let result = rename_project_with(&json!({"project":pro,"new_name":"new"}), || {
+            std::fs::write(&moved, external).unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(body(&result)["error"]["kind"], "mutation_outcome_uncertain");
+        assert_eq!(body(&result)["failing_target"], moved.display().to_string());
+        assert_eq!(std::fs::read_to_string(moved).unwrap(), external);
+    }
+
     // A quote is a valid POSIX filename but forbidden by Windows filenames.
     #[cfg(unix)]
     #[tokio::test]
@@ -2200,25 +2422,30 @@ mod rename_recovery_tests {
 
 #[cfg(test)]
 mod project_name_encoding_tests {
-    use super::rewrite_project_references;
+    use super::{rewrite_project_references, rewrite_project_settings};
+    use std::path::Path;
     #[test]
     fn quoted_names_roundtrip_in_both_document_encodings() {
         let name = "new\"name";
-        let (json, hits) = rewrite_project_references(
-            r#"{"name":"old","filename":"old.kicad_pro"}"#,
-            "old",
-            name,
-            false,
-        );
-        assert_eq!(hits, 2);
+        let output_path = format!("{name}.kicad_pro");
+        let (json, hits) = rewrite_project_settings(
+            r#"{"meta":{"filename":"old.kicad_pro"},"text_variables":{"name":"old"}}"#,
+            Path::new("old.kicad_pro"),
+            Path::new(&output_path),
+            None,
+            &[],
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(hits, 1);
         let json: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(json["name"], name);
-        assert_eq!(json["filename"], format!("{name}.kicad_pro"));
+        assert_eq!(json["meta"]["filename"], output_path);
+        assert_eq!(json["text_variables"]["name"], "old");
         let (sexp, hits) = rewrite_project_references(
             r#"(instances (project "old" (path "/")))"#,
             "old",
             name,
-            true,
+            None,
         );
         assert_eq!(hits, 1);
         let node = konnect_sexp::parse_sexp(&sexp).unwrap();
@@ -2309,20 +2536,30 @@ mod rename_boundary_tests {
             let root = "5b9623a5-6d01-41fc-9865-e1bc779418c8";
             let child = "00000000-0000-0000-0000-00004b3a1333";
             let second_root = "f5d7a48d-4587-4550-a504-c505ca11d375";
+            let (display_name, configured_uuid) = if old == "Default" {
+                ("Custom root", "00000000-0000-0000-0000-000000000000")
+            } else {
+                (old, root)
+            };
             let settings = json!({
                 "meta": {"filename": format!("{old}.kicad_pro")},
                 "board": {"design_settings": {"minimum_edge_clearance": 0.07}},
                 "net_settings": {"classes": [{"name": "Default"}]},
                 "text_variables": {"value": old, "filename": format!("{old}.kicad_sch")},
                 "schematic": {"top_level_sheets": [
-                    {"filename": format!("{old}.kicad_sch"), "name": old, "uuid": root},
+                    {"filename": format!("{old}.kicad_sch"), "name": display_name, "uuid": configured_uuid},
                     {"filename": "secondary.kicad_sch", "name": old, "uuid": second_root}
                 ]},
                 "sheets": [[root, old], [child, old], [second_root, old]]
             });
             let local = json!({
                 "meta": {"filename": format!("{old}.kicad_prl")},
-                "board": {"visible_layers": old, "saved_alias": format!("{old}.kicad_prl")}
+                "board": {"visible_layers": old, "saved_alias": format!("{old}.kicad_prl")},
+                "project": {"files": [
+                    {"name": format!("./{old}.kicad_sch"), "open": true},
+                    {"name": format!("other/{old}.kicad_sch"), "open": false},
+                    {"name": format!("{old}.kicad_pcb"), "open": false}
+                ]}
             });
             std::fs::write(&pro, settings.to_string()).unwrap();
             std::fs::write(&prl, local.to_string()).unwrap();
@@ -2343,11 +2580,14 @@ mod rename_boundary_tests {
             let mut expected = settings;
             expected["meta"]["filename"] = json!("renamed.kicad_pro");
             expected["schematic"]["top_level_sheets"][0]["filename"] = json!("renamed.kicad_sch");
-            expected["schematic"]["top_level_sheets"][0]["name"] = json!("renamed");
+            if display_name == old {
+                expected["schematic"]["top_level_sheets"][0]["name"] = json!("renamed");
+            }
             expected["sheets"][0][1] = json!("renamed");
             assert_eq!(load("renamed.kicad_pro"), expected, "old project: {old}");
             let mut expected = local;
             expected["meta"]["filename"] = json!("renamed.kicad_prl");
+            expected["project"]["files"][0]["name"] = json!("renamed.kicad_sch");
             assert_eq!(load("renamed.kicad_prl"), expected, "old project: {old}");
         }
     }
@@ -2506,7 +2746,7 @@ mod rename_boundary_tests {
             "(kicad_sch (project old (path \"/\")))",
             "(kicad_sch (project\t\"old\" (path \"/\")))",
         ] {
-            let (updated, count) = rewrite_project_references(source, "old", "new", true);
+            let (updated, count) = rewrite_project_references(source, "old", "new", None);
             assert_eq!(count, 1);
             assert_eq!(
                 konnect_sexp::parse_sexp(&updated)
@@ -2524,7 +2764,7 @@ mod rename_boundary_tests {
             "(kicad_sch (property \"Value\" \"old\"))",
         ] {
             assert_eq!(
-                rewrite_project_references(source, "old", "new", true),
+                rewrite_project_references(source, "old", "new", None),
                 (source.to_string(), 0)
             );
         }
@@ -2637,7 +2877,7 @@ mod coverage_project_observation {
                 konnect_sexp::quoted(old),
                 konnect_sexp::quoted(old)
             );
-            let (rewritten, hits) = rewrite_project_references(&source, old, "new", true);
+            let (rewritten, hits) = rewrite_project_references(&source, old, "new", None);
             assert_eq!(hits, 1);
             let tree = konnect_sexp::parse_sexp(&rewritten).unwrap();
             assert_eq!(tree.find_str("project"), Some("new"));
@@ -2647,7 +2887,7 @@ mod coverage_project_observation {
             );
         }
         for malformed in ["(project old", "(project other)"] {
-            let (rewritten, hits) = rewrite_project_references(malformed, "old", "new", true);
+            let (rewritten, hits) = rewrite_project_references(malformed, "old", "new", None);
             assert_eq!((rewritten, hits), (malformed.to_string(), 0));
         }
     }

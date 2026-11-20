@@ -66,7 +66,7 @@ and Windows servers do not.
 | `open_project` | List PCB documents open in the running KiCad UI and optionally check a specific `.kicad_pro` or `.kicad_pcb` path over IPC; when KiCad does not answer, `ipc_failure` names why. |
 | `save_project` | Save the currently open PCB board file via KiCAD IPC. Requires KiCAD to be running with IPC enabled. |
 | `get_project_info` | Read project metadata from a `.kicad_pro` file. Returns name, schematic/PCB paths, last-modified time, project-file format version, and the generator versions recorded by the sibling design files. |
-| `rename_project` | Rename the `.kicad_pro`/`.kicad_sch`/`.kicad_pcb`/`.kicad_prl` files *and* the internal references that carry the old name. Renaming the files alone makes KiCad treat the design as unannotated, losing every reference designator, because each symbol instance stores `(project "name")`. Supports `dry_run`. |
+| `rename_project` | Rename the `.kicad_pro`/`.kicad_sch`/`.kicad_pcb`/`.kicad_prl` files and update schematic annotations, project metadata, and PCB footprint references to the renamed root schematic. Supports `dry_run`. |
 | `snapshot_project` | Export the schematic and PCB to PDF as a timestamped snapshot/checkpoint. Useful before major edits. |
 | `open_schematic_viewer` | Launch the live schematic viewer (SVG with auto-refresh on file change). Use after placing components so the user can see changes in real time. |
 
