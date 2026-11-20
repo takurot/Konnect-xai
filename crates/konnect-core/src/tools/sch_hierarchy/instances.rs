@@ -10,11 +10,21 @@ use std::collections::BTreeMap;
 
 type Placements = BTreeMap<PathBuf, BTreeSet<String>>;
 
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct PlacedSheet {
+    order: Vec<usize>,
+    parent: PathBuf,
+    instance: String,
+    uuid: String,
+}
+
 #[derive(Default)]
 struct Forest {
     placements: Placements,
     missing: BTreeSet<PathBuf>,
     roots: Vec<(PathBuf, String)>,
+    root_pages: BTreeSet<u32>,
+    sheets: Vec<PlacedSheet>,
     max_page: u32,
 }
 
@@ -109,7 +119,7 @@ impl HierarchySnapshot {
         };
         let mut root_ids = BTreeSet::new();
         let mut identities = BTreeSet::new();
-        for (root, configured_id) in self.roots.clone() {
+        for (index, (root, configured_id)) in self.roots.clone().into_iter().enumerate() {
             let root = normalize_path(&root)?;
             let source = self.source(&root, overrides)?;
             let document = cse::Schematic::from_source(&root, source)?;
@@ -123,11 +133,19 @@ impl HierarchySnapshot {
             forest.roots.push((root.clone(), root_id.clone()));
             for footer in parse_sexp(source)?.find_all("sheet_instances") {
                 for instance in footer.find_all("path") {
-                    include_page(&mut forest.max_page, instance.find_str("page"));
+                    if let Some(page) = instance
+                        .find_str("page")
+                        .and_then(|page| page.parse::<u32>().ok())
+                    {
+                        forest.max_page = forest.max_page.max(page);
+                        if instance.get(1).and_then(|node| node.as_str()) == Some("/") {
+                            forest.root_pages.insert(page);
+                        }
+                    }
                 }
             }
-            let mut pending = vec![(root, format!("/{root_id}"), Vec::new())];
-            while let Some((file, placement, mut ancestors)) = pending.pop() {
+            let mut pending = vec![(root, format!("/{root_id}"), Vec::new(), vec![index])];
+            while let Some((file, placement, mut ancestors, order)) = pending.pop() {
                 anyhow::ensure!(
                     ancestors.len() <= MAX_HIERARCHY_DEPTH && !ancestors.contains(&file),
                     "Cycle or depth limit at {}",
@@ -140,7 +158,7 @@ impl HierarchySnapshot {
                 forest
                     .placements
                     .entry(file.clone())
-                    .or_insert_with(BTreeSet::new)
+                    .or_default()
                     .insert(placement.clone());
                 let source = self.source(&file, overrides)?;
                 let document = cse::Schematic::from_source(&file, source)?;
@@ -151,7 +169,17 @@ impl HierarchySnapshot {
                         .placements
                         .get(&file)
                         .is_some_and(|previous| previous.contains(&placement));
-                for sheet in document.sheets.iter().rev() {
+                for (index, sheet) in document.sheets.iter().enumerate().rev() {
+                    let mut sheet_order = order.clone();
+                    sheet_order.push(index);
+                    if reading_before {
+                        forest.sheets.push(PlacedSheet {
+                            parent: file.clone(),
+                            instance: placement.clone(),
+                            uuid: sheet.uuid.clone(),
+                            order: sheet_order.clone(),
+                        });
+                    }
                     for page in &sheet.instances {
                         if survives
                             && page.project_name == self.project_name
@@ -180,6 +208,7 @@ impl HierarchySnapshot {
                         child,
                         format!("{placement}/{}", sheet.uuid),
                         ancestors.clone(),
+                        sheet_order,
                     ));
                 }
             }
@@ -199,6 +228,118 @@ impl HierarchySnapshot {
             self.sources.insert(path.to_owned(), read_consistent(path)?);
         }
         Ok(&self.sources[path])
+    }
+
+    fn verify_no_competing_owner(
+        &self,
+        path: &Path,
+        competing_sources: &mut BTreeMap<PathBuf, String>,
+    ) -> anyhow::Result<()> {
+        let active = self.project.as_ref().map(|(project, _)| project.as_path());
+        let competitor = resolve_schematic_ownership_with(path, active, &mut |input| {
+            let input = input.canonicalize()?;
+            if let Some(source) = self.sources.get(&input) {
+                return Ok(source.clone());
+            }
+            if !competing_sources.contains_key(&input) {
+                competing_sources.insert(input.clone(), read_consistent(&input)?);
+            }
+            Ok(competing_sources[&input].clone())
+        })?;
+        if let Some(competitor) = competitor {
+            let mut roots = self
+                .roots
+                .iter()
+                .map(|(root, _)| root.clone())
+                .collect::<Vec<_>>();
+            roots.push(competitor.root_schematic);
+            return Err(crate::tools::SchematicTargetError::ProjectConflict {
+                target: path.to_path_buf(),
+                roots,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Renumber all placements in the proven project forest. Shared physical
+    /// files contribute several placements but only one transaction target.
+    pub fn renumber_project(mut self) -> anyhow::Result<Vec<Value>> {
+        let mut placements = std::mem::take(&mut self.before.sheets);
+        placements.sort_unstable();
+        let mut documents = BTreeMap::<PathBuf, (cse::Schematic, BTreeSet<String>)>::new();
+        let mut report = Vec::new();
+        let mut page = 1;
+        for placement in placements {
+            page = following_page(page)?;
+            while self.before.root_pages.contains(&page) {
+                page = following_page(page)?;
+            }
+
+            let (document, changed) = match documents.entry(placement.parent.clone()) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let source = &self.sources[&placement.parent];
+                    let schematic = cse::Schematic::from_source(&placement.parent, source)?;
+                    entry.insert((schematic, BTreeSet::new()))
+                }
+            };
+            let sheet = document
+                .sheets
+                .by_uuid_mut(&placement.uuid)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Missing sheet {} in {}",
+                        placement.uuid,
+                        placement.parent.display()
+                    )
+                })?;
+            let old = sheet.instances.clone();
+            let mut seen = BTreeSet::new();
+            let live = &self.before.placements[&placement.parent];
+            sheet.instances.retain(|row| {
+                row.project_name != self.project_name
+                    || (live.contains(&row.path) && seen.insert(row.path.clone()))
+            });
+            let page_text = page.to_string();
+            sheet.set_page(&self.project_name, &placement.instance, &page_text);
+            if sheet.instances != old {
+                changed.insert(placement.uuid);
+            }
+            report.push(json!({
+                "sheet_name": sheet.name(),
+                "file": sheet.file(),
+                "page": page_text,
+                "parent_instance_path": placement.instance,
+            }));
+        }
+
+        let mut transitions = Vec::new();
+        let mut competing_sources = BTreeMap::new();
+        for (path, (document, changed)) in documents {
+            if changed.is_empty() {
+                continue;
+            }
+            self.verify_no_competing_owner(&path, &mut competing_sources)?;
+            let before = &self.sources[&path];
+            let ids = changed
+                .into_iter()
+                .map(ItemId::new)
+                .collect::<Result<Vec<_>, _>>()?;
+            let command = SchematicCommand::replace_items_from_document(
+                before,
+                &document.to_source(),
+                ids,
+                "Renumber project sheet pages",
+            )?;
+            let (after, _) = prepare_command(&path, before, &command)?;
+            transitions.push(FileTransition::replace(path, before, after));
+        }
+        if !transitions.is_empty() {
+            let high_water = self.max_page.max(page);
+            self.commit(transitions, competing_sources, high_water)?;
+        }
+        Ok(report)
     }
 
     pub fn update(
@@ -234,30 +375,8 @@ impl HierarchySnapshot {
             if !overrides.contains_key(&path) && (repair.is_some() || prior_paths == paths) {
                 continue;
             }
+            self.verify_no_competing_owner(&path, &mut competing_sources)?;
             let active = self.project.as_ref().map(|(project, _)| project.as_path());
-            let competitor = resolve_schematic_ownership_with(&path, active, &mut |input| {
-                let input = input.canonicalize()?;
-                if let Some(source) = self.sources.get(&input) {
-                    return Ok(source.clone());
-                }
-                if !competing_sources.contains_key(&input) {
-                    competing_sources.insert(input.clone(), read_consistent(&input)?);
-                }
-                Ok(competing_sources[&input].clone())
-            })?;
-            if let Some(competitor) = competitor {
-                let mut roots = self
-                    .roots
-                    .iter()
-                    .map(|(root, _)| root.clone())
-                    .collect::<Vec<_>>();
-                roots.push(competitor.root_schematic);
-                return Err(crate::tools::SchematicTargetError::ProjectConflict {
-                    target: path,
-                    roots,
-                }
-                .into());
-            }
             let foreign_projects = schematic_project_candidates(&path)?
                 .iter()
                 .filter(|project| active != Some(project.as_path()))
@@ -301,23 +420,7 @@ impl HierarchySnapshot {
         }
 
         if !transitions.is_empty() && repair != Some(false) {
-            let mut dependencies = self
-                .sources
-                .into_iter()
-                .filter(|(path, _)| {
-                    !transitions
-                        .iter()
-                        .any(|transition| transition.path() == path)
-                })
-                .collect::<Vec<_>>();
-            dependencies.extend(competing_sources);
-            dependencies.extend(self.project);
-            let page_history = self.page_history.expect("loaded page history");
-            match page_history.commit_input(high_water)? {
-                PageHistoryInput::Write(transition) => transitions.push(transition),
-                PageHistoryInput::Read(path, source) => dependencies.push((path, source)),
-            }
-            commit_file_transaction_with_dependencies(&self.directory, transitions, dependencies)?;
+            self.commit(transitions, competing_sources, high_water)?;
             for (path, context) in verify {
                 let checked = cse::Schematic::load(&path)
                     .map_err(anyhow::Error::from)
@@ -335,6 +438,31 @@ impl HierarchySnapshot {
             }
         }
         Ok(update)
+    }
+    fn commit(
+        self,
+        mut transitions: Vec<FileTransition>,
+        competing_sources: BTreeMap<PathBuf, String>,
+        high_water: u32,
+    ) -> anyhow::Result<()> {
+        let mut dependencies = self
+            .sources
+            .into_iter()
+            .filter(|(path, _)| {
+                !transitions
+                    .iter()
+                    .any(|transition| transition.path() == path)
+            })
+            .collect::<Vec<_>>();
+        dependencies.extend(competing_sources);
+        dependencies.extend(self.project);
+        let page_history = self.page_history.expect("loaded page history");
+        match page_history.commit_input(high_water)? {
+            PageHistoryInput::Write(transition) => transitions.push(transition),
+            PageHistoryInput::Read(path, source) => dependencies.push((path, source)),
+        }
+        commit_file_transaction_with_dependencies(&self.directory, transitions, dependencies)?;
+        Ok(())
     }
 }
 

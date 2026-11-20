@@ -177,7 +177,7 @@ async fn shared_subtrees_survive_generated_repoint_delete_and_readd_sequences() 
             let root_doc = cse::Schematic::load(&root).unwrap();
             let root_id = root_doc.uuid.as_deref().unwrap();
             let mut expected = Vec::new();
-            let mut parent_paths = std::collections::BTreeMap::new();
+            let mut parent_paths = std::collections::BTreeMap::<_, BTreeSet<_>>::new();
             let mut pages = BTreeSet::from(["1".to_string()]);
             for entry in root_doc.sheets.iter() {
                 let child = cse::Schematic::load(directory.path().join(entry.file())).unwrap();
@@ -185,7 +185,7 @@ async fn shared_subtrees_survive_generated_repoint_delete_and_readd_sequences() 
                 let parent = format!("/{root_id}/{}", entry.uuid);
                 parent_paths
                     .entry(entry.file())
-                    .or_insert_with(BTreeSet::new)
+                    .or_default()
                     .insert(parent.clone());
                 expected.push(format!("{parent}/{}", inner.uuid));
                 assert!(pages.insert(entry.page("project").unwrap().to_owned()));
@@ -550,4 +550,85 @@ async fn invalid_page_history_blocks_topology_edits() {
     assert_eq!(std::fs::read(&root).unwrap(), before);
     assert_eq!(std::fs::read_to_string(history).unwrap(), invalid);
     assert!(!directory.path().join("a.kicad_sch").exists());
+}
+
+#[tokio::test]
+async fn project_renumber_reserves_root_pages_and_preserves_previous_high_water() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.kicad_sch");
+    let second = directory.path().join("second.kicad_sch");
+    let shared = directory.path().join("shared.kicad_sch");
+    let leaf = directory.path().join("leaf.kicad_sch");
+    for path in [&first, &second, &shared, &leaf] {
+        create_blank_schematic(path).unwrap();
+    }
+    let first_id = "4187d28e-1569-4eba-b9b7-e900f7d6d8e3";
+    let second_id = "ef67c491-50cc-4611-9d4c-f378bfa497c0";
+    std::fs::write(
+        directory.path().join("project.kicad_pro"),
+        json!({"schematic": {"top_level_sheets": [
+            {"filename": "first.kicad_sch", "uuid": first_id},
+            {"filename": "second.kicad_sch", "uuid": second_id},
+        ]}})
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut paths = Vec::new();
+    for (file, id, page) in [(&first, first_id, "50"), (&second, second_id, "12")] {
+        let mut schematic = cse::Schematic::load(file).unwrap();
+        let mut sheet = cse::Sheet::new("Shared", "shared.kicad_sch", 20.0, 20.0, 40.0, 30.0);
+        sheet.set_page("project", &format!("/{id}"), page);
+        paths.push(format!("/{id}/{}", sheet.uuid));
+        schematic.add_sheet(sheet);
+        if file == &second {
+            schematic
+                .raw_other
+                .retain(|node| node.tag() != Some("sheet_instances"));
+            schematic.raw_other.push(
+                cse::sexp::parser::parse(r#"(sheet_instances (path "/" (page "2")))"#).unwrap(),
+            );
+        }
+        schematic.overwrite().unwrap();
+    }
+    let mut schematic = cse::Schematic::load(&shared).unwrap();
+    schematic.add_sheet(cse::Sheet::new(
+        "Leaf",
+        "leaf.kicad_sch",
+        20.0,
+        20.0,
+        40.0,
+        30.0,
+    ));
+    schematic.overwrite().unwrap();
+    assert!(!directory.path().join(".konnect-sheet-pages.json").exists());
+
+    let result = decoded(
+        handle_renumber_sheet_pages(&json!({"schematic": second}), &context())
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(result["scope"], "project");
+    let first_doc = cse::Schematic::load(&first).unwrap();
+    let first_rows = &first_doc.sheets.by_name("Shared").unwrap().instances;
+    assert_eq!(first_rows[0].path, format!("/{first_id}"));
+    assert_eq!(first_rows[0].page, "3");
+    let second_doc = cse::Schematic::load(&second).unwrap();
+    let second_rows = &second_doc.sheets.by_name("Shared").unwrap().instances;
+    assert_eq!(second_rows[0].path, format!("/{second_id}"));
+    assert_eq!(second_rows[0].page, "5");
+    let shared_doc = cse::Schematic::load(&shared).unwrap();
+    let rows = &shared_doc.sheets.by_name("Leaf").unwrap().instances;
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .any(|row| row.path == paths[0] && row.page == "4"));
+    assert!(rows
+        .iter()
+        .any(|row| row.path == paths[1] && row.page == "6"));
+    assert_eq!(
+        add(&first, "After", "after.kicad_sch").await["sheet"]["page"],
+        "51"
+    );
 }

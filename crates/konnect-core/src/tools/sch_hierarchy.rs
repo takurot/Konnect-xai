@@ -198,10 +198,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "renumber_sheet_pages",
-            "Walk the whole sheet tree from a root schematic and reassign sequential page \
-             numbers (2, 3, 4, ... — page 1 is always the root and is left untouched) in \
-             depth-first order. Fixes gaps left by delete_sheet/duplicate_sheet. Only \
-             touches files whose page numbers actually changed.",
+            "Renumber child sheet placements in depth-first order, starting at page 2 and \
+             skipping top-level pages. A project-owned schematic renumbers the full project \
+             hierarchy across all configured roots. Automatic allocation history is retained.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1762,6 +1761,32 @@ async fn handle_renumber_sheet_pages(
     // matching what eeschema writes.
     let root_before = read_consistent(&root_path)?;
     let (root_base, root_uuid) = ensure_source_root_uuid(&root_before)?;
+    match super::resolve_schematic_ownership(&root_path) {
+        Ok(Some(_)) => {
+            let graph = match HierarchySnapshot::load(
+                &root_path,
+                &root_before,
+                &root_base,
+                opt_str(args, "project_name"),
+            ) {
+                Ok(graph) => graph,
+                Err(error) => return hierarchy_error(error),
+            };
+            let project_name = graph.project_name.clone();
+            let pages = match graph.renumber_project() {
+                Ok(pages) => pages,
+                Err(error) => return hierarchy_error(error),
+            };
+            return Ok(CallToolResult::json(&json!({
+                "scope": "project",
+                "project_name": project_name,
+                "renumbered_count": pages.len(),
+                "pages": pages,
+            })));
+        }
+        Ok(None) => {}
+        Err(error) => return Ok(error.into_tool_result()),
+    }
     let root_prefix = format!("/{root_uuid}");
 
     let mut next_page = 2u32; // page 1 is always the root, left untouched
