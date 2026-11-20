@@ -1352,3 +1352,133 @@ mod child_stdio {
         wait_for_file(&finished).await;
     }
 }
+
+fn assert_reported_mm(value: &Value, expected: f64) {
+    assert_eq!(value, &json!(expected), "unexpected millimetre value");
+    let rendered = value.to_string();
+    if let Some((_, decimals)) = rendered.split_once('.') {
+        assert!(
+            decimals.len() <= 6,
+            "excess millimetre precision: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn schematic_pin_lookup_aliases_report_nanometre_precision() {
+    let directory = tempfile::tempdir().unwrap();
+    let schematic = directory.path().join("ecc83.kicad_sch");
+    std::fs::write(
+        &schematic,
+        include_str!("../../konnect-core/tests/fixtures/ecc83_multiunit.kicad_sch"),
+    )
+    .unwrap();
+    let mut server = McpProcess::spawn_configured(Some(directory.path()), true);
+    let loaded = server.call_tool("load_toolset", json!({"name":"sch_analysis"}));
+    assert_eq!(loaded["isError"], false, "{loaded}");
+
+    for name in ["get_pin_connections", "get_pin_net_name"] {
+        let result = server.call_tool(
+            name,
+            json!({"schematic":schematic,"reference":"U1","pin_number":"8"}),
+        );
+        assert_eq!(result["isError"], false, "{result}");
+        let body = McpProcess::tool_body(&result);
+        assert_eq!(body["reference"], "U1");
+        assert_eq!(body["pin"], "8");
+        assert_reported_mm(&body["pin_x"], 157.48);
+        assert_reported_mm(&body["pin_y"], 74.93);
+    }
+}
+
+#[test]
+fn schematic_overlap_depth_and_bounds_report_nanometre_precision() {
+    let directory = tempfile::tempdir().unwrap();
+    let schematic = directory.path().join("overlap.kicad_sch");
+    std::fs::write(
+        &schematic,
+        r#"(kicad_sch (version 20260206)
+          (lib_symbols (symbol "Test:Block" (symbol "Block_1_1"
+            (rectangle (start -1.016 -1.016) (end 1.016 1.016)
+              (stroke (width 0)) (fill (type none))))))
+          (symbol (lib_id "Test:Block") (at 100 50 0) (unit 1) (property "Reference" "R1"))
+          (symbol (lib_id "Test:Block") (at 101 50 0) (unit 1) (property "Reference" "R2")))"#,
+    )
+    .unwrap();
+    let mut server = McpProcess::spawn_configured(Some(directory.path()), true);
+    let loaded = server.call_tool("load_toolset", json!({"name":"sch_analysis"}));
+    assert_eq!(loaded["isError"], false, "{loaded}");
+    let result = server.call_tool("check_schematic_overlaps", json!({"schematic":schematic}));
+    assert_eq!(result["isError"], false, "{result}");
+    let body = McpProcess::tool_body(&result);
+    assert_eq!(body["overlap_count"], 1);
+    let overlap = &body["overlaps"][0];
+    assert_eq!(overlap["a"], "R1");
+    assert_eq!(overlap["b"], "R2");
+    assert_reported_mm(&overlap["overlap_x_mm"], 1.032);
+    assert_reported_mm(&overlap["overlap_y_mm"], 2.032);
+    for (bounds, x_min, x_max) in [("bounds_a", 98.984, 101.016), ("bounds_b", 99.984, 102.016)] {
+        assert_reported_mm(&overlap[bounds]["x_min"], x_min);
+        assert_reported_mm(&overlap[bounds]["x_max"], x_max);
+        assert_reported_mm(&overlap[bounds]["y_min"], 48.984);
+        assert_reported_mm(&overlap[bounds]["y_max"], 51.016);
+    }
+}
+
+#[test]
+fn connectivity_refusal_formats_endpoint_and_candidate_millimetres() {
+    let directory = tempfile::tempdir().unwrap();
+    let schematic = directory.path().join("connectivity.kicad_sch");
+    let source = r#"(kicad_sch (version 20260206)
+      (wire (pts (xy 0 0) (xy 97.78999999999999 10)) (uuid "fixture-wire"))
+      (label "A" (at 97.76 10 0))
+      (label "B" (at 97.83000000000001 10 0)))"#;
+    std::fs::write(&schematic, source).unwrap();
+    let mut server = McpProcess::spawn_configured(Some(directory.path()), true);
+    let loaded = server.call_tool("load_toolset", json!({"name":"sch_export"}));
+    assert_eq!(loaded["isError"], false, "{loaded}");
+    let result = server.call_tool("fix_connectivity", json!({"schematic":schematic}));
+    assert_eq!(result["isError"], true, "{result}");
+    let body = McpProcess::tool_body(&result);
+    assert_eq!(body["error"]["kind"], "stale_target");
+    assert_eq!(
+        body["error"]["target"],
+        "wire fixture-wire end endpoint at (97.79, 10)"
+    );
+    assert_eq!(
+        body["error"]["reason"],
+        "more than one snap destination was observed: (97.76, 10), (97.83, 10)"
+    );
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("(97.79, 10)") && message.contains("(97.83, 10)"));
+    assert_eq!(std::fs::read_to_string(schematic).unwrap(), source);
+}
+
+#[test]
+fn estimate_cost_rounds_reported_board_dimensions() {
+    let directory = tempfile::tempdir().unwrap();
+    let board = directory.path().join("precision.kicad_pcb");
+    std::fs::write(
+        &board,
+        r#"(kicad_pcb (version 20260206)
+          (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+          (gr_rect (start 0.1 0.1) (end 0.3 0.3)
+            (stroke (width 0) (type solid)) (layer "Edge.Cuts")))"#,
+    )
+    .unwrap();
+    let mut server = McpProcess::spawn_configured(Some(directory.path()), true);
+    let loaded = server.call_tool("load_toolset", json!({"name":"manufacturing"}));
+    assert_eq!(loaded["isError"], false, "{loaded}");
+    let result = server.call_tool(
+        "estimate_cost",
+        json!({"board":board,"fab_house":"pcbway","quantity":7}),
+    );
+    assert_eq!(result["isError"], false, "{result}");
+    let body = McpProcess::tool_body(&result);
+    assert_reported_mm(&body["board"]["width_mm"], 0.2);
+    assert_reported_mm(&body["board"]["height_mm"], 0.2);
+    assert_eq!(body["board"]["copper_layers"], 2);
+    assert_eq!(body["quantity"], 7);
+    assert_eq!(body["cost_estimate"]["total_estimate"], "$6.00");
+    assert_eq!(body["cost_estimate"]["per_board"], "$0.86");
+}
