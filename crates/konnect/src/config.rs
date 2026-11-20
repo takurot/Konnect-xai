@@ -12,6 +12,10 @@ pub struct Config {
     #[serde(default = "default_kicad_cli")]
     pub kicad_cli: String,
 
+    /// Exact directory containing KiCad's global library tables and settings.
+    #[serde(default, deserialize_with = "absolute_kicad_config_dir")]
+    pub kicad_config_dir: Option<PathBuf>,
+
     /// Path to the KiCAD binary (for launching the UI)
     #[serde(default = "default_kicad_binary")]
     pub kicad_binary: String,
@@ -133,6 +137,19 @@ impl IpcAddressSource {
             konnect_ipc::redact_endpoint(address)
         ))
     }
+}
+
+fn absolute_kicad_config_dir<'de, D>(deserializer: D) -> Result<Option<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let path = Option::<PathBuf>::deserialize(deserializer)?;
+    if path.as_ref().is_some_and(|path| !path.is_absolute()) {
+        return Err(serde::de::Error::custom(
+            "kicad_config_dir must be an absolute path",
+        ));
+    }
+    Ok(path)
 }
 
 fn default_kicad_cli() -> String {
@@ -267,6 +284,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             kicad_cli: default_kicad_cli(),
+            kicad_config_dir: None,
             kicad_binary: default_kicad_binary(),
             project_dir: None,
             // Blank until `resolve_ipc_address` fills it in.
@@ -365,6 +383,18 @@ fn dirs_config_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn kicad_config_dir_requires_an_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = format!("kicad_config_dir = '{}'", dir.path().display());
+        let configured: Config = toml::from_str(&input).unwrap();
+        assert_eq!(configured.kicad_config_dir.as_deref(), Some(dir.path()));
+        for path in ["", "relative"] {
+            let input = format!("kicad_config_dir = '{path}'");
+            assert!(toml::from_str::<Config>(&input).is_err());
+        }
+    }
 
     #[test]
     fn generic_bin_install_cannot_discover_parent_settings() {

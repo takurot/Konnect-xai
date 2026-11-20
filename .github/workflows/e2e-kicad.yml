@@ -33,16 +33,16 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup toolchain install --no-self-update
 
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: protoc@3.23.4
           fallback: none
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: e2e-kicad
 
@@ -50,10 +50,21 @@ jobs:
       # day KiCAD 11 ships, while metadata.json still declares kicad_version
       # 10.x. Bump deliberately alongside the supported-version claim.
       - name: Install KiCAD
-        run: choco install kicad --version=10.0.5 --no-progress --yes
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "kicad-10.0.5-x86_64.exe"
+          curl.exe --fail --location --retry 3 --max-time 240 --output $installer `
+            https://github.com/KiCad/kicad-source-mirror/releases/download/10.0.5/kicad-10.0.5-x86_64.exe
+          if ($LASTEXITCODE -ne 0) { throw "KiCad installer download failed: $LASTEXITCODE" }
+          $sha256 = (Get-FileHash -Algorithm SHA256 -Path $installer).Hash
+          if ($sha256 -ne "d2702ed1fabf2b52bd631450407f141563bc14393a607fb335b63194a8284d33") {
+            throw "Unexpected KiCad installer SHA256: $sha256"
+          }
+          $process = Start-Process -FilePath $installer -ArgumentList "/S", "/allusers" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "KiCad installer exited $($process.ExitCode)" }
 
-      - name: Locate kicad-cli and demos
-        id: kicad
+      - name: Verify kicad-cli and locate its demos
         shell: pwsh
         run: |
           $cli = Get-ChildItem "C:\Program Files\KiCad" -Recurse -Filter kicad-cli.exe -ErrorAction SilentlyContinue |
@@ -61,11 +72,15 @@ jobs:
           if (-not $cli) { $cli = Get-ChildItem "C:\KiCad" -Recurse -Filter kicad-cli.exe -ErrorAction SilentlyContinue |
                  Select-Object -First 1 -ExpandProperty FullName }
           if (-not $cli) { throw "kicad-cli.exe not found after install" }
+          $version = (& $cli --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $version -ne "10.0.5") { throw "Expected KiCad 10.0.5 at ${cli}, got ${version}" }
+          Write-Host "KiCad $version at $cli"
           "KICAD_CLI=$cli" | Out-File $env:GITHUB_ENV -Append
           (Split-Path $cli) | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
           $demos = Join-Path (Split-Path (Split-Path $cli)) "share\kicad\demos"
-          if (Test-Path $demos) { "KICAD_DEMOS=$demos" | Out-File $env:GITHUB_ENV -Append }
-          & $cli --version
+          if (-not (Test-Path $demos -PathType Container)) { throw "KiCad demo directory missing: $demos" }
+          "KICAD_DEMOS=$demos" | Out-File $env:GITHUB_ENV -Append
+          Write-Host "KiCad demos at $demos"
 
       - name: E2E design loop (create → wire → ERC → Gerber → DRC)
         env:
@@ -73,7 +88,9 @@ jobs:
         run: cargo test -p konnect --test e2e_kicad -- --ignored --nocapture
 
       - name: Demo-corpus conformance (115+ eeschema-authored schematics)
-        run: cargo test -p konnect-core --test conformance_test -- --nocapture
+        env:
+          KONNECT_REQUIRE_DEMOS: "1"
+        run: cargo test -p konnect-core --locked --test conformance_test -- --nocapture
 
       # The variant grammar of record (fixtures/variants/README.md) is
       # evidence adjudicated by kicad-cli; this re-runs the adjudication so a
@@ -87,7 +104,7 @@ jobs:
       - name: IPC wedge timeout regression
         run: cargo test -p konnect-ipc --test mock_server_test -- --ignored --nocapture
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: "3.12"
 
@@ -101,7 +118,7 @@ jobs:
 
       - name: Upload artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: e2e-failure-artifacts
           path: |

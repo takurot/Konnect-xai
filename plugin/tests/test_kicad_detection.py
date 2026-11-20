@@ -4,6 +4,7 @@ import importlib.util
 import os
 from pathlib import Path
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -35,21 +36,31 @@ class FakeRegistryKey:
         return False
 
 
-def fake_winreg(install_dir):
-    child = FakeRegistryKey({
-        "DisplayName": "KiCad 10.0 (current user)",
-        "DisplayVersion": "10.0.5",
-        "InstallLocation": install_dir,
-    })
-    uninstall = FakeRegistryKey(children={"KiCad 10.0": child})
+def fake_winreg(*installs):
+    children = {
+        f"KiCad {version}": FakeRegistryKey({
+            "DisplayName": f"KiCad {version} (current user)",
+            "DisplayVersion": version,
+            "InstallLocation": install_dir,
+        })
+        for version, install_dir in installs
+    }
+    uninstall = FakeRegistryKey(children=children)
     module = types.ModuleType("winreg")
     module.HKEY_CURRENT_USER = "HKCU"
     module.HKEY_LOCAL_MACHINE = "HKLM"
     module.KEY_READ = 1
     module.KEY_WOW64_64KEY = 2
     module.KEY_WOW64_32KEY = 4
-    module.OpenKey = lambda parent, name, *_args: (
-        uninstall if parent == "HKCU" else parent.children[name])
+
+    def open_key(parent, name, *_args):
+        if parent == "HKCU":
+            return uninstall
+        if parent == "HKLM":
+            raise FileNotFoundError(name)
+        return parent.children[name]
+
+    module.OpenKey = open_key
     module.QueryInfoKey = lambda key: (len(key.children), 0, 0)
     module.EnumKey = lambda key, index: list(key.children)[index]
     module.QueryValueEx = lambda key, name: (key.values[name], 1)
@@ -63,7 +74,7 @@ class KiCadDetectionTests(unittest.TestCase):
 
     def test_current_user_uninstall_record_is_discovered(self):
         install_dir = r"C:\Users\casey\AppData\Local\Programs\KiCad\10.0"
-        registry = fake_winreg(install_dir)
+        registry = fake_winreg(("10.0.5", install_dir))
         expected = os.path.join(install_dir, "bin", "kicad-cli.exe")
 
         with mock.patch.object(self.dialog.sys, "platform", "win32"), \
@@ -72,18 +83,35 @@ class KiCadDetectionTests(unittest.TestCase):
                                   side_effect=lambda path: path == expected):
             self.assertEqual(self.dialog.detect_kicad_cli(), expected)
 
-    def test_local_app_data_is_a_fallback_without_registry(self):
-        local_app_data = r"C:\Users\casey\AppData\Local"
-        expected = os.path.join(
-            local_app_data, "Programs", "KiCad", "10.0", "bin", "kicad-cli.exe")
+    def test_registry_discovery_sorts_future_versions_numerically(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            old, future = home / "old", home / "future"
+            for install in [old, future]:
+                (install / "bin").mkdir(parents=True)
+                (install / "bin" / "kicad-cli.exe").touch()
+            registry = fake_winreg(("10.0.5", old), ("11.2.0", future))
+            with mock.patch.object(self.dialog.sys, "platform", "win32"), \
+                    mock.patch.dict(sys.modules, {"winreg": registry}):
+                self.assertEqual(self.dialog.detect_kicad_cli(),
+                                 str(future / "bin" / "kicad-cli.exe"))
 
-        with mock.patch.object(self.dialog.sys, "platform", "win32"), \
-                mock.patch.dict(self.dialog.os.environ,
-                                {"LOCALAPPDATA": local_app_data}, clear=True), \
-                mock.patch.dict(sys.modules, {"winreg": None}), \
-                mock.patch.object(self.dialog.os.path, "isfile",
-                                  side_effect=lambda path: path == expected):
-            self.assertEqual(self.dialog.detect_kicad_cli(), expected)
+    def test_root_fallback_sorts_version_folders_across_install_locations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            local = home / "local"
+            programs = home / "programs"
+            nightly = programs / "KiCad" / "10.99" / "bin" / "kicad-cli.exe"
+            old = local / "Programs" / "KiCad" / "10.0" / "bin" / "kicad-cli.exe"
+            invalid = programs / "KiCad" / "99.0.backup" / "bin" / "kicad-cli.exe"
+            for cli in [old, nightly, invalid]:
+                cli.parent.mkdir(parents=True)
+                cli.touch()
+            with mock.patch.object(self.dialog.sys, "platform", "win32"), \
+                    mock.patch.dict(self.dialog.os.environ,
+                                    {"LOCALAPPDATA": str(local), "ProgramFiles": str(programs)}, clear=True), \
+                    mock.patch.dict(sys.modules, {"winreg": None}):
+                self.assertEqual(self.dialog.detect_kicad_cli(), str(nightly))
 
 
 if __name__ == "__main__":

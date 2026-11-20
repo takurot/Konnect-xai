@@ -5,32 +5,59 @@
 //! designs — if our parser or editors disagree with anything in there, we
 //! disagree with KiCAD.
 //!
-//! These tests locate an installed KiCAD (or `KICAD_DEMOS` env override) and
-//! SKIP silently when none is present, so plain CI stays green while the
-//! scheduled real-KiCAD workflow and local dev runs get full coverage.
-//! (Same skip pattern the predecessor project used for its kicad-cli tests.)
+//! Local workspace tests may skip if KiCad demos are unavailable.
+//! Real-KiCad CI sets `KONNECT_REQUIRE_DEMOS=1` to require a usable corpus.
 
 use konnect_sexp::{parse_sexp, writer};
 use std::path::PathBuf;
 
-fn demo_dirs() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("KICAD_DEMOS") {
-        let pb = PathBuf::from(p);
-        if pb.exists() {
-            return Some(pb);
-        }
-    }
+fn demo_schematics() -> Option<Vec<PathBuf>> {
+    let required = std::env::var("KONNECT_REQUIRE_DEMOS").as_deref() == Ok("1");
+    let configured = std::env::var_os("KICAD_DEMOS").map(PathBuf::from);
     let candidates: &[&str] = if cfg!(target_os = "windows") {
         &[
             r"C:\KiCad\10.0\share\kicad\demos",
             r"C:\Program Files\KiCad\10.0\share\kicad\demos",
         ]
     } else if cfg!(target_os = "macos") {
-        &["/Applications/KiCad/KiCad.app/Contents/SharedSupport/demos"]
+        &[
+            "/Applications/KiCad/demos",
+            "/Applications/KiCad/KiCad.app/Contents/SharedSupport/demos",
+            "/Library/Application Support/kicad/demos",
+        ]
     } else {
         &["/usr/share/kicad/demos", "/usr/local/share/kicad/demos"]
     };
-    candidates.iter().map(PathBuf::from).find(|p| p.exists())
+    let root = if required && configured.is_some() {
+        configured
+    } else {
+        configured.filter(|path| path.is_dir()).or_else(|| {
+            candidates
+                .iter()
+                .map(PathBuf::from)
+                .find(|path| path.is_dir())
+        })
+    };
+    let Some(root) = root else {
+        assert!(
+            !required,
+            "no KiCad demos found; set KICAD_DEMOS to a demo directory"
+        );
+        eprintln!("SKIP: no KiCad demos found (set KICAD_DEMOS to enable)");
+        return None;
+    };
+    assert!(
+        root.is_dir(),
+        "KiCad demo directory missing: {}",
+        root.display()
+    );
+    let schematics = collect_schematics(&root);
+    assert!(
+        !schematics.is_empty(),
+        "KiCad demo directory contains no .kicad_sch files: {}",
+        root.display()
+    );
+    Some(schematics)
 }
 
 fn collect_schematics(root: &std::path::Path) -> Vec<PathBuf> {
@@ -52,21 +79,39 @@ fn collect_schematics(root: &std::path::Path) -> Vec<PathBuf> {
     out
 }
 
+#[test]
+fn required_demo_corpus_rejects_invalid_explicit_paths() {
+    let empty = tempfile::tempdir().expect("create empty demo directory");
+    for (path, diagnostic) in [
+        (empty.path().join("missing"), "KiCad demo directory missing"),
+        (
+            empty.path().to_path_buf(),
+            "KiCad demo directory contains no .kicad_sch files",
+        ),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", "demo_files_survive_edit_cycle", "--color=never"])
+            .env("KONNECT_REQUIRE_DEMOS", "1")
+            .env("KICAD_DEMOS", &path)
+            .output()
+            .expect("run demo test with an invalid corpus");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !output.status.success() && stdout.contains(diagnostic),
+            "expected failure for {} with {diagnostic}: {stdout}",
+            path.display()
+        );
+    }
+}
+
 /// Every schematic eeschema ships must parse. This is the broadest format-
 /// coverage test we have: hierarchical sheets, multi-unit symbols, buses,
 /// text boxes, images — whatever the demos contain, the parser must accept.
 #[test]
 fn every_installed_demo_schematic_parses() {
-    let Some(root) = demo_dirs() else {
-        eprintln!("SKIP: no KiCAD demos found (set KICAD_DEMOS to enable)");
+    let Some(schematics) = demo_schematics() else {
         return;
     };
-    let schematics = collect_schematics(&root);
-    assert!(
-        !schematics.is_empty(),
-        "demo dir exists but contains no .kicad_sch files: {}",
-        root.display()
-    );
 
     let mut parsed = 0usize;
     let mut failures = Vec::new();
@@ -98,15 +143,14 @@ fn every_installed_demo_schematic_parses() {
 /// transforms compute without panicking for every instance.
 #[test]
 fn demo_corpus_structural_extraction() {
-    let Some(root) = demo_dirs() else {
-        eprintln!("SKIP: no KiCAD demos found");
+    let Some(schematics) = demo_schematics() else {
         return;
     };
     use konnect_sexp::schematic::{extract_symbol_instances, extract_wires};
 
     let mut total_symbols = 0usize;
     let mut total_wires = 0usize;
-    for sch in collect_schematics(&root) {
+    for sch in schematics {
         let content = std::fs::read_to_string(&sch).unwrap_or_default();
         let Ok(tree) = parse_sexp(&content) else {
             continue; // parse failures are the previous test's job
@@ -131,11 +175,9 @@ fn demo_corpus_structural_extraction() {
 /// corruption class without needing a full serializer.
 #[test]
 fn demo_files_survive_edit_cycle() {
-    let Some(root) = demo_dirs() else {
-        eprintln!("SKIP: no KiCAD demos found");
+    let Some(schematics) = demo_schematics() else {
         return;
     };
-    let schematics = collect_schematics(&root);
     // A representative slice keeps this test fast even on huge corpora.
     for sch in schematics.iter().take(10) {
         let original = std::fs::read_to_string(sch).unwrap();
@@ -182,8 +224,7 @@ fn demo_files_survive_edit_cycle() {
 /// direction leading away from that body.
 #[test]
 fn pin_anchored_labels_match_eeschema_orientation() {
-    let Some(root) = demo_dirs() else {
-        eprintln!("SKIP: no KiCad demos found");
+    let Some(schematics) = demo_schematics() else {
         return;
     };
     use konnect_sexp::geometry::points_coincident;
@@ -194,7 +235,7 @@ fn pin_anchored_labels_match_eeschema_orientation() {
 
     let (mut horizontal, mut vertical) = (0usize, 0usize);
     let (mut disagreements, mut sideways) = (Vec::new(), Vec::new());
-    for sch in collect_schematics(&root) {
+    for sch in schematics {
         let content = std::fs::read_to_string(&sch).unwrap_or_default();
         let Ok(tree) = parse_sexp(&content) else {
             continue;

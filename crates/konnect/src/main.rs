@@ -190,7 +190,13 @@ async fn main() -> Result<()> {
         .call_log
         .then(konnect_core::observability::default_calls_log_path)
         .flatten();
-    let handler = McpHandler::new_with_call_log(server_config, config_resolution, call_log).await?;
+    let handler = McpHandler::new_configured(
+        server_config,
+        config_resolution,
+        config.kicad_config_dir.clone(),
+        call_log,
+    )
+    .await?;
     match install::InstalledGuidanceProbe::for_current_user() {
         Ok(probe) => handler.set_guidance_probe(std::sync::Arc::new(probe)),
         Err(error) => tracing::warn!("guidance drift detection unavailable: {error:#}"),

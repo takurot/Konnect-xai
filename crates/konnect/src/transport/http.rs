@@ -19,7 +19,7 @@
 use super::http_policy::{origin_allowed, HttpPolicy};
 use anyhow::Result;
 use axum::{
-    extract::{Request, State},
+    extract::{rejection::JsonRejection, Request, State},
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{
@@ -29,7 +29,10 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use konnect_core::mcp::handler::McpHandler;
+use konnect_core::mcp::{
+    handler::McpHandler,
+    protocol::{JsonRpcError, JsonRpcResponse, PARSE_ERROR},
+};
 use serde_json::Value;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -109,7 +112,20 @@ fn refusal(policy: &HttpPolicy, path: &str, headers: &HeaderMap) -> Option<Respo
     None
 }
 
-async fn handle_post(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+async fn handle_post(
+    State(state): State<AppState>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(JsonRejection::JsonSyntaxError(_)) => {
+            let error =
+                JsonRpcResponse::error(Value::Null, JsonRpcError::new(PARSE_ERROR, "Invalid JSON"));
+            return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+        }
+        Err(rejection) => return rejection.into_response(),
+    };
+
     match state.handler.handle_message(body).await {
         // JSON-RPC request → single JSON response object.
         Some(resp) => Json(resp).into_response(),

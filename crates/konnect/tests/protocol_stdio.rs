@@ -217,6 +217,42 @@ fn handshake_baseline_and_full_registry_loads() {
 }
 
 #[test]
+fn sheet_pages_are_not_reused_after_a_server_restart() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().join("project.kicad_sch");
+    std::fs::write(root.with_extension("kicad_pro"), "{}").unwrap();
+    let spawn = || {
+        let mut process = McpProcess::spawn_configured(Some(project.path()), true);
+        process.call_tool("load_toolset", json!({"name": "sch_hierarchy"}));
+        process
+    };
+    let add = |process: &mut McpProcess, name: &str, file: &str| {
+        let result = process.call_tool(
+            "add_hierarchical_sheet",
+            json!({
+                "schematic": root, "sheet_name": name, "sheet_file": file,
+            }),
+        );
+        assert_ne!(result["isError"], true, "{result:#?}");
+        McpProcess::tool_body(&result)["sheet"]["page"].clone()
+    };
+
+    let mut first = spawn();
+    let created = first.call_tool("create_schematic", json!({"path": root}));
+    assert_ne!(created["isError"], true, "{created:#?}");
+    assert_eq!(add(&mut first, "A", "a.kicad_sch"), "2");
+    assert_eq!(add(&mut first, "B", "b.kicad_sch"), "3");
+    let deleted = first.call_tool(
+        "delete_sheet",
+        json!({"schematic": root, "sheet_name": "B"}),
+    );
+    assert_ne!(deleted["isError"], true, "{deleted:#?}");
+    drop(first);
+
+    assert_eq!(add(&mut spawn(), "C", "c.kicad_sch"), "4");
+}
+
+#[test]
 fn installation_info_reports_the_serving_process_without_leaking_endpoint_secrets() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -318,16 +354,114 @@ fn structured_errors_guide_recovery() {
 }
 
 #[test]
-fn unknown_method_is_json_rpc_error_not_crash() {
+fn protocol_request_errors_have_standard_codes() {
     let mut p = McpProcess::spawn();
-    let resp = p.request("tools/definitely_not_a_method", json!({}));
+    for (method, params, code) in [
+        ("resources/templates/list", json!({}), -32601),
+        ("logging/setLevel", json!({}), -32601),
+        ("completion/complete", json!({}), -32601),
+        ("resources/read", json!({"uri": "file:///example"}), -32601),
+        ("tools/call", json!({"arguments": {}}), -32602),
+        (
+            "tools/call",
+            json!({"name": "list_toolboxes", "arguments": []}),
+            -32602,
+        ),
+        (
+            "tools/call",
+            json!({"name": "list_toolboxes", "arguments": null}),
+            -32602,
+        ),
+        ("tools/call", json!([]), -32602),
+    ] {
+        let response = p.request(method, params);
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["error"]["code"], code, "{method}: {response}");
+        assert!(response.get("result").is_none());
+    }
+    assert_eq!(p.request("ping", json!({}))["result"], json!({}));
+}
+
+#[test]
+fn protocol_notifications_emit_no_stdout() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_konnect"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        for _ in 0..100 {
+            writeln!(
+                stdin,
+                "{}",
+                json!({"jsonrpc":"2.0","method":"notifications/roots/list_changed"})
+            )
+            .unwrap();
+        }
+        for method in ["notifications/cancelled", "ping"] {
+            writeln!(stdin, "{}", json!({"jsonrpc":"2.0","method":method})).unwrap();
+        }
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
     assert!(
-        resp.get("error").is_some(),
-        "expected JSON-RPC error: {resp}"
+        output.stdout.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stdout)
     );
-    // Server must still be alive afterwards.
-    let ping = p.request("ping", json!({}));
-    assert!(ping.get("result").is_some());
+}
+
+#[test]
+fn protocol_invalid_messages_get_errors_before_the_next_ping() {
+    let mut p = McpProcess::spawn();
+    for (index, (message, id, code)) in [
+        (
+            r#"[{"jsonrpc":"2.0","id":6,"method":"ping"}]"#,
+            Value::Null,
+            -32600,
+        ),
+        ("[]", Value::Null, -32600),
+        (r#"{"id":7,"method":"ping"}"#, json!(7), -32600),
+        (
+            r#"{"jsonrpc":"1.0","id":"wrong-version","method":"ping"}"#,
+            json!("wrong-version"),
+            -32600,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+            Value::Null,
+            -32600,
+        ),
+        (r#"{"jsonrpc":"2.0"}"#, Value::Null, -32600),
+        ("{", Value::Null, -32700),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fence_id = 100 + index;
+        writeln!(p.stdin, "{message}").unwrap();
+        writeln!(
+            p.stdin,
+            r#"{{"jsonrpc":"2.0","id":{fence_id},"method":"ping"}}"#
+        )
+        .unwrap();
+        p.stdin.flush().unwrap();
+        let mut line = String::new();
+        p.reader.read_line(&mut line).unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["jsonrpc"], "2.0", "{message}: {response}");
+        assert_eq!(response.get("id"), Some(&id), "{message}: {response}");
+        assert_eq!(response["error"]["code"], code, "{message}: {response}");
+        assert!(response.get("result").is_none());
+        line.clear();
+        p.reader.read_line(&mut line).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap(),
+            json!({"jsonrpc":"2.0","id":fence_id,"result":{}})
+        );
+    }
 }
 
 /// Regression test for issue #19. After `load_toolset`, the server must emit
@@ -887,26 +1021,42 @@ fn check_freerouting_reports_every_location_it_searched_over_stdio() {
     let tmp = tempfile::tempdir().unwrap();
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    let third_party: Vec<String> = ["3rd-10", "3rd-9", "3rd-8"]
+    let third_party: Vec<_> = ["3rd-11", "3rd-10", "3rd-9"]
         .iter()
         .map(|name| {
             let dir = tmp.path().join(name);
             std::fs::create_dir_all(&dir).unwrap();
-            dir.display().to_string()
+            dir
         })
         .collect();
-    let (bin_s, home_s) = (bin.display().to_string(), tmp.path().display().to_string());
-    let mut p = McpProcess::spawn_with_env(
-        Some(tmp.path()),
-        true,
-        &[
-            ("PATH", bin_s.as_str()),
-            ("USERPROFILE", home_s.as_str()),
-            ("KICAD10_3RD_PARTY", third_party[0].as_str()),
-            ("KICAD9_3RD_PARTY", third_party[1].as_str()),
-            ("KICAD8_3RD_PARTY", third_party[2].as_str()),
-        ],
-    );
+    let plugin_dirs: Vec<_> = ["11.0", "10.99", "9.0"]
+        .into_iter()
+        .flat_map(|version| {
+            ["Documents/KiCad", ".local/share/kicad"]
+                .map(|base| tmp.path().join(base).join(version).join("3rdparty/plugins"))
+        })
+        .collect();
+    for dir in &plugin_dirs {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy().to_ascii_uppercase();
+        if name.starts_with("KICAD") && name.ends_with("_3RD_PARTY") {
+            command.env_remove(key);
+        }
+    }
+    command
+        .current_dir(tmp.path())
+        .env("HOME", tmp.path())
+        .env("APPDATA", tmp.path())
+        .env("USERPROFILE", tmp.path())
+        .env("PATH", &bin)
+        .env_remove("KICAD_DOCUMENTS_HOME")
+        .env("KICAD11_3RD_PARTY", &third_party[0])
+        .env("KICAD10_3RD_PARTY", &third_party[1])
+        .env("KICAD9_3RD_PARTY", &third_party[2]);
+    let mut p = McpProcess::spawn_command(command);
     McpProcess::tool_body(&p.call_tool("load_toolset", json!({"name": "integration"})));
 
     let result = p.call_tool("check_freerouting", json!({}));
@@ -924,7 +1074,7 @@ fn check_freerouting_reports_every_location_it_searched_over_stdio() {
         .collect();
     // `HOME` and `USERPROFILE` name the same directory here, so on Windows the
     // `Documents` plugin folders are reached twice and searched once.
-    let plugin_folders = 6;
+    let plugin_folders = plugin_dirs.len();
     let mut expected = vec!["kicad_3rd_party_variable"; 3];
     expected.extend(vec!["kicad_plugin_folder"; plugin_folders]);
     expected.extend(["working_directory", "system_directory", "system_directory"]);
@@ -933,6 +1083,11 @@ fn check_freerouting_reports_every_location_it_searched_over_stdio() {
 
     for (root, dir) in searched[..3].iter().zip(&third_party) {
         assert_eq!(root["location_path"], json!(dir), "{root}");
+        assert_eq!(root["exists"], true, "{root}");
+    }
+    for (root, path) in searched[3..3 + plugin_folders].iter().zip(&plugin_dirs) {
+        let actual = std::path::Path::new(root["location_path"].as_str().unwrap());
+        assert_eq!(actual, path, "{root}");
         assert_eq!(root["exists"], true, "{root}");
     }
     let working = std::path::PathBuf::from(
@@ -947,7 +1102,7 @@ fn check_freerouting_reports_every_location_it_searched_over_stdio() {
     );
     assert_eq!(searched[3 + plugin_folders]["exists"], false);
     let last = searched.last().unwrap();
-    assert_eq!(last["location_path"], json!(bin_s), "{last}");
+    assert_eq!(last["location_path"], json!(bin), "{last}");
     assert_eq!(last["max_depth"], 1, "{last}");
 }
 

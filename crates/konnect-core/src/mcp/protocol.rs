@@ -9,6 +9,8 @@ use serde_json::Value;
 
 pub const PARSE_ERROR: i32 = -32700;
 pub const INVALID_REQUEST: i32 = -32600;
+pub const METHOD_NOT_FOUND: i32 = -32601;
+pub const INVALID_PARAMS: i32 = -32602;
 pub const INTERNAL_ERROR: i32 = -32603;
 
 // ─── JSON-RPC 2.0 Base Types ─────────────────────────────────────────────────
@@ -46,6 +48,33 @@ pub struct JsonRpcNotification {
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
+}
+
+/// The MCP 2025-06-18 request ID type.
+pub fn is_request_id(id: &Value) -> bool {
+    id.is_string() || id.is_i64() || id.is_u64()
+}
+
+/// Identify request and notification envelopes before transport-side routing.
+pub fn request_method(message: &Value) -> Option<&str> {
+    if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || message.get("id").is_some_and(|id| !is_request_id(id))
+        || message.get("result").is_some()
+        || message.get("error").is_some()
+    {
+        return None;
+    }
+    message.get("method").and_then(Value::as_str)
+}
+
+impl JsonRpcError {
+    pub fn new(code: i32, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: None,
+        }
+    }
 }
 
 impl JsonRpcResponse {

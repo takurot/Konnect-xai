@@ -249,17 +249,15 @@ never refuses a sync: staging is a starting position.
 
 ## Unreleased: `check_freerouting` reports where it searched (minor release)
 
-The `jar_path` argument of `check_freerouting` and `route_specctra_dsn` was
-described as "uses config default", but no Freerouting setting exists. Both
-descriptions now list where discovery looks, in order: the directories named
-by `KICAD10_3RD_PARTY`, `KICAD9_3RD_PARTY` and `KICAD8_3RD_PARTY`; the KiCad
-10.0, 9.0 and 8.0 plugin folders `$HOME/Documents/KiCad/<version>/3rdparty/plugins`,
-`$HOME/.local/share/kicad/<version>/3rdparty/plugins` and, on Windows,
-`$USERPROFILE/Documents/KiCad/<version>/3rdparty/plugins`; `freerouting.jar` in
-the server's working directory; `/usr/local/lib/freerouting` and
-`/opt/freerouting`; then every directory on `PATH`. The search and both
-descriptions are built from the same table of places, and the search itself is
-unchanged.
+The optional `jar_path` argument of `check_freerouting` and `route_specctra_dsn`
+points to a local JAR. When omitted, both tools search the directories named by
+`KICAD<major>_3RD_PARTY` in descending major version order. They then search
+existing `<major>.<minor>` directories under `$KICAD_DOCUMENTS_HOME`,
+`$HOME/Documents/KiCad`, `$HOME/.local/share/kicad`, and on Windows
+`$USERPROFILE/Documents/KiCad`, newest version first. Each
+version contributes its `3rdparty/plugins` path. The final locations are
+`freerouting.jar` in the server's working directory, `/usr/local/lib/freerouting`,
+`/opt/freerouting`, and every directory on `PATH`.
 
 When nothing is found, `check_freerouting` adds `searched_locations`: one
 entry per location visited, with `kind`, `location_path`, `max_depth` and
@@ -318,6 +316,29 @@ so that each hook runs once.
 The `Hooks: N entries patched` count now includes refreshed entries and a
 removed legacy handler, so it is non-zero whenever the hook settings changed
 (#739).
+
+## Unreleased: hierarchy instance maintenance
+
+Schematic writes recognize the top-level files and effective root UUIDs in
+`schematic.top_level_sheets` in KiCad 10 projects. Add, duplicate, repoint, and
+delete reconcile saved instance paths for affected sheets and symbols in a
+single file transaction. In a repoint, surviving placement metadata carries
+forward when the old and new paths can be matched uniquely.
+
+New pages use the larger of the current live pages and the recorded allocation
+history across the project's roots. Konnect saves that history in
+`.konnect-sheet-pages.json` in the project directory. Keep that file with
+copies that need to preserve the allocation history. Explicit
+`renumber_sheet_pages` can reassign existing pages and leaves the saved
+allocation history in place. Pages deleted before Konnect could record them
+are outside that history.
+
+On a stale sheet, call `repair_sheet_instances` in the `sch_hierarchy` toolset
+with `schematic` set to the file path. The default dry run reports the symbol
+guard's diagnosis and proposed changes for the selected file. Pass
+`"apply": true` to commit and verify the repair. Projects whose ownership
+cannot be proved, including conflicting project owners, require manual
+inspection.
 
 ## Unreleased: `create_schematic` and `set_schematic_page` move to `sch_hierarchy` (minor release)
 
@@ -1836,6 +1857,25 @@ count rather than a substring count clamped to a minimum of two; a board with
 no `(layers …)` table reports `0` and a warning rather than an invented `2`.
 `validate_for_manufacturing`'s `board_info.copper_layers` changes value on any
 board with non-`signal` copper; its shape is unchanged.
+## Unreleased: schematic overlap geometry and item identities
+
+`check_schematic_overlaps` checks the graphics envelope and individual pin
+segments of each selected symbol unit. Pin tips touching other pins are valid
+connections. Component body collisions keep the `symbol_geometry` detection
+and their overlap dimensions. Pin segment collisions use `pin_geometry`; the
+origin fallback still identifies unresolved embedded geometry.
+
+The same tool now estimates visible label, symbol field, sheet field, and free
+text rectangles from the saved schematic. It reports `label_overlap`,
+`text_overlap`, `text_body_overlap`, or `text_wire_overlap`. Text dimensions are
+an estimate based on the saved font size, line length, alignment and rotation.
+Custom fonts, variable expansion, graphic label outlines and individual glyphs
+can differ from the estimated rectangles. Conflicting label names at near-coincident
+anchors are still reported using the requested tolerance.
+
+Every finding includes `uuid_a` and `uuid_b`. An unnumbered field uses its
+owning symbol or sheet UUID. A missing identifier is explicitly `null`.
+
 ## Unreleased: schematic nets resolve by identity (minor release)
 
 One electrical net can carry several names — a rail named by a `+3V3` power
@@ -2267,3 +2307,21 @@ Project-settings tools also refuse `~<project>.kicad_pro.lck`, including a lock
 left by Eeschema with no PCB Editor open. A lock cannot safely be assumed stale
 from KiCad 10's username/hostname metadata. Close editors and verify ownership
 before manually removing a leftover lock.
+
+## Unreleased: schematic net queries expose pins, UUIDs, and missing names
+
+`get_net_connections` adds `pins` with `reference`, `unit`, `pin_number`,
+`pin_name`, `electrical_type`, and endpoint coordinates `x` and `y` in mm.
+The query uses the saved schematic sheet. Pin membership follows the connected
+net, including aliases and disconnected segments joined by a shared net name.
+Power symbols and power flags are omitted from the component pin list.
+
+Both net queries return `uuid` on each label, including the symbol UUID for a
+power label. `get_net_connectivity` also returns each wire's `uuid`. The field
+is `null` if the file has no identifier for that item. Labels are still
+filtered by the exact queried name.
+
+Both tools now report a missing name as an MCP tool error with
+`error: {kind: "not_found", net, suggestions}`. Suggestions are the sorted
+known names that match case-insensitively, or an empty array. A named net
+without component pins still returns a successful result.

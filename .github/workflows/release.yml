@@ -13,6 +13,10 @@ on:
         required: false
         default: '0.0.0'
         type: string
+      fail_pcm:
+        description: Fail one PCM lane before upload to exercise publication gating
+        type: boolean
+        default: false
 
 # Job-level permissions only: the build jobs never need write access, so the
 # `release` job below is the sole holder of contents: write.
@@ -28,6 +32,32 @@ env:
   KONNECT_BUILD_COMMIT: ${{ github.sha }}
 
 jobs:
+  validate-version:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+
+      - name: Resolve the package version
+        id: version
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            # The PCM archive uses the synthetic version. The binary and npm use the workspace.
+            node -e 'require("./npm/scripts/version").assertVersion(process.env.RELEASE_VERSION)'
+            version="$(node npm/scripts/version.js)"
+          else
+            version="$(node npm/scripts/version.js "${RELEASE_VERSION#v}")"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
   real-kicad-acceptance:
     name: Real KiCAD acceptance
     permissions:
@@ -35,6 +65,7 @@ jobs:
     uses: ./.github/workflows/e2e-kicad.yml
 
   build:
+    needs: [validate-version]
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -60,18 +91,14 @@ jobs:
             archive: zip
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      # rust-toolchain.toml overrides the action-installed stable with the
-      # pinned toolchain, which only has the host target — cross targets
-      # (x86_64-apple-darwin on arm64 runners) must be added to the ACTIVE
-      # toolchain explicitly or the build dies with E0463 (v0.2.1 lesson).
+      # rustup selects the checked-in toolchain. Cross targets must be
+      # installed on that toolchain rather than on a second compiler.
       - name: Add matrix target to the pinned toolchain
-        run: rustup target add ${{ matrix.target }}
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add ${{ matrix.target }}
 
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
@@ -89,26 +116,41 @@ jobs:
         if: runner.os == 'Linux'
         run: packaging/check-glibc.sh "target/${{ matrix.target }}/release/konnect"
 
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Prepare Rosetta for the Intel binary
+        if: matrix.target == 'x86_64-apple-darwin' && runner.arch == 'ARM64'
+        run: arch -x86_64 /usr/bin/true || sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Smoke test release binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: python packaging/smoke-release-binary.py "$env:TARGET"
+        shell: pwsh
+
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ env.BINARY_NAME }}-${{ env.RELEASE_ARTIFACT_LABEL }}-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }}
+          tar czf "../../../${BINARY_NAME}-${RELEASE_ARTIFACT_LABEL}-${{ matrix.target }}.tar.gz" "$BINARY_NAME"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           cd target/${{ matrix.target }}/release
-          Compress-Archive -Path "${{ env.BINARY_NAME }}.exe" -DestinationPath "../../../${{ env.BINARY_NAME }}-${{ env.RELEASE_ARTIFACT_LABEL }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path "${env:BINARY_NAME}.exe" -DestinationPath "../../../${env:BINARY_NAME}-${env:RELEASE_ARTIFACT_LABEL}-${{ matrix.target }}.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
           path: ${{ env.BINARY_NAME }}-${{ env.RELEASE_ARTIFACT_LABEL }}-${{ matrix.target }}.*
 
   pcm-package:
+    needs: [validate-version]
     name: KiCAD PCM plugin package (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -125,9 +167,9 @@ jobs:
           - platform: linux
             os: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup toolchain install --no-self-update
 
       # macOS packages ship a universal binary so one download serves both
       # Apple Silicon and Intel — PCM has no architecture dimension, only
@@ -160,14 +202,12 @@ jobs:
         if: matrix.platform != 'macos'
         run: cargo build --release --locked -p konnect
 
-      - name: Build schematic viewer (optional)
+      - name: Build schematic viewer
         if: matrix.platform != 'macos'
-        continue-on-error: true
         run: cargo build --release --locked --manifest-path crates/schematic-viewer/Cargo.toml
 
-      # continue-on-error above keeps partial logs useful, but a release
-      # artifact must not silently ship without the viewer — the PCM scripts
-      # omit a missing viewer binary without failing.
+      # The PCM scripts allow an omitted viewer for local builds. Releases
+      # require the viewer built and present in each platform lane.
       - name: Require viewer binary (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -199,9 +239,8 @@ jobs:
             target/x86_64-apple-darwin/release/konnect
           lipo -info dist/universal/konnect
 
-      - name: Build universal schematic viewer (macOS, optional)
+      - name: Build universal schematic viewer (macOS)
         if: matrix.platform == 'macos'
-        continue-on-error: true
         run: |
           set -euo pipefail
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
@@ -220,7 +259,7 @@ jobs:
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
-          $version = "${{ env.RELEASE_VERSION }}".TrimStart('v')
+          $version = $env:RELEASE_VERSION.TrimStart('v')
           ./packaging/build-pcm.ps1 -Version $version `
             -BinaryPath target/release/konnect.exe `
             -ViewerPath crates/schematic-viewer/target/release/schematic-viewer.exe `
@@ -247,7 +286,7 @@ jobs:
 
       # Gate: the package must declare the platform it carries, and the bundled
       # binary must actually be that platform's executable format.
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: "3.12"
 
@@ -260,15 +299,19 @@ jobs:
           python packaging/validate-pcm.py \
             --zip "dist/konnect-pcm-v$version-${{ matrix.platform }}.zip"
 
+      - name: Exercise a failed PCM lane
+        if: github.event_name == 'workflow_dispatch' && inputs.fail_pcm && matrix.platform == 'linux'
+        run: exit 1
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: konnect-pcm-${{ matrix.platform }}
           path: dist/konnect-pcm-*.zip
 
   linux-compatibility:
     name: Linux npm compatibility (${{ matrix.os }}, ${{ matrix.image }})
-    needs: build
+    needs: [validate-version, build]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     permissions:
@@ -279,11 +322,11 @@ jobs:
         os: [ubuntu-22.04, ubuntu-22.04-arm]
         image: ['ubuntu:22.04', 'debian:12']
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: konnect-*
           path: artifacts
@@ -291,87 +334,144 @@ jobs:
       - name: Install candidate packages and initialize MCP
         env:
           LINUX_IMAGE: ${{ matrix.image }}
+          VERSION: ${{ needs.validate-version.outputs.version }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            version=$(node npm/scripts/version.js)
-          else
-            version=$(node npm/scripts/version.js "${RELEASE_VERSION#v}")
-          fi
-          node npm/scripts/stage.js "$version" artifacts
+          node npm/scripts/stage.js "$VERSION" artifacts
           node_prefix=$(dirname "$(dirname "$(command -v node)")")
           docker run --rm -v "$PWD:/work:ro" -v "$node_prefix:/opt/node:ro" -w /work \
             "$LINUX_IMAGE" bash -euc '
               export PATH="/opt/node/bin:$PATH"
               getconf GNU_LIBC_VERSION
               exec node npm/scripts/smoke.js "$1" npm
-            ' bash "$version"
+            ' bash "$VERSION"
 
-  # Publishes @konnect-xai/konnect and its five platform packages. Auth is npm
-  # Trusted Publishing (OIDC, registered per package for this workflow file), so
-  # no npm token exists anywhere. A manual dispatch stages and smoke-tests the
-  # packages and checks their local pack contents without contacting the registry.
-  publish-npm:
-    name: Publish to npm
-    needs: [real-kicad-acceptance, build, linux-compatibility]
+  prepare-publication:
+    name: Verify release assets and npm packages
+    needs: [validate-version, real-kicad-acceptance, build, pcm-package, linux-compatibility]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
-      id-token: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
 
       - name: Launcher and staging tests
         run: node --test "npm/test/*.test.js"
 
-      - name: Resolve the package version
-        id: version
-        run: |
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            # The dry run reports the real binary's version, not the synthetic input.
-            version="$(node npm/scripts/version.js)"
-          else
-            version="$(node npm/scripts/version.js "${RELEASE_VERSION#v}")"
-          fi
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
+          pattern: konnect-*
           path: artifacts
           merge-multiple: true
 
-      - name: Stage platform binaries
-        run: node npm/scripts/stage.js "${{ steps.version.outputs.version }}" artifacts
+      - name: Check asset inventory and generate digests
+        run: python3 packaging/release-checksums.py artifacts "$RELEASE_ARTIFACT_LABEL" "${RELEASE_VERSION#v}"
 
-      - name: Smoke test the installed package
-        run: node npm/scripts/smoke.js "${{ steps.version.outputs.version }}" npm
+      - name: Stage platform binaries and smoke test the installed package
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          node npm/scripts/stage.js "$VERSION" artifacts
+          node npm/scripts/smoke.js "$VERSION" npm
 
       - name: Check local npm packages
-        if: github.event_name == 'workflow_dispatch'
         run: |
-          # npm publish --dry-run still rejects versions already in the registry.
           for dir in konnect-linux-x64 konnect-linux-arm64 konnect-darwin-x64 konnect-darwin-arm64 konnect-win32-x64 konnect; do
             npm pack --dry-run "./npm/${dir}"
           done
 
-      - name: Publish
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: verified-release-assets
+          path: artifacts/*
+          if-no-files-found: error
+
+  attest:
+    name: Attest verified release archives
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [prepare-publication]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: verified-release-assets
+          path: artifacts
+
+      - name: Check release asset digests
+        working-directory: artifacts
+        run: sha256sum --check --strict SHA256SUMS
+
+      - name: Attest release archives
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: artifacts/SHA256SUMS
+
+  # Trusted Publishing is registered for this workflow and each package.
+  publish-npm:
+    name: Publish to npm
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [validate-version, prepare-publication, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+
+      - name: Download verified release assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: verified-release-assets
+          path: artifacts
+
+      - name: Check release asset digests
+        working-directory: artifacts
+        run: sha256sum --check --strict SHA256SUMS
+
+      - name: Stage platform binaries
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: node npm/scripts/stage.js "$VERSION" artifacts
+
+      - name: Publish
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
         run: |
           tag=latest
           case "$VERSION" in *-*) tag=next ;; esac
           # Platform packages first so the launcher never points at a missing one.
           for dir in konnect-linux-x64 konnect-linux-arm64 konnect-darwin-x64 konnect-darwin-arm64 konnect-win32-x64 konnect; do
             name="$(node -p "require('./npm/${dir}/package.json').name")"
-            if npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
-              echo "${name}@${VERSION} is already published, skipping"
-              continue
+            if existing="$(npm view "${name}@${VERSION}" dist.integrity 2>npm-view-error)"; then
+              if [ -n "$existing" ]; then
+                expected="$(npm pack --dry-run --json "./npm/${dir}" | node -pe 'JSON.parse(require("node:fs").readFileSync(0,"utf8"))[0].integrity')"
+                if [ "$existing" != "$expected" ]; then
+                  echo "::error::${name}@${VERSION} differs from this candidate; refusing to continue"
+                  exit 1
+                fi
+                echo "${name}@${VERSION} is already published with matching integrity, skipping"
+                continue
+              fi
+            elif ! grep -q 'npm error code E404' npm-view-error; then
+              cat npm-view-error >&2
+              exit 1
             fi
             npm publish "./npm/${dir}" --access public --provenance --tag "$tag"
           done
@@ -379,21 +479,54 @@ jobs:
   release:
     name: Create Release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [real-kicad-acceptance, build, pcm-package, linux-compatibility]
+    needs: [prepare-publication, publish-npm]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          path: artifacts
-          merge-multiple: true
+          persist-credentials: false
 
-      - name: Create GitHub Release
+      - name: Download verified release assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: verified-release-assets
+          path: artifacts
+
+      - name: Check release asset digests
+        working-directory: artifacts
+        run: sha256sum --check --strict SHA256SUMS
+
+      - name: Stage GitHub Release as a draft
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          files: artifacts/*
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/SHA256SUMS
+          fail_on_unmatched_files: true
+          draft: true
+          overwrite_files: false
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify uploaded draft release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          gh release view "$GITHUB_REF_NAME" --json isDraft,tagName,assets |
+            python3 packaging/release-checksums.py --verify-draft artifacts "$GITHUB_REF_NAME"
+
+      - name: Publish the complete GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PRERELEASE: ${{ contains(github.ref_name, '-') }}
+          LATEST: ${{ !contains(github.ref_name, '-') }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease="$PRERELEASE" --latest="$LATEST"
