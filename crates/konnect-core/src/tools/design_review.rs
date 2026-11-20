@@ -2138,6 +2138,93 @@ mod review_completion_tests {
     }
 
     #[tokio::test]
+    async fn kicad_hierarchy_audits_use_saved_instance_references() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("complex_hierarchy.kicad_sch");
+        for (name, content) in [
+            (
+                "complex_hierarchy.kicad_pro",
+                include_str!("../../tests/fixtures/project_ownership/complex_hierarchy.kicad_pro"),
+            ),
+            (
+                "complex_hierarchy.kicad_sch",
+                include_str!("../../tests/fixtures/project_ownership/complex_hierarchy.kicad_sch"),
+            ),
+            (
+                "ampli_ht.kicad_sch",
+                include_str!("../../tests/fixtures/project_ownership/ampli_ht.kicad_sch"),
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), content).unwrap();
+        }
+        let args = json!({"schematic": root, "schematic_scope": "hierarchy"});
+        let ctx = test_ctx();
+        let decoupling = tool_json(handle_audit_decoupling(&args, &ctx).await.unwrap());
+        let channel = decoupling["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| {
+                finding["sheet_instance_path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("4b3a13a4/"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            channel.iter().any(|finding| {
+                finding["component"] == "U301"
+                    && finding["issue"].as_str().unwrap().contains("U301")
+                    && finding["recommendation"].as_str().unwrap().contains("U301")
+            }),
+            "{decoupling}"
+        );
+        assert!(channel.iter().all(|finding| finding["component"] != "U201"));
+
+        let health = tool_json(handle_check_bom_health(&args, &ctx).await.unwrap());
+        assert_eq!(health["total_components"], 68, "{health}");
+        assert!(
+            health["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| {
+                    finding["component"] == "U301"
+                        && finding["sheet_instance_path"]
+                            .as_str()
+                            .unwrap()
+                            .ends_with("4b3a13a4/")
+                }),
+            "{health}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kicad_bom_health_counts_ecc83_packages_once() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ecc83-pp.kicad_sch");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch"),
+        )
+        .unwrap();
+        let result = tool_json(
+            handle_check_bom_health(&json!({"schematic": path}), &test_ctx())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["total_components"], 11, "{result}");
+        let missing_u1_mpn = result["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| {
+                finding["component"] == "U1" && finding["issue"].as_str().unwrap().contains("MPN")
+            })
+            .count();
+        assert_eq!(missing_u1_mpn, 1, "{result}");
+    }
+
+    #[tokio::test]
     async fn design_review_uses_shared_instance_aware_hierarchy_coverage() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("root.kicad_sch");
