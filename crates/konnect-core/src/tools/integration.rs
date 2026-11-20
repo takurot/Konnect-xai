@@ -1419,9 +1419,7 @@ async fn handle_enrich_datasheets(
         ));
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    let client = lcsc_datasheet_client(30).build()?;
     let mut urls = HashMap::new();
     let mut lookups = std::collections::BTreeMap::new();
 
@@ -1847,6 +1845,16 @@ async fn datasheet_from_catalog(
 
 const LCSC_PRODUCT_ENDPOINT: &str = "https://wmsc.lcsc.com/ftps/wm/product/detail";
 
+fn lcsc_datasheet_client(timeout_seconds: u64) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_seconds))
+        .user_agent(concat!(
+            "Konnect/",
+            env!("CARGO_PKG_VERSION"),
+            " (+https://github.com/takurot/Konnect-xai)"
+        ))
+}
+
 async fn fetch_lcsc_datasheet(
     client: &reqwest::Client,
     endpoint: &str,
@@ -1942,8 +1950,7 @@ async fn handle_get_datasheet_url(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15));
-    get_datasheet_url_at(args, ctx, LCSC_PRODUCT_ENDPOINT, client).await
+    get_datasheet_url_at(args, ctx, LCSC_PRODUCT_ENDPOINT, lcsc_datasheet_client(15)).await
 }
 
 async fn get_datasheet_url_at(
@@ -4274,7 +4281,11 @@ mod jlcpcb_cache_tests {
                 for _ in 0..attempts {
                     let (mut socket, _) = listener.accept().await.unwrap();
                     let mut request = [0; 1024];
-                    assert!(socket.read(&mut request).await.unwrap() > 0);
+                    let n = socket.read(&mut request).await.unwrap();
+                    let request = std::str::from_utf8(&request[..n]).unwrap();
+                    assert!(request
+                        .to_ascii_lowercase()
+                        .contains("user-agent: konnect/"));
                     let response = format!(
                         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                         payload.len()
@@ -4282,9 +4293,7 @@ mod jlcpcb_cache_tests {
                     socket.write_all(response.as_bytes()).await.unwrap();
                 }
             });
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .timeout(std::time::Duration::from_secs(5));
+            let client = lcsc_datasheet_client(5).no_proxy();
             let result = get_datasheet_url_at(&args, &ctx, &endpoint, client)
                 .await
                 .unwrap();
