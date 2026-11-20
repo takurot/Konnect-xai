@@ -445,7 +445,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `audit_power_rails` | Check power rail integrity: missing bulk capacitance, no test points, missing regulator output caps. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
 | `audit_manufacturing` | DFM checks for the configured fab house: component spacing, silkscreen overlap, via-in-pad, acid traps, board-outline issues. |
 | `run_design_review` | Run all available audit checks across every reachable schematic sheet and produce a consolidated report with status, coverage, and diagnostics. Returns `INCOMPLETE` rather than approval when coverage is partial or failed. |
-| `check_bom_health` | Analyze the BOM for supply-chain risks: parts with no MPN, lifecycle warnings, low stock, unavailable from preferred distributors. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
+| `check_bom_health` | Check saved BOM packages for missing values, footprints, and MPN or LCSC fields. Defaults to one file. Use `schematic_scope: hierarchy` for saved sheet-instance references, and `check_passive_mpn: false` to exempt standard Device passives from the MPN check. |
 
 ---
 

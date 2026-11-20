@@ -257,6 +257,79 @@ fn fabrication_and_document_exports_through_mcp() {
 }
 
 #[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
+fn schematic_audits_agree_with_native_bom_references_and_counts() {
+    let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
+    let dir = tempfile::tempdir().unwrap();
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../konnect-core/tests/fixtures");
+    for name in [
+        "complex_hierarchy.kicad_pro",
+        "complex_hierarchy.kicad_sch",
+        "ampli_ht.kicad_sch",
+    ] {
+        std::fs::copy(
+            fixtures.join("project_ownership").join(name),
+            dir.path().join(name),
+        )
+        .unwrap();
+    }
+    let ecc_dir = dir.path().join("ecc83");
+    std::fs::create_dir(&ecc_dir).unwrap();
+    let ecc = ecc_dir.join("ecc83-pp.kicad_sch");
+    std::fs::copy(fixtures.join("ecc83_multiunit.kicad_sch"), &ecc).unwrap();
+    let complex = dir.path().join("complex_hierarchy.kicad_sch");
+    let mut mcp = Mcp::spawn(&kicad_cli);
+    mcp.load("design_review");
+    for (schematic, scope, expected_count) in [(&complex, "hierarchy", 68), (&ecc, "file", 11)] {
+        let output = schematic.with_extension("csv");
+        let native = Command::new(&kicad_cli)
+            .args(["sch", "export", "bom", "--output"])
+            .arg(&output)
+            .args(["--fields", "Reference", "--labels", "Refs"])
+            .arg(schematic)
+            .output()
+            .unwrap();
+        assert!(
+            native.status.success(),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        let csv = std::fs::read_to_string(output).unwrap();
+        let references: Vec<_> = csv.lines().skip(1).collect();
+        assert_eq!(references.len(), expected_count, "{csv}");
+        let report = body(&mcp.tool(
+            "check_bom_health",
+            json!({"schematic": schematic, "schematic_scope": scope}),
+        ));
+        assert_eq!(report["total_components"], references.len(), "{report}");
+        if scope == "hierarchy" {
+            assert!(references
+                .iter()
+                .any(|entry| entry.trim_matches('"') == "U301"));
+            let decoupling = body(&mcp.tool(
+                "audit_decoupling",
+                json!({"schematic": schematic, "schematic_scope": scope}),
+            ));
+            assert!(
+                decoupling["findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|finding| {
+                        finding["component"] == "U301"
+                            && finding["sheet_instance_path"]
+                                .as_str()
+                                .unwrap()
+                                .ends_with("4b3a13a4/")
+                    }),
+                "{decoupling}"
+            );
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires kicad-cli and standard symbol libraries; run via e2e workflow"]
 fn native_assembly_attributes_survive_real_kicad_bom_export() {
     let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");

@@ -2342,3 +2342,20 @@ target.
 
 Diagnostics present ordinary Windows canonical drive and UNC paths in their
 usual spelling. The transaction journal keeps its existing relative-path format.
+
+## Unreleased: saved references and package counts in schematic audits
+
+Standalone schematic audits with `schematic_scope: "hierarchy"` use saved
+reference designators for the selected project and each logical sheet
+instance. `sheet_instance_path` still identifies the finding's location.
+When reference records for a reused sheet are missing or ambiguous, the
+audit marks coverage partial and identifies the affected instance.
+
+`check_bom_health` counts each numbered package once per sheet instance.
+Units that have distinct numbers and share the same library definition and
+value form one package. Conflicting assignments are reported, and unnumbered
+placements are counted individually. The inventory includes saved
+`in_bom` components and keeps DNP parts, matching the KiCad BOM export
+default. The audit checks missing value, footprint, and MPN or LCSC fields.
+Set `check_passive_mpn: false` to exempt the standard `Device` resistor,
+capacitor, inductor, and diode families from the MPN check.
