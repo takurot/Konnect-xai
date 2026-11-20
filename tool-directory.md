@@ -458,7 +458,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 |------|-------------|
 | `search_templates` | Search the reference circuit template library. Returns matches for common subcircuits; templates have verified component values. |
 | `get_template` | Get full details for a template: components, connections, design notes. Use the template ID from `search_templates`. |
-| `apply_template` | Instantiate a template into the current schematic. Places all components and wires per the connection map; `net_mappings` re-binds template nets to project nets. |
+| `apply_template` | Place template components in the schematic and return a connection guide. No wires or labels are added. `net_mappings` renames nets in the guide. |
 | `list_template_categories` | List all available template categories and the number of templates in each. |
 
 **Built-in templates** (loaded by `load_all_templates` in `templates.rs`):
