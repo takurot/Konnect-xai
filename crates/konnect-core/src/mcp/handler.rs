@@ -752,7 +752,9 @@ async fn schematic_path_error(path: &std::path::Path) -> Option<CallToolResult> 
         Ok(Err(error)) => {
             let path = konnect_sexp::paths::display_path(path).into_owned();
             Some(CallToolResult::error_kind(
-                ToolErrorKind::FileNotFound { path: path.clone() },
+                ToolErrorKind::HandlerError {
+                    reason: error.to_string(),
+                },
                 format!("Could not read schematic '{path}': {error}"),
             ))
         }
@@ -1242,6 +1244,26 @@ mod schematic_document_boundary_tests {
             }
         }
         assert!(checked > 80, "covered only {checked} registered tools");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn schematic_probe_preserves_missing_paths_and_classifies_other_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.kicad_sch");
+        assert!(schematic_path_error(&missing).await.is_none());
+
+        // This parent is a regular file, so looking beneath it fails even
+        // when the tests run with permission to read every fixture.
+        let parent = dir.path().join("not-a-directory");
+        std::fs::write(&parent, b"fixture").unwrap();
+        let unobservable = parent.join("sheet.kicad_sch");
+        let result = schematic_path_error(&unobservable).await.unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("handler_error")
+        );
     }
 
     #[tokio::test]
