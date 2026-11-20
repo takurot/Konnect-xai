@@ -314,16 +314,114 @@ fn structured_errors_guide_recovery() {
 }
 
 #[test]
-fn unknown_method_is_json_rpc_error_not_crash() {
+fn protocol_request_errors_have_standard_codes() {
     let mut p = McpProcess::spawn();
-    let resp = p.request("tools/definitely_not_a_method", json!({}));
+    for (method, params, code) in [
+        ("resources/templates/list", json!({}), -32601),
+        ("logging/setLevel", json!({}), -32601),
+        ("completion/complete", json!({}), -32601),
+        ("resources/read", json!({"uri": "file:///example"}), -32601),
+        ("tools/call", json!({"arguments": {}}), -32602),
+        (
+            "tools/call",
+            json!({"name": "list_toolboxes", "arguments": []}),
+            -32602,
+        ),
+        (
+            "tools/call",
+            json!({"name": "list_toolboxes", "arguments": null}),
+            -32602,
+        ),
+        ("tools/call", json!([]), -32602),
+    ] {
+        let response = p.request(method, params);
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["error"]["code"], code, "{method}: {response}");
+        assert!(response.get("result").is_none());
+    }
+    assert_eq!(p.request("ping", json!({}))["result"], json!({}));
+}
+
+#[test]
+fn protocol_notifications_emit_no_stdout() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_konnect"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        for _ in 0..100 {
+            writeln!(
+                stdin,
+                "{}",
+                json!({"jsonrpc":"2.0","method":"notifications/roots/list_changed"})
+            )
+            .unwrap();
+        }
+        for method in ["notifications/cancelled", "ping"] {
+            writeln!(stdin, "{}", json!({"jsonrpc":"2.0","method":method})).unwrap();
+        }
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
     assert!(
-        resp.get("error").is_some(),
-        "expected JSON-RPC error: {resp}"
+        output.stdout.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&output.stdout)
     );
-    // Server must still be alive afterwards.
-    let ping = p.request("ping", json!({}));
-    assert!(ping.get("result").is_some());
+}
+
+#[test]
+fn protocol_invalid_messages_get_errors_before_the_next_ping() {
+    let mut p = McpProcess::spawn();
+    for (index, (message, id, code)) in [
+        (
+            r#"[{"jsonrpc":"2.0","id":6,"method":"ping"}]"#,
+            Value::Null,
+            -32600,
+        ),
+        ("[]", Value::Null, -32600),
+        (r#"{"id":7,"method":"ping"}"#, json!(7), -32600),
+        (
+            r#"{"jsonrpc":"1.0","id":"wrong-version","method":"ping"}"#,
+            json!("wrong-version"),
+            -32600,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+            Value::Null,
+            -32600,
+        ),
+        (r#"{"jsonrpc":"2.0"}"#, Value::Null, -32600),
+        ("{", Value::Null, -32700),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fence_id = 100 + index;
+        writeln!(p.stdin, "{message}").unwrap();
+        writeln!(
+            p.stdin,
+            r#"{{"jsonrpc":"2.0","id":{fence_id},"method":"ping"}}"#
+        )
+        .unwrap();
+        p.stdin.flush().unwrap();
+        let mut line = String::new();
+        p.reader.read_line(&mut line).unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["jsonrpc"], "2.0", "{message}: {response}");
+        assert_eq!(response.get("id"), Some(&id), "{message}: {response}");
+        assert_eq!(response["error"]["code"], code, "{message}: {response}");
+        assert!(response.get("result").is_none());
+        line.clear();
+        p.reader.read_line(&mut line).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap(),
+            json!({"jsonrpc":"2.0","id":fence_id,"result":{}})
+        );
+    }
 }
 
 /// Regression test for issue #19. After `load_toolset`, the server must emit

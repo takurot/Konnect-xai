@@ -101,8 +101,20 @@ async fn cancellation_kills_cli_keeps_ping_responsive_and_never_sends_cancelled_
     })
     .await
     .expect("export must start fake CLI");
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"1.0","method":"notifications/cancelled","params":{"requestId":"export"}}),
+    )
+    .await;
+    let malformed = response(&mut lines).await;
+    assert_eq!(malformed["error"]["code"], -32600);
+    assert_eq!(malformed.get("id"), Some(&Value::Null));
     send(&mut stdin, json!({"jsonrpc":"2.0","id":3,"method":"ping"})).await;
     assert_eq!(response(&mut lines).await["id"], 3);
+    assert!(
+        process_exists(&pid),
+        "invalid cancellation must leave the export running"
+    );
     send(
         &mut stdin,
         json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"export"}}),

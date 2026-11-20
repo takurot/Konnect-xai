@@ -19,6 +19,12 @@ fallback for `KICAD_API_SOCKET`. The transport implementations live in
 installation is owned by `crates/konnect/src/install.rs`; schematic transaction
 inspection and recovery commands are owned by `transaction_cli.rs`.
 
+Both transports accept one JSON-RPC 2.0 message at a time and reject batch
+arrays with an invalid-request error. MCP request IDs are strings or integers.
+Valid notifications produce no stdio response and receive HTTP 202 with an
+empty body. Malformed JSON receives the JSON-RPC parse error on either
+transport, with HTTP status 400 for HTTP requests.
+
 ### MCP and domain logic: `crates/konnect-core`
 
 `crates/konnect-core/src/mcp/handler.rs` handles MCP methods, enforces required
