@@ -4259,7 +4259,7 @@ mod jlcpcb_cache_tests {
 
     #[tokio::test]
     async fn lcsc_lookup_distinguishes_a_catalog_miss_from_http_failure() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = test_ctx();
@@ -4279,18 +4279,30 @@ mod jlcpcb_cache_tests {
             let endpoint = format!("http://{}/product/detail", listener.local_addr().unwrap());
             let server = tokio::spawn(async move {
                 for _ in 0..attempts {
-                    let (mut socket, _) = listener.accept().await.unwrap();
-                    let mut request = [0; 1024];
-                    let n = socket.read(&mut request).await.unwrap();
-                    let request = std::str::from_utf8(&request[..n]).unwrap();
-                    assert!(request
-                        .to_ascii_lowercase()
-                        .contains("user-agent: konnect/"));
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let mut line = String::new();
+                    let mut identified = false;
+                    loop {
+                        line.clear();
+                        assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        identified |= line
+                            .to_ascii_lowercase()
+                            .starts_with("user-agent: konnect/");
+                    }
+                    assert!(identified);
                     let response = format!(
                         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                         payload.len()
                     );
-                    socket.write_all(response.as_bytes()).await.unwrap();
+                    socket
+                        .get_mut()
+                        .write_all(response.as_bytes())
+                        .await
+                        .unwrap();
                 }
             });
             let client = lcsc_datasheet_client(5).no_proxy();
