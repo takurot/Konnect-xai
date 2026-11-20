@@ -50,10 +50,9 @@ fn collect_sheets(
         Some(saved) => saved.clone(),
         None => {
             let (source, tree) = read_schematic(&canonical)?;
-            let saved = Arc::new(Snapshot {
-                tree,
-                schematic: cse::Schematic::from_source(&canonical, source)?,
-            });
+            let schematic = cse::Schematic::from_source(&canonical, source)?;
+            verify_snapshot(&canonical, &tree, &schematic)?;
+            let saved = Arc::new(Snapshot { tree, schematic });
             sources.insert(canonical.clone(), saved.clone());
             saved
         }
@@ -100,6 +99,39 @@ fn collect_sheets(
         )?;
     }
     ancestry.pop();
+    Ok(())
+}
+
+/// The editor parser can omit incomplete records. Project connectivity needs
+/// every placement and every parent-side port before it can name a net.
+fn verify_snapshot(path: &Path, tree: &SexpNode, schematic: &cse::Schematic) -> anyhow::Result<()> {
+    let sheets = tree.find_all("sheet");
+    if sheets.len() != schematic.sheets.len()
+        || tree.find_all("symbol").len() != schematic.symbols.len()
+        || sheets
+            .iter()
+            .zip(schematic.sheets.iter())
+            .any(|(raw, sheet)| {
+                raw.find_str("uuid") != Some(sheet.uuid.as_str())
+                    || raw.find_all("pin").len() != sheet.pins.len()
+            })
+    {
+        bail!(
+            "Could not read every saved sheet, symbol and sheet pin in '{}'",
+            path.display()
+        );
+    }
+    let mut ids = HashSet::new();
+    if schematic
+        .symbols
+        .iter()
+        .any(|symbol| symbol.uuid.is_empty() || !ids.insert(&symbol.uuid))
+    {
+        bail!(
+            "Missing or repeated saved symbol UUID in '{}'",
+            path.display()
+        );
+    }
     Ok(())
 }
 

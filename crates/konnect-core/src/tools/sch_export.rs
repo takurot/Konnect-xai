@@ -137,7 +137,8 @@ pub fn tools() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
-                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" }
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "scope": { "type": "string", "enum": ["sheet", "project"], "default": "sheet" }
                 },
                 "required": ["schematic"]
             }),
