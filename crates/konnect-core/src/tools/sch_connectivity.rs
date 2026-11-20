@@ -345,6 +345,17 @@ pub(crate) struct NetGraph {
     root_aliases: HashMap<NetRoot, BTreeSet<String>>,
 }
 
+/// Default KiCad alphabetic sub-reference: A through Z, then AA, AB, ….
+fn default_unit_suffix(mut unit: u32) -> String {
+    let mut reversed = Vec::new();
+    while unit > 0 {
+        let digit = (unit - 1) % 26;
+        reversed.push(char::from(b'A' + digit as u8));
+        unit = (unit - 1) / 26;
+    }
+    reversed.into_iter().rev().collect()
+}
+
 impl NetGraph {
     fn new(precision: Precision) -> Self {
         NetGraph {
@@ -522,6 +533,7 @@ impl NetGraph {
     }
 
     fn name_unlabelled_nets(&mut self, tree: &SexpNode) {
+        let unit_counts = super::sch_annotate::lib_symbol_units(tree);
         let no_connect: HashSet<_> = extract_no_connects(tree)
             .into_iter()
             .map(|(x, y)| schematic_point(x, y))
@@ -534,6 +546,14 @@ impl NetGraph {
             {
                 continue;
             }
+            let named_reference = if unit_counts
+                .get(symbol.lib_symbol_name())
+                .is_some_and(|&count| count > 1)
+            {
+                format!("{}{}", symbol.reference, default_unit_suffix(symbol.unit))
+            } else {
+                symbol.reference.clone()
+            };
             for (pin, transform) in &pins {
                 let (x, y) = pin_endpoint(pin, *transform);
                 if pin.electrical_type == "no_connect"
@@ -547,15 +567,14 @@ impl NetGraph {
                 }
                 let name = if pin.name.is_empty() || pin.name == "~" || pin.name == pin.number {
                     format!("Net-({}-Pad{})", symbol.reference, pin.number)
-                } else if pins
-                    .iter()
-                    .filter(|(other, _)| other.name == pin.name)
-                    .count()
-                    > 1
-                {
-                    format!("Net-({}-{}-Pad{})", symbol.reference, pin.name, pin.number)
+                } else if pins.iter().any(|(other, _)| {
+                    other.name == pin.name
+                        && other.number != pin.number
+                        && other.electrical_type != "no_connect"
+                }) {
+                    format!("Net-({named_reference}-{}-Pad{})", pin.name, pin.number)
                 } else {
-                    format!("Net-({}-{})", symbol.reference, pin.name)
+                    format!("Net-({named_reference}-{})", pin.name)
                 };
                 candidates
                     .entry(root)

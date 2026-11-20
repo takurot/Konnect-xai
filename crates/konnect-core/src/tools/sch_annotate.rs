@@ -89,7 +89,7 @@ pub(crate) struct PlacedSymbol {
 /// sub-symbol names KiCad writes under `lib_symbols`; a derived definition
 /// (`extends`) takes its parent's count. A definition with no unit
 /// sub-symbols is a single-unit part.
-fn lib_symbol_units(tree: &SexpNode) -> BTreeMap<String, u32> {
+pub(super) fn lib_symbol_units(tree: &SexpNode) -> BTreeMap<String, u32> {
     let mut declared: BTreeMap<String, Option<u32>> = BTreeMap::new();
     let mut extends: BTreeMap<String, String> = BTreeMap::new();
     if let Some(lib) = tree.find("lib_symbols") {

@@ -2331,8 +2331,9 @@ without component pins still returns a successful result.
 Saved-sheet net queries and `export_netlist_summary` now include generated
 names for unlabeled connections that join distinct annotated component pins,
 such as `Net-(R1-Pad2)`. If an existing alias uses the same text, the
-generated query name receives a numbered suffix. An isolated unnamed pin still
-returns `null` in the pin query or `"~"` in the summary. The inventory continues to expose named
+generated query name receives a numbered suffix. For named pins on multi-unit
+symbols, saved-file analysis uses KiCad's default alphabetic unit suffix. An
+isolated unnamed pin still returns `null` in the pin query or `"~"` in the summary. The inventory continues to expose named
 aliases. Both `A/B` and `A{slash}B` look up the same alias; the label inventory
 continues to show the literal saved text.
 
