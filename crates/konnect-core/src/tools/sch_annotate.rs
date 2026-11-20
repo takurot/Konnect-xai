@@ -868,6 +868,7 @@ fn select_project(
     path: &Path,
     symbols: &[PlacedSymbol],
     requested: Option<&str>,
+    require_proven_owner: bool,
 ) -> Result<(String, Option<std::path::PathBuf>), CallToolResult> {
     let named: Vec<String> = symbols
         .iter()
@@ -892,7 +893,7 @@ fn select_project(
     // the other sheets' numbers visible.
     let owner = match crate::tools::resolve_schematic_ownership(path) {
         Ok(owner) => owner,
-        Err(error) if requested.is_some() => {
+        Err(error) if requested.is_some() && !require_proven_owner => {
             info!("[annotate] project ownership not proven ({error}); only this file's numbers are reserved");
             None
         }
@@ -907,6 +908,15 @@ fn select_project(
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default()
     });
+    if require_proven_owner {
+        if let (Some(requested), Some(owner)) = (requested, owner_stem.as_deref()) {
+            if requested != owner {
+                return Err(refuse(format!(
+                    "saved project '{requested}' does not own this schematic; the owner is '{owner}'"
+                )));
+            }
+        }
+    }
     let root_for = |project: &str| {
         owner
             .as_ref()
@@ -958,6 +968,7 @@ struct SheetSurvey {
     unannotated: Vec<OtherSheet>,
     trees: BTreeMap<PathBuf, SexpNode>,
     sources: BTreeMap<PathBuf, String>,
+    offer_recovery: bool,
 }
 
 #[derive(Serialize)]
@@ -1317,7 +1328,7 @@ fn body(
     written: bool,
 ) -> Value {
     let mut unresolved = json!(plan.unresolved);
-    if survey.unreadable.is_empty() {
+    if survey.offer_recovery && survey.unreadable.is_empty() {
         let used =
             reserved_designators(symbols, &plan.project, &survey.reserved, &plan.assignments);
         if let Some(reports) = unresolved.as_array_mut() {
@@ -1376,7 +1387,7 @@ pub(crate) fn rename_instance_reference(
     let [symbol] = matches.as_slice() else {
         return super::invalid_arg("uuid", "expected exactly one matching placed symbol");
     };
-    let (project, project_file) = match select_project(path, &before, project) {
+    let (project, project_file) = match select_project(path, &before, project, true) {
         Ok(selected) => selected,
         Err(error) => return error,
     };
@@ -1548,15 +1559,16 @@ fn annotate_file_with_persistence(
             );
         }
     };
-    let (project, project_file) = match select_project(path, &before, options.project.as_deref()) {
-        Ok(selected) => selected,
-        Err(refusal) => return refusal,
-    };
+    let (project, project_file) =
+        match select_project(path, &before, options.project.as_deref(), false) {
+            Ok(selected) => selected,
+            Err(refusal) => return refusal,
+        };
     let (roots, _) = match saved_roots(path, project_file.as_deref()) {
         Ok(roots) => roots,
         Err(error) => return error,
     };
-    let survey = inspect_sheets(&roots, path, &project);
+    let mut survey = inspect_sheets(&roots, path, &project);
     let placement = placement_order(&roots, path, &project, &before, &survey);
     let plan = plan_annotation_reserving(
         &before,
@@ -1565,6 +1577,9 @@ fn annotate_file_with_persistence(
         &placement,
         options.resolve_duplicates,
     );
+    survey.offer_recovery = !plan.unresolved.is_empty()
+        && (project_file.is_some()
+            || super::schematic_project_candidates(path).is_ok_and(|paths| paths.is_empty()));
     let target = path.display().to_string();
     let requested = plan.assignments.len() + plan.unresolved.len();
 
@@ -2386,6 +2401,30 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn uuid_recovery_refuses_cached_project_that_does_not_own_the_sheet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("different-owner.kicad_sch");
+        std::fs::write(&path, MULTI_UNIT).unwrap();
+        std::fs::write(path.with_extension("kicad_pro"), "{}").unwrap();
+        let symbols = symbols_of(MULTI_UNIT);
+        let symbol = symbols
+            .iter()
+            .find(|symbol| !symbol.paths.is_empty())
+            .unwrap();
+        let row = &symbol.paths[0];
+        let result = rename_instance_reference(
+            &path,
+            &symbol.uuid,
+            Some(&row.project),
+            Some(&row.path),
+            "U1234",
+        );
+        assert!(result.is_error);
+        assert!(response_json(&result).to_string().contains("does not own"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), MULTI_UNIT);
     }
 
     #[test]
