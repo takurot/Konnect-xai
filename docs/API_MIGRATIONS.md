@@ -1821,6 +1821,25 @@ count rather than a substring count clamped to a minimum of two; a board with
 no `(layers …)` table reports `0` and a warning rather than an invented `2`.
 `validate_for_manufacturing`'s `board_info.copper_layers` changes value on any
 board with non-`signal` copper; its shape is unchanged.
+## Unreleased: schematic overlap geometry and item identities
+
+`check_schematic_overlaps` checks the graphics envelope and individual pin
+segments of each selected symbol unit. Pin tips touching other pins are valid
+connections. Component body collisions keep the `symbol_geometry` detection
+and their overlap dimensions. Pin segment collisions use `pin_geometry`; the
+origin fallback still identifies unresolved embedded geometry.
+
+The same tool now estimates visible label, symbol field, sheet field, and free
+text rectangles from the saved schematic. It reports `label_overlap`,
+`text_overlap`, `text_body_overlap`, or `text_wire_overlap`. Text dimensions are
+an estimate based on the saved font size, line length, alignment and rotation.
+Custom fonts, variable expansion, graphic label outlines and individual glyphs
+can differ from the estimated rectangles. Conflicting label names at near-coincident
+anchors are still reported using the requested tolerance.
+
+Every finding includes `uuid_a` and `uuid_b`. An unnumbered field uses its
+owning symbol or sheet UUID. A missing identifier is explicitly `null`.
+
 ## Unreleased: schematic nets resolve by identity (minor release)
 
 One electrical net can carry several names — a rail named by a `+3V3` power

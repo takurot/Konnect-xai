@@ -14,9 +14,8 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident, round6},
     schematic::{
-        extract_all_net_labels, extract_buses, extract_labels, extract_sheet_pins,
-        extract_symbol_instances, extract_wires, find_lib_symbol, read_schematic,
-        symbol_bounds_for_instance, Label, LabelKind, LibPin, SymbolBounds, Wire,
+        extract_all_net_labels, extract_buses, extract_sheet_pins, extract_symbol_instances,
+        extract_wires, read_schematic, Label, LabelKind, LibPin, Wire,
     },
 };
 use serde_json::json;
@@ -186,9 +185,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_schematic_overlaps",
-            "Find overlapping symbols from their transformed drawing/pin bounds (excluding \
-             free text), plus conflicting labels at the same location. Reports any symbol whose \
-             embedded geometry could not be resolved and used the origin fallback instead.",
+            "Find overlapping symbols, visible text, and text over wires. Uses placed body and pin \
+             geometry, approximate saved text extents, and reports unresolved symbol bounds.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -999,99 +997,9 @@ async fn handle_check_overlaps(
         ));
     }
     let (_, tree) = read_schematic(&sch_path)?;
-    let instances = extract_symbol_instances(&tree);
-    let lib_symbols = tree
-        .find("lib_symbols")
-        .map(|node| node.find_all("symbol"))
-        .unwrap_or_default();
-
-    // Compare the actual selected-unit graphic/pin envelopes. Distinct origins
-    // can still place two large symbols on top of each other; the old origin
-    // comparison missed that normal collision shape entirely.
-    let placements = instances
-        .iter()
-        .map(|instance| {
-            let bounds = find_lib_symbol(&lib_symbols, instance)
-                .and_then(|symbol| symbol_bounds_for_instance(symbol, instance));
-            (instance, bounds)
-        })
-        .collect::<Vec<_>>();
-    let mut comp_overlaps: Vec<serde_json::Value> = Vec::new();
-    let bounds_json = |bounds: SymbolBounds| {
-        json!({
-            "x_min": round6(bounds.min_x),
-            "y_min": round6(bounds.min_y),
-            "x_max": round6(bounds.max_x),
-            "y_max": round6(bounds.max_y)
-        })
-    };
-    for (index, (a, a_bounds)) in placements.iter().enumerate() {
-        for (b, b_bounds) in &placements[index + 1..] {
-            match (a_bounds, b_bounds) {
-                (Some(a_bounds), Some(b_bounds)) => {
-                    let (overlap_x, overlap_y) = a_bounds.overlap_depth(*b_bounds);
-                    // Edge/pin contact is a normal connection. Positive area
-                    // on both axes means the placed symbol envelopes collide.
-                    if overlap_x > 1e-9 && overlap_y > 1e-9 {
-                        comp_overlaps.push(json!({
-                            "type": "component_overlap",
-                            "a": a.reference,
-                            "unit_a": a.unit,
-                            "b": b.reference,
-                            "unit_b": b.unit,
-                            "overlap_x_mm": overlap_x,
-                            "overlap_y_mm": overlap_y,
-                            "bounds_a": bounds_json(*a_bounds),
-                            "bounds_b": bounds_json(*b_bounds),
-                            "detection": "symbol_geometry"
-                        }));
-                    }
-                }
-                // Preserve a useful conservative check when an old or damaged
-                // schematic lacks the embedded definition. The response names
-                // every such fallback below so it cannot look authoritative.
-                _ if points_coincident(a.x, a.y, b.x, b.y, tol) => {
-                    comp_overlaps.push(json!({
-                        "type": "component_overlap",
-                        "a": a.reference,
-                        "unit_a": a.unit,
-                        "b": b.reference,
-                        "unit_b": b.unit,
-                        "x": round6(a.x),
-                        "y": round6(a.y),
-                        "detection": "origin_fallback"
-                    }));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // The structural extractor already combines local, global, and
-    // hierarchical labels.
-    let all_labels = extract_labels(&tree);
-    let mut label_overlaps: Vec<serde_json::Value> = Vec::new();
-    for (i, a) in all_labels.iter().enumerate() {
-        for b in &all_labels[i + 1..] {
-            if points_coincident(a.x, a.y, b.x, b.y, tol) && a.net != b.net {
-                label_overlaps.push(json!({ "type": "label_overlap", "net_a": a.net, "net_b": b.net, "x": round6(a.x), "y": round6(a.y) }));
-            }
-        }
-    }
-
-    let mut all = comp_overlaps;
-    all.extend(label_overlaps);
-    let bounds_unresolved = placements
-        .iter()
-        .filter(|(_, bounds)| bounds.is_none())
-        .map(|(instance, _)| instance.reference.as_str())
-        .collect::<Vec<_>>();
-    Ok(CallToolResult::json(&json!({
-        "overlap_count": all.len(),
-        "overlaps": all,
-        "bounds_resolved": placements.len() - bounds_unresolved.len(),
-        "bounds_unresolved": bounds_unresolved
-    })))
+    Ok(CallToolResult::json(&super::sch_overlap::find_overlaps(
+        &tree, tol,
+    )))
 }
 
 #[cfg(test)]
@@ -1198,6 +1106,130 @@ mod placement_overlap_tests {
         let result = overlaps(&schematic(&[("R1", 100.0, 50.0), ("R2", 102.032, 50.0)])).await;
 
         assert_eq!(result["overlap_count"], 0, "{result}");
+    }
+
+    const NATIVE: &str = include_str!("../../tests/fixtures/overlaps_kicad10.kicad_sch");
+
+    #[tokio::test]
+    async fn native_label_extents_and_power_pin_tip_are_distinguished() {
+        let result = overlaps(NATIVE).await;
+        let findings = result["overlaps"].as_array().unwrap();
+        assert_eq!(findings.len(), 1, "{result}");
+        assert_eq!(findings[0]["type"], "label_overlap");
+        let uuids = [&findings[0]["uuid_a"], &findings[0]["uuid_b"]];
+        assert!(uuids.contains(&&json!("fc0cc965-47c7-4935-964f-b2936fb5d4cf")));
+        assert!(uuids.contains(&&json!("0fa485e0-be78-49a0-8d1e-fecd5a02403a")));
+
+        let moved = NATIVE.replacen("(at 96.19 100 0)", "(at 100 99.5 0)", 1);
+        let result = overlaps(&moved).await;
+        let findings = result["overlaps"].as_array().unwrap();
+        let collision = findings
+            .iter()
+            .find(|finding| finding["type"] == "component_overlap")
+            .unwrap();
+        assert_eq!(collision["uuid_a"], "0bb65184-85ad-4de5-9aa6-9c6c8c3e92bc");
+        assert_eq!(collision["uuid_b"], "b88ea8a8-1554-4c53-94d5-5e6a70a26915");
+    }
+
+    #[tokio::test]
+    async fn conflicting_opposite_labels_still_use_anchor_tolerance() {
+        use super::tool_call_support::call;
+
+        let source = r#"(kicad_sch
+            (label "RIGHT" (at 100 100 0)
+                (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "right"))
+            (label "LEFT" (at 99.8 100 180)
+                (effects (font (size 1.27 1.27)) (justify right bottom)) (uuid "left")))"#;
+        let result = overlaps(source).await;
+        assert_eq!(result["overlap_count"], 1);
+        assert_eq!(result["overlaps"][0]["uuid_a"], "right");
+        assert_eq!(result["overlaps"][0]["uuid_b"], "left");
+
+        let result = call(
+            source,
+            "check_schematic_overlaps",
+            json!({ "tolerance": 0.1 }),
+        )
+        .await;
+        assert_eq!(result["overlap_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn oriented_labels_and_mirrored_symbol_fields_use_saved_layout() {
+        let extras = r#"
+  (wire (pts (xy 133 128) (xy 133 132)) (uuid "global-cross"))
+  (wire (pts (xy 173 120) (xy 177 120)) (uuid "hier-cross"))
+  (text "X" (at 101.2 95 0) (effects (font (size 0.6 0.6))) (uuid "field-probe"))
+"#;
+        let modified = format!("{}{extras})", NATIVE.trim_end().strip_suffix(')').unwrap());
+        let result = overlaps(&modified).await;
+        let findings = result["overlaps"].as_array().unwrap();
+        for (text, wire) in [
+            ("984f10b4-09d0-4215-bb1e-64ce340ee3bf", "global-cross"),
+            ("bd75fa5e-7bb2-4c8d-b77e-8b5af48ef288", "hier-cross"),
+        ] {
+            assert!(
+                findings.iter().any(|item| {
+                    item["type"] == "text_wire_overlap"
+                        && item["uuid_a"] == text
+                        && item["uuid_b"] == wire
+                }),
+                "{result}"
+            );
+        }
+        assert!(
+            findings.iter().any(|item| {
+                item["type"] == "text_overlap"
+                    && [item["uuid_a"].as_str(), item["uuid_b"].as_str()]
+                        .contains(&Some("field-probe"))
+                    && [item["uuid_a"].as_str(), item["uuid_b"].as_str()]
+                        .contains(&Some("b88ea8a8-1554-4c53-94d5-5e6a70a26915"))
+            }),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_reports_sheet_owners_and_other_bodies_but_skips_hidden_fields() {
+        let source = schematic(&[("R1", 100.0, 50.0), ("R2", 110.0, 50.0)])
+            .replacen(
+                "(property \"Value\" \"10k\")",
+                "(property \"Value\" \"10k\" (at 110 50 0) (effects (font (size 1.27 1.27))))",
+                1,
+            )
+            .replacen(
+                "(property \"Reference\" \"R2\")",
+                "(property \"Reference\" \"HIDDEN\" (at 130 50 0) (hide yes) (effects (font (size 1.27 1.27))))",
+                1,
+            );
+        let extras = r#"
+  (sheet (at 130 51) (size 10 10) (uuid "sheet")
+    (property "Sheetname" "CHILD" (at 130 50 0) (effects (font (size 1.27 1.27)))))
+  (text "NOTE" (at 130 50 0) (effects (font (size 1.27 1.27))))
+"#;
+        let result = overlaps(&format!(
+            "{}{extras})",
+            source.trim_end().strip_suffix(')').unwrap()
+        ))
+        .await;
+        let findings = result["overlaps"].as_array().unwrap();
+        assert_eq!(findings.len(), 2, "{result}");
+        assert!(
+            findings.iter().any(|item| {
+                item["type"] == "text_body_overlap"
+                    && item["uuid_a"] == "R1"
+                    && item["uuid_b"] == "R2"
+            }),
+            "{result}"
+        );
+        assert!(
+            findings.iter().any(|item| {
+                item["type"] == "text_overlap"
+                    && [item["uuid_a"].as_str(), item["uuid_b"].as_str()].contains(&Some("sheet"))
+                    && (item["uuid_a"].is_null() || item["uuid_b"].is_null())
+            }),
+            "{result}"
+        );
     }
 
     #[tokio::test]
