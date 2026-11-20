@@ -151,6 +151,100 @@ fn body(result: &Value) -> Value {
 
 #[test]
 #[ignore = "requires kicad-cli; run via e2e workflow"]
+fn numbered_component_conflicts_preserve_real_kicad_netlist() {
+    let cli = find_kicad_cli().expect("KiCad CLI required for reference collision workflow");
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("references");
+    let schematic = project.join("references.kicad_sch");
+    let mut mcp = Mcp::spawn(&cli);
+    mcp.tool(
+        "create_project",
+        json!({"name": "references", "path": project}),
+    );
+    mcp.load("sch_components");
+    mcp.load("sch_batch");
+    mcp.load("templates");
+
+    for (lib_id, reference, x) in [("Device:R", "R1", 75.0), ("Device:C", "C1", 90.0)] {
+        mcp.tool(
+            "add_schematic_component",
+            json!({
+                "schematic": schematic, "lib_id": lib_id, "reference": reference, "x": x, "y": 100.0
+            }),
+        );
+    }
+    let references = |name: &str| {
+        let destination = root.path().join(name);
+        let output = Command::new(&cli)
+            .args(["sch", "export", "netlist", "--format", "kicadsexpr", "-o"])
+            .arg(&destination)
+            .arg(&schematic)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let source = std::fs::read_to_string(destination).unwrap();
+        let tree = konnect_sexp::parse_sexp(&source).unwrap();
+        let mut references = tree
+            .find("components")
+            .unwrap()
+            .find_all("comp")
+            .iter()
+            .map(|part| part.find_str("ref").unwrap().to_owned())
+            .collect::<Vec<_>>();
+        references.sort_unstable();
+        references
+    };
+
+    assert_eq!(references("before.net"), ["C1", "R1"]);
+    let before = std::fs::read(&schematic).unwrap();
+    let rejected = mcp.request("tools/call", json!({
+        "name": "edit_schematic_component",
+        "arguments": {"schematic": schematic, "reference": "C1", "new_reference": "R1", "value": "22u"}
+    }));
+    assert_eq!(rejected["result"]["isError"], true, "{rejected}");
+    assert_eq!(
+        body(&rejected["result"])["error"]["kind"],
+        "reference_conflict"
+    );
+    assert_eq!(std::fs::read(&schematic).unwrap(), before);
+    assert_eq!(references("after_refusal.net"), ["C1", "R1"]);
+
+    let batch = body(&mcp.tool(
+        "batch_place_components",
+        json!({
+            "schematic": schematic, "components": [
+                {"lib_id": "Device:R", "reference": "R2", "x": 105.0, "y": 100.0},
+                {"lib_id": "Device:R", "reference": "R2", "x": 120.0, "y": 100.0}
+            ]
+        }),
+    ));
+    assert_eq!(batch["placed_count"], 1, "{batch}");
+    assert_eq!(
+        batch["failures"][0]["kind"], "reference_conflict",
+        "{batch}"
+    );
+
+    for x in [135.0, 150.0] {
+        mcp.tool(
+            "apply_template",
+            json!({
+                "schematic": schematic, "template_id": "led_indicator",
+                "ref_start": 1, "position_x": x, "position_y": 100.0
+            }),
+        );
+    }
+    assert_eq!(
+        references("after_placements.net"),
+        ["C1", "D1", "D2", "R1", "R2", "R3", "R4"]
+    );
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
 fn fabrication_and_document_exports_through_mcp() {
     let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
     let dir = tempfile::tempdir().unwrap();
