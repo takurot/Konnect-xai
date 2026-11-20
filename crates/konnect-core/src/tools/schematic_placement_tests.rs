@@ -323,7 +323,7 @@ async fn references_are_reserved_across_saved_top_level_sheets() {
     let mut other = Schematic::load(&root).unwrap();
     let other_uuid = "cdebdb5d-a7f9-445d-93b9-c6ecdcdebef8";
     other.uuid = Some(other_uuid.to_owned());
-    other.sheets.retain(|_| false);
+    other.sheets = konnect_schematic_editor::SheetCollection::new(Vec::new());
     other.symbols.retain(|_| false);
     other.save(&sibling).unwrap();
 
@@ -1540,12 +1540,19 @@ async fn native_component_writes_accept_children_under_both_configured_roots() {
         let expected = format!("/{root_id}{sheet_suffix}");
         std::fs::write(path, child_source.replace(PATH_A, &expected)).unwrap();
     }
-    for (path, root_id) in children {
+    for ((path, root_id), reference) in children.into_iter().zip(["U999", "U1000"]) {
         let expected = format!("/{root_id}{sheet_suffix}");
-        let result = place("add_schematic_component", path).await;
+        let result = add_native_component(
+            path,
+            json!({
+                "lib_id": "complex_hierarchy:LM358N", "reference": reference,
+                "x": 100.1, "y": 80.2, "unit": 2
+            }),
+        )
+        .await;
         assert!(!result.is_error, "{result:?}");
         let doc = Schematic::load(path).unwrap();
-        let symbol = doc.symbols.by_reference("U999").unwrap();
+        let symbol = doc.symbols.by_reference(reference).unwrap();
         assert_eq!(
             symbol.instance_paths(),
             [("complex_hierarchy".to_owned(), expected)]
