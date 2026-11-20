@@ -33,6 +33,16 @@ pub fn read_schematic(path: &Path) -> Result<(String, SexpNode), SexpError> {
     Ok((content, tree))
 }
 
+#[test]
+fn read_schematic_refuses_an_unrecognized_root_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mislabeled.kicad_sch");
+    for wrong_type in ["(kicad_pcb)", "(\"kicad_sch\")", "kicad_sch"] {
+        std::fs::write(&path, wrong_type).unwrap();
+        assert!(read_schematic(&path).is_err());
+    }
+}
+
 // ─── Coordinate helpers ───────────────────────────────────────────────────────
 
 /// Parse `(at X Y [ROT])` from a node.

@@ -128,6 +128,13 @@ pub struct Schematic {
     pub raw_other: Vec<SexpNode>,
 }
 
+#[test]
+fn non_schematic_root_refusal_contract() {
+    for wrong_type in ["(kicad_pcb)", "(\"kicad_sch\")", "kicad_sch"] {
+        assert!(Schematic::from_source("mislabeled.kicad_sch", wrong_type).is_err());
+    }
+}
+
 impl Schematic {
     // ---- I/O ----------------------------------------------------------------
 

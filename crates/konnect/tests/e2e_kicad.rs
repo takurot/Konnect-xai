@@ -151,6 +151,70 @@ fn body(result: &Value) -> Value {
 
 #[test]
 #[ignore = "requires kicad-cli; run via e2e workflow"]
+fn schematic_calls_preserve_the_board_and_project_when_passed_the_wrong_file() {
+    let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("document_types");
+    let board = project.join("document_types.kicad_pcb");
+    let settings = project.join("document_types.kicad_pro");
+    let schematic = project.join("document_types.kicad_sch");
+
+    let mut mcp = Mcp::spawn(&kicad_cli);
+    mcp.tool(
+        "create_project",
+        json!({"name": "document_types", "path": project}),
+    );
+    mcp.load("sch_wiring");
+    mcp.load("sch_hierarchy");
+    mcp.load("sch_analysis");
+
+    for (tool, args, original) in [
+        (
+            "add_junction",
+            json!({"schematic": board, "x": 50.8, "y": 50.8}),
+            &board,
+        ),
+        (
+            "set_schematic_page",
+            json!({"schematic": board, "size": "A3"}),
+            &board,
+        ),
+        (
+            "list_schematic_nets",
+            json!({"schematic": settings}),
+            &settings,
+        ),
+    ] {
+        let before = std::fs::read(original).unwrap();
+        let response = mcp.request("tools/call", json!({"name": tool, "arguments": args}));
+        let result = &response["result"];
+        assert_eq!(result["isError"], true, "{response}");
+        let refusal = body(result);
+        assert_eq!(refusal["error"]["kind"], "invalid_argument", "{response}");
+        assert_eq!(refusal["error"]["field"], "schematic", "{response}");
+        assert_eq!(refusal["error"]["reason"], "not_a_schematic", "{response}");
+        assert_eq!(std::fs::read(original).unwrap(), before);
+    }
+
+    mcp.tool(
+        "set_schematic_page",
+        json!({"schematic": schematic, "size": "A3"}),
+    );
+    for (domain, operation, input) in [("pcb", "drc", &board), ("sch", "erc", &schematic)] {
+        let report = dir.path().join(format!("{domain}-report.txt"));
+        let result = Command::new(&kicad_cli)
+            .args([domain, operation, "--output"])
+            .arg(&report)
+            .arg(input)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        assert!(report.is_file(), "{report:?}");
+    }
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
 fn fabrication_and_document_exports_through_mcp() {
     let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
     let dir = tempfile::tempdir().unwrap();

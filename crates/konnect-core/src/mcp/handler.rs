@@ -1083,6 +1083,135 @@ mod required_argument_dispatch_tests {
     }
 }
 
+#[cfg(test)]
+mod schematic_document_boundary_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn schema_example(schema: &Value, fallback: &Path) -> Value {
+        if let Some(value) = schema["enum"].get(0).or_else(|| schema.get("default")) {
+            return value.clone();
+        }
+        match schema["type"].as_str() {
+            Some("string") => json!(fallback),
+            Some("boolean") => json!(false),
+            Some("number" | "integer") => json!(10),
+            Some("array") => Value::Array(
+                (0..schema["minItems"].as_u64().unwrap_or_default())
+                    .map(|_| schema_example(&schema["items"], fallback))
+                    .collect(),
+            ),
+            Some("object") => Value::Object(
+                schema["required"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|field| {
+                        let field = field.as_str().unwrap();
+                        (
+                            field.to_owned(),
+                            schema_example(&schema["properties"][field], fallback),
+                        )
+                    })
+                    .collect(),
+            ),
+            other => panic!("no example for schema type {other:?} in {schema}"),
+        }
+    }
+
+    async fn assert_invalid_schematic(handler: &McpHandler, tool: &str, args: Value, field: &str) {
+        let (result, status, kind) = handler.dispatch_tool(tool, &args).await;
+        assert!(
+            result.is_error,
+            "{tool}: wrong document type must be refused"
+        );
+        assert_eq!(status, CallStatus::Error, "{tool}");
+        assert_eq!(
+            kind.as_deref(),
+            Some("invalid_argument"),
+            "{tool}: {result:?}"
+        );
+        let Some(ToolContent::Text { text }) = result.content.first() else {
+            panic!("{tool}: missing structured error payload");
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["field"], field, "{tool}: {body}");
+        assert_eq!(body["error"]["reason"], "not_a_schematic", "{tool}: {body}");
+    }
+
+    #[tokio::test]
+    async fn schematic_tools_refuse_other_documents_without_changing_their_bytes() {
+        let handler = McpHandler::new(crate::tools::ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let board = "(kicad_pcb (version 20240108) (paper \"A4\"))";
+        let inputs = [
+            ("unrelated.kicad_pcb", board),
+            (
+                "unrelated.kicad_pro",
+                r#"{"meta":{"filename":"unrelated.kicad_pro"}}"#,
+            ),
+            ("mislabeled.kicad_sch", board),
+        ];
+        let mut tools = handler.ctx.router.active_tools().await;
+        tools.sort_by_key(|tool| tool.name);
+        let mut checked = 0;
+
+        for tool in tools {
+            let schema = &tool.input_schema;
+            if schema["properties"]["schematic"]["type"] != "string" {
+                continue;
+            }
+            checked += 1;
+
+            for (filename, source) in inputs {
+                let path = dir.path().join(filename);
+                std::fs::write(&path, source).unwrap();
+                let fallback = dir.path().join("unused");
+                let mut args = schema_example(schema, &fallback);
+                args["schematic"] = json!(path);
+                for alternatives in schema["allOf"].as_array().into_iter().flatten() {
+                    for field in alternatives["anyOf"][0]["required"].as_array().unwrap() {
+                        let field = field.as_str().unwrap();
+                        args[field] = schema_example(&schema["properties"][field], &fallback);
+                    }
+                }
+                assert!(
+                    tool.input_validator.is_valid(&args),
+                    "{}: {args}",
+                    tool.name
+                );
+                assert_invalid_schematic(&handler, tool.name, args, "schematic").await;
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    source.as_bytes(),
+                    "{}",
+                    tool.name
+                );
+            }
+        }
+        assert!(checked > 80, "covered only {checked} registered tools");
+    }
+
+    #[tokio::test]
+    async fn create_schematic_refuses_other_extensions_before_creating_a_file() {
+        let handler = McpHandler::new(crate::tools::ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-schematic.txt");
+        assert_invalid_schematic(&handler, "create_schematic", json!({"path": path}), "path").await;
+        assert!(!path.exists());
+    }
+}
+
 /// Every registered tool refuses a call that omits its required arguments.
 ///
 /// Exhaustive rather than a sample, and safe to be exhaustive *because of* the
