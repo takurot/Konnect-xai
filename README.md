@@ -142,6 +142,35 @@ Linux x64 binaries require glibc 2.43. The Linux x64 PCM viewer also needs
 the distribution's GTK 3 and WebKitGTK 4.1 runtimes
 (`libgtk-3-0`, `libwebkit2gtk-4.1-0` on Ubuntu 22.04).
 
+### Preinstall for clients with a startup deadline
+
+The first `npx` connection downloads the launcher and native binary before
+Konnect can initialize. Registry downloads can take longer than the client's
+startup deadline. Install the package once into a dedicated directory, then
+point the client at the installed launcher. [Observed first-run behavior](https://github.com/takurot/Konnect-xai/issues/100).
+
+```sh
+npm install --prefix "<absolute-prefix>" --ignore-scripts @konnect-xai/konnect@0.16.0
+node "<absolute-prefix>/node_modules/@konnect-xai/konnect/bin/konnect.js" --version
+```
+
+Use the absolute path to Node (`node.exe` on Windows) and the launcher path in
+your MCP client configuration. Replace both paths with the ones on your machine.
+
+```json
+{
+  "mcpServers": {
+    "konnect": {
+      "command": "/absolute/path/to/node",
+      "args": ["/absolute-prefix/node_modules/@konnect-xai/konnect/bin/konnect.js"]
+    }
+  }
+}
+```
+
+To pass server options such as `--config`, add them after the launcher path.
+Install a newer pinned version into the same prefix when you want to update.
+
 ### From the KiCAD Plugin Manager (recommended)
 
 1. Download the package for your OS from [Releases](https://github.com/takurot/Konnect-xai/releases):
