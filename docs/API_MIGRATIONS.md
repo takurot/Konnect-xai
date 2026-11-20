@@ -65,7 +65,8 @@ instead of `ref1`/`ref2`, and `connect_to_net` accepts `uuid` instead of
 measures the area of the authored courtyard contours after the footprint
 rotation. A boundary touch has zero overlap area. Circles and arcs use
 inscribed chords with at most 0.001 mm deviation. A potentially overlapping
-pair whose courtyard cannot be assembled is reported in `unproven_courtyards`
+pair whose courtyard cannot be assembled or whose clearance falls within the
+curve approximation tolerance is reported in `unproven_courtyards`
 and can produce a `courtyard_unproven` verdict, which blocks automatic placement.
 The existing same-side policy and pad-only fallback still apply.
 

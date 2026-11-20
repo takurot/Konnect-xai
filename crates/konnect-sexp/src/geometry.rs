@@ -320,6 +320,8 @@ pub(crate) fn flatten_arc(start: Point, mid: Point, end: Point) -> Option<Vec<Po
     Some(points)
 }
 
+pub(crate) const CURVE_MAX_CHORD_ERROR_MM: f64 = 0.001;
+
 pub(crate) fn flatten_circle_arc(
     center: Point,
     radius: f64,
@@ -330,7 +332,7 @@ pub(crate) fn flatten_circle_arc(
         return None;
     }
     // Inscribed polygons keep the maximum chord deviation below one micron.
-    let chord_angle = 2.0 * (1.0 - (0.001 / radius).min(1.0)).acos();
+    let chord_angle = 2.0 * (1.0 - (CURVE_MAX_CHORD_ERROR_MM / radius).min(1.0)).acos();
     let segments = ((sweep.abs() / chord_angle).ceil() as usize).max(4);
     if segments > 2048 {
         return None;

@@ -726,6 +726,7 @@ pub struct FootprintCourtyard {
     /// Closed polygons in board coordinates. None means authored geometry
     /// could not be assembled into simple, closed rings.
     outline: Option<Vec<Vec<CourtyardPoint>>>,
+    curved: bool,
     /// KiCad's own lock state for this footprint, from a direct `(locked yes)`
     /// child (or the legacy bare `locked` token). A locked footprint is one the
     /// user has pinned in the editor: automated placement must treat it as an
@@ -762,6 +763,7 @@ fn footprint_courtyard(fp: &SexpNode) -> Option<FootprintCourtyard> {
     // Hull of the courtyard artwork in footprint-local coordinates.
     // All-or-nothing: one unreadable courtyard shape poisons the footprint.
     let mut local: Option<(f64, f64, f64, f64)> = None;
+    let mut curved = false;
     for child in fp.children().unwrap_or(&[]) {
         let Some(head) = child.head() else { continue };
         if !FP_SHAPE_TAGS.contains(&head) {
@@ -772,6 +774,7 @@ fn footprint_courtyard(fp: &SexpNode) -> Option<FootprintCourtyard> {
             _ => continue,
         }
         let bb = fp_shape_bbox(child, head)?;
+        curved |= matches!(head, "fp_arc" | "fp_circle");
         local = Some(merge_bbox(local, bb));
     }
 
@@ -827,6 +830,7 @@ fn footprint_courtyard(fp: &SexpNode) -> Option<FootprintCourtyard> {
             }
             CourtyardSource::AnchorOnly => Some(Vec::new()),
         },
+        curved,
         locked: footprint_locked(fp),
     })
 }
@@ -961,21 +965,25 @@ fn is_simple_ring(ring: &[CourtyardPoint]) -> bool {
         })
 }
 
-fn boundaries_intersect((a, b): Segment, (c, d): Segment) -> bool {
-    crossing_y((a, b), (c, d)).is_some()
-        || [(a, c, d), (b, c, d), (c, a, b), (d, a, b)]
-            .into_iter()
-            .any(|(p, s, e)| {
-                crate::geometry::point_on_segment(
-                    p.0,
-                    p.1,
-                    s.0,
-                    s.1,
-                    e.0,
-                    e.1,
-                    COURTYARD_ENDPOINT_TOLERANCE_MM,
-                )
-            })
+fn boundaries_intersect(first: Segment, second: Segment) -> bool {
+    crossing_y(first, second).is_some()
+        || endpoints_within(first, second, COURTYARD_ENDPOINT_TOLERANCE_MM)
+}
+
+fn endpoints_within((a, b): Segment, (c, d): Segment, tolerance: f64) -> bool {
+    [(a, c, d), (b, c, d), (c, a, b), (d, a, b)]
+        .into_iter()
+        .any(|(p, s, e)| {
+            let dx = e.0 - s.0;
+            let dy = e.1 - s.1;
+            let length_sq = dx * dx + dy * dy;
+            let fraction = if length_sq > 0.0 {
+                (((p.0 - s.0) * dx + (p.1 - s.1) * dy) / length_sq).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (p.0 - s.0 - fraction * dx).hypot(p.1 - s.1 - fraction * dy) <= tolerance
+        })
 }
 
 fn crossing_y((a, b): Segment, (c, d): Segment) -> Option<f64> {
@@ -1051,6 +1059,18 @@ impl FootprintCourtyard {
                     area += (a[1].min(b[1]) - a[0].max(b[0])).max(0.0) * height;
                 }
             }
+        }
+        let curve_error = f64::from(u8::from(self.curved) + u8::from(other.curved))
+            * crate::geometry::CURVE_MAX_CHORD_ERROR_MM;
+        if area <= 1e-9
+            && curve_error > 0.0
+            && first_edges.iter().any(|&a| {
+                second_edges
+                    .iter()
+                    .any(|&b| crossing_y(a, b).is_some() || endpoints_within(a, b, curve_error))
+            })
+        {
+            return None;
         }
         Some(area)
     }
@@ -1498,6 +1518,40 @@ fn index_into(node: &SexpNode, owner: &ItemOwner, out: &mut HashMap<String, Uuid
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn crossing_and_pinch_are_distinguished_from_separate_diagonal_boundaries() {
+        assert!(boundaries_intersect(
+            ((0.0, 0.0), (2.0, 2.0)),
+            ((1.0, 1.0), (2.0, 0.0))
+        ));
+        assert!(!boundaries_intersect(
+            ((0.0, 0.0), (2.0, 2.0)),
+            ((1.0, 0.99), (2.0, 0.0))
+        ));
+    }
+
+    #[test]
+    fn near_chord_contact_is_unproven_even_when_polygon_overlap_is_zero() {
+        let root = crate::parse_sexp(
+            r#"(kicad_pcb
+            (footprint "A" (layer "F.Cu") (at 0 0)
+                (fp_circle (center 0 0) (end 1 0) (layer "F.CrtYd"))))"#,
+        )
+        .unwrap();
+        let circle = footprint_courtyard(root.find("footprint").unwrap()).unwrap();
+        let ring = &circle.outline.as_ref().unwrap()[0];
+        let midpoint = ((ring[0].0 + ring[1].0) / 2.0, (ring[0].1 + ring[1].1) / 2.0);
+        let start = (midpoint.0 + 0.0002, midpoint.1 - 0.00005);
+        let end = (start.0 + 0.0001, start.1 + 0.0001);
+        let probe = FootprintCourtyard {
+            outline: Some(vec![rectangle_ring(start, end)]),
+            bbox: (start.0, start.1, end.0, end.1),
+            curved: false,
+            ..circle.clone()
+        };
+        assert_eq!(circle.overlap_area(&probe), None);
+    }
     use super::*;
     use crate::parser::parse_sexp;
 
