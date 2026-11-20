@@ -2342,3 +2342,12 @@ target.
 
 Diagnostics present ordinary Windows canonical drive and UNC paths in their
 usual spelling. The transaction journal keeps its existing relative-path format.
+
+## Unreleased `connect_to_net` checks the endpoint's saved net
+
+When the endpoint already belongs to the requested net on the saved sheet,
+`connect_to_net` returns `connected` and `already_connected: true` without
+writing another wire or label. The existing label type and geometry stay in
+place. If the endpoint belongs to a different named net, the tool returns
+`would_join_nets` with the existing names, the requested name, and the endpoint
+position. Pass `allow_join: true` to authorize an intentional join.

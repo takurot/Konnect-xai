@@ -4,7 +4,8 @@
 //! junction dots. This uses `konnect_sexp::schematic::find_t_junctions`.
 
 use super::sch_route_safety::{
-    allow_join, check_coordinate_route, check_route, local_junctions, route_segments,
+    allow_join, check_coordinate_route, check_named_stub_route, check_route, local_junctions,
+    route_segments, NamedStubRoute,
 };
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -2596,14 +2597,14 @@ async fn handle_connect_to_net(
         None => crate::tools::resolve_stub_direction(direction, (pin_x, pin_y), &tree),
     };
     let end = dir.end((pin_x, pin_y), stub_length);
-    if let Err(e) = check_route(
-        &tree,
-        &[((pin_x, pin_y), end)],
-        &[(pin_x, pin_y)],
-        Some(&net),
-        allow,
-    ) {
-        return Ok(e);
+    match check_named_stub_route(&tree, ((pin_x, pin_y), end), &net, allow) {
+        Ok(NamedStubRoute::AlreadyConnected) => {
+            return Ok(CallToolResult::json(
+                &json!({"connected": net, "already_connected": true}),
+            ));
+        }
+        Ok(NamedStubRoute::Write) => {}
+        Err(error) => return Ok(error),
     }
     let mut sch = cse::Schematic::from_source(&sch_path, content)?;
     let pins = crate::tools::all_pin_endpoints(&tree);
