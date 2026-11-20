@@ -6,8 +6,8 @@
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::sch_connectivity::{
-    analysis_net_graph, analysis_net_labels, analysis_net_name, label_roots, schematic_point,
-    ConnectivityIndex,
+    analysis_net_graph, analysis_net_labels, analysis_net_name, electrical_t_junctions,
+    label_roots, schematic_point, ConnectivityIndex,
 };
 use crate::tools::{
     get_path, is_power_symbol_reference, opt_f64, opt_positive_f64, placed_pins_by_reference,
@@ -364,7 +364,7 @@ async fn handle_get_net_connectivity(
         .map(|w| json!({ "x1": round6(w.x1), "y1": round6(w.y1), "x2": round6(w.x2), "y2": round6(w.y2), "uuid": w.uuid }))
         .collect();
     let net_labels = net_query_labels(&labels, &net);
-    let t_junctions = konnect_sexp::schematic::find_t_junctions(&net_wire_objs, 0.01);
+    let t_junctions = electrical_t_junctions(&net_wire_objs);
     Ok(CallToolResult::json(&json!({
         "net": net,
         "wires": net_wires,
@@ -507,11 +507,8 @@ async fn handle_trace_from_point(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    // A zero or negative tolerance makes every coincidence test below answer
-    // "nothing here" while the net graph, which resolves at its own fixed
-    // tolerance, still names a net — a successful response asserting a net at a
-    // point it also reports as bare. Refused rather than answered, as
-    // `find_orphan_items` refuses it.
+    // The tolerance searches for nearby items. The returned net is resolved
+    // only at the queried electrical point.
     let tol = match opt_positive_f64(args, "tolerance") {
         Ok(value) => value.unwrap_or(0.05),
         Err(e) => return Ok(e),

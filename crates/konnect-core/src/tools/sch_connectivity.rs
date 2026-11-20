@@ -256,6 +256,16 @@ impl<'a> WireIndex<'a> {
     }
 }
 
+pub(crate) fn electrical_t_junctions(wires: &[Wire]) -> Vec<(f64, f64)> {
+    let index = WireIndex::build_with_precision(wires, Precision::Electrical);
+    let mut seen = HashSet::new();
+    wires
+        .iter()
+        .flat_map(|wire| [(wire.x1, wire.y1), (wire.x2, wire.y2)])
+        .filter(|&(x, y)| seen.insert(schematic_point(x, y)) && index.covers_interior(x, y))
+        .collect()
+}
+
 // ─── Union-find net graph ─────────────────────────────────────────────────────
 
 /// A graph node's identity: coordinates quantized to 1 µm.
