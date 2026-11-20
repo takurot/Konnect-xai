@@ -700,3 +700,40 @@ async fn connect_to_net_repeating_a_stub_leaves_only_one_wire_and_label() {
     assert_eq!(body(&second)["already_connected"], true);
     assert_eq!(read(&path), connected);
 }
+
+#[tokio::test]
+async fn connect_to_net_does_not_conflate_same_text_label_scopes() {
+    let (_dir, path) = sheet(concat!(
+        "  (label \"SIG\" (at 10 20 0) (uuid \"local\"))\n",
+        "  (global_label \"SIG\" (shape input) (at 31.27 30 0) (uuid \"global\"))\n",
+    ));
+    let before = read(&path);
+    let mut at_local = json!({
+        "schematic": p(&path), "pin_x": 10.0, "pin_y": 20.0,
+        "net": "SIG", "label_type": "global_label", "direction": "left"
+    });
+    let at_unrelated_global = json!({
+        "schematic": p(&path), "pin_x": 30.0, "pin_y": 30.0,
+        "net": "SIG", "label_type": "net_label", "direction": "right"
+    });
+    for args in [&at_local, &at_unrelated_global] {
+        let refusal = handle_connect_to_net(args, &ctx()).await.unwrap();
+        assert!(refusal.is_error, "{}", text(&refusal));
+        assert_eq!(body(&refusal)["error"]["kind"], "would_join_nets");
+        assert_eq!(read(&path), before);
+    }
+
+    at_local["allow_join"] = json!(true);
+    let joined = handle_connect_to_net(&at_local, &ctx()).await.unwrap();
+    assert!(!joined.is_error, "{}", text(&joined));
+    assert!(body(&joined)["wire"].is_object());
+    let after = read(&path);
+    assert_ne!(before, after);
+    let parsed = parse_sexp(&after).unwrap();
+    assert_eq!(parsed.find_all("global_label").len(), 2);
+
+    let repeated = handle_connect_to_net(&at_local, &ctx()).await.unwrap();
+    assert!(!repeated.is_error, "{}", text(&repeated));
+    assert_eq!(body(&repeated)["already_connected"], true);
+    assert_eq!(read(&path), after);
+}
