@@ -19,7 +19,7 @@ use konnect_sexp::{
     parser::parse_sexp,
     schematic::{
         extract_symbol_instances, extract_wires, find_lib_symbol, format_junction, format_wire,
-        parse_at, pin_endpoint, pin_outward_direction, read_schematic, Wire,
+        parse_at, pin_endpoint, pin_outward_direction, read_schematic, LabelKind, Wire,
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
@@ -2597,7 +2597,12 @@ async fn handle_connect_to_net(
         None => crate::tools::resolve_stub_direction(direction, (pin_x, pin_y), &tree),
     };
     let end = dir.end((pin_x, pin_y), stub_length);
-    match check_named_stub_route(&tree, ((pin_x, pin_y), end), &net, allow) {
+    let label_kind = if label_type == "global_label" {
+        LabelKind::GlobalLabel
+    } else {
+        LabelKind::NetLabel
+    };
+    match check_named_stub_route(&tree, ((pin_x, pin_y), end), &net, label_kind, allow) {
         Ok(NamedStubRoute::AlreadyConnected) => {
             return Ok(CallToolResult::json(
                 &json!({"connected": net, "already_connected": true}),

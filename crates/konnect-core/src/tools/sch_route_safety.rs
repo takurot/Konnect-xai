@@ -1,10 +1,14 @@
 //! Preflight new wire routes against the saved sheet before any mutation.
-use super::sch_connectivity::{net_graph_for, ConnectivityIndex, NetGraph};
+use super::sch_connectivity::{
+    net_graph_for, net_graph_for_physical_links, ConnectivityIndex, NetGraph,
+};
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use konnect_sexp::{
     geometry::point_on_segment,
-    schematic::{extract_all_net_labels, extract_sheet_pins, extract_wires, Label, Wire},
+    schematic::{
+        extract_all_net_labels, extract_sheet_pins, extract_wires, Label, LabelKind, Wire,
+    },
     SexpNode,
 };
 use std::collections::HashSet;
@@ -73,7 +77,9 @@ pub(crate) fn check_route(
     let wires = extract_wires(tree);
     let labels = extract_all_net_labels(tree);
     let graph = net_graph_for(tree, &wires, &labels);
-    check_route_on_graph(tree, segments, endpoints, named_net, &wires, &labels, graph)
+    check_route_on_graph(tree, segments, endpoints, &wires, &labels, graph, |label| {
+        named_net == Some(label.net.as_str())
+    })
 }
 
 pub(crate) enum NamedStubRoute {
@@ -85,18 +91,23 @@ pub(crate) fn check_named_stub_route(
     tree: &SexpNode,
     segment: Segment,
     net: &str,
+    label_kind: LabelKind,
     allow_join: bool,
 ) -> Result<NamedStubRoute, CallToolResult> {
     let wires = extract_wires(tree);
     let labels = extract_all_net_labels(tree);
-    let mut graph = net_graph_for(tree, &wires, &labels);
+    let mut graph = net_graph_for_physical_links(tree, &wires, &labels);
     let (x, y) = segment.0;
     let root = graph.root_at(x, y);
-    let mut aliases = graph.aliases_of_root(root);
-    if aliases.contains(net) {
+    let matches_request = |label: &Label| label.kind == label_kind && label.net == net;
+    if labels
+        .iter()
+        .any(|label| matches_request(label) && graph.root_at(label.x, label.y) == root)
+    {
         return Ok(NamedStubRoute::AlreadyConnected);
     }
     if !allow_join {
+        let mut aliases = graph.aliases_of_root(root);
         if !aliases.is_empty() {
             aliases.insert(net.to_owned());
             return Err(CallToolResult::error_kind(
@@ -104,17 +115,17 @@ pub(crate) fn check_named_stub_route(
                     nets: aliases.into_iter().collect(),
                     at: vec![[x, y]],
                 },
-                "The selected endpoint already belongs to another named net. Set allow_join: true to join the nets explicitly.",
+                "The selected endpoint uses a different net name or label scope. Set allow_join: true to join the nets explicitly.",
             ));
         }
         check_route_on_graph(
             tree,
             &[segment],
             &[(x, y)],
-            Some(net),
             &wires,
             &labels,
             graph,
+            matches_request,
         )?;
     }
     Ok(NamedStubRoute::Write)
@@ -124,10 +135,10 @@ fn check_route_on_graph(
     tree: &SexpNode,
     segments: &[Segment],
     endpoints: &[Point],
-    named_net: Option<&str>,
     wires: &[Wire],
     labels: &[Label],
     mut graph: NetGraph,
+    matches_request: impl Fn(&Label) -> bool,
 ) -> Result<(), CallToolResult> {
     let index = ConnectivityIndex::build(tree, wires, &[], labels, TOL);
     let mut allowed = HashSet::new();
@@ -135,7 +146,7 @@ fn check_route_on_graph(
         allowed.insert(graph.root_at(x, y));
     }
     for label in labels {
-        if named_net == Some(label.net.as_str()) {
+        if matches_request(label) {
             allowed.insert(graph.root_at(label.x, label.y));
         }
     }
