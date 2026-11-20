@@ -2342,9 +2342,11 @@ the active saved unit and body style.
 The analysis compares coordinates in KiCad's schematic internal units
 (0.0001 mm). `find_orphan_items` includes dangling wire ends, floating labels,
 and unconnected pins in `orphans`. The optional `tolerance` controls which of
-them also appear in `near_misses`. The analysis is scoped to the requested
-schematic file. Whole-project hierarchy, bus expansion, and complete netlist
-parity still require KiCad's native netlist export.
+them also appear in `near_misses`. The default analysis scope is the requested schematic file. Set
+`export_netlist_summary.scope` to `project` on a top-level schematic to include
+saved child instances, sheet-pin links and global aliases. This mode reports
+`sheet_instance_path` on component placements. The native exporter remains the
+source for bus expansion and other KiCad-specific netlist features.
 
 ## Unreleased KiCad platform integration
 

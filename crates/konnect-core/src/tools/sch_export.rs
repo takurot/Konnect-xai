@@ -133,7 +133,7 @@ pub fn tools() -> Vec<ToolDef> {
             "export_netlist_summary",
             "Return a human-readable JSON summary of the schematic netlist: all \
              components, their nets, pin counts. Includes generated names for unlabeled \
-             connections. Does not require kicad-cli.",
+             connections. Use project scope on the root schematic to include its saved child instances. Does not require kicad-cli.",
             json!({
                 "type": "object",
                 "properties": {
@@ -537,6 +537,15 @@ async fn handle_export_netlist_summary(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    match args.get("scope") {
+        None => {}
+        Some(scope) if scope.as_str() == Some("sheet") => {}
+        Some(scope) if scope.as_str() == Some("project") => {
+            let summary = super::sch_project_netlist::project_netlist_summary(&sch_path)?;
+            return Ok(CallToolResult::json(&summary));
+        }
+        Some(_) => return Ok(super::invalid_arg("scope", "expected sheet or project")),
+    }
     let (_, tree) = read_schematic(&sch_path)?;
 
     let instances = extract_symbol_instances(&tree);
