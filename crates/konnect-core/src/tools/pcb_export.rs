@@ -1701,6 +1701,105 @@ mod export_boundary_contract_tests {
     }
 
     #[tokio::test]
+    async fn registered_export_paths_refuse_design_files_before_work() {
+        use crate::mcp::handler::McpHandler;
+        use crate::router::registry::tools_for;
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("source.kicad_pcb");
+        let schematic = dir.path().join("source.kicad_sch");
+        std::fs::write(
+            &board,
+            r#"(kicad_pcb (layers (0 "F.Cu" signal) (44 "Edge.Cuts" user)))"#,
+        )
+        .unwrap();
+        std::fs::write(&schematic, crate::tools::blank_schematic_template()).unwrap();
+        let protected = dir.path().join("designs");
+        std::fs::create_dir(&protected).unwrap();
+        let cli = cli::test_support::write_script(
+            dir.path(),
+            "unexpected-cli",
+            "#!/bin/sh\nprintf started > \"$0.started\"\nexit 3\n",
+            "@echo off\r\necho started>\"%~f0.started\"\r\nexit /b 3\r\n",
+        );
+        let marker = PathBuf::from(format!("{}.started", cli.display()));
+        let mut config = context().config;
+        config.kicad_cli = cli.display().to_string();
+        config.eager_toolsets = true;
+        let handler = McpHandler::new(config).await.unwrap();
+
+        let mut failures = Vec::new();
+        let mut checked = 0;
+        for toolset in ["pcb_export", "sch_export", "verification", "manufacturing"] {
+            for tool in tools_for(toolset).unwrap() {
+                let properties = &tool.input_schema["properties"];
+                for field in ["output", "output_dir", "manifest_output_path"] {
+                    if properties.get(field).is_none() {
+                        continue;
+                    }
+                    checked += 1;
+                    for name in [
+                        "board.kicad_pcb",
+                        "sheet.kicad_sch",
+                        "project.kicad_pro",
+                        "library.KICAD_SYM",
+                        "footprint.kicad_mod",
+                        "part.pretty",
+                        "sym-lib-table",
+                    ] {
+                        let path = protected.join(name);
+                        std::fs::write(&path, b"original design bytes").unwrap();
+                        let mut arguments = json!({});
+                        if properties.get("board").is_some() {
+                            arguments["board"] = json!(board);
+                        }
+                        if properties.get("schematic").is_some() {
+                            arguments["schematic"] = json!(schematic);
+                        }
+                        if tool.name == "export_dxf" {
+                            arguments["layers"] = json!(["Edge.Cuts"]);
+                        }
+                        if tool.name == "export_manufacturing_package" {
+                            arguments["include_assembly"] = json!(false);
+                        }
+                        if tool.name == "export_specctra_dsn" {
+                            arguments["output"] = json!(dir.path().join("new.dsn"));
+                        }
+                        arguments[field] = json!(path);
+                        let response = handler
+                            .handle_message(json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "tools/call",
+                                "params": { "name": tool.name, "arguments": arguments }
+                            }))
+                            .await
+                            .unwrap()
+                            .result
+                            .expect("tool returns a JSON-RPC result");
+                        let text = response["content"][0]["text"].as_str().unwrap();
+                        if response["isError"] != true
+                            || !text.contains("reserved for a KiCad design or library")
+                        {
+                            failures.push(format!("{} {field} {name}: {text}", tool.name));
+                        }
+                        if marker.exists() {
+                            failures.push(format!("{} {field} {name}: CLI started", tool.name));
+                            std::fs::remove_file(&marker).unwrap();
+                        }
+                        assert_eq!(std::fs::read(&path).unwrap(), b"original design bytes");
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 21,
+            "export catalogue only covered {checked} paths"
+        );
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[tokio::test]
     async fn default_plot_refuses_a_board_without_enabled_front_layers() {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("back-only.kicad_pcb");
