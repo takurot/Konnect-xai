@@ -304,6 +304,29 @@ The `Hooks: N entries patched` count now includes refreshed entries and a
 removed legacy handler, so it is non-zero whenever the hook settings changed
 (#739).
 
+## Unreleased: hierarchy instance maintenance
+
+Schematic writes recognize the top-level files and effective root UUIDs in
+`schematic.top_level_sheets` in KiCad 10 projects. Add, duplicate, repoint, and
+delete reconcile saved instance paths for affected sheets and symbols in a
+single file transaction. In a repoint, surviving placement metadata carries
+forward when the old and new paths can be matched uniquely.
+
+New pages use the larger of the current live pages and the recorded allocation
+history across the project's roots. Konnect saves that history in
+`.konnect-sheet-pages.json` in the project directory. Keep that file with
+copies that need to preserve the allocation history. Explicit
+`renumber_sheet_pages` can reassign existing pages and leaves the saved
+allocation history in place. Pages deleted before Konnect could record them
+are outside that history.
+
+On a stale sheet, call `repair_sheet_instances` in the `sch_hierarchy` toolset
+with `schematic` set to the file path. The default dry run reports the symbol
+guard's diagnosis and proposed changes for the selected file. Pass
+`"apply": true` to commit and verify the repair. Projects whose ownership
+cannot be proved, including conflicting project owners, require manual
+inspection.
+
 ## Unreleased: `create_schematic` and `set_schematic_page` move to `sch_hierarchy` (minor release)
 
 `create_schematic` and `set_schematic_page` move from the `sch_components`
