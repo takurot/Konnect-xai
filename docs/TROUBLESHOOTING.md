@@ -487,10 +487,10 @@ affected schematic. Treat them as sensitive, do not attach them to bug reports
 without reviewing their contents, and do not commit them. Both forms are
 ignored by the repository `.gitignore`.
 
-Cooperative document locks are stored outside the project under the platform
-local-data directory. Set `KONNECT_STATE_DIR` to an absolute directory to
-override that location. A relative override is rejected rather than falling
-back to project-local sidecars.
+Cooperative document locks use the [Konnect state directory](KICAD_INTEGRATION.md#konnect-state-directory).
+Set `KONNECT_STATE_DIR` to an absolute directory shared by Konnect processes
+that edit the same documents. Invalid paths are reported without creating
+project-local sidecars.
 
 ## Tools don't appear after `load_toolset`
 

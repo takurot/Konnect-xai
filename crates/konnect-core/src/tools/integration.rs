@@ -170,25 +170,28 @@ pub fn tools() -> Vec<ToolDef> {
 
 // ─── JLCPCB database path helper ─────────────────────────────────────────────
 
-fn default_jlcpcb_db_path() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        PathBuf::from(appdata).join("konnect").join("jlcpcb.db")
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".konnect").join("jlcpcb.db")
-    }
+fn default_jlcpcb_db_path() -> anyhow::Result<PathBuf> {
+    use konnect_sexp::state::{self, StateDir};
+
+    let state = StateDir::resolve().map_err(anyhow::Error::msg)?;
+    Ok(state.existing_or_default("jlcpcb.db", || {
+        #[cfg(windows)]
+        let old = state::legacy_roaming_dir();
+        #[cfg(not(windows))]
+        let old = state::legacy_home_dir();
+        old.map(|dir| dir.join("jlcpcb.db"))
+    }))
 }
 
-pub(super) fn resolve_db_path(args: &serde_json::Value, ctx: &ToolContext) -> PathBuf {
+pub(super) fn resolve_db_path(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<PathBuf> {
     if let Some(p) = args["output_path"].as_str() {
-        return PathBuf::from(p);
+        return Ok(PathBuf::from(p));
     }
     if let Some(p) = &ctx.config.jlcpcb_db_path {
-        return p.clone();
+        return Ok(p.clone());
     }
     default_jlcpcb_db_path()
 }
@@ -212,6 +215,7 @@ mod configured_db_path_tests {
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
+                .env("KONNECT_STATE_DIR", dir.path().join("state"))
                 .env("APPDATA", dir.path())
                 .env("HOME", dir.path())
                 .output()
@@ -225,7 +229,7 @@ mod configured_db_path_tests {
             return;
         }
 
-        let default = default_jlcpcb_db_path();
+        let default = default_jlcpcb_db_path().unwrap();
         std::fs::create_dir_all(default.parent().unwrap()).unwrap();
         let configured = default.with_file_name(" configured.db");
         let override_path = default.with_file_name("override.db");
@@ -250,7 +254,7 @@ mod configured_db_path_tests {
                 config.clone(),
                 std::sync::Arc::new(crate::router::ToolRouter::new()),
             );
-            assert_eq!(resolve_db_path(&json!({}), &direct), expected);
+            assert_eq!(resolve_db_path(&json!({}), &direct).unwrap(), expected);
             let handler = McpHandler::new(config).await.unwrap();
             for selected in [&expected, &override_path] {
                 for (name, mut arguments) in [
@@ -695,7 +699,7 @@ async fn handle_download_jlcpcb(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let db_path = resolve_db_path(args, ctx);
+    let db_path = resolve_db_path(args, ctx)?;
     let force = args["force"].as_bool().unwrap_or(false);
 
     if db_path.exists() && !force {
@@ -861,7 +865,7 @@ async fn handle_search_jlcpcb_parts(
         Err(e) => return Ok(e),
     };
 
-    let db_path = resolve_db_path(args, ctx);
+    let db_path = resolve_db_path(args, ctx)?;
     if !db_path.exists() {
         return Ok(CallToolResult::error(
             "JLCPCB database not found. Run download_jlcpcb_database first.",
@@ -1008,7 +1012,7 @@ async fn handle_get_jlcpcb_part(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let db_path = resolve_db_path(args, ctx);
+    let db_path = resolve_db_path(args, ctx)?;
     if !db_path.exists() {
         return Ok(CallToolResult::error(
             "JLCPCB database not found. Run download_jlcpcb_database first.",
@@ -1264,7 +1268,7 @@ async fn handle_suggest_alternatives(
         ));
     };
 
-    let db_path = resolve_db_path(args, ctx);
+    let db_path = resolve_db_path(args, ctx)?;
     if !db_path.exists() {
         return Ok(CallToolResult::error(
             "JLCPCB database not found. Run download_jlcpcb_database first.",
@@ -1344,7 +1348,7 @@ async fn handle_jlcpcb_stats(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let db_path = resolve_db_path(args, ctx);
+    let db_path = resolve_db_path(args, ctx)?;
     if !db_path.exists() {
         return Ok(CallToolResult::text(
             serde_json::to_string(&json!({
@@ -1820,7 +1824,7 @@ async fn datasheet_from_catalog(
     lcsc_id: Option<&str>,
     mpn: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
-    let db_path = resolve_db_path(args, ctx);
+    let db_path = resolve_db_path(args, ctx)?;
     if !db_path.exists() {
         return Ok(None);
     }
@@ -1912,7 +1916,7 @@ async fn handle_get_datasheet_url(
     // Both sources missed — say which were tried, not just that the answer
     // is null (#255).
     let mut tried = vec![];
-    if resolve_db_path(&serde_json::Value::Null, ctx).exists() {
+    if resolve_db_path(&serde_json::Value::Null, ctx).is_ok_and(|path| path.exists()) {
         tried.push("local catalog");
     } else {
         tried.push("local catalog (database not downloaded)");

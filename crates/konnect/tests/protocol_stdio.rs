@@ -15,6 +15,7 @@ struct McpProcess {
     next_id: i64,
     /// The handshake's `initialize` response.
     initialized: Value,
+    _state: tempfile::TempDir,
 }
 
 impl McpProcess {
@@ -28,18 +29,12 @@ impl McpProcess {
             .current_dir(dir)
             .args(["--config", "konnect.toml"])
             .env("HOME", dir)
-            .env("APPDATA", dir);
+            .env("APPDATA", dir)
+            .env("KONNECT_STATE_DIR", dir.join("state"));
         Self::spawn_command(command)
     }
 
-    /// Spawn with the working directory set to `dir` and, when `isolate_home`,
-    /// the platform config directory redirected there too.
-    ///
-    /// `dirs_config_path()` is the last search candidate and is built from
-    /// `HOME` (`APPDATA` on Windows), so on a developer machine that already has
-    /// `~/Library/Application Support/konnect/config.toml` a "no config exists"
-    /// test silently resolves to that real file instead. Redirecting HOME makes
-    /// the candidate list depend only on the temp dir.
+    /// Optionally redirect client and Konnect state to the fixture directory.
     fn spawn_configured(dir: Option<&std::path::Path>, isolate_home: bool) -> Self {
         Self::spawn_with_env(dir, isolate_home, &[])
     }
@@ -62,12 +57,20 @@ impl McpProcess {
             if isolate_home {
                 command.env("HOME", dir);
                 command.env("APPDATA", dir);
+                command.env("KONNECT_STATE_DIR", dir.join("state"));
             }
         }
         Self::spawn_command(command)
     }
 
     fn spawn_command(mut command: Command) -> Self {
+        let state = tempfile::tempdir().unwrap();
+        if !command
+            .get_envs()
+            .any(|(key, _)| key == "KONNECT_STATE_DIR")
+        {
+            command.env("KONNECT_STATE_DIR", state.path());
+        }
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -82,6 +85,7 @@ impl McpProcess {
             reader,
             next_id: 1,
             initialized: Value::Null,
+            _state: state,
         };
         // MCP handshake
         let init = p.request(
@@ -637,14 +641,7 @@ fn canonical(path: &std::path::Path) -> String {
 }
 
 fn startup_config_under(home: &std::path::Path) -> std::path::PathBuf {
-    let root = if cfg!(target_os = "windows") {
-        home.to_path_buf()
-    } else if cfg!(target_os = "macos") {
-        home.join("Library/Application Support")
-    } else {
-        home.join(".config")
-    };
-    let parent = root.join("konnect");
+    let parent = home.join("state");
     std::fs::create_dir_all(&parent).unwrap();
     parent.join("config.toml")
 }
@@ -667,7 +664,8 @@ fn pcm_command(root: &std::path::Path) -> (Command, std::path::PathBuf) {
     command
         .current_dir(root)
         .env("HOME", root)
-        .env("APPDATA", root);
+        .env("APPDATA", root)
+        .env("KONNECT_STATE_DIR", root.join("state"));
     (command, plugin.join("settings.json"))
 }
 
@@ -797,6 +795,13 @@ fn run_expecting_startup_failure(dir: &std::path::Path, args: &[&str]) -> (bool,
 }
 
 fn run_startup_command(mut command: Command) -> (bool, String) {
+    let state = tempfile::tempdir().unwrap();
+    if !command
+        .get_envs()
+        .any(|(key, _)| key == "KONNECT_STATE_DIR")
+    {
+        command.env("KONNECT_STATE_DIR", state.path());
+    }
     let output = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -879,19 +884,8 @@ fn ipc_failure_kind_and_message_reach_the_client_over_stdio() {
     }
 }
 
-/// Where `user_config_path()` puts the preferences file when `HOME` /
-/// `APPDATA` point at `home`.
 fn user_config_under(home: &std::path::Path) -> std::path::PathBuf {
-    let dir = if cfg!(target_os = "windows") {
-        home.join("konnect")
-    } else if cfg!(target_os = "macos") {
-        home.join("Library")
-            .join("Application Support")
-            .join("konnect")
-    } else {
-        home.join(".konnect")
-    };
-    dir.join("config.json")
+    home.join("state/config.json")
 }
 
 /// #580 over real stdio: a user preferences file that exists and cannot be
@@ -949,7 +943,7 @@ fn an_absent_user_configuration_reports_defaults_over_stdio() {
 
 /// The served binary compares installed guidance with its own bundle once per
 /// installed version and tells both the model and `get_installation_info`
-/// (#728). It writes only its record under `.konnect`, and a second start with
+/// (#728). It writes its check record under the state root, and a second start with
 /// the same install neither rescans nor repeats the notice.
 /// Unix only: `dirs::home_dir` ignores `HOME` on Windows, so the child would
 /// read the real profile there.
@@ -959,7 +953,16 @@ fn a_legacy_guidance_marker_is_reported_on_the_first_start_only() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".konnect")).unwrap();
     std::fs::write(tmp.path().join(".konnect/.installed"), "0.2.2").unwrap();
-    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let spawn = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+        command
+            .current_dir(tmp.path())
+            .env("HOME", tmp.path())
+            .env("XDG_DATA_HOME", tmp.path().join("data"))
+            .env_remove("KONNECT_STATE_DIR");
+        McpProcess::spawn_command(command)
+    };
+    let mut p = spawn();
     let instructions = p.initialized["result"]["instructions"].as_str().unwrap();
     assert!(
         instructions.starts_with("Konnect Claude guidance (installed by v0.2.2)"),
@@ -983,7 +986,7 @@ fn a_legacy_guidance_marker_is_reported_on_the_first_start_only() {
         .all(|file| file["status"] == "missing"));
     drop(p);
 
-    let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
+    let mut p = spawn();
     let init = &p.initialized["result"];
     assert!(init.get("instructions").is_none(), "{init}");
     let result = p.call_tool("get_installation_info", json!({}));
@@ -996,21 +999,17 @@ fn a_legacy_guidance_marker_is_reported_on_the_first_start_only() {
     for dir in [".claude", ".agents"] {
         assert!(!tmp.path().join(dir).exists(), "detection wrote {dir}");
     }
-    let mut data = std::fs::read_dir(tmp.path().join(".konnect"))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        // The call log and runtime directory every server start keeps.
-        .filter(|name| name != "logs" && name != "run")
-        .collect::<Vec<_>>();
-    data.sort();
     assert_eq!(
-        data,
-        [
-            ".guidance-checked-claude",
-            ".guidance-checked-codex",
-            ".installed"
-        ]
+        std::fs::read_to_string(tmp.path().join(".konnect/.installed")).unwrap(),
+        "0.2.2"
     );
+    let state = if cfg!(target_os = "macos") {
+        tmp.path().join("Library/Application Support/konnect")
+    } else {
+        tmp.path().join("data/konnect")
+    };
+    assert!(state.join(".guidance-checked-claude").is_file());
+    assert!(state.join(".guidance-checked-codex").is_file());
 }
 
 /// #787 over real stdio: with nothing to find, `check_freerouting` reports

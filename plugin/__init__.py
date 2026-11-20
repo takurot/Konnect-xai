@@ -26,7 +26,7 @@ if _plugin_dir not in sys.path:
     sys.path.insert(0, _plugin_dir)
 
 from settings_dialog import KonnectSettingsDialog, load_settings
-from native_bridge import NativeSpecctraBridge
+from native_bridge import NativeSpecctraBridge, cache_root
 import wx
 
 PLUGIN_DIR = _plugin_dir
@@ -41,11 +41,11 @@ _server_thread = None
 # the server. The plugin uses pipes for its stdio transport.
 _POPEN_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-_CACHE_DIR = os.path.join(
-    os.environ.get("LOCALAPPDATA", os.path.expanduser("~/.cache")),
-    "konnect", "cache",
-)
-_PID_FILE = os.path.join(_CACHE_DIR, "server.pid")
+try:
+    _CACHE_DIR = cache_root()
+    _PID_FILE = os.path.join(_CACHE_DIR, "server.pid")
+except (OSError, ValueError):
+    _CACHE_DIR = _PID_FILE = None
 _native_bridge = NativeSpecctraBridge(pcbnew, wx)
 
 
@@ -145,6 +145,8 @@ def _kill_tracked():
     signal value, so it would actually kill the process instead of probing.
     Use taskkill/kill by PID; if the PID is stale, the kill is a harmless no-op.
     """
+    if _PID_FILE is None:
+        return
     try:
         with open(_PID_FILE) as f:
             pid = int(f.read().strip())
@@ -206,6 +208,11 @@ def start_server():
     """Start the MCP server in a background thread."""
     global _server_thread
 
+    if _CACHE_DIR is None:
+        wx.MessageBox("Konnect state path is unavailable. Check KONNECT_STATE_DIR.",
+                      "Konnect", wx.OK | wx.ICON_ERROR)
+        return False
+
     if not os.path.exists(BINARY_PATH):
         wx.MessageBox(
             f"Konnect binary not found at:\n{BINARY_PATH}\n\n"
@@ -237,7 +244,7 @@ def is_server_running():
     PID file existence as a proxy -- survives module re-imports. If the
     server crashed on its own, the next start_server preflight cleans up.
     """
-    return os.path.exists(_PID_FILE)
+    return _PID_FILE is not None and os.path.exists(_PID_FILE)
 
 
 # ─── KiCAD Action Plugin entry point ─────────────────────────────────────────

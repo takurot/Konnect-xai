@@ -77,29 +77,13 @@ fn default_project_config() -> serde_json::Value {
 
 // ─── Config file paths ───────────────────────────────────────────────────────
 
-fn user_config_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        PathBuf::from(appdata).join("konnect")
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("konnect")
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".konnect")
-    }
-}
+fn user_config_path() -> anyhow::Result<PathBuf> {
+    use konnect_sexp::state::{legacy_roaming_dir, StateDir};
 
-fn user_config_path() -> PathBuf {
-    user_config_dir().join("config.json")
+    let state = StateDir::resolve().map_err(anyhow::Error::msg)?;
+    Ok(state.existing_or_default("config.json", || {
+        legacy_roaming_dir().map(|dir| dir.join("config.json"))
+    }))
 }
 
 fn project_config_path(project_dir: &Path) -> PathBuf {
@@ -579,7 +563,7 @@ async fn handle_load_user_config(
     _args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let path = user_config_path();
+    let path = user_config_path()?;
     info!(path = %path.display(), "[BETA] Loading user config");
     Ok(load_user_config_at(&path))
 }
@@ -605,7 +589,7 @@ async fn handle_save_user_config(
         Err(refusal) => return Ok(refusal),
     };
 
-    let path = user_config_path();
+    let path = user_config_path()?;
     info!(key_path = %key_path, "[BETA] Saving user config");
     Ok(
         match update_config(
@@ -722,7 +706,7 @@ async fn handle_get_effective_config(
         .ok()
         .map(|dir| project_config_path(&dir));
     Ok(effective_config_at(
-        &user_config_path(),
+        &user_config_path()?,
         project_path.as_deref(),
     ))
 }
@@ -738,7 +722,7 @@ async fn handle_add_design_rule(
     let scope = args["scope"].as_str().unwrap_or("project");
 
     let (path, which, default) = if scope == "user" {
-        (user_config_path(), "user", default_user_config())
+        (user_config_path()?, "user", default_user_config())
     } else {
         let project_dir = resolve_project_dir(args, ctx)?;
         (
@@ -790,7 +774,7 @@ async fn handle_list_design_rules(
         .ok()
         .map(|dir| project_config_path(&dir));
     Ok(list_design_rules_at(
-        &user_config_path(),
+        &user_config_path()?,
         project_path.as_deref(),
     ))
 }

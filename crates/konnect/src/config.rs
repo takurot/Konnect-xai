@@ -1,6 +1,7 @@
 use crate::transport::http_policy::BearerToken;
 use anyhow::Result;
 use konnect_core::config_resolution::ConfigResolution;
+use konnect_sexp::state::StateDir;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -50,6 +51,10 @@ pub struct Config {
     /// JLCPCB database cache path
     #[serde(default)]
     pub jlcpcb_db_path: Option<PathBuf>,
+
+    /// Persist bounded per-call JSONL diagnostics. In-memory counters stay available.
+    #[serde(default = "default_call_log")]
+    pub call_log: bool,
 
     /// Log level (error, warn, info, debug, trace)
     #[serde(default = "default_log_level")]
@@ -271,6 +276,10 @@ impl Config {
     }
 }
 
+fn default_call_log() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -285,6 +294,7 @@ impl Default for Config {
             http_allow_remote: false,
             http_token: None,
             jlcpcb_db_path: None,
+            call_log: default_call_log(),
             log_level: default_log_level(),
             auto_load_toolsets: false,
             eager_toolsets: false,
@@ -298,7 +308,15 @@ fn default_config_paths() -> Vec<PathBuf> {
     let pcm = std::env::current_exe()
         .ok()
         .and_then(|exe| pcm_settings_path(&exe));
-    pcm.into_iter().chain(dirs_config_path()).collect()
+    let Ok(state) = StateDir::resolve() else {
+        return pcm.into_iter().collect();
+    };
+    let current = state.root().join("config.toml");
+    let legacy = (!state.is_overridden())
+        .then(dirs_config_path)
+        .flatten()
+        .filter(|old| old != &current);
+    pcm.into_iter().chain([current]).chain(legacy).collect()
 }
 
 /// Pick the first existing candidate, and report the later ones that exist and

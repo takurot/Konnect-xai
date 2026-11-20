@@ -4,9 +4,7 @@
 use super::error::{extract_error_kind, ToolErrorKind};
 use super::protocol::*;
 use super::server::McpServerState;
-use crate::observability::{
-    default_calls_log_path, new_call_id, unix_ms, CallObserver, CallRecord, CallStatus,
-};
+use crate::observability::{new_call_id, unix_ms, CallObserver, CallRecord, CallStatus};
 use crate::outcome::OutcomeStatus;
 use crate::router::{meta_tools, ToolRouter};
 use axum::response::sse::Event;
@@ -71,14 +69,15 @@ impl McpHandler {
         config: crate::tools::ServerConfig,
         config_resolution: crate::config_resolution::ConfigResolution,
     ) -> anyhow::Result<Self> {
-        Self::new_configured(config, config_resolution, None).await
+        Self::new_configured(config, config_resolution, None, None).await
     }
 
-    /// Build a handler with a startup KiCad settings directory override.
+    /// Build a handler with a KiCad settings override and an optional call log.
     pub async fn new_configured(
         config: crate::tools::ServerConfig,
         config_resolution: crate::config_resolution::ConfigResolution,
         kicad_config_dir: Option<std::path::PathBuf>,
+        call_log: Option<std::path::PathBuf>,
     ) -> anyhow::Result<Self> {
         let router = Arc::new(ToolRouter::new());
 
@@ -95,7 +94,7 @@ impl McpHandler {
             router.load_starter_kit().await;
         }
 
-        let observer = CallObserver::new(Some(default_calls_log_path()));
+        let observer = CallObserver::new(call_log);
         let meta_input_validators = meta_tools::meta_tool_descriptions_for(cfg!(unix))
             .into_iter()
             .map(|tool| {
@@ -3366,6 +3365,7 @@ mod kicad_config_scope_tests {
                     },
                     crate::config_resolution::ConfigResolution::unavailable(),
                     Some(config_dir),
+                    None,
                 )
                 .await
                 .unwrap(),

@@ -80,10 +80,15 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
             auto_load_toolsets: config.auto_load_toolsets,
             eager_toolsets: config.eager_toolsets,
         };
+        let call_log = config
+            .call_log
+            .then(konnect_core::observability::default_calls_log_path)
+            .flatten();
         match McpHandler::new_configured(
             server_config,
             config_resolution,
             config.kicad_config_dir.clone(),
+            call_log,
         )
         .await
         {
