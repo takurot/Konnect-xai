@@ -931,7 +931,10 @@ fn effective_configuration_combines_rules_with_scope_and_keeps_override_preceden
     std::fs::create_dir(&project).unwrap();
     let mut p = McpProcess::spawn_with_env(Some(tmp.path()), true, &[]);
 
-    let result = p.call_tool("add_design_rule", json!({"rule": "User rule", "scope": "user"}));
+    let result = p.call_tool(
+        "add_design_rule",
+        json!({"rule": "User rule", "scope": "user"}),
+    );
     assert_ne!(result["isError"], json!(true), "{result}");
     let result = p.call_tool(
         "save_user_config",
@@ -939,12 +942,22 @@ fn effective_configuration_combines_rules_with_scope_and_keeps_override_preceden
     );
     assert_ne!(result["isError"], json!(true), "{result}");
 
-    for (args, source) in [(json!({}), "not_configured"), (json!({"project_dir": project}), "defaults")] {
+    for (args, source) in [
+        (json!({}), "not_configured"),
+        (json!({"project_dir": project}), "defaults"),
+    ] {
         let result = p.call_tool("get_effective_config", args);
         let body = McpProcess::tool_body(&result);
         assert_eq!(body["sources"]["project"], source, "{body}");
-        assert_eq!(body["effective_config"]["design_rules"], json!(["User rule"]), "{body}");
-        assert_eq!(body["design_rule_sources"], json!([{"rule":"User rule","source":"user"}]));
+        assert_eq!(
+            body["effective_config"]["design_rules"],
+            json!(["User rule"]),
+            "{body}"
+        );
+        assert_eq!(
+            body["design_rule_sources"],
+            json!([{"rule":"User rule","source":"user"}])
+        );
     }
     assert!(!project.join(".konnect").exists());
 
@@ -961,12 +974,18 @@ fn effective_configuration_combines_rules_with_scope_and_keeps_override_preceden
     let result = p.call_tool("get_effective_config", json!({"project_dir": project}));
     let body = McpProcess::tool_body(&result);
     assert_eq!(body["sources"]["project"], "file");
-    assert_eq!(body["effective_config"]["design_rules"], json!(["User rule", "Project rule"]));
+    assert_eq!(
+        body["effective_config"]["design_rules"],
+        json!(["User rule", "Project rule"])
+    );
     assert_eq!(
         body["design_rule_sources"],
         json!([{"rule":"User rule","source":"user"},{"rule":"Project rule","source":"project"}])
     );
-    assert_eq!(body["effective_config"]["sourcing"]["avl"], json!(["Murata"]));
+    assert_eq!(
+        body["effective_config"]["sourcing"]["avl"],
+        json!(["Murata"])
+    );
 }
 
 #[test]
@@ -999,13 +1018,26 @@ fn configuration_mutations_refuse_invalid_requests_without_writing_and_accept_ex
     ];
     for (key_path, value) in invalid {
         for (tool, args) in [
-            ("save_user_config", json!({"key_path":key_path,"value":value})),
-            ("save_project_config", json!({"project_dir":project,"key_path":key_path,"value":value})),
+            (
+                "save_user_config",
+                json!({"key_path":key_path,"value":value}),
+            ),
+            (
+                "save_project_config",
+                json!({"project_dir":project,"key_path":key_path,"value":value}),
+            ),
         ] {
             let result = p.call_tool(tool, args);
-            assert_eq!(result["isError"], json!(true), "{tool}: {key_path}: {result}");
+            assert_eq!(
+                result["isError"],
+                json!(true),
+                "{tool}: {key_path}: {result}"
+            );
             let body = McpProcess::tool_body(&result);
-            assert_eq!(body["error"]["kind"], "invalid_argument", "{tool}: {key_path}: {body}");
+            assert_eq!(
+                body["error"]["kind"], "invalid_argument",
+                "{tool}: {key_path}: {body}"
+            );
             if key_path == "fab_constraints.fab_hosue" {
                 let reason = body["error"]["reason"].as_str().unwrap();
                 assert!(reason.contains("fab_house"), "{reason}");
@@ -1023,15 +1055,27 @@ fn configuration_mutations_refuse_invalid_requests_without_writing_and_accept_ex
     ] {
         let result = p.call_tool("add_design_rule", args);
         assert_eq!(result["isError"], json!(true), "{result}");
-        assert_eq!(McpProcess::tool_body(&result)["error"]["kind"], "invalid_argument");
+        assert_eq!(
+            McpProcess::tool_body(&result)["error"]["kind"],
+            "invalid_argument"
+        );
         assert_eq!(std::fs::read_to_string(&project_config).unwrap(), original);
         assert_eq!(std::fs::read_to_string(&user_config).unwrap(), original);
     }
 
     for (tool, args) in [
-        ("save_project_config", json!({"project_dir":absent,"key_path":"fab_constraints.fab_house","value":"JLCPCB"})),
-        ("add_design_rule", json!({"project_dir":absent,"rule":"Missing directory"})),
-        ("save_project_config", json!({"project_dir":project,"key_path":"fab_constraints.layer_count","value":null})),
+        (
+            "save_project_config",
+            json!({"project_dir":absent,"key_path":"fab_constraints.fab_house","value":"JLCPCB"}),
+        ),
+        (
+            "add_design_rule",
+            json!({"project_dir":absent,"rule":"Missing directory"}),
+        ),
+        (
+            "save_project_config",
+            json!({"project_dir":project,"key_path":"fab_constraints.layer_count","value":null}),
+        ),
     ] {
         let result = p.call_tool(tool, args);
         assert_eq!(result["isError"], json!(true), "{result}");
@@ -1044,12 +1088,19 @@ fn configuration_mutations_refuse_invalid_requests_without_writing_and_accept_ex
         json!({"project_dir":project,"key_path":"fab_constraints.fab_house","value":null}),
     );
     assert_ne!(result["isError"], json!(true), "{result}");
-    let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&project_config).unwrap()).unwrap();
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&project_config).unwrap()).unwrap();
     assert_eq!(stored["legacy"]["keep"], 1);
     assert_eq!(stored["fab_constraints"]["min_clearance_mm"], 0.15);
-    assert!(!stored["fab_constraints"].as_object().unwrap().contains_key("fab_house"));
+    assert!(!stored["fab_constraints"]
+        .as_object()
+        .unwrap()
+        .contains_key("fab_house"));
     let result = p.call_tool("get_effective_config", json!({"project_dir": project}));
-    assert_eq!(McpProcess::tool_body(&result)["effective_config"]["fab_constraints"]["fab_house"], "JLCPCB");
+    assert_eq!(
+        McpProcess::tool_body(&result)["effective_config"]["fab_constraints"]["fab_house"],
+        "JLCPCB"
+    );
 }
 
 /// The other half: with no preferences file the load says it answered with
