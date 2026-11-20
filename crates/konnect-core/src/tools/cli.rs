@@ -587,6 +587,7 @@ impl Drop for ExportStaging {
 }
 
 fn export_staging_dir(destination: &Path) -> Result<Arc<ExportStaging>> {
+    ensure_export_destination_is_not_design_file(destination)?;
     let parent = destination
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -599,7 +600,7 @@ fn export_staging_dir(destination: &Path) -> Result<Arc<ExportStaging>> {
         .context("failed to create an export staging directory")
 }
 
-fn ensure_export_destination_is_not_design_file(destination: &Path) -> Result<()> {
+pub(crate) fn ensure_export_destination_is_not_design_file(destination: &Path) -> Result<()> {
     let canonical = destination.canonicalize().ok();
     let reserved = [Some(destination), canonical.as_deref()]
         .into_iter()
@@ -704,6 +705,7 @@ fn publish_verified_file_blocking(
     staging: &ExportStaging,
     before_install: impl FnOnce(),
 ) -> Result<u64> {
+    ensure_export_destination_is_not_design_file(destination)?;
     let metadata = std::fs::metadata(staged).with_context(|| {
         format!(
             "{artifact} export reported success but did not create {}",
@@ -1517,6 +1519,7 @@ pub(crate) async fn export_named_schematic_svg(
     output: &Path,
     options: &SchematicSvgOptions<'_>,
 ) -> Result<Vec<PathBuf>> {
+    ensure_export_destination_is_not_design_file(output)?;
     anyhow::ensure!(
         output
             .extension()
@@ -1526,7 +1529,6 @@ pub(crate) async fn export_named_schematic_svg(
     let root_name = output
         .file_name()
         .context("root SVG output has no file name")?;
-    ensure_export_destination_is_not_design_file(output)?;
     let root_exists = match tokio::fs::symlink_metadata(output).await {
         Ok(metadata) => {
             anyhow::ensure!(
@@ -1778,6 +1780,7 @@ pub async fn export_netlist(
     output: &Path,
     format: &str,
 ) -> Result<()> {
+    ensure_export_destination_is_not_design_file(output)?;
     // Map friendly names to v10 format values
     let lower = format.to_lowercase();
     let v10_format = match lower.as_str() {
@@ -2068,6 +2071,7 @@ pub async fn export_3d(
     format: &str,
     include_unspecified: bool,
 ) -> Result<()> {
+    ensure_export_destination_is_not_design_file(output)?;
     let args = export_3d_args(
         pcb.to_str().unwrap(),
         output.to_str().unwrap(),
@@ -2170,7 +2174,6 @@ pub(crate) async fn export_native_netlist(
     output: &Path,
     schematic: bool,
 ) -> Result<()> {
-    ensure_export_destination_is_not_design_file(output)?;
     let staging = export_staging_dir(output)?;
     let staged = staging.path().join(
         output
@@ -2188,6 +2191,7 @@ pub(crate) async fn export_native_netlist(
 
 /// KiCAD 10: `pcb export ipcd356 --output <path> <input>`
 pub async fn export_ipcd356(cli: &str, pcb: &Path, output: &Path) -> Result<()> {
+    ensure_export_destination_is_not_design_file(output)?;
     let args = [
         "pcb",
         "export",
@@ -2207,6 +2211,7 @@ pub async fn export_ipcd356(cli: &str, pcb: &Path, output: &Path) -> Result<()> 
 /// KiCAD 10 rejects — #250). DXF differs in output shape only: one file per
 /// requested layer is written into `output_dir` (verified against KiCAD 10.0).
 pub async fn export_dxf(cli: &str, pcb: &Path, output_dir: &Path, layers: &[&str]) -> Result<()> {
+    ensure_export_destination_is_not_design_file(output_dir)?;
     let output_str = output_dir.to_str().unwrap();
     let pcb_str = pcb.to_str().unwrap();
     let layers_csv = layers.join(",");
@@ -2225,6 +2230,7 @@ pub async fn export_dxf(cli: &str, pcb: &Path, output_dir: &Path, layers: &[&str
 
 /// KiCAD 10: `pcb export gencad --output <path> <input>`
 pub async fn export_gencad(cli: &str, pcb: &Path, output: &Path) -> Result<()> {
+    ensure_export_destination_is_not_design_file(output)?;
     let args = [
         "pcb",
         "export",
@@ -2245,6 +2251,7 @@ pub async fn export_ipc2581(
     units: &str,
     compress: bool,
 ) -> Result<()> {
+    ensure_export_destination_is_not_design_file(output)?;
     let output_str = output.to_str().unwrap();
     let pcb_str = pcb.to_str().unwrap();
 
@@ -2269,6 +2276,7 @@ pub async fn export_odb(
     units: &str,
     compression: &str,
 ) -> Result<()> {
+    ensure_export_destination_is_not_design_file(output)?;
     let args = [
         "pcb",
         "export",
@@ -2308,6 +2316,7 @@ pub async fn render_pcb_png(
     width: u32,
     height: u32,
 ) -> Result<()> {
+    ensure_export_destination_is_not_design_file(output)?;
     let width_str = width.to_string();
     let height_str = height.to_string();
     let args = vec![

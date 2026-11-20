@@ -139,6 +139,7 @@ async fn handle_export_manufacturing_package(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let output_dir = get_path(args, "output_dir")?;
+    cli::ensure_export_destination_is_not_design_file(&output_dir)?;
     let fab_house = args["fab_house"].as_str().unwrap_or("jlcpcb");
     let include_assembly = args["include_assembly"].as_bool().unwrap_or(true);
     let is_jlcpcb = fab_house == "jlcpcb";

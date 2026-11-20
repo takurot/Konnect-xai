@@ -1209,6 +1209,14 @@ A refusal leaves the file byte-identical. The remedy depends on which one it is:
 - For `stale_target` naming a marker with no UUID, delete and re-add that
   marker so KiCad's writer gives it one.
 
+## Unreleased – KiCad design paths are reserved export destinations
+
+Choose a separate destination for manufacturing exports, plots, netlists, BOMs,
+renders, and ERC or DRC reports. Export tools refuse a destination whose name
+or existing symlink target identifies a KiCad design or library before invoking
+KiCad or writing the result. Directory-valued exports also reserve terminal
+names such as `.pretty`, which can name a KiCad footprint library.
+
 ## Unreleased: explicit live-board synchronization for CLI DRC
 
 `run_drc` and `get_drc_violations` accept `sync_live_board: false` and

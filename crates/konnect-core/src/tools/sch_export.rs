@@ -265,6 +265,7 @@ async fn handle_render_png(
         Some(p) => std::path::PathBuf::from(p),
         None => sch_path.with_extension("png"),
     };
+    cli::ensure_export_destination_is_not_design_file(&output_path)?;
 
     // Render the SVG into a temp dir so the intermediate never collides with
     // caller files, then rasterize in-process.
@@ -290,6 +291,7 @@ async fn handle_render_png(
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    cli::ensure_export_destination_is_not_design_file(&output_path)?;
     std::fs::write(&output_path, &rendered.png)?;
 
     // Dimensions come from the produced image, never echoed from the request.
@@ -704,6 +706,10 @@ async fn handle_run_erc(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let min_severity = args["severity"].as_str().unwrap_or("warning");
+    let output = args["output"].as_str().map(Path::new);
+    if let Some(path) = output {
+        cli::ensure_export_destination_is_not_design_file(path)?;
+    }
 
     let owning_root = match owning_project_root(&sch_path) {
         Ok(root) => root,
@@ -740,8 +746,9 @@ async fn handle_run_erc(
     // the violation array alone: the file is the copy that gets handed to
     // another tool or another person, and a coordinate must not travel
     // without the `coordinates` block saying what it is worth.
-    if let Some(out_path) = args["output"].as_str() {
-        std::fs::write(out_path, serde_json::to_string_pretty(&response)?)?;
+    if let Some(path) = output {
+        cli::ensure_export_destination_is_not_design_file(path)?;
+        std::fs::write(path, serde_json::to_string_pretty(&response)?)?;
     }
 
     Ok(CallToolResult::json(&response))

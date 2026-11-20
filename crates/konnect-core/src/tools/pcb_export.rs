@@ -496,6 +496,7 @@ async fn handle_export_gerber(
     let board = get_path(args, "board")?;
     let output_dir = get_path(args, "output_dir")?;
     let drill = args["drill_file"].as_bool().unwrap_or(true);
+    cli::ensure_export_destination_is_not_design_file(&output_dir)?;
 
     let requested_layers = match optional_string_array(args, "layers") {
         Ok(layers) => layers,
@@ -806,6 +807,15 @@ async fn handle_export_specctra_dsn(
         .unwrap_or_else(|| default_specctra_manifest_path(&output_path));
     let native_bridge_mode = resolve_native_bridge_mode(args);
 
+    for (field, destination) in [
+        ("output", &output_path),
+        ("manifest_output_path", &manifest_output_path),
+    ] {
+        if let Err(error) = cli::ensure_export_destination_is_not_design_file(destination) {
+            return Ok(invalid_export_argument(field, error.to_string()));
+        }
+    }
+
     if !extension_is(&board_path, "kicad_pcb") {
         return Ok(invalid_export_argument(
             "board",
@@ -1055,6 +1065,7 @@ async fn handle_export_dxf(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let output_dir = get_path(args, "output_dir")?;
+    cli::ensure_export_destination_is_not_design_file(&output_dir)?;
     // Required here, unlike `export_pdf`/`export_svg` where it is genuinely
     // optional. An omitted `layers` became an empty vec, and `cli.rs` only
     // passes `--layers` when the list is non-empty — so the flag vanished from
