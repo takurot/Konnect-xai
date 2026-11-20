@@ -75,8 +75,15 @@ jobs:
             git -C "$source" checkout --detach FETCH_HEAD
             mv "$source/demos" "$install/demos"
           fi
-          echo "KICAD_CLI=$install/KiCad.app/Contents/MacOS/kicad-cli" >> "$GITHUB_ENV"
-          echo "KICAD_DEMOS=$install/demos" >> "$GITHUB_ENV"
+          # Template tests isolate HOME, so pass the installed stock libraries
+          # explicitly when the app is under the runner's home directory.
+          symbols="$install/KiCad.app/Contents/SharedSupport/symbols"
+          test -f "$symbols/Connector.kicad_sym" || test -d "$symbols/Connector.kicad_symdir"
+          {
+            echo "KICAD10_SYMBOL_DIR=$symbols"
+            echo "KICAD_CLI=$install/KiCad.app/Contents/MacOS/kicad-cli"
+            echo "KICAD_DEMOS=$install/demos"
+          } >> "$GITHUB_ENV"
 
       - name: Install KiCad 10.0.8 on Ubuntu
         if: runner.os == 'Linux'
