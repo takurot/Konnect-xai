@@ -150,6 +150,64 @@ fn body(result: &Value) -> Value {
 }
 
 #[test]
+#[ignore = "requires kicad-cli and stock libraries; run via e2e workflow"]
+fn pcbway_package_excludes_schematic_dnp_from_bom_and_positions() {
+    let cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("project");
+    let schematic = project.join("assembly.kicad_sch");
+    let board = project.join("assembly.kicad_pcb");
+    let output = directory.path().join("package");
+    let footprint = "Resistor_SMD:R_0603_1608Metric";
+    let mut mcp = Mcp::spawn(&cli);
+    mcp.tool(
+        "create_project",
+        json!({"name": "assembly", "path": project}),
+    );
+    mcp.load("sch_components");
+    mcp.load("pcb_components");
+    mcp.load("manufacturing");
+    for (reference, x, dnp) in [("R1", 55.88, false), ("R2", 68.58, true)] {
+        mcp.tool(
+            "add_schematic_component",
+            json!({
+                "schematic": schematic, "lib_id": "Device:R", "reference": reference,
+                "footprint": footprint, "x": x, "y": 50.8, "dnp": dnp
+            }),
+        );
+        mcp.tool(
+            "place_component",
+            json!({
+                "board": board, "footprint": footprint, "reference": reference, "x": x, "y": 50.8
+            }),
+        );
+    }
+    let saved = std::fs::read(&board).unwrap();
+    let package = body(&mcp.tool(
+        "export_manufacturing_package",
+        json!({
+            "board": board, "schematic": schematic, "output_dir": output, "fab_house": "pcbway",
+            "bom_fields": "Reference,Value,Footprint,${QUANTITY}"
+        }),
+    ));
+    assert_eq!(package["complete"], true, "{package}");
+    for file in ["bom.csv", "positions.csv"] {
+        let contents = std::fs::read_to_string(output.join(file)).unwrap();
+        assert!(
+            contents
+                .lines()
+                .any(|line| line.starts_with("R1,") || line.starts_with("\"R1\",")),
+            "populated control R1 missing from {file}: {contents}"
+        );
+        assert!(
+            !contents.contains("R2"),
+            "unfitted R2 included in {file}: {contents}"
+        );
+    }
+    assert_eq!(std::fs::read(board).unwrap(), saved);
+}
+
+#[test]
 #[ignore = "requires kicad-cli; run via e2e workflow"]
 fn fabrication_and_document_exports_through_mcp() {
     let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
