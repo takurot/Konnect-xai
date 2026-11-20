@@ -18,6 +18,7 @@
 //! baseline context stays small. The LLM reads `list_toolboxes` and calls
 //! `load_toolset(name)` to expose the tools it actually needs for the task.
 
+#[cfg(unix)]
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::{CallToolResult, McpToolDescription};
 use crate::observability::MAX_RECENT_CALLS;
