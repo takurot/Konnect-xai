@@ -2254,3 +2254,21 @@ Project-settings tools also refuse `~<project>.kicad_pro.lck`, including a lock
 left by Eeschema with no PCB Editor open. A lock cannot safely be assumed stale
 from KiCad 10's username/hostname metadata. Close editors and verify ownership
 before manually removing a leftover lock.
+
+## Unreleased: schematic net queries expose pins, UUIDs, and missing names
+
+`get_net_connections` adds `pins` with `reference`, `unit`, `pin_number`,
+`pin_name`, `electrical_type`, and endpoint coordinates `x` and `y` in mm.
+The query uses the saved schematic sheet. Pin membership follows the connected
+net, including aliases and disconnected segments joined by a shared net name.
+Power symbols and power flags are omitted from the component pin list.
+
+Both net queries return `uuid` on each label, including the symbol UUID for a
+power label. `get_net_connectivity` also returns each wire's `uuid`. The field
+is `null` if the file has no identifier for that item. Labels are still
+filtered by the exact queried name.
+
+Both tools now report a missing name as an MCP tool error with
+`error: {kind: "not_found", net, suggestions}`. Suggestions are the sorted
+known names that match case-insensitively, or an empty array. A named net
+without component pins still returns a successful result.

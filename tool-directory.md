@@ -158,8 +158,8 @@ and Windows servers do not.
 | `list_schematic_wires` | List all wire segments with start/end coordinates and UUIDs. |
 | `list_schematic_nets` | List all distinct net names from net labels, global labels, and power symbols. |
 | `list_schematic_labels` | List all label instances (net/global/hierarchical) with positions, names, and types. |
-| `get_net_connections` | Get all pins and labels connected to a named net. |
-| `get_net_connectivity` | Build the full connectivity graph for a net using union-find. Returns wires, labels, and T-junction locations. |
+| `get_net_connections` | Get the component pins and labels for an exact net name on the requested schematic sheet. |
+| `get_net_connectivity` | Get the wires, labels, and T-junction locations for an exact net name on the requested schematic sheet. |
 | `get_pin_connections` | Get the net connected to a specific pin by tracing wires from the pin endpoint. |
 | `get_pin_net_name` | Return just the net name for a specific pin on a component. |
 | `get_component_nets` | Get all nets connected to every pin of a component. |
