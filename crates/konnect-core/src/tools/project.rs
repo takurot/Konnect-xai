@@ -1297,12 +1297,33 @@ fn relocated_filename<'a>(
     directory: &Path,
 ) -> Option<&'a str> {
     let path = Path::new(value);
-    if path.file_name()? != before.file_name()? {
+    let name = path.file_name()?.to_str()?;
+    let original = before.file_name()?.to_str()?;
+    if !name.eq_ignore_ascii_case(original) {
         return None;
     }
     let parent = path.parent()?;
     if !parent.as_os_str().is_empty() && directory.join(parent).canonicalize().ok()? != directory {
         return None;
+    }
+    if name != original {
+        // Accept a case alias only if both spellings identify the only
+        // matching directory entry while the original file still exists.
+        if !before.is_file() || !directory.join(path).is_file() {
+            return None;
+        }
+        let matches = std::fs::read_dir(directory)
+            .ok()?
+            .try_fold(0, |count, entry| {
+                let entry = entry.ok()?.file_name();
+                let matches = entry
+                    .to_str()
+                    .is_some_and(|leaf| leaf.eq_ignore_ascii_case(original));
+                Some(count + usize::from(matches))
+            })?;
+        if matches != 1 {
+            return None;
+        }
     }
     // The renamed file lives beside its owner. Relative references keep
     // working if the containing directory moves as well.
@@ -1322,8 +1343,8 @@ fn validate_project_name(name: &str) -> Result<(), &'static str> {
     if name.contains(['/', '\\']) || name.chars().any(char::is_control) {
         return Err("must be a bare name without path separators or control characters");
     }
-    if cfg!(windows) && name.contains(['<', '>', ':', '"', '|', '?', '*']) {
-        return Err("contains a character that Windows filenames cannot use");
+    if cfg!(windows) && invalid_windows_project_name(name) {
+        return Err("must be a valid Windows filename");
     }
     if name
         .rsplit_once('.')
@@ -1332,6 +1353,32 @@ fn validate_project_name(name: &str) -> Result<(), &'static str> {
         return Err("must not end in a KiCad file extension");
     }
     Ok(())
+}
+
+fn invalid_windows_project_name(name: &str) -> bool {
+    if name.contains(['<', '>', ':', '"', '|', '?', '*'])
+        || name.starts_with(' ')
+        || name.ends_with([' ', '.'])
+    {
+        return true;
+    }
+    // Win32 also reserves device names followed by an extension.
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
 }
 
 fn rewrite_setting(value: Option<&mut serde_json::Value>, old: &str, new: &str) -> usize {
@@ -1358,11 +1405,16 @@ fn rewrite_project_settings(
 
     let mut settings: Value = serde_json::from_str(text)?;
     anyhow::ensure!(settings.is_object(), "settings must be a JSON object");
-    let mut hits = rewrite_setting(
-        settings.pointer_mut("/meta/filename"),
-        &before.file_name().unwrap_or_default().to_string_lossy(),
-        &after.file_name().unwrap_or_default().to_string_lossy(),
-    );
+    let mut hits = 0;
+    if let Some(filename) = settings.pointer_mut("/meta/filename") {
+        if let Some(updated) = filename
+            .as_str()
+            .and_then(|value| relocated_filename(value, before, after, directory))
+        {
+            *filename = json!(updated);
+            hits += 1;
+        }
+    }
 
     let extension = before.extension().and_then(|ext| ext.to_str());
     if let Some(root) = root.filter(|_| extension == Some("kicad_pro")) {
@@ -1683,28 +1735,35 @@ async fn rename_project_with_moves(
         });
     }
 
-    // Prepare both JSON rewrites before any files move. A malformed settings
-    // document must fail the preview and apply with no filenames changed.
-    let mut settings = std::collections::BTreeMap::new();
+    // Resolve saved filename references while the original names exist.
+    // Malformed settings must fail without changing any filenames.
+    let mut prepared = std::collections::BTreeMap::new();
     for (before, after) in &planned_files {
-        if !before
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| matches!(extension, "kicad_pro" | "kicad_prl"))
-        {
+        let extension = before.extension().and_then(|extension| extension.to_str());
+        if !matches!(extension, Some("kicad_pro" | "kicad_prl" | "kicad_pcb")) {
             continue;
         }
         let text = std::fs::read_to_string(before)?;
-        match rewrite_project_settings(
-            &text,
-            before,
-            after,
-            root.as_ref(),
-            &planned_files,
-            &directory_path,
-        ) {
+        let plan = if extension == Some("kicad_pcb") {
+            Ok(rewrite_project_references(
+                &text,
+                &old_name,
+                &new_name,
+                root.as_ref(),
+            ))
+        } else {
+            rewrite_project_settings(
+                &text,
+                before,
+                after,
+                root.as_ref(),
+                &planned_files,
+                &directory_path,
+            )
+        };
+        match plan {
             Ok((updated, hits)) => {
-                settings.insert(after, (text, updated, hits));
+                prepared.insert(after, (text, updated, hits));
             }
             Err(error) => {
                 let reason = format!("Invalid project settings {}: {error}", before.display());
@@ -1766,6 +1825,24 @@ async fn rename_project_with_moves(
             completed_renames.push((from.clone(), to.clone()));
         }
         after_rename();
+        if let Some(root) = &root {
+            let source = konnect_sexp::writer::ensure_kicad_design_document_is_closed(root.after)
+                .and_then(|()| konnect_sexp::writer::read_consistent(root.after));
+            let drift = match source {
+                Ok(text) if text == root.source => None,
+                Ok(_) => Some("Root schematic changed since rename planning.".to_string()),
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(reason) = drift {
+                return Ok(rename_uncertain_result(
+                    root.after,
+                    reason,
+                    &completed_renames,
+                    &rewritten,
+                    &[],
+                ));
+            }
+        }
         // The renamed set plus every child sheet: a hierarchical design keeps
         // `(project "NAME"` in each sheet file, and the children are never
         // renamed, so rewriting only the root would de-annotate them.
@@ -1801,11 +1878,11 @@ async fn rename_project_with_moves(
                     &[],
                 ));
             }
-            let (updated, hits) = if let Some((original, updated, hits)) = settings.remove(target) {
+            let (updated, hits) = if let Some((original, updated, hits)) = prepared.remove(target) {
                 if text != original {
                     return Ok(rename_uncertain_result(
                         target,
-                        "Project settings changed since rename planning.",
+                        "File changed since rename planning.",
                         &completed_renames,
                         &rewritten,
                         &[],
@@ -1813,10 +1890,7 @@ async fn rename_project_with_moves(
                 }
                 (updated, hits)
             } else {
-                let board_root = root
-                    .as_ref()
-                    .filter(|_| target.extension().is_some_and(|ext| ext == "kicad_pcb"));
-                rewrite_project_references(&text, &old_name, &new_name, board_root)
+                rewrite_project_references(&text, &old_name, &new_name, None)
             };
             if hits > 0 {
                 if let Err(error) =
@@ -1842,14 +1916,11 @@ async fn rename_project_with_moves(
             .map(|(from, to)| (from, to))
             .chain(children.iter().map(|sheet| (sheet, sheet)))
         {
-            let hits = if let Some((_, _, hits)) = settings.get(target) {
+            let hits = if let Some((_, _, hits)) = prepared.get(target) {
                 *hits
             } else {
                 let text = std::fs::read_to_string(source)?;
-                let board_root = root
-                    .as_ref()
-                    .filter(|_| source.extension().is_some_and(|ext| ext == "kicad_pcb"));
-                rewrite_project_references(&text, &old_name, &new_name, board_root).1
+                rewrite_project_references(&text, &old_name, &new_name, None).1
             };
             rewritten.push(json!({
                 "file": target.file_name().and_then(|s| s.to_str()),
@@ -2322,6 +2393,29 @@ mod rename_recovery_tests {
         assert_eq!(std::fs::read_to_string(moved).unwrap(), external);
     }
 
+    #[tokio::test]
+    async fn late_root_change_is_detected_before_rewriting_project_settings() {
+        let (dir, pro, _) = fixture();
+        let expected_settings = std::fs::read_to_string(&pro).unwrap();
+        let root_after = dir.path().join("new.kicad_sch");
+        let external = r#"(kicad_sch (project "other"))"#;
+        let result = rename_project_with(&json!({"project":pro,"new_name":"new"}), || {
+            std::fs::write(&root_after, external).unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let response = body(&result);
+        assert_eq!(response["error"]["kind"], "mutation_outcome_uncertain");
+        assert_eq!(response["failing_target"], root_after.display().to_string());
+        assert_eq!(response["content_rewrites"], json!([]));
+        assert_eq!(std::fs::read_to_string(&root_after).unwrap(), external);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("new.kicad_pro")).unwrap(),
+            expected_settings
+        );
+    }
+
     // A quote is a valid POSIX filename but forbidden by Windows filenames.
     #[cfg(unix)]
     #[tokio::test]
@@ -2480,6 +2574,25 @@ mod rename_boundary_tests {
         }
     }
 
+    #[test]
+    fn windows_reserved_and_normalized_names_are_rejected() {
+        for name in [
+            "CON",
+            "nul.txt",
+            "COM¹",
+            "lpt9.rev",
+            "trailing.",
+            "trailing ",
+            " leading",
+            "a:b",
+        ] {
+            assert!(invalid_windows_project_name(name), "{name}");
+        }
+        for name in [".hidden", "CONSOLE", "COM10", "LPT0", "valid rev.2"] {
+            assert!(!invalid_windows_project_name(name), "{name}");
+        }
+    }
+
     #[tokio::test]
     async fn rename_refusals_and_same_name_never_move_existing_files() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2622,10 +2735,16 @@ mod rename_boundary_tests {
         let tmp = tempfile::tempdir().unwrap();
         let pro = fixture(tmp.path());
         let board = tmp.path().join("old.kicad_pcb");
+        let uppercase_root = tmp.path().join("OLD.kicad_sch");
+        let case_alias = uppercase_root.exists();
+        if !case_alias {
+            std::fs::write(&uppercase_root, "(kicad_sch)").unwrap();
+        }
         let before = r#"(kicad_pcb
             (footprint "Device:R" (sheetfile "old.kicad_sch") (property "Value" "old.kicad_sch"))
             (footprint "Device:R" (sheetfile "child.kicad_sch"))
             (footprint "Device:R" (sheetfile "other/old.kicad_sch"))
+            (footprint "Device:R" (sheetfile "OLD.kicad_sch"))
         )"#;
         std::fs::write(&board, before).unwrap();
 
@@ -2642,7 +2761,8 @@ mod rename_boundary_tests {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|item| item["file"] == "new.kicad_pcb" && item["references_updated"] == 1),
+                    .any(|item| item["file"] == "new.kicad_pcb"
+                        && item["references_updated"] == 1 + usize::from(case_alias)),
                 "{result:?}"
             );
             if dry_run {
@@ -2651,13 +2771,22 @@ mod rename_boundary_tests {
             }
         }
         assert!(!board.exists());
+        let expected = before.replacen(
+            r#"(sheetfile "old.kicad_sch")"#,
+            r#"(sheetfile "new.kicad_sch")"#,
+            1,
+        );
+        let expected = if case_alias {
+            expected.replace(
+                r#"(sheetfile "OLD.kicad_sch")"#,
+                r#"(sheetfile "new.kicad_sch")"#,
+            )
+        } else {
+            expected
+        };
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("new.kicad_pcb")).unwrap(),
-            before.replacen(
-                r#"(sheetfile "old.kicad_sch")"#,
-                r#"(sheetfile "new.kicad_sch")"#,
-                1
-            )
+            expected
         );
     }
 
