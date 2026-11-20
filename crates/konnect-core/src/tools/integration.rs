@@ -4114,6 +4114,22 @@ mod jlcpcb_cache_tests {
         assert!(fresh["count"].as_u64().unwrap() >= 1);
     }
 
+    #[tokio::test]
+    #[ignore = "requires the public LCSC API"]
+    async fn live_lcsc_datasheet_url_reports_the_observed_pdf_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx();
+        ctx.config.jlcpcb_db_path = Some(dir.path().join("absent.db"));
+        let result = handle_get_datasheet_url(&json!({"lcsc_id": "C25804"}), &ctx)
+            .await
+            .unwrap();
+        let body = response_json(&result);
+        assert_eq!(body["lookup"]["status"], "found", "{body}");
+        let url = body["datasheet_url"].as_str().unwrap();
+        assert!(url.starts_with("https://datasheet.lcsc.com/"));
+        assert!(url.contains(".pdf"));
+    }
+
     /// With no database at all the tool degrades to its old behaviour — web
     // lookup (unreachable in tests), then null with a note naming what was
     // tried rather than blaming only the API (#255).
