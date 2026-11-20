@@ -289,6 +289,8 @@ pub(crate) struct AnnotationPlan {
     pub assignments: Vec<Assignment>,
     pub unresolved: Vec<Unresolved>,
     pub outside_project: Vec<OutsideProject>,
+    #[serde(skip)]
+    preserve_shared_reference: bool,
 }
 
 const REASON_DUPLICATE: &str = "duplicate designator in this project; set resolve_duplicates \
@@ -652,7 +654,21 @@ pub(crate) fn symbol_block(content: &str, uuid: &str) -> Result<(usize, usize), 
 /// path in the file (the `multichannel` demo has `#PWR016` in the property
 /// and `#PWR024` on its first path). So the property follows the instance
 /// whose designator it currently shows, and is otherwise left alone.
-fn property_after(symbol: &PlacedSymbol, assignments: &[&Assignment]) -> String {
+fn property_after(
+    symbol: &PlacedSymbol,
+    assignments: &[&Assignment],
+    preserve_shared_reference: bool,
+) -> String {
+    if preserve_shared_reference
+        && symbol.paths.iter().any(|row| {
+            row.reference == symbol.property_reference
+                && !assignments.iter().any(|assignment| {
+                    assignment.project == row.project && assignment.path == row.path
+                })
+        })
+    {
+        return symbol.property_reference.clone();
+    }
     assignments
         .iter()
         .find(|a| a.from == symbol.property_reference)
@@ -745,7 +761,7 @@ pub(crate) fn plan_edits(
                 &format!("symbol {uuid} instance '{}'", assignment.path),
             )?);
         }
-        let property = property_after(symbol, &assignments);
+        let property = property_after(symbol, &assignments, plan.preserve_shared_reference);
         if property != symbol.property_reference {
             edits.push(replace_quoted_after(
                 content,
@@ -822,7 +838,7 @@ pub(crate) fn verify_applied(
             .iter()
             .filter(|a| a.uuid == symbol.uuid)
             .collect();
-        let expected_property = property_after(symbol, &own);
+        let expected_property = property_after(symbol, &own, plan.preserve_shared_reference);
         if observed.property_reference != expected_property {
             return Err(format!(
                 "symbol {} Reference property reads '{}', expected '{expected_property}'",
@@ -908,14 +924,13 @@ fn select_project(
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default()
     });
-    if require_proven_owner {
-        if let (Some(requested), Some(owner)) = (requested, owner_stem.as_deref()) {
-            if requested != owner {
-                return Err(refuse(format!(
-                    "saved project '{requested}' does not own this schematic; the owner is '{owner}'"
-                )));
-            }
-        }
+    if let Some((requested, owner)) = requested
+        .zip(owner_stem.as_deref())
+        .filter(|(requested, owner)| require_proven_owner && requested != owner)
+    {
+        return Err(refuse(format!(
+            "saved project '{requested}' does not own this schematic; the owner is '{owner}'"
+        )));
     }
     let root_for = |project: &str| {
         owner
@@ -1470,6 +1485,7 @@ pub(crate) fn rename_instance_reference(
             from: row.reference.clone(),
             to: new_reference.to_string(),
         }],
+        preserve_shared_reference: true,
         ..Default::default()
     };
     let edits = match plan_edits(&content, &before, &plan) {
@@ -2425,6 +2441,45 @@ mod tests {
         assert!(result.is_error);
         assert!(response_json(&result).to_string().contains("does not own"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), MULTI_UNIT);
+    }
+
+    #[test]
+    fn uuid_recovery_preserves_the_reference_showing_an_untouched_instance() {
+        let symbols = symbols_of(REUSED_SHEET);
+        let resistor = symbols
+            .iter()
+            .find(|symbol| symbol.property_reference.starts_with('R'))
+            .unwrap();
+        let source = set_every_reference(REUSED_SHEET, &resistor.uuid, "R?");
+        let (_dir, path) = write_fixture(&source);
+        let paths = symbols_of(&source)
+            .into_iter()
+            .find(|symbol| symbol.uuid == resistor.uuid)
+            .unwrap()
+            .paths;
+        assert!(paths.len() > 1);
+        let chosen = &paths[0];
+        let result = rename_instance_reference(
+            &path,
+            &resistor.uuid,
+            Some(&chosen.project),
+            Some(&chosen.path),
+            "R99999",
+        );
+        assert!(!result.is_error, "{result:?}");
+        let after = symbols_of(&std::fs::read_to_string(&path).unwrap())
+            .into_iter()
+            .find(|symbol| symbol.uuid == resistor.uuid)
+            .unwrap();
+        assert_eq!(after.property_reference, "R?");
+        for (before, after) in paths.iter().zip(&after.paths) {
+            let reference = if before == chosen { "R99999" } else { "R?" };
+            assert_eq!(after.reference, reference);
+            assert_eq!(
+                (&after.project, &after.path),
+                (&before.project, &before.path)
+            );
+        }
     }
 
     #[test]

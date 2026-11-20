@@ -2910,7 +2910,12 @@ async fn handle_edit_schematic_component(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    if let Some(uuid) = opt_str(args, "uuid") {
+    if args.get("uuid").is_some() {
+        for field in ["uuid", "project", "instance_path"] {
+            if args.get(field).is_some_and(|value| !value.is_string()) {
+                return Ok(crate::tools::invalid_arg(field, "expected a string"));
+            }
+        }
         if let Some(field) = args
             .as_object()
             .into_iter()
@@ -2931,7 +2936,10 @@ async fn handle_edit_schematic_component(
             Ok(value) => value.to_owned(),
             Err(error) => return Ok(error),
         };
-        let uuid = uuid.to_owned();
+        let uuid = match require_str(args, "uuid") {
+            Ok(value) => value.to_owned(),
+            Err(error) => return Ok(error),
+        };
         let project = opt_str(args, "project").map(str::to_owned);
         let instance_path = opt_str(args, "instance_path").map(str::to_owned);
         return Ok(
@@ -10528,6 +10536,21 @@ mod coverage_component_observation_contracts {
                 Some("stale_target")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_uuid_selector_cannot_fall_back_to_reference_edit() {
+        let original = source();
+        let (_dir, path) = fixture(&original);
+        let result = handle_edit_schematic_component(
+            &json!({"schematic": path, "uuid": null, "reference": "R1", "value": "20k"}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(body(&result)["error"]["field"], "uuid");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
     }
 
     #[tokio::test]

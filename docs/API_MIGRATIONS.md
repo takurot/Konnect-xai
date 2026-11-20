@@ -1361,8 +1361,10 @@ separate. Choose a unit that belongs to its own package, pass the returned
 arguments to `edit_schematic_component`, then run `annotate_schematic`
 again. The new selector accepts `uuid` with `new_reference` and optional
 `project` and `instance_path`. Pass an explicit path when a UUID has several
-instances in the selected project. The existing `reference` selector
-continues to edit shared fields across a component's placed units.
+instances in the selected project. If another instance still uses the
+displayed Reference property value, the edit preserves that shared property.
+The existing `reference` selector continues to edit shared fields across
+a component's placed units.
 
 
 ## Unreleased: `rotate_schematic_component` carries field text round (patch release)
