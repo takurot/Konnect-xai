@@ -428,6 +428,9 @@ impl Schematic {
     // ---- internal -----------------------------------------------------------
 
     fn from_sexp(root: SexpNode, filepath: PathBuf, original_source: String) -> Result<Self> {
+        if root.tag() != Some("kicad_sch") {
+            return Err(crate::error::Error::MissingField("kicad_sch"));
+        }
         let mut version = None;
         let mut generator = None;
         let mut generator_version = None;

@@ -410,6 +410,15 @@ impl McpHandler {
             if let Err(error) = tool_def.input_validator.validate(args) {
                 return schema_argument_error(&error);
             }
+            if let Some(path) = args["schematic"]
+                .as_str()
+                .filter(|_| tool_def.input_schema["properties"]["schematic"]["type"] == "string")
+            {
+                if let Some(error) = schematic_path_error(std::path::Path::new(path)).await {
+                    let kind = extract_error_kind(&error);
+                    return (error, CallStatus::Error, kind);
+                }
+            }
             let call = async { (tool_def.handler)(args, self.ctx.clone()).await };
             let result = if tool_def.uses_kicad_config {
                 let dir = self
@@ -716,6 +725,44 @@ fn result_content_bytes(result: &CallToolResult) -> usize {
             ToolContent::Image { data, .. } => data.len(),
         })
         .sum()
+}
+
+/// Every registered string argument named `schematic` refers to a saved
+/// schematic. An absent file keeps the individual tool's existing response.
+async fn schematic_path_error(path: &std::path::Path) -> Option<CallToolResult> {
+    use konnect_sexp::schematic::{has_schematic_extension, has_schematic_root};
+
+    let wrong_type = || crate::tools::invalid_arg("schematic", "not_a_schematic");
+    if !has_schematic_extension(path) {
+        return Some(wrong_type());
+    }
+    let probe_path = path.to_path_buf();
+    match crate::tools::blocking_work::spawn_read_only_blocking(move || {
+        if !probe_path.metadata()?.is_file() {
+            return Ok(false);
+        }
+        let file = std::fs::File::open(probe_path)?;
+        has_schematic_root(std::io::BufReader::new(file))
+    })
+    .await
+    {
+        Ok(Ok(true)) => None,
+        Ok(Ok(false)) => Some(wrong_type()),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(Err(error)) => {
+            let path = konnect_sexp::paths::display_path(path).into_owned();
+            Some(CallToolResult::error_kind(
+                ToolErrorKind::FileNotFound { path: path.clone() },
+                format!("Could not read schematic '{path}': {error}"),
+            ))
+        }
+        Err(error) => Some(CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: error.to_string(),
+            },
+            format!("Could not check schematic file type: {error}"),
+        )),
+    }
 }
 
 /// A missing *path* argument must reach the caller as `invalid_argument`

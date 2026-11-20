@@ -200,6 +200,10 @@ fn schematic_calls_preserve_the_board_and_project_when_passed_the_wrong_file() {
         "set_schematic_page",
         json!({"schematic": schematic, "size": "A3"}),
     );
+    let saved = std::fs::read_to_string(&schematic).unwrap();
+    let document = konnect_sexp::parse_sexp(&saved).unwrap();
+    assert_eq!(document.find_str("paper"), Some("A3"));
+
     for (domain, operation, input) in [("pcb", "drc", &board), ("sch", "erc", &schematic)] {
         let report = dir.path().join(format!("{domain}-report.txt"));
         let result = Command::new(&kicad_cli)

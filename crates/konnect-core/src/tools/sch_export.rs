@@ -10,11 +10,12 @@ use crate::tools::{get_path, placed_pins, placed_pins_by_reference, ToolContext,
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident, round6},
     parser::{parse_sexp, SexpNode},
+    schematic::write_schematic_if_unchanged,
     schematic::{
         extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
         pin_endpoint, read_schematic,
     },
-    writer::{apply_edits, find_direct_child_blocks, write_atomic_if_unchanged, SexpEdit},
+    writer::{apply_edits, find_direct_child_blocks, SexpEdit},
     SexpError,
 };
 use serde_json::json;
@@ -931,7 +932,7 @@ async fn handle_fix_connectivity(
     }
 
     let new_content = apply_edits(content.clone(), file_edits);
-    if let Err(error) = write_atomic_if_unchanged(&sch_path, &content, &new_content) {
+    if let Err(error) = write_schematic_if_unchanged(&sch_path, &content, &new_content) {
         if let Some(refusal) = connectivity_write_refusal(&sch_path, &error) {
             return Ok(refusal);
         }

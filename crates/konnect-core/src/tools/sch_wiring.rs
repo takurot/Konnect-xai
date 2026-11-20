@@ -13,6 +13,7 @@ use crate::tools::{
 };
 use konnect_schematic_editor as cse;
 use konnect_schematic_editor::types::fmt_f64;
+use konnect_sexp::schematic::write_schematic_if_unchanged;
 use konnect_sexp::{
     geometry::{round6, snap_point},
     parser::parse_sexp,
@@ -22,8 +23,7 @@ use konnect_sexp::{
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
-        find_direct_child_blocks, find_enclosing_block, read_consistent, write_atomic_if_unchanged,
-        SexpEdit,
+        find_enclosing_block, read_consistent, SexpEdit,
     },
 };
 use serde_json::json;
@@ -430,10 +430,16 @@ pub fn tools() -> Vec<ToolDef> {
 // So wires and labels must be inserted before the first (symbol block,
 // NOT at the end of the file.
 
-pub(crate) fn insert_before_close(content: &str, new_sexp: &str) -> String {
-    // Find the first top-level (symbol block — insert before it
-    let item_pos = find_first_symbol_instance(content)
-        .unwrap_or_else(|| content.rfind(')').unwrap_or(content.len()));
+pub(crate) fn insert_before_close(content: &str, new_sexp: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        konnect_sexp::schematic::has_schematic_root(content.as_bytes())?,
+        "expected a kicad_sch root"
+    );
+    let root_start = content.len() - content.trim_start().len();
+    let (_, root_end) = konnect_sexp::writer::find_balanced_block(content, root_start)
+        .filter(|(_, end)| content[*end..].trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("expected one complete kicad_sch document"))?;
+    let item_pos = find_first_symbol_instance(content, root_start).unwrap_or(root_end - 1);
     let line_start = content[..item_pos].rfind('\n').map_or(0, |pos| pos + 1);
     let insert_pos = if content[line_start..item_pos]
         .chars()
@@ -445,20 +451,21 @@ pub(crate) fn insert_before_close(content: &str, new_sexp: &str) -> String {
     };
     let insertion = format!("{}\n", new_sexp.trim_matches('\n'));
     let edits = vec![SexpEdit::insert(insert_pos, insertion)];
-    apply_edits(content.to_string(), edits)
+    Ok(apply_edits(content.to_string(), edits))
 }
 
 /// Find the byte offset of the first top-level symbol instance in the schematic.
-/// Top-level instances have `(lib_id` as a child, while lib_symbols definitions don't.
-/// Returns the position where wires/labels should be inserted BEFORE.
-fn find_first_symbol_instance(content: &str) -> Option<usize> {
-    for (start, end) in find_direct_child_blocks(content, "kicad_sch") {
-        let block = &content[start..end];
-        if block.starts_with("(symbol") && block.contains("(lib_id ") {
-            return Some(start);
-        }
-    }
-    None
+/// Library symbols are nested under `lib_symbols`, so they are not candidates.
+fn find_first_symbol_instance(content: &str, root_start: usize) -> Option<usize> {
+    konnect_sexp::writer::find_direct_child_blocks_at(content, root_start)
+        .into_iter()
+        .find_map(|(start, end)| {
+            let tag = content[start + 1..end]
+                .trim_start()
+                .split(|c: char| c.is_ascii_whitespace() || matches!(c, '(' | ')'))
+                .next()?;
+            (tag == "symbol").then_some(start)
+        })
 }
 
 // ─── Bridge: convert konnect-schematic-editor wires to konnect_sexp wires ──────
@@ -531,7 +538,7 @@ pub(crate) fn insert_wire_with_junctions(
     let mut junctions = local_junctions(&existing_wires, &new_wire);
     let pins = crate::tools::all_pin_endpoints(&tree);
     junctions.extend(pins_mid_segment(&pins, x1, y1, x2, y2));
-    let mut c = insert_before_close(&content, &format_wire(x1, y1, x2, y2));
+    let mut c = insert_before_close(&content, &format_wire(x1, y1, x2, y2))?;
     let mut emitted = existing_junctions;
     for (jx, jy) in junctions {
         if emitted
@@ -540,7 +547,7 @@ pub(crate) fn insert_wire_with_junctions(
         {
             continue;
         }
-        c = insert_before_close(&c, &format_junction(jx, jy));
+        c = insert_before_close(&c, &format_junction(jx, jy))?;
         emitted.push((jx, jy));
     }
     Ok(c)
@@ -589,7 +596,7 @@ async fn handle_add_wire(
         return Ok(e);
     }
     let new_content = insert_wire_with_junctions(content.clone(), x1, y1, x2, y2)?;
-    write_atomic_if_unchanged(&sch_path, &content, &new_content)?;
+    write_schematic_if_unchanged(&sch_path, &content, &new_content)?;
     Ok(CallToolResult::json(
         &json!({ "added_wire": { "x1": round6(x1), "y1": round6(y1), "x2": round6(x2), "y2": round6(y2) } }),
     ))
@@ -631,7 +638,7 @@ async fn handle_batch_add_wire(
         }
         new_content = insert_wire_with_junctions(new_content, x1, y1, x2, y2)?;
     }
-    write_atomic_if_unchanged(&sch_path, &content, &new_content)?;
+    write_schematic_if_unchanged(&sch_path, &content, &new_content)?;
     Ok(CallToolResult::json(&json!({ "added_wires": wires.len() })))
 }
 
@@ -652,7 +659,7 @@ async fn handle_delete_wire(
     let edits = vec![SexpEdit::delete(del_start, del_end)];
     let new_content = apply_edits(content, edits);
     let (new_content, pruned) = prune_orphaned_junctions(new_content, &removed);
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
     Ok(CallToolResult::text(match pruned {
         0 => "Wire deleted.".to_string(),
         n => format!("Wire deleted. Removed {n} orphaned junction(s)."),
@@ -1374,13 +1381,10 @@ pub(crate) fn reconcile_junctions_at(
     ranges.sort_unstable();
     ranges.dedup();
     let pruned = ranges.len();
-    let mut out = apply_edits(
-        content,
-        ranges
-            .into_iter()
-            .map(|(s, e)| SexpEdit::delete(s, e))
-            .collect(),
-    );
+    let edits = ranges
+        .into_iter()
+        .map(|(start, end)| SexpEdit::delete(start, end))
+        .collect();
     let mut to_add: Vec<(f64, f64)> = to_add
         .into_iter()
         // Pin endpoints come out of arithmetic (136.19 + 3.81 = 139.70000000000002)
@@ -1391,10 +1395,18 @@ pub(crate) fn reconcile_junctions_at(
     to_add.sort_by(|a, b| a.partial_cmp(b).expect("rounded coordinates are finite"));
     to_add.dedup();
     let added = to_add.len();
-    for (x, y) in to_add {
-        out = insert_before_close(&out, &format_junction(x, y));
+    if added == 0 {
+        return (apply_edits(content, edits), 0, pruned);
     }
-    (out, added, pruned)
+    let out = apply_edits(content.clone(), edits);
+    let junctions: String = to_add
+        .into_iter()
+        .map(|(x, y)| format_junction(x, y))
+        .collect();
+    match insert_before_close(&out, &junctions) {
+        Ok(out) => (out, added, pruned),
+        Err(_) => (content, 0, 0),
+    }
 }
 
 /// Drop the junction dots the removed wires left with nothing to justify them.
@@ -1532,7 +1544,7 @@ async fn handle_batch_delete_wire(
         .collect();
     let content = apply_edits(content, edits);
     let (content, pruned) = prune_orphaned_junctions(content, &removed);
-    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+    write_schematic_if_unchanged(&sch_path, &expected, &content)?;
     Ok(CallToolResult::json(&json!({
         "deleted": deleted,
         "junctions_pruned_count": pruned,
@@ -1633,8 +1645,8 @@ async fn handle_split_wire_at_point(
     let w2 = format_wire(px, py, w.x2, w.y2);
     let junc = format_junction(px, py);
     let insert = format!("{w1}{w2}{junc}");
-    let new_content = insert_before_close(&content, &insert);
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    let new_content = insert_before_close(&content, &insert)?;
+    write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "split_at": { "x": round6(px), "y": round6(py) },
@@ -1771,7 +1783,7 @@ async fn handle_delete_net_label(
     let kind = label.kind;
     let edits = vec![SexpEdit::delete(del_start, del_end)];
     let new_content = apply_edits(content, edits);
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
     Ok(CallToolResult::json(&json!({
         "deleted_label": net,
         "type": kind,
@@ -1972,7 +1984,7 @@ async fn handle_rotate_label(
     }
 
     let new_content = apply_edits(content, edits);
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
     // The shared CAS verifies committed bytes and preserves typed uncertainty.
     Ok(CallToolResult::json(&json!({
         "rotated_label": net,
@@ -2088,7 +2100,7 @@ async fn handle_move_labels_by_offset(
 
     let moved = matching.len();
     let new_content = apply_edits(content, edits);
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
     // The shared CAS verifies committed bytes and preserves typed uncertainty.
 
     Ok(CallToolResult::json(
@@ -2392,7 +2404,7 @@ async fn handle_delete_no_connect(
         ));
     };
     let new_content = apply_edits(content, vec![SexpEdit::delete(del_start, del_end)]);
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
     Ok(CallToolResult::text("No-connect deleted."))
 }
 
@@ -2472,7 +2484,7 @@ async fn handle_batch_delete_no_connect(
         .map(|(s, e)| SexpEdit::delete(s, e))
         .collect();
     let content = apply_edits(content, edits);
-    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+    write_schematic_if_unchanged(&sch_path, &expected, &content)?;
     Ok(CallToolResult::json(&json!({
         "deleted": deleted,
         "errors": errors
@@ -2774,7 +2786,7 @@ async fn handle_connect_pins(
     }
     let new_content = route_between(content, x1, y1, x2, y2)?;
 
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "connected": {
@@ -2925,7 +2937,7 @@ async fn handle_add_schematic_connection(
     }
     let content = route_between(content, x1, y1, x2, y2)?;
 
-    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+    write_schematic_if_unchanged(&sch_path, &expected, &content)?;
     Ok(CallToolResult::json(&json!({
         "connected": { "from": [x1, y1], "to": [x2, y2] }
     })))

@@ -21,6 +21,7 @@ use crate::tools::{
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::geometry::round6;
+use konnect_sexp::schematic::write_schematic_if_unchanged;
 use konnect_sexp::{
     commit_command,
     geometry::snap_point,
@@ -29,9 +30,7 @@ use konnect_sexp::{
         extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
         pin_outward_direction, read_schematic,
     },
-    writer::{
-        apply_edits, find_direct_child_blocks, read_consistent, write_atomic_if_unchanged, SexpEdit,
-    },
+    writer::{apply_edits, find_direct_child_blocks, read_consistent, SexpEdit},
     ItemAnchor, ItemId, SchematicCommand, SexpError,
 };
 use serde_json::json;
@@ -3417,7 +3416,7 @@ async fn handle_move_schematic_component(
     };
     let candidate = sch.to_source();
     let (candidate, added, pruned) = reconcile_junctions_for_placement(&before_source, candidate);
-    write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
+    write_schematic_if_unchanged(&sch_path, &before_source, &candidate)?;
     let moved_markers =
         match observed_no_connect_moves(&sch_path, "move_schematic_component", &carried)? {
             Ok(moved) => moved,
@@ -3496,7 +3495,7 @@ async fn handle_rotate_schematic_component(
     };
     let candidate = sch.to_source();
     let (candidate, added, pruned) = reconcile_junctions_for_placement(&before_source, candidate);
-    write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
+    write_schematic_if_unchanged(&sch_path, &before_source, &candidate)?;
     let moved_markers =
         match observed_no_connect_moves(&sch_path, "rotate_schematic_component", &carried)? {
             Ok(moved) => moved,
@@ -3600,7 +3599,7 @@ async fn handle_move_region(
     };
     let candidate = sch.to_source();
     let (candidate, added, pruned) = reconcile_junctions_for_placement(&before_source, candidate);
-    write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
+    write_schematic_if_unchanged(&sch_path, &before_source, &candidate)?;
 
     let moved_markers = match observed_no_connect_moves(&sch_path, "move_region", &carried)? {
         Ok(moved) => moved,
@@ -4151,7 +4150,7 @@ async fn handle_update_symbols_from_library(
     }
 
     if !updated.is_empty() && !dry_run {
-        write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+        write_schematic_if_unchanged(&sch_path, &expected, &content)?;
     }
 
     let mut body = json!({
@@ -4481,7 +4480,7 @@ async fn handle_replace_component(
         None => return Ok(no_connect_carry_unwritable(&sch_path)),
     };
     let (content, added, pruned) = reconcile_junctions_for_placement(&expected, content);
-    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+    write_schematic_if_unchanged(&sch_path, &expected, &content)?;
 
     let moved_markers = match observed_no_connect_moves(&sch_path, "replace_component", &carries)? {
         Ok(moved) => moved,
