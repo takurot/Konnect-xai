@@ -306,11 +306,11 @@ async fn handle_export_manufacturing_package(
             .await
             .map(Some)
         } else {
-            cli::export_position_file(
+            export_generic_positions(
                 cli_path,
                 &board,
+                schematic.as_deref(),
                 &pos_path,
-                "csv",
                 position_units,
                 position_side,
             )
@@ -357,7 +357,7 @@ async fn handle_export_manufacturing_package(
                 fields: args["bom_fields"].as_str(),
                 labels: args["bom_labels"].as_str(),
                 group_by: args["bom_group_by"].as_str(),
-                exclude_dnp: is_jlcpcb,
+                exclude_dnp: true,
             };
             let bom_result = if is_jlcpcb {
                 cli::export_bom_with_ref_range_delimiter(cli_path, sch, &bom_path, &bom_options, "")
@@ -512,7 +512,117 @@ fn midpoint_failure(error: konnect_ipc::IpcFailure) -> CallToolResult {
     }
 }
 
-pub(super) async fn export_jlcpcb_cpl(
+pub(super) async fn export_generic_positions(
+    cli_path: &str,
+    board: &Path,
+    schematic: Option<&Path>,
+    output: &Path,
+    units: &str,
+    side: &str,
+) -> anyhow::Result<()> {
+    let Some(schematic) = schematic else {
+        return cli::export_position_file_excluding_dnp(
+            cli_path, board, output, "csv", units, side,
+        )
+        .await;
+    };
+
+    let board_source = tokio::fs::read_to_string(board).await?;
+    let schematic_source = tokio::fs::read(schematic).await?;
+    let staged = tempfile::tempdir()?;
+    let netlist = staged.path().join("components.net");
+    cli::export_netlist(cli_path, schematic, &netlist, "kicadsexpr").await?;
+    let exported = tokio::fs::read_to_string(netlist).await?;
+    let (identity, components) = pcb_sync::linked_netlist_components(schematic, &exported)?;
+    let board_tree = konnect_sexp::parse_sexp(&board_source)?;
+    let footprints = board_tree.find_all("footprint");
+    let sibling = tokio::fs::canonicalize(board.with_extension("kicad_sch"))
+        .await
+        .ok();
+    let same_project =
+        sibling.as_deref() == Some(tokio::fs::canonicalize(schematic).await?.as_path());
+    let mut excluded = BTreeSet::new();
+    for component in components.into_iter().filter(|component| component.dnp) {
+        let mut candidates = footprints.iter().filter(|footprint| {
+            konnect_sexp::board::footprint_reference(footprint).as_deref()
+                == Some(component.reference.as_str())
+        });
+        let Some(footprint) = candidates.next() else {
+            continue;
+        };
+        anyhow::ensure!(
+            candidates.next().is_none(),
+            "multiple footprints use DNP reference {}",
+            component.reference
+        );
+        anyhow::ensure!(
+            footprint.get(1).and_then(konnect_sexp::SexpNode::as_str)
+                == Some(component.footprint_id.as_str()),
+            "PCB footprint does not match schematic DNP reference {}",
+            component.reference
+        );
+        let matches = match footprint.find_str("path") {
+            Some(path) => {
+                identity.matching_path(path)? == identity.matching_path(&component.symbol_path)?
+            }
+            None => same_project,
+        };
+        anyhow::ensure!(
+            matches,
+            "cannot associate PCB footprint {} with the selected DNP symbol",
+            component.reference
+        );
+        excluded.insert(component.reference);
+    }
+
+    let position_file = staged.path().join("positions.csv");
+    cli::export_position_file_excluding_dnp(cli_path, board, &position_file, "csv", units, side)
+        .await?;
+    let position_bytes = tokio::fs::read(position_file).await?;
+    let filtered = exclude_position_references(&position_bytes, &excluded)?;
+    anyhow::ensure!(
+        tokio::fs::read(board).await? == board_source.as_bytes()
+            && tokio::fs::read(schematic).await? == schematic_source,
+        "assembly inputs changed before publishing positions"
+    );
+    cli::publish_verified_bytes(output, &filtered, "assembly position file").await
+}
+
+fn exclude_position_references(
+    input: &[u8],
+    excluded: &BTreeSet<String>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut reader = csv::Reader::from_reader(input);
+    let reference = reader
+        .headers()?
+        .iter()
+        .position(|column| column == "Ref")
+        .context("KiCad position CSV has no Ref column")?;
+    // The CSV reader can stop on the CR of a CRLF terminator.
+    let record_end = |offset| -> anyhow::Result<usize> {
+        let end = usize::try_from(offset)?;
+        let trailing_lf =
+            end > 0 && input.get(end - 1) == Some(&b'\r') && input.get(end) == Some(&b'\n');
+        Ok(end + usize::from(trailing_lf))
+    };
+    let mut start = record_end(reader.position().byte())?;
+    let mut filtered = input[..start].to_vec();
+    let mut record = csv::StringRecord::new();
+    while reader.read_record(&mut record)? {
+        let end = record_end(reader.position().byte())?;
+        if !excluded.contains(
+            record
+                .get(reference)
+                .context("position row has no reference")?,
+        ) {
+            filtered.extend_from_slice(&input[start..end]);
+        }
+        start = end;
+    }
+    Ok(filtered)
+}
+
+async fn export_jlcpcb_cpl(
     cli_path: &str,
     board: &Path,
     output: &Path,
@@ -1177,6 +1287,8 @@ struct JlcpcbPricing {
     extended_feeder_fee_usd: f64,
     #[serde(skip)]
     order_parts_cost_usd: f64,
+    #[serde(skip)]
+    missing_catalog_refs: Vec<String>,
 }
 
 fn jlcpcb_component_pricing(
@@ -1186,7 +1298,8 @@ fn jlcpcb_component_pricing(
 ) -> anyhow::Result<JlcpcbPricing> {
     use rusqlite::OptionalExtension;
 
-    let conn = if parts.values().any(Option::is_some) && db_path.try_exists()? {
+    let has_identified_parts = parts.values().any(Option::is_some);
+    let conn = if has_identified_parts && db_path.try_exists()? {
         Some(integration::open_jlcpcb_catalog(db_path)?)
     } else {
         None
@@ -1214,7 +1327,13 @@ fn jlcpcb_component_pricing(
             catalog.insert(id, row);
         }
     }
-    let pricing = price_parts(parts, &catalog, quantity);
+    let mut pricing = price_parts(parts, &catalog, quantity);
+    if has_identified_parts && conn.is_none() {
+        pricing.missing_catalog_refs = parts
+            .iter()
+            .filter_map(|(reference, id)| id.as_ref().map(|_| reference.clone()))
+            .collect();
+    }
     anyhow::ensure!(
         pricing.order_parts_cost_usd.is_finite(),
         "catalog prices overflow the order total"
@@ -1459,6 +1578,12 @@ async fn handle_estimate_cost(
             }
         }).await?;
         warnings.extend(warning);
+        if !estimate.missing_catalog_refs.is_empty() {
+            warnings.push(format!(
+                "The local JLCPCB catalog is absent; identified parts [{}] use the fallback average",
+                estimate.missing_catalog_refs.join(", ")
+            ));
+        }
         pricing = Some(estimate);
     }
     let fabrication_scope = if width_mm == 0.0 || height_mm == 0.0 {
@@ -1598,6 +1723,16 @@ mod package_export_option_tests {
             }),
             "{body}"
         );
+    }
+
+    #[test]
+    fn position_filter_preserves_native_rows_for_other_references() {
+        let header = b"Ref,Val,Package,PosX,PosY,Rot,Side\r\n";
+        let first = b"\"R1\",\"value, with comma\",\"Pkg\",5.000000,-3.000000,0.000000,top\r\n";
+        let second = b"\"R2\",\"value\",\"Pkg\",6.000000,-3.000000,0.000000,top\r\n";
+        let input = [header.as_slice(), first.as_slice(), second.as_slice()].concat();
+        let kept = exclude_position_references(&input, &BTreeSet::from(["R2".into()])).unwrap();
+        assert_eq!(kept, [header.as_slice(), first.as_slice()].concat());
     }
 
     #[test]
