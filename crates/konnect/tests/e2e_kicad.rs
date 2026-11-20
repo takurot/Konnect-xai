@@ -219,6 +219,93 @@ fn schematic_calls_preserve_the_board_and_project_when_passed_the_wrong_file() {
 
 #[test]
 #[ignore = "requires kicad-cli; run via e2e workflow"]
+fn native_library_loading_survives_rejected_symbol_and_footprint_edits() {
+    let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
+    let area = tempfile::tempdir().unwrap();
+    let symbols = area.path().join("Parts.kicad_sym");
+    let pads = area.path().join("Pads.pretty");
+    let footprint = pads.join("Fixture.kicad_mod");
+    let mut mcp = Mcp::spawn(&kicad_cli);
+    mcp.load("library");
+
+    mcp.tool(
+        "create_symbol",
+        json!({
+            "library_path": symbols, "name": "Parent", "reference_prefix": "U",
+            "pins": [{"number": "1", "name": "IN", "type": "input", "x": -5.08, "y": 0, "angle": 0}]
+        }),
+    );
+    let mut source = std::fs::read_to_string(&symbols).unwrap();
+    let close = source.rfind(')').unwrap();
+    source.insert_str(
+        close,
+        r#"(symbol "Dependent"
+            (extends "Parent")
+            (property "Value" "Dependent" (at 0 -2.54 0) (effects (font (size 1.27 1.27)))))
+        "#,
+    );
+    std::fs::write(&symbols, &source).unwrap();
+
+    let response = mcp.request(
+        "tools/call",
+        json!({
+            "name": "delete_symbol",
+            "arguments": {"library_path": symbols, "symbol_name": "Parent"}
+        }),
+    );
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    let error = body(&response["result"]);
+    assert!(
+        error["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Dependent"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&symbols).unwrap(), source);
+
+    mcp.tool(
+        "create_footprint",
+        json!({
+            "output": footprint, "name": "Fixture",
+            "pads": [{"number":"1","type":"smd","shape":"rect","x":0,"y":0,"width":2,"height":2}]
+        }),
+    );
+    let original = std::fs::read(&footprint).unwrap();
+    let response = mcp.request(
+        "tools/call",
+        json!({
+            "name": "edit_footprint_pad",
+            "arguments": {"footprint_path": footprint, "pad_number": "1", "width": -2}
+        }),
+    );
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    assert_eq!(
+        body(&response["result"])["error"]["kind"],
+        "invalid_argument"
+    );
+    assert_eq!(std::fs::read(&footprint).unwrap(), original);
+
+    let upgraded_symbols = area.path().join("Upgraded.kicad_sym");
+    let upgraded_pads = area.path().join("Upgraded.pretty");
+    for (mode, source, target) in [
+        ("sym", &symbols, &upgraded_symbols),
+        ("fp", &pads, &upgraded_pads),
+    ] {
+        let result = Command::new(&kicad_cli)
+            .args([mode, "upgrade", "--force", "--output"])
+            .arg(target)
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+    }
+    assert!(upgraded_symbols.is_file());
+    assert!(upgraded_pads.join("Fixture.kicad_mod").is_file());
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
 fn fabrication_and_document_exports_through_mcp() {
     let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
     let dir = tempfile::tempdir().unwrap();

@@ -10355,6 +10355,184 @@ mod file_safety_tests {
 }
 
 #[cfg(test)]
+mod library_write_contract_tests {
+    use super::*;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            Default::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn symbol_args(path: &Path, name: &str) -> serde_json::Value {
+        json!({
+            "library_path": path, "name": name, "reference_prefix": "U",
+            "pins": [{"number":"1","name":"IN","type":"input","x":-5.08,"y":0,"angle":0}]
+        })
+    }
+
+    fn pad_args() -> serde_json::Value {
+        json!({"number":"1","type":"smd","shape":"rect","x":0,"y":0,"width":2,"height":2})
+    }
+
+    fn assert_refusal(result: CallToolResult, field: &str) {
+        assert!(result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected structured tool error");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], field, "{body}");
+    }
+
+    #[tokio::test]
+    async fn library_creation_refuses_wrong_extensions_and_disguised_designs() {
+        let area = tempfile::tempdir().unwrap();
+        let ctx = context();
+        for (basename, source) in [
+            ("project.kicad_pcb", "(kicad_pcb (version 20240108))"),
+            ("project.kicad_sch", "(kicad_sch (version 20250610))"),
+            ("disguised.kicad_sym", "(kicad_sch (version 20250610))"),
+        ] {
+            let path = area.path().join(basename);
+            std::fs::write(&path, source).unwrap();
+            let result = handle_create_symbol(&symbol_args(&path, "Valid"), &ctx)
+                .await
+                .unwrap();
+            assert_refusal(result, "library_path");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        }
+
+        for (basename, source) in [
+            ("project.kicad_pcb", "(kicad_pcb (version 20240108))"),
+            ("project.kicad_sch", "(kicad_sch (version 20250610))"),
+            ("disguised.kicad_mod", "(kicad_pcb (version 20240108))"),
+        ] {
+            let path = area.path().join(basename);
+            std::fs::write(&path, source).unwrap();
+            let result = handle_create_footprint(
+                &json!({"output":path, "name":"Valid", "pads":[pad_args()], "overwrite":true}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert_refusal(result, "output");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        }
+    }
+
+    #[tokio::test]
+    async fn symbol_deletion_preserves_the_parent_and_names_its_dependents() {
+        let area = tempfile::tempdir().unwrap();
+        let path = area.path().join("Parts.kicad_sym");
+        let original = r#"(kicad_symbol_lib
+          (symbol "Parent")
+          (symbol "LeafB" (extends "Parent"))
+          (symbol "LeafA" (extends "Parent")))"#;
+        std::fs::write(&path, original).unwrap();
+        let ctx = context();
+        let result =
+            handle_delete_symbol(&json!({"library_path":path, "symbol_name":"Parent"}), &ctx)
+                .await
+                .unwrap();
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected dependency evidence");
+        };
+        assert!(text.contains("LeafA") && text.contains("LeafB"), "{text}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let result =
+            handle_delete_symbol(&json!({"library_path":path, "symbol_name":"LeafA"}), &ctx)
+                .await
+                .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let surviving = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            top_level_symbol_names(&surviving).unwrap(),
+            ["LeafB", "Parent"]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_identifiers_do_not_create_or_modify_library_files() {
+        let area = tempfile::tempdir().unwrap();
+        let ctx = context();
+        let symbols = area.path().join("Symbols.kicad_sym");
+        let symbol_table = area.path().join("sym-lib-table");
+        let footprint_table = area.path().join("fp-lib-table");
+        let old_symbol_table = "(sym_lib_table (version 7))";
+        let old_footprint_table = "(fp_lib_table (version 7))";
+        std::fs::write(&symbol_table, old_symbol_table).unwrap();
+        std::fs::write(&footprint_table, old_footprint_table).unwrap();
+
+        for invalid in ["Bad:Name", "Bad\"Name", "  "] {
+            let result = handle_create_symbol(&symbol_args(&symbols, invalid), &ctx)
+                .await
+                .unwrap();
+            assert_refusal(result, "name");
+            assert!(!symbols.exists());
+            let result = handle_register_symbol_library(
+                &json!({"library_path":symbols, "nickname":invalid, "project":area.path()}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert_refusal(result, "nickname");
+            let result = handle_register_footprint_library(
+                &json!({"library_path":area.path().join("Pads.pretty"), "nickname":invalid, "project":area.path()}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert_refusal(result, "nickname");
+            assert_eq!(
+                std::fs::read_to_string(&symbol_table).unwrap(),
+                old_symbol_table
+            );
+            assert_eq!(
+                std::fs::read_to_string(&footprint_table).unwrap(),
+                old_footprint_table
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_pad_keywords_and_dimensions_are_refused_before_writing() {
+        let area = tempfile::tempdir().unwrap();
+        let path = area.path().join("Pads.pretty").join("Fixture.kicad_mod");
+        let ctx = context();
+        let args = json!({"output":path, "name":"Fixture", "pads":[pad_args()]});
+        for (field, invalid) in [
+            ("type", json!("smt")),
+            ("shape", json!("blob")),
+            ("width", json!(0)),
+            ("height", json!(-2)),
+            ("drill", json!(0)),
+            ("width", json!(0.0000001)),
+        ] {
+            let mut malformed = args.clone();
+            malformed["pads"][0][field] = invalid;
+            assert_refusal(
+                handle_create_footprint(&malformed, &ctx).await.unwrap(),
+                &format!("pads[0].{field}"),
+            );
+            assert!(!path.parent().unwrap().exists());
+        }
+
+        assert!(!handle_create_footprint(&args, &ctx).await.unwrap().is_error);
+        let original = std::fs::read(&path).unwrap();
+        for (field, invalid) in [("width", -2.0), ("height", 0.0000001), ("drill", 0.0)] {
+            let mut edit = json!({"footprint_path":path, "pad_number":"1"});
+            edit[field] = json!(invalid);
+            assert_refusal(handle_edit_footprint_pad(&edit, &ctx).await.unwrap(), field);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+}
+
+#[cfg(test)]
 mod quoted_symbol_readback_tests {
     use super::*;
     #[tokio::test]
