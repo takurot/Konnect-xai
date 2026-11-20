@@ -209,8 +209,12 @@ def start_server(parent=None):
     global _server_thread
 
     if _CACHE_DIR is None:
-        wx.MessageBox("Konnect state path is unavailable. Check KONNECT_STATE_DIR.",
-                      "Konnect", wx.OK | wx.ICON_ERROR)
+        wx.MessageBox(
+            "Konnect state path is unavailable. Check KONNECT_STATE_DIR.",
+            "Konnect",
+            wx.OK | wx.ICON_ERROR,
+            parent=parent,
+        )
         return False
 
     if not os.path.exists(BINARY_PATH):

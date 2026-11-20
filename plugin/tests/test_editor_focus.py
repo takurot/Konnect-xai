@@ -35,6 +35,17 @@ class EditorFocusTests(unittest.TestCase):
         plugin.start_server.assert_called_once_with(parent=dialog)
         manager.Raise.assert_not_called()
 
+    def test_unavailable_state_error_uses_the_settings_dialog_as_parent(self):
+        plugin = _load_plugin()
+        plugin._CACHE_DIR = None
+        plugin.wx = types.SimpleNamespace(MessageBox=mock.Mock(), OK=1, ICON_ERROR=2)
+        dialog = object()
+
+        self.assertFalse(plugin.start_server(parent=dialog))
+
+        plugin.wx.MessageBox.assert_called_once()
+        self.assertIs(plugin.wx.MessageBox.call_args.kwargs.get("parent"), dialog)
+
     def test_settings_stays_reachable_without_falling_back_to_the_manager(self):
         plugin = _load_plugin()
         manager = mock.Mock()
