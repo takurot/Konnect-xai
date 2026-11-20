@@ -59,12 +59,20 @@ fn find_kicad_cli() -> Option<String> {
 
 impl Mcp {
     fn spawn(kicad_cli: &str) -> Self {
+        Self::spawn_with_home(kicad_cli, None)
+    }
+
+    fn spawn_with_home(kicad_cli: &str, home: Option<&std::path::Path>) -> Self {
         let mut config = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
         write!(config, "{}", json!({"kicad_cli": kicad_cli})).unwrap();
         config.flush().unwrap();
         let (_persist, config_path) = config.keep().unwrap();
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_konnect"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+        if let Some(home) = home {
+            command.env("HOME", home).env("APPDATA", home);
+        }
+        let mut child = command
             .arg("--config")
             .arg(&config_path)
             .stdin(Stdio::piped())
@@ -1016,4 +1024,196 @@ fn a_written_default_netclass_still_plots_wires() {
         (after - radius).abs() < 1e-6,
         "a sparse named class changed the junction dot: {radius} -> {after}"
     );
+}
+
+#[test]
+#[ignore = "requires KiCad 10 and its stock symbol libraries"]
+fn builtin_templates_place_with_complete_guides_on_stock_kicad() {
+    use std::collections::{HashMap, HashSet};
+
+    let cli = find_kicad_cli().expect("stock KiCad 10 required for template placement test");
+    let dir = tempfile::tempdir().unwrap();
+    let mut mcp = Mcp::spawn_with_home(&cli, Some(dir.path()));
+    mcp.load("templates");
+    mcp.load("sch_components");
+    let tools = mcp.request("tools/list", json!({}));
+    let description = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "apply_template")
+        .unwrap()["description"]
+        .as_str()
+        .unwrap();
+    assert!(description.contains("places components"), "{description}");
+    assert!(description.contains("does not wire"), "{description}");
+
+    let found = body(&mcp.tool("search_templates", json!({"query": ""})));
+    let templates = found["templates"].as_array().unwrap();
+    assert!(templates.len() >= 6, "{found}");
+    for entry in templates {
+        let id = entry["id"].as_str().unwrap();
+        let project = dir.path().join(id);
+        mcp.tool("create_project", json!({"name":id,"path":project}));
+        let path = project.join(format!("{id}.kicad_sch"));
+        let result = body(&mcp.tool(
+            "apply_template",
+            json!({"template_id":id,"schematic":path,"ref_start":100,"net_mappings":{"GND":"PROJECT_GND"}}),
+        ));
+        assert_eq!(result["template"], id);
+        assert_eq!(result["wired"], false, "{result}");
+        assert!(result["next_steps"]
+            .as_str()
+            .unwrap()
+            .contains("No wires or labels were added"));
+
+        let source = std::fs::read_to_string(&path).unwrap();
+        let saved = konnect_sexp::parse_sexp(&source).unwrap();
+        let symbols = saved.find_all("symbol");
+        let placed = result["components_placed"].as_array().unwrap();
+        let template = body(&mcp.tool("get_template", json!({"template_id":id})));
+        let expected_count: u64 = template["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["quantity"].as_u64().unwrap_or(1))
+            .sum();
+        assert_eq!(placed.len(), expected_count as usize, "{id}");
+        assert_eq!(symbols.len(), placed.len(), "{id}");
+        for tag in [
+            "wire",
+            "junction",
+            "label",
+            "global_label",
+            "hierarchical_label",
+        ] {
+            assert!(
+                saved.find_all(tag).is_empty(),
+                "{id} unexpectedly added {tag}"
+            );
+        }
+
+        let netlist = project.join(format!("{id}.net"));
+        let exported = Command::new(&cli)
+            .args(["sch", "export", "netlist", "--output"])
+            .arg(&netlist)
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            exported.status.success() && netlist.is_file(),
+            "{id}: native KiCad could not read the saved placement: {}",
+            String::from_utf8_lossy(&exported.stderr)
+        );
+
+        let mut pins = HashSet::new();
+        let mut passive_pins = HashSet::new();
+        for item in placed {
+            let reference = item["reference"].as_str().unwrap();
+            assert!(
+                symbols.iter().any(|symbol| {
+                    symbol.find_all("property").iter().any(|property| {
+                        property.get(1).and_then(|value| value.as_str()) == Some("Reference")
+                            && property.get(2).and_then(|value| value.as_str()) == Some(reference)
+                    })
+                }),
+                "{id}: missing saved symbol {reference}"
+            );
+            let locations = body(&mcp.tool(
+                "get_schematic_pin_locations",
+                json!({"schematic":path,"reference":reference}),
+            ));
+            let numbers = locations["pins"].as_array().unwrap();
+            assert!(!numbers.is_empty(), "{id}: {reference} has no pins");
+            for pin in numbers {
+                let endpoint = format!("{reference}.{}", pin["number"].as_str().unwrap());
+                if numbers.len() == 2 {
+                    passive_pins.insert(endpoint.clone());
+                }
+                pins.insert(endpoint);
+            }
+        }
+
+        let mut covered = HashSet::new();
+        let mut nets = HashMap::new();
+        for row in result["connections_to_wire"].as_array().unwrap() {
+            let from = row["from"].as_str().unwrap();
+            assert!(pins.contains(from), "{id}: unknown source pin {from}");
+            covered.insert(from.to_string());
+            if let Some(to) = row["to"].as_str() {
+                assert!(pins.contains(to), "{id}: unknown target pin {to}");
+                covered.insert(to.to_string());
+            } else {
+                let net = row["to_net"].as_str().unwrap();
+                assert!(
+                    nets.insert(from, net).is_none(),
+                    "{id}: repeated assignment for {from}"
+                );
+                assert_ne!(net, "GND", "{id}: ground alias was not applied");
+                if net == "PROJECT_GND" {
+                    assert_eq!(row["mapped_from"], "GND", "{id}: {row}");
+                }
+            }
+        }
+        if id != "i2c_pullups" {
+            assert!(
+                nets.values().any(|net| *net == "PROJECT_GND"),
+                "{id}: no mapped ground"
+            );
+        }
+        assert!(
+            passive_pins.is_subset(&covered),
+            "{id}: unwired guide pins {:?}",
+            passive_pins.difference(&covered).collect::<Vec<_>>()
+        );
+
+        let required: &[(&str, &str)] = match id {
+            "usb_c_5v_sink" => &[
+                ("J100.A4", "VUSB"),
+                ("J100.A9", "VUSB"),
+                ("J100.B4", "VUSB"),
+                ("J100.B9", "VUSB"),
+                ("J100.A1", "PROJECT_GND"),
+                ("J100.A12", "PROJECT_GND"),
+                ("J100.B1", "PROJECT_GND"),
+                ("J100.B12", "PROJECT_GND"),
+                ("J100.A6", "USB_DP"),
+                ("J100.B6", "USB_DP"),
+                ("J100.A7", "USB_DN"),
+                ("J100.B7", "USB_DN"),
+                ("D100.1", "PROJECT_GND"),
+                ("D100.2", "USB_DP"),
+                ("D100.3", "USB_DN"),
+                ("D100.4", "VUSB"),
+            ],
+            "stm32_minimal" => &[
+                ("U100.24", "VCC_3V3"),
+                ("U100.36", "VCC_3V3"),
+                ("U100.48", "VCC_3V3"),
+                ("U100.23", "PROJECT_GND"),
+                ("U100.35", "PROJECT_GND"),
+                ("U100.47", "PROJECT_GND"),
+                ("U100.49", "PROJECT_GND"),
+                ("U100.22", "VCAP"),
+                ("U100.34", "SWDIO"),
+                ("U100.37", "SWCLK"),
+                ("J100.2", "SWDIO"),
+                ("J100.4", "SWCLK"),
+                ("J100.10", "NRST"),
+            ],
+            "ldo_3v3" => &[("U100.1", "VIN"), ("U100.3", "VIN"), ("U100.5", "VCC_3V3")],
+            "buck_converter" => &[
+                ("U100.4", "FB"),
+                ("U100.6", "BOOT"),
+                ("C104.1", "BOOT"),
+                ("C104.2", "SW"),
+            ],
+            "i2c_pullups" => &[("R100.1", "SDA"), ("R101.1", "SCL")],
+            "led_indicator" => &[("R100.1", "GPIO"), ("D100.1", "PROJECT_GND")],
+            _ => &[],
+        };
+        for &(pin, net) in required {
+            assert_eq!(nets.get(pin), Some(&net), "{id}: {pin}");
+        }
+    }
 }
