@@ -1673,6 +1673,46 @@ mod net_query_tests {
     }
 
     #[tokio::test]
+    async fn legacy_invisible_power_input_uses_the_global_pin_name() {
+        // The PIC programmer demo's old VPP supply uses this same hidden-pin
+        // convention instead of a power symbol annotation.
+        let schematic = r#"(kicad_sch
+          (lib_symbols
+            (symbol "Test:Invisible" (symbol "Invisible_1_1"
+              (pin power_in line (at 0 0 0) (hide yes) (name "VPP") (number "1"))))
+            (symbol "Test:Visible" (symbol "Visible_1_1"
+              (pin power_in line (at 0 0 0) (hide no) (name "VPP") (number "1"))))
+            (symbol "Test:Passive" (symbol "Passive_1_1"
+              (pin passive line (at 0 0 0) (hide yes) (name "VPP") (number "1")))))
+          (symbol (lib_id "Test:Invisible") (at 10 20 0) (unit 1) (uuid "a")
+            (property "Reference" "U1") (property "Value" "one"))
+          (symbol (lib_id "Test:Invisible") (at 30 20 0) (unit 1) (uuid "b")
+            (property "Reference" "U2") (property "Value" "two"))
+          (symbol (lib_id "Test:Visible") (at 50 20 0) (unit 1) (uuid "c")
+            (property "Reference" "U3") (property "Value" "three"))
+          (symbol (lib_id "Test:Passive") (at 70 20 0) (unit 1) (uuid "d")
+            (property "Reference" "U4") (property "Value" "four"))
+        )"#;
+        let listed = call(schematic, "list_schematic_nets", json!({})).await;
+        assert_eq!(listed["nets"], json!(["VPP"]));
+        let pin = call(
+            schematic,
+            "get_pin_connections",
+            json!({"reference": "U1", "pin_number": "1"}),
+        )
+        .await;
+        assert_eq!(pin["net"], "VPP");
+        let members = call(schematic, "get_net_connections", json!({"net": "VPP"})).await;
+        let references: BTreeSet<_> = members["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["reference"].as_str().unwrap())
+            .collect();
+        assert_eq!(references, BTreeSet::from(["U1", "U2"]));
+    }
+
+    #[tokio::test]
     async fn named_net_reports_real_sheet_pins() {
         let ground = call(SCH, "get_net_connections", json!({ "net": "GND" })).await;
         let pins = ground["pins"].as_array().unwrap();
