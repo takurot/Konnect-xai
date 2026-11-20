@@ -144,10 +144,11 @@ the distribution's GTK 3 and WebKitGTK 4.1 runtimes
 
 ### Preinstall for clients with a startup deadline
 
-The first `npx` connection downloads the launcher and native binary before
+With an empty npm cache, `npx` downloads the launcher and native binary before
 Konnect can initialize. Registry downloads can take longer than the client's
-startup deadline. Install the package once into a dedicated directory, then
-point the client at the installed launcher. [Observed first-run behavior](https://github.com/takurot/Konnect-xai/issues/100).
+startup deadline. Install the package and its optional dependencies into a
+dedicated directory, then point the client at the installed launcher.
+[Observed first-run behavior](https://github.com/takurot/Konnect-xai/issues/100).
 
 ```sh
 npm install --prefix "<absolute-prefix>" --ignore-scripts @konnect-xai/konnect@0.16.0
