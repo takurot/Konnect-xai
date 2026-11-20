@@ -2342,3 +2342,21 @@ target.
 
 Diagnostics present ordinary Windows canonical drive and UNC paths in their
 usual spelling. The transaction journal keeps its existing relative-path format.
+
+## Unreleased - library search and listing on a fresh KiCad installation
+
+`search_symbols`, `search_footprints`, `list_symbol_libraries`, and
+`list_footprint_libraries` read the selected KiCad user table when it exists.
+When it is absent, these tools can read the matching installation's shipped
+template and include `table_source: "template"` in the response. They do not
+install or modify the user table.
+
+When neither a requested project table, a user table nor a shipped template is
+available, a search or global listing returns `library_table_unavailable`.
+An existing empty table or a search with no matches still returns an empty
+result. Unreadable and malformed tables return a diagnostic.
+
+`search_footprints` accepts an optional `project` path to a `.kicad_pro` file
+or a project directory. It defaults to the server's configured
+`project_dir`. Project footprint libraries are searched first. When a project
+and global table use the same nickname, the project entry is used for search.

@@ -405,12 +405,13 @@ pub fn tools() -> Vec<ToolDef> {
         .with_kicad_config(),
         tool!(
             "search_footprints",
-            "Search for footprints across all registered libraries by name or keyword.",
+            "Search global and project footprint libraries by name or keyword.",
             json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search string (partial name or keyword)" },
-                    "limit": { "type": "integer", "description": "Maximum number of results to return", "default": 50 }
+                    "limit": { "type": "integer", "description": "Maximum number of results to return", "default": 50 },
+                    "project": { "type": "string", "description": "Path to a .kicad_pro file or project directory. Defaults to the configured project_dir." }
                 },
                 "required": ["query"]
             }),
@@ -1632,7 +1633,11 @@ fn kicad_user_path_vars() -> std::collections::HashMap<String, String> {
         .unwrap_or_default()
 }
 
-fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
+fn expand_lib_uri(
+    uri: &str,
+    kiprjmod: Option<&Path>,
+    template_share: Option<&Path>,
+) -> Option<PathBuf> {
     let Some(rest) = uri.strip_prefix("${") else {
         return (!uri.is_empty()).then(|| PathBuf::from(uri));
     };
@@ -1684,6 +1689,10 @@ fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
         return None;
     };
 
+    if let Some(share) = template_share {
+        let path = share.join(kind).join(tail);
+        return path.exists().then_some(path);
+    }
     super::find_kicad_library_dirs(kind)
         .into_iter()
         .map(|base| base.join(tail))
@@ -1711,6 +1720,7 @@ fn flatten_lib_table(
     content: &str,
     depth: usize,
     kiprjmod: Option<&Path>,
+    template_share: Option<&Path>,
 ) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
 
@@ -1727,14 +1737,19 @@ fn flatten_lib_table(
                 );
                 continue;
             }
-            match expand_lib_uri(&uri, kiprjmod).map(std::fs::read_to_string) {
-                Some(Ok(nested)) => out.extend(flatten_lib_table(&nested, depth + 1, kiprjmod)),
+            match expand_lib_uri(&uri, kiprjmod, template_share).map(std::fs::read_to_string) {
+                Some(Ok(nested)) => out.extend(flatten_lib_table(
+                    &nested,
+                    depth + 1,
+                    kiprjmod,
+                    template_share,
+                )),
                 _ => tracing::warn!("nested lib-table '{}' could not be read", uri),
             }
             continue;
         }
 
-        if let Some(path) = expand_lib_uri(&uri, kiprjmod) {
+        if let Some(path) = expand_lib_uri(&uri, kiprjmod, template_share) {
             entry["path"] = json!(path.to_string_lossy());
         }
         out.push(entry);
@@ -1760,7 +1775,7 @@ fn read_lib_table_checked(path: &Path) -> Result<Vec<serde_json::Value>, String>
         // table. For the global table the parent is KiCad's config dir, where
         // a ${KIPRJMOD} entry would be authoring error to begin with — the
         // expansion then simply fails its exists() check.
-        Ok(content) => Ok(flatten_lib_table(&content, 0, path.parent())),
+        Ok(content) => Ok(flatten_lib_table(&content, 0, path.parent(), None)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!("Cannot read lib-table {}: {}", path.display(), e)),
     }
@@ -1777,6 +1792,146 @@ fn read_flat_lib_table(path: &Path) -> Vec<serde_json::Value> {
             tracing::warn!("{msg}");
             Vec::new()
         }
+    }
+}
+
+/// The two available scopes of a read-only library catalogue.
+#[derive(Default)]
+struct LibraryCatalogue {
+    global: Vec<serde_json::Value>,
+    project: Vec<serde_json::Value>,
+    used_template: bool,
+}
+
+impl LibraryCatalogue {
+    fn load(
+        configured_cli: &str,
+        filename: &str,
+        include_global: bool,
+        project_dir: Option<&Path>,
+    ) -> Result<Self, CallToolResult> {
+        let mut catalogue = Self::default();
+        let project = project_dir
+            .map(|dir| catalogue_table(&dir.join(filename), None))
+            .transpose()?
+            .flatten();
+        let global_path = super::kicad_config_dir().join(filename);
+        let mut global = None;
+        if include_global {
+            global = catalogue_table(&global_path, None)?;
+            if global.is_none() {
+                for template in
+                    crate::kicad_install::library_template_candidates(configured_cli, filename)
+                {
+                    let share = template.parent().and_then(Path::parent);
+                    if let Some(entries) = catalogue_table(&template, share)? {
+                        global = Some(entries);
+                        catalogue.used_template = true;
+                        break;
+                    }
+                }
+            }
+            if global.is_none() && project.is_none() {
+                return Err(CallToolResult::error_kind(
+                    ToolErrorKind::LibraryTableUnavailable { table: filename.into() },
+                    format!(
+                        "No {filename} is available in the selected KiCad configuration, its installed templates, or the requested project"
+                    ),
+                ));
+            }
+        }
+        catalogue.global = global.unwrap_or_default();
+        catalogue.project = project.unwrap_or_default();
+        Ok(catalogue)
+    }
+
+    fn global_search_entries(&self) -> impl Iterator<Item = &serde_json::Value> {
+        let project_names: std::collections::HashSet<_> = self
+            .project
+            .iter()
+            .filter_map(|entry| entry["nickname"].as_str())
+            .collect();
+        self.global.iter().filter(move |entry| {
+            !entry["nickname"]
+                .as_str()
+                .is_some_and(|name| project_names.contains(name))
+        })
+    }
+
+    fn response(&self, mut body: serde_json::Value) -> CallToolResult {
+        if self.used_template {
+            body["table_source"] = json!("template");
+        }
+        CallToolResult::json(&body)
+    }
+
+    fn listing(&self) -> CallToolResult {
+        let libraries: Vec<_> = [("global", &self.global), ("project", &self.project)]
+            .into_iter()
+            .flat_map(|(scope, entries)| {
+                entries.iter().cloned().map(move |mut entry| {
+                    entry["scope"] = json!(scope);
+                    entry
+                })
+            })
+            .collect();
+        self.response(json!({"count": libraries.len(), "libraries": libraries}))
+    }
+}
+
+fn catalogue_table(
+    table: &Path,
+    template_share: Option<&Path>,
+) -> Result<Option<Vec<serde_json::Value>>, CallToolResult> {
+    let trouble = |detail: &str| {
+        let reason = format!("Cannot read lib-table {}: {detail}", table.display());
+        CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: reason.clone(),
+            },
+            reason,
+        )
+    };
+    let text = match std::fs::read_to_string(table) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(trouble(&error.to_string())),
+    };
+    let text = text.trim();
+    if find_balanced_block(text, 0) != Some((0, text.len())) {
+        return Err(trouble("expected one complete library table"));
+    }
+    let root = parse_sexp(text).map_err(|error| trouble(&error.to_string()))?;
+    let expected = table_root_element(table);
+    if !matches!(root.get(0), Some(SexpNode::Atom(head)) if head == expected) {
+        return Err(trouble(&format!("expected '{expected}' root")));
+    }
+    Ok(Some(flatten_lib_table(
+        text,
+        0,
+        table.parent(),
+        template_share,
+    )))
+}
+
+fn list_catalogue(args: &serde_json::Value, ctx: &ToolContext, filename: &str) -> CallToolResult {
+    let scope = args["scope"].as_str().unwrap_or("all");
+    let project_dir = if matches!(scope, "project" | "all") {
+        match args["project"].as_str().map(project_table_dir).transpose() {
+            Ok(project_dir) => project_dir,
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
+    match LibraryCatalogue::load(
+        &ctx.config.kicad_cli,
+        filename,
+        matches!(scope, "global" | "all"),
+        project_dir.as_deref(),
+    ) {
+        Ok(catalogue) => catalogue.listing(),
+        Err(error) => error,
     }
 }
 
@@ -2003,45 +2158,9 @@ async fn handle_register_footprint_library(
 
 async fn handle_list_footprint_libraries(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let scope = args["scope"].as_str().unwrap_or("all");
-    let mut all_libs = Vec::new();
-
-    // A table that exists but cannot be read is reported rather than counted
-    // as zero libraries — "0" is the symptom of the bug this PR fixes, so the
-    // two must not look alike.
-    if scope == "global" || scope == "all" {
-        let mut libs = match read_lib_table_checked(&global_fp_lib_table()) {
-            Ok(libs) => libs,
-            Err(msg) => return Ok(CallToolResult::error(msg)),
-        };
-        for lib in &mut libs {
-            lib["scope"] = json!("global");
-        }
-        all_libs.extend(libs);
-    }
-
-    if (scope == "project" || scope == "all") && args["project"].is_string() {
-        let proj = PathBuf::from(args["project"].as_str().unwrap());
-        let table = proj.parent().unwrap_or(Path::new(".")).join("fp-lib-table");
-        let mut libs = match read_lib_table_checked(&table) {
-            Ok(libs) => libs,
-            Err(msg) => return Ok(CallToolResult::error(msg)),
-        };
-        for lib in &mut libs {
-            lib["scope"] = json!("project");
-        }
-        all_libs.extend(libs);
-    }
-
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "count": all_libs.len(),
-            "libraries": all_libs
-        }))
-        .unwrap(),
-    ))
+    Ok(list_catalogue(args, ctx, "fp-lib-table"))
 }
 
 /// A lib-table path written the way KiCad writes one: forward slashes on every
@@ -2277,47 +2396,9 @@ async fn handle_register_symbol_library(
 
 async fn handle_list_symbol_libraries(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let scope = args["scope"].as_str().unwrap_or("all");
-    let mut all_libs = Vec::new();
-
-    // Same as the footprint listing: an unreadable table is an error, not a
-    // zero count.
-    if scope == "global" || scope == "all" {
-        let mut libs = match read_lib_table_checked(&global_sym_lib_table()) {
-            Ok(libs) => libs,
-            Err(msg) => return Ok(CallToolResult::error(msg)),
-        };
-        for lib in &mut libs {
-            lib["scope"] = json!("global");
-        }
-        all_libs.extend(libs);
-    }
-
-    if (scope == "project" || scope == "all") && args["project"].is_string() {
-        let proj = PathBuf::from(args["project"].as_str().unwrap());
-        let table = proj
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("sym-lib-table");
-        let mut libs = match read_lib_table_checked(&table) {
-            Ok(libs) => libs,
-            Err(msg) => return Ok(CallToolResult::error(msg)),
-        };
-        for lib in &mut libs {
-            lib["scope"] = json!("project");
-        }
-        all_libs.extend(libs);
-    }
-
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "count": all_libs.len(),
-            "libraries": all_libs
-        }))
-        .unwrap(),
-    ))
+    Ok(list_catalogue(args, ctx, "sym-lib-table"))
 }
 
 /// Root S-expression element for a lib-table file, decided by its filename:
@@ -4840,36 +4921,29 @@ async fn handle_search_symbols(
         .map(PathBuf::from)
         .or_else(|| ctx.config.project_dir.clone());
 
-    // Gather (nickname, path) entries from the global sym-lib-table and, when a
-    // project dir is supplied, the project's own sym-lib-table too — this is
-    // what makes project-attached libraries searchable. Nested `(type "Table")`
-    // references are followed and `${KICAD*_DIR}` URIs expanded, so the
-    // libraries KiCad ships are included.
-    let mut entries: Vec<(String, String)> = Vec::new();
-    let mut tables = vec![global_sym_lib_table()];
-    if let Some(pd) = &project_dir {
-        tables.push(pd.join("sym-lib-table"));
-    }
-    for table in &tables {
-        for lib in read_flat_lib_table(table) {
-            if let (Some(nick), Some(path)) = (lib["nickname"].as_str(), lib["path"].as_str()) {
-                entries.push((nick.to_string(), path.to_string()));
-            }
-        }
-    }
-
+    let catalogue = match LibraryCatalogue::load(
+        &ctx.config.kicad_cli,
+        "sym-lib-table",
+        true,
+        project_dir.as_deref(),
+    ) {
+        Ok(catalogue) => catalogue,
+        Err(error) => return Ok(error),
+    };
     let mut results = Vec::new();
-    // `entries` holds resolved filesystem paths, not the raw uris they came
-    // from — read_flat_lib_table does that expansion now.
-    'outer: for (nickname, resolved) in entries {
-        let lib_path = PathBuf::from(&resolved);
+    'outer: for entry in catalogue.global_search_entries().chain(&catalogue.project) {
+        let (Some(nickname), Some(path)) = (entry["nickname"].as_str(), entry["path"].as_str())
+        else {
+            continue;
+        };
+        let lib_path = PathBuf::from(path);
         if !lib_path.exists() {
             continue;
         }
         let Ok(lib_content) = tokio::fs::read_to_string(&lib_path).await else {
             continue;
         };
-        for hit in search_lib_symbols(&nickname, &lib_content, &query) {
+        for hit in search_lib_symbols(nickname, &lib_content, &query) {
             results.push(hit);
             if results.len() >= limit {
                 break 'outer;
@@ -4877,14 +4951,11 @@ async fn handle_search_symbols(
         }
     }
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "query": query,
-            "count": results.len(),
-            "results": results
-        }))
-        .unwrap(),
-    ))
+    Ok(catalogue.response(json!({
+        "query": query,
+        "count": results.len(),
+        "results": results
+    })))
 }
 
 async fn handle_list_library_footprints(
@@ -5060,7 +5131,7 @@ async fn handle_get_footprint_info(
 
 async fn handle_search_footprints(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let query = match require_str(args, "query") {
         Ok(v) => v.to_lowercase(),
@@ -5068,12 +5139,25 @@ async fn handle_search_footprints(
     };
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
-    // Walk global fp-lib-table
-    let fp_lib_table_path = super::kicad_config_dir().join("fp-lib-table");
-
+    let project_dir = match args["project"].as_str().map(project_table_dir).transpose() {
+        Ok(project_dir) => project_dir.or_else(|| ctx.config.project_dir.clone()),
+        Err(error) => return Ok(error),
+    };
+    let catalogue = match LibraryCatalogue::load(
+        &ctx.config.kicad_cli,
+        "fp-lib-table",
+        true,
+        project_dir.as_deref(),
+    ) {
+        Ok(catalogue) => catalogue,
+        Err(error) => return Ok(error),
+    };
     let mut results = Vec::new();
-
-    'outer: for lib in read_flat_lib_table(&fp_lib_table_path) {
+    'outer: for lib in catalogue
+        .project
+        .iter()
+        .chain(catalogue.global_search_entries())
+    {
         let nickname = lib["nickname"].as_str().unwrap_or("").to_string();
         let Some(dir) = lib["path"].as_str().map(PathBuf::from) else {
             continue;
@@ -5100,14 +5184,11 @@ async fn handle_search_footprints(
         }
     }
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "query": args["query"].as_str().unwrap_or(""),
-            "count": results.len(),
-            "results": results
-        }))
-        .unwrap(),
-    ))
+    Ok(catalogue.response(json!({
+        "query": args["query"].as_str().unwrap_or(""),
+        "count": results.len(),
+        "results": results
+    })))
 }
 
 // ─── get_symbol_info (moved from verification toolset) ───────────────────────
@@ -5513,7 +5594,7 @@ mod tests {
             &[("KiCad", "Table", &nested.to_string_lossy())],
         );
 
-        let libs = flatten_lib_table(&root, 0, None);
+        let libs = flatten_lib_table(&root, 0, None, None);
         assert_eq!(libs.len(), 1, "nested table not followed: {libs:?}");
         assert_eq!(libs[0]["nickname"], "Resistor_SMD");
         assert_eq!(
@@ -5538,7 +5619,7 @@ mod tests {
         .unwrap();
 
         let content = std::fs::read_to_string(&table).unwrap();
-        assert!(flatten_lib_table(&content, 0, None).is_empty());
+        assert!(flatten_lib_table(&content, 0, None, None).is_empty());
     }
 
     #[test]
@@ -5712,11 +5793,11 @@ mod tests {
         let _env = footprint_dir_env(tmp.path());
 
         assert_eq!(
-            expand_lib_uri("${KICAD10_FOOTPRINT_DIR}/Resistor_SMD.pretty", None),
+            expand_lib_uri("${KICAD10_FOOTPRINT_DIR}/Resistor_SMD.pretty", None, None),
             Some(pretty)
         );
         assert_eq!(
-            expand_lib_uri("/plain/path", None),
+            expand_lib_uri("/plain/path", None, None),
             Some(PathBuf::from("/plain/path")),
             "a non-variable URI must pass through untouched"
         );
@@ -5747,7 +5828,10 @@ mod tests {
 
         // Without a project context (direct call, no table), it must not
         // resolve rather than guess.
-        assert_eq!(expand_lib_uri("${KIPRJMOD}/MyParts.pretty", None), None);
+        assert_eq!(
+            expand_lib_uri("${KIPRJMOD}/MyParts.pretty", None, None),
+            None
+        );
     }
 
     #[test]
@@ -10770,6 +10854,141 @@ mod project_catalog_contract_tests {
             crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
             other => panic!("expected JSON, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn catalogue_fallback_does_not_replace_empty_or_malformed_global_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let cli = dir.path().join("selected/bin/kicad-cli");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&cli, "").unwrap();
+        let share = dir.path().join("selected/share/kicad");
+        let symbols = share.join("symbols");
+        let templates = share.join("template");
+        std::fs::create_dir_all(&symbols).unwrap();
+        std::fs::create_dir_all(&templates).unwrap();
+        std::fs::write(
+            symbols.join("Test.kicad_sym"),
+            r#"(kicad_symbol_lib (symbol "KonnectCatalogueFixture"))"#,
+        )
+        .unwrap();
+        std::fs::write(
+            templates.join("sym-lib-table"),
+            r#"(sym_lib_table (lib (name "Selected") (type "KiCad") (uri "${KICAD94999_SYMBOL_DIR}/Test.kicad_sym")))"#,
+        )
+        .unwrap();
+        let other = dir.path().join("unselected");
+        let other_cli = other.join("bin/kicad-cli");
+        let other_share = other.join("share/kicad");
+        let other_symbols = other_share.join("symbols");
+        let other_templates = other_share.join("template");
+        for folder in [
+            other_cli.parent().unwrap(),
+            &other_symbols,
+            &other_templates,
+        ] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        std::fs::write(&other_cli, "").unwrap();
+        std::fs::copy(
+            templates.join("sym-lib-table"),
+            other_templates.join("sym-lib-table"),
+        )
+        .unwrap();
+        std::fs::write(
+            other_symbols.join("Test.kicad_sym"),
+            r#"(kicad_symbol_lib (symbol "KonnectCatalogueFixtureUnselected"))"#,
+        )
+        .unwrap();
+
+        let global = config.join("sym-lib-table");
+        let mut ctx = context();
+        ctx.config.kicad_cli = cli.to_string_lossy().into_owned();
+        let args = json!({"query":"KonnectCatalogueFixture"});
+        crate::kicad_install::REQUEST_CONFIG_DIR
+            .scope(config.clone(), async {
+                let fallback = body(handle_search_symbols(&args, &ctx).await.unwrap());
+                assert_eq!(fallback["count"], 1, "{fallback}");
+                assert_eq!(
+                    fallback["results"][0]["id"],
+                    "Selected:KonnectCatalogueFixture"
+                );
+                assert_eq!(fallback["table_source"], "template");
+                assert!(!global.exists(), "a search must never create a user table");
+                ctx.config.kicad_cli = other_cli.to_string_lossy().into_owned();
+                let other = body(handle_search_symbols(&args, &ctx).await.unwrap());
+                assert_eq!(other["count"], 1, "{other}");
+                assert_eq!(
+                    other["results"][0]["id"],
+                    "Selected:KonnectCatalogueFixtureUnselected"
+                );
+                ctx.config.kicad_cli = cli.to_string_lossy().into_owned();
+
+                std::fs::write(&global, "(sym_lib_table (version 7))").unwrap();
+                let empty = body(handle_search_symbols(&args, &ctx).await.unwrap());
+                assert_eq!(empty["count"], 0, "{empty}");
+                assert!(empty.get("table_source").is_none(), "{empty}");
+
+                std::fs::write(&global, "(fp_lib_table)").unwrap();
+                let malformed = handle_search_symbols(&args, &ctx).await.unwrap();
+                assert!(malformed.is_error);
+                assert_eq!(body(malformed)["error"]["kind"], "handler_error");
+                assert_eq!(std::fs::read_to_string(&global).unwrap(), "(fp_lib_table)");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn footprint_search_distinguishes_absence_and_uses_the_exact_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let project = dir.path().join("project");
+        let project_table = project.join("fp-lib-table");
+        let footprint_lib = project.join("Local.pretty");
+        std::fs::create_dir_all(&footprint_lib).unwrap();
+        std::fs::write(footprint_lib.join("ProjectOnly.kicad_mod"), "").unwrap();
+        std::fs::write(
+            &project_table,
+            r#"(fp_lib_table (lib (name "Local") (type "KiCad") (uri "${KIPRJMOD}/Local.pretty")))"#,
+        )
+        .unwrap();
+        let mut ctx = context();
+        ctx.config.kicad_cli = dir
+            .path()
+            .join("missing/bin/kicad-cli")
+            .to_string_lossy()
+            .into_owned();
+        crate::kicad_install::REQUEST_CONFIG_DIR
+            .scope(config, async {
+                let missing = handle_search_footprints(&json!({"query":"ProjectOnly"}), &ctx)
+                    .await
+                    .unwrap();
+                assert!(missing.is_error);
+                assert_eq!(body(missing)["error"]["kind"], "library_table_unavailable");
+
+                for reference in [project.clone(), project.join("fixture.kicad_pro")] {
+                    let args = json!({"query":"ProjectOnly","project":reference});
+                    let found = body(handle_search_footprints(&args, &ctx).await.unwrap());
+                    assert_eq!(found["results"][0]["id"], "Local:ProjectOnly", "{found}");
+                    assert!(found.get("table_source").is_none(), "{found}");
+                }
+                ctx.config.project_dir = Some(project.clone());
+                let args = json!({"query":"Different"});
+                let available = body(handle_search_footprints(&args, &ctx).await.unwrap());
+                assert_eq!(available["count"], 0, "{available}");
+
+                let invalid = handle_search_footprints(
+                    &json!({"query":"ProjectOnly","project":dir.path().join("wrong.txt")}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+                assert!(invalid.is_error);
+            })
+            .await;
     }
 
     #[tokio::test]

@@ -49,6 +49,8 @@ pub enum ToolErrorKind {
     InvalidArgument { field: String, reason: String },
     /// A referenced file or discovery directory doesn't exist or can't be read.
     FileNotFound { path: String },
+    /// No project, user, or bundled table is available for this catalogue.
+    LibraryTableUnavailable { table: String },
     /// No item on the queried schematic sheet names the requested net.
     NotFound {
         net: String,
@@ -170,6 +172,7 @@ impl ToolErrorKind {
             Self::UnknownTool { .. } => "unknown_tool",
             Self::InvalidArgument { .. } => "invalid_argument",
             Self::FileNotFound { .. } => "file_not_found",
+            Self::LibraryTableUnavailable { .. } => "library_table_unavailable",
             Self::NotFound { .. } => "not_found",
             Self::Conflict { .. } => "conflict",
             Self::WouldJoinNets { .. } => "would_join_nets",
@@ -378,6 +381,9 @@ mod tests {
                 reason: "r".into(),
             },
             ToolErrorKind::AmbiguousOpenBoard { path: "p".into() },
+            ToolErrorKind::LibraryTableUnavailable {
+                table: "sym-lib-table".into(),
+            },
             ToolErrorKind::HandlerError { reason: "r".into() },
         ];
         for kind in kinds {
