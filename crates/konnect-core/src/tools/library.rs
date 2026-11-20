@@ -1633,7 +1633,12 @@ fn kicad_user_path_vars() -> std::collections::HashMap<String, String> {
         .unwrap_or_default()
 }
 
-fn expand_lib_uri(
+#[cfg(test)]
+fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
+    expand_catalogue_uri(uri, kiprjmod, None)
+}
+
+fn expand_catalogue_uri(
     uri: &str,
     kiprjmod: Option<&Path>,
     template_share: Option<&Path>,
@@ -1720,6 +1725,14 @@ fn flatten_lib_table(
     content: &str,
     depth: usize,
     kiprjmod: Option<&Path>,
+) -> Vec<serde_json::Value> {
+    flatten_catalogue_table(content, depth, kiprjmod, None)
+}
+
+fn flatten_catalogue_table(
+    content: &str,
+    depth: usize,
+    kiprjmod: Option<&Path>,
     template_share: Option<&Path>,
 ) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
@@ -1737,8 +1750,9 @@ fn flatten_lib_table(
                 );
                 continue;
             }
-            match expand_lib_uri(&uri, kiprjmod, template_share).map(std::fs::read_to_string) {
-                Some(Ok(nested)) => out.extend(flatten_lib_table(
+            match expand_catalogue_uri(&uri, kiprjmod, template_share).map(std::fs::read_to_string)
+            {
+                Some(Ok(nested)) => out.extend(flatten_catalogue_table(
                     &nested,
                     depth + 1,
                     kiprjmod,
@@ -1749,7 +1763,7 @@ fn flatten_lib_table(
             continue;
         }
 
-        if let Some(path) = expand_lib_uri(&uri, kiprjmod, template_share) {
+        if let Some(path) = expand_catalogue_uri(&uri, kiprjmod, template_share) {
             entry["path"] = json!(path.to_string_lossy());
         }
         out.push(entry);
@@ -1775,7 +1789,7 @@ fn read_lib_table_checked(path: &Path) -> Result<Vec<serde_json::Value>, String>
         // table. For the global table the parent is KiCad's config dir, where
         // a ${KIPRJMOD} entry would be authoring error to begin with — the
         // expansion then simply fails its exists() check.
-        Ok(content) => Ok(flatten_lib_table(&content, 0, path.parent(), None)),
+        Ok(content) => Ok(flatten_lib_table(&content, 0, path.parent())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!("Cannot read lib-table {}: {}", path.display(), e)),
     }
@@ -1906,7 +1920,7 @@ fn catalogue_table(
     if !matches!(root.get(0), Some(SexpNode::Atom(head)) if head == expected) {
         return Err(trouble(&format!("expected '{expected}' root")));
     }
-    Ok(Some(flatten_lib_table(
+    Ok(Some(flatten_catalogue_table(
         text,
         0,
         table.parent(),
@@ -5594,7 +5608,7 @@ mod tests {
             &[("KiCad", "Table", &nested.to_string_lossy())],
         );
 
-        let libs = flatten_lib_table(&root, 0, None, None);
+        let libs = flatten_lib_table(&root, 0, None);
         assert_eq!(libs.len(), 1, "nested table not followed: {libs:?}");
         assert_eq!(libs[0]["nickname"], "Resistor_SMD");
         assert_eq!(
@@ -5619,7 +5633,7 @@ mod tests {
         .unwrap();
 
         let content = std::fs::read_to_string(&table).unwrap();
-        assert!(flatten_lib_table(&content, 0, None, None).is_empty());
+        assert!(flatten_lib_table(&content, 0, None).is_empty());
     }
 
     #[test]
@@ -5793,11 +5807,11 @@ mod tests {
         let _env = footprint_dir_env(tmp.path());
 
         assert_eq!(
-            expand_lib_uri("${KICAD10_FOOTPRINT_DIR}/Resistor_SMD.pretty", None, None),
+            expand_lib_uri("${KICAD10_FOOTPRINT_DIR}/Resistor_SMD.pretty", None),
             Some(pretty)
         );
         assert_eq!(
-            expand_lib_uri("/plain/path", None, None),
+            expand_lib_uri("/plain/path", None),
             Some(PathBuf::from("/plain/path")),
             "a non-variable URI must pass through untouched"
         );
@@ -5828,10 +5842,7 @@ mod tests {
 
         // Without a project context (direct call, no table), it must not
         // resolve rather than guess.
-        assert_eq!(
-            expand_lib_uri("${KIPRJMOD}/MyParts.pretty", None, None),
-            None
-        );
+        assert_eq!(expand_lib_uri("${KIPRJMOD}/MyParts.pretty", None), None);
     }
 
     #[test]
