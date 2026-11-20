@@ -2266,6 +2266,63 @@ mod tests {
         assert!(rules.contains("(layer \"F.Cu\")"));
     }
 
+    #[tokio::test]
+    async fn set_layer_constraints_rejects_non_enabled_layers_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let rules = board.with_extension("kicad_dru");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+        let existing =
+            b"(version 1)\n(rule \"width\" (layer \"F.Cu\") (constraint track_width (min 1mm)))\n";
+        tokio::fs::write(&rules, existing).await.unwrap();
+        let ctx = test_ctx();
+
+        for layer in ["f.cu", "Bogus.Cu", "In7.Cu"] {
+            let result = handle_set_layer_constraints(
+                &json!({"board": board, "layer": layer, "min_clearance": 0.2}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{layer} was accepted");
+            let body = match &result.content[0] {
+                crate::mcp::protocol::ToolContent::Text { text } => {
+                    serde_json::from_str::<Value>(text).unwrap()
+                }
+                _ => panic!("expected textual tool error"),
+            };
+            assert_eq!(body["error"]["kind"], "invalid_argument");
+            assert_eq!(body["error"]["field"], "layer");
+            assert!(body["error"]["reason"].as_str().unwrap().contains("F.Cu"));
+            assert_eq!(tokio::fs::read(&rules).await.unwrap(), existing);
+        }
+
+        tokio::fs::remove_file(&rules).await.unwrap();
+        let result = handle_set_layer_constraints(
+            &json!({"board": board, "layer": "In7.Cu", "min_clearance": 0.2}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(!rules.exists());
+
+        let with_inner = blank_board().replace(
+            "(31 \"B.Cu\" signal)",
+            "(4 \"In1.Cu\" power) (31 \"B.Cu\" signal)",
+        );
+        tokio::fs::write(&board, with_inner).await.unwrap();
+        let result = handle_set_layer_constraints(
+            &json!({"board": board, "layer": "In1.Cu", "min_clearance": 0.2}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        let text = tokio::fs::read_to_string(&rules).await.unwrap();
+        assert!(text.contains("(layer \"In1.Cu\")"));
+    }
+
     /// #410 stage 1: the number is the distance between two placement
     /// anchors, and the response now says so. Real KiCad-saved board
     /// (`specctra_two_resistors.kicad_pcb`, see its README).
