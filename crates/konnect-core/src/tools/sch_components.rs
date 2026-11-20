@@ -10,14 +10,14 @@ use crate::mcp::{
 };
 use crate::tool;
 use crate::tools::{
-    find_all_symbol_instance_blocks, get_path, opt_f64, opt_str, opt_u32, reembed_lib_symbols,
-    require_array, require_f64, require_str,
+    find_all_symbol_instance_blocks, get_path, invalid_arg, normalize_schematic_rotation, opt_str,
+    opt_u32, reembed_lib_symbols, require_array, require_f64, require_str,
     sch_wiring::{
         apply_no_connect_carries, carry_no_connects, no_connect_carry_unwritable,
         observed_no_connect_moves, plan_no_connect_carry_for_replacement,
         reconcile_junctions_for_placement,
     },
-    ReembedOutcome, ToolContext, ToolDef,
+    schematic_rotation_arg, ReembedOutcome, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::geometry::round6;
@@ -53,7 +53,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "lib_id": { "type": "string", "description": "Library:Symbol (e.g. 'Device:R')" },
                     "x": { "type": "number", "description": "X position in mm" },
                     "y": { "type": "number", "description": "Y position in mm" },
-                    "rotation": { "type": "number", "description": "Rotation in degrees (0/90/180/270)", "default": 0 },
+                    "rotation": { "type": "number", "description": "Multiple of 90 degrees, normalized modulo 360", "default": 0 },
                     "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric." },
                     "reference": { "type": "string", "description": "Optional reference designator. Default: the library prefix plus '?' (e.g. 'R?', '#FLG?'), which annotate_schematic numbers" },
                     "value": { "type": "string", "description": "Optional override for the library symbol's Value" },
@@ -190,7 +190,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "schematic": { "type": "string" },
                     "reference": { "type": "string" },
-                    "rotation": { "type": "number", "description": "Absolute rotation in degrees" }
+                    "rotation": { "type": "number", "description": "Absolute multiple of 90 degrees, normalized modulo 360" }
                 },
                 "required": ["schematic", "reference", "rotation"]
             }),
@@ -586,7 +586,10 @@ async fn handle_add_schematic_component(
         Ok(v) => v,
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
-    let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
+    let rotation = match schematic_rotation_arg(args.get("rotation"), "rotation", Some(0.0)) {
+        Ok(rotation) => rotation,
+        Err(error) => return Ok(failed_component_placement(error, &sch_path)),
+    };
     let mirror = match mirror_arg(args, "mirror") {
         Ok(mirror) => mirror,
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
@@ -3451,9 +3454,9 @@ async fn handle_rotate_schematic_component(
         Ok(r) => r.to_string(),
         Err(e) => return Ok(e),
     };
-    let rotation = match require_f64(args, "rotation") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
+    let rotation = match schematic_rotation_arg(args.get("rotation"), "rotation", None) {
+        Ok(rotation) => rotation,
+        Err(error) => return Ok(error),
     };
 
     let before_source = read_consistent(&sch_path)?;
@@ -3462,31 +3465,37 @@ async fn handle_rotate_schematic_component(
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
-    let target_uuids = target.uuids();
-    let selected = target_uuids.iter().cloned().collect::<BTreeSet<_>>();
-    let anchor_uuid = &target.units[0].uuid;
-    let anchor = sch
-        .symbols
-        .iter()
-        .find(|symbol| symbol.uuid == *anchor_uuid)
-        .expect("structural target UUID is present in the loaded schematic");
-    let rotation_delta = rotation - anchor.at.rotation.unwrap_or(0.0);
-    for unit in &mut target.units {
-        unit.rotation = (unit.rotation + rotation_delta).rem_euclid(360.0);
+    // Apply the anchor's delta to every other unit while preserving its
+    // relative orientation. Refuse if any unit would still be non-cardinal.
+    let anchor_rotation = target.units[0].rotation;
+    if !anchor_rotation.is_finite() {
+        return Ok(invalid_arg(
+            "rotation",
+            "saved anchor rotation is not finite",
+        ));
     }
-    for symbol in sch
-        .symbols
-        .iter_mut()
-        .filter(|symbol| selected.contains(&symbol.uuid))
-    {
-        // The delta lands each unit at its own angle, so a unit already at
-        // 270° asked to follow a +90° turn computes 360° — normalize into
-        // [0, 360) before writing; eeschema only ever stores 0/90/180/270
-        // and re-saves anything else, so an unnormalized angle survives only
-        // until KiCad touches the file and then silently diverges from what
-        // this response reported.
-        let new_rotation = (symbol.at.rotation.unwrap_or(0.0) + rotation_delta).rem_euclid(360.0);
-        symbol.set_rotation(new_rotation);
+    let rotation_delta = rotation - anchor_rotation.rem_euclid(360.0);
+    target.units[0].rotation = rotation;
+    for unit in &mut target.units[1..] {
+        let Some(angle) =
+            normalize_schematic_rotation(unit.rotation.rem_euclid(360.0) + rotation_delta)
+        else {
+            return Ok(invalid_arg(
+                "rotation",
+                &format!("would leave unit {} at a non-cardinal angle", unit.unit),
+            ));
+        };
+        unit.rotation = angle;
+    }
+    let planned_rotations = target
+        .units
+        .iter()
+        .map(|unit| (unit.uuid.as_str(), unit.rotation))
+        .collect::<BTreeMap<_, _>>();
+    for symbol in sch.symbols.iter_mut() {
+        if let Some(&angle) = planned_rotations.get(symbol.uuid.as_str()) {
+            symbol.set_rotation(angle);
+        }
     }
     // A turn relocates pin endpoints exactly as a move does, so the markers on
     // those pins travel with them here too (#626).

@@ -9,7 +9,8 @@ use super::sch_route_safety::{
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    get_path, opt_f64, opt_str, require_array, require_f64, require_str, ToolContext, ToolDef,
+    get_path, opt_f64, opt_str, require_array, require_f64, require_str, schematic_rotation_arg,
+    ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_schematic_editor::types::fmt_f64;
@@ -137,7 +138,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string" },
                     "net": { "type": "string", "description": "Net name" },
                     "x": { "type": "number" }, "y": { "type": "number" },
-                    "rotation": { "type": "number", "default": 0 },
+                    "rotation": { "type": "number", "description": "Multiple of 90 degrees, normalized modulo 360", "default": 0 },
                     "label_type": {
                         "type": "string",
                         "enum": ["net_label", "global_label", "hierarchical_label"],
@@ -176,7 +177,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string" },
                     "net": { "type": "string" },
                     "x": { "type": "number" }, "y": { "type": "number" },
-                    "rotation": { "type": "number" }
+                    "rotation": { "type": "number", "description": "Multiple of 90 degrees, normalized modulo 360" }
                 },
                 "required": ["schematic", "net", "x", "y", "rotation"]
             }),
@@ -210,7 +211,7 @@ pub fn tools() -> Vec<ToolDef> {
                             "properties": {
                                 "net": { "type": "string" },
                                 "x": { "type": "number" }, "y": { "type": "number" },
-                                "rotation": { "type": "number" }
+                                "rotation": { "type": "number", "description": "Multiple of 90 degrees, normalized modulo 360" }
                             }
                         }
                     }
@@ -232,7 +233,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string" },
                     "power_net": { "type": "string", "description": "Net name (e.g. 'VCC', 'GND')" },
                     "x": { "type": "number" }, "y": { "type": "number" },
-                    "rotation": { "type": "number", "default": 0 }
+                    "rotation": { "type": "number", "description": "Multiple of 90 degrees, normalized modulo 360", "default": 0 }
                 },
                 "required": ["schematic", "power_net", "x", "y"]
             }),
@@ -1660,7 +1661,10 @@ async fn handle_add_net_label(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
+    let rotation = match schematic_rotation_arg(args.get("rotation"), "rotation", Some(0.0)) {
+        Ok(rotation) => rotation,
+        Err(error) => return Ok(error),
+    };
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
     let shape = opt_str(args, "shape").unwrap_or("input");
 
@@ -1865,9 +1869,9 @@ async fn handle_rotate_label(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let rotation = match require_f64(args, "rotation") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
+    let rotation = match schematic_rotation_arg(args.get("rotation"), "rotation", None) {
+        Ok(rotation) => rotation,
+        Err(error) => return Ok(error),
     };
 
     let content = read_consistent(&sch_path)?;
@@ -2105,14 +2109,30 @@ async fn handle_batch_rotate_labels(
         Ok(a) => a.clone(),
         Err(e) => return Ok(e),
     };
+    let rotations = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            schematic_rotation_arg(
+                label.get("rotation"),
+                &format!("labels[{index}].rotation"),
+                None,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let rotations = match rotations {
+        Ok(rotations) => rotations,
+        Err(error) => return Ok(error),
+    };
+
     let mut rotated = 0usize;
-    for (index, label_arg) in labels.iter().enumerate() {
+    for (index, (label_arg, rotation)) in labels.iter().zip(rotations).enumerate() {
         let full_args = json!({
             "schematic": sch_path.display().to_string(),
             "net": label_arg["net"],
             "x": label_arg["x"],
             "y": label_arg["y"],
-            "rotation": label_arg["rotation"]
+            "rotation": rotation
         });
         let outcome = handle_rotate_label(&full_args, ctx).await?;
         if outcome.is_error {
@@ -2162,7 +2182,10 @@ async fn handle_add_power_symbol(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
+    let rotation = match schematic_rotation_arg(args.get("rotation"), "rotation", Some(0.0)) {
+        Ok(rotation) => rotation,
+        Err(error) => return Ok(error),
+    };
     // Snap like `place_one_component` does for the other two placers. Wires and
     // labels are snapped to this grid, so a power symbol left off it cannot be
     // reached by them: ERC reports the endpoint off grid and the pin

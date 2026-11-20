@@ -1351,6 +1351,16 @@ free number for a prefix (a gap between `R1` and `R3` is filled; before, the
 next number was always the maximum plus one), and `#`-prefixed designators
 spelled `#PWR01`, `#PWR010`, `#PWR0100` as eeschema spells them (before:
 `#PWR1`). Both places a designator lives are written.
+
+## Unreleased schematic symbol and label rotations
+
+Component placement and rotation, power symbol placement, and label placement
+and rotation accept angles in degrees that are multiples of 90. Konnect writes
+0, 90, 180, or 270 after normalizing modulo 360, so `-90` and `270` have
+the same effect. Other values return `invalid_argument` before anything is
+written. Batch placement and batch label rotation check every requested angle
+before making any changes.
+
 ## Unreleased: `rotate_schematic_component` carries field text round (patch release)
 
 `rotate_schematic_component` wrote the symbol's new angle and nothing else.
