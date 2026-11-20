@@ -50,4 +50,4 @@ plan to use Konnect and the size of your team, and I'll get back to you with ter
 ## Contributions
 
 To keep dual licensing possible, contributions to Konnect require agreeing to the
-contributor terms described in [CONTRIBUTING.md](CONTRIBUTING.md).
+contributor terms described in [upstream contribution terms](docs/upstream/CONTRIBUTING.md).
