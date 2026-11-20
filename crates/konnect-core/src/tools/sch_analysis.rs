@@ -1640,6 +1640,23 @@ mod net_query_tests {
     }
 
     #[tokio::test]
+    async fn a_nearby_same_net_wire_does_not_form_a_t_junction() {
+        let near = r#"(kicad_sch
+          (wire (pts (xy 10 20) (xy 30 20)) (uuid "horizontal"))
+          (wire (pts (xy 15 10) (xy 15 19.995)) (uuid "vertical"))
+          (label "SIG" (at 10 20 0))
+          (label "SIG" (at 15 10 0))
+        )"#;
+        let result = call(near, "get_net_connectivity", json!({"net": "SIG"})).await;
+        assert_eq!(result["wires"].as_array().unwrap().len(), 2);
+        assert_eq!(result["t_junctions"], json!([]));
+
+        let t = near.replace("19.995", "20");
+        let result = call(&t, "get_net_connectivity", json!({"net": "SIG"})).await;
+        assert_eq!(result["t_junctions"], json!([{"x": 15.0, "y": 20.0}]));
+    }
+
+    #[tokio::test]
     async fn named_net_reports_real_sheet_pins() {
         let ground = call(SCH, "get_net_connections", json!({ "net": "GND" })).await;
         let pins = ground["pins"].as_array().unwrap();
