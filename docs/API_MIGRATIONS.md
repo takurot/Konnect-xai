@@ -59,6 +59,16 @@ accept an instance UUID; `connect_pins` additionally accepts `uuid1`/`uuid2`
 instead of `ref1`/`ref2`, and `connect_to_net` accepts `uuid` instead of
 `reference`. Parse failures refuse instead of bypassing junction analysis.
 
+## Unreleased: placement scores actual courtyard intersections
+
+`score_placement` uses bounding boxes to select possible overlap pairs, then
+measures the area of the authored courtyard contours after the footprint
+rotation. A boundary touch has zero overlap area. Circles and arcs use
+inscribed chords with at most 0.001 mm deviation. A potentially overlapping
+pair whose courtyard cannot be assembled is reported in `unproven_courtyards`
+and can produce a `courtyard_unproven` verdict, which blocks automatic placement.
+The existing same-side policy and pad-only fallback still apply.
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at

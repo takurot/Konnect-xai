@@ -723,6 +723,9 @@ pub struct FootprintCourtyard {
     pub bbox: (f64, f64, f64, f64),
     /// What the bbox actually bounds.
     pub bbox_source: CourtyardSource,
+    /// Closed polygons in board coordinates. None means authored geometry
+    /// could not be assembled into simple, closed rings.
+    outline: Option<Vec<Vec<CourtyardPoint>>>,
     /// KiCad's own lock state for this footprint, from a direct `(locked yes)`
     /// child (or the legacy bare `locked` token). A locked footprint is one the
     /// user has pinned in the editor: automated placement must treat it as an
@@ -817,8 +820,226 @@ fn footprint_courtyard(fp: &SexpNode) -> Option<FootprintCourtyard> {
         layer_side,
         bbox,
         bbox_source,
+        outline: match bbox_source {
+            CourtyardSource::Courtyard => courtyard_rings(fp, fx, fy, rot, layer_side),
+            CourtyardSource::PadsFallback => {
+                Some(vec![rectangle_ring((bbox.0, bbox.1), (bbox.2, bbox.3))])
+            }
+            CourtyardSource::AnchorOnly => Some(Vec::new()),
+        },
         locked: footprint_locked(fp),
     })
+}
+
+type CourtyardPoint = (f64, f64);
+const COURTYARD_ENDPOINT_TOLERANCE_MM: f64 = 0.000_001;
+
+fn rectangle_ring(start: CourtyardPoint, end: CourtyardPoint) -> Vec<CourtyardPoint> {
+    vec![start, (end.0, start.1), end, (start.0, end.1), start]
+}
+
+fn same_endpoint(a: CourtyardPoint, b: CourtyardPoint) -> bool {
+    (a.0 - b.0).hypot(a.1 - b.1) <= COURTYARD_ENDPOINT_TOLERANCE_MM
+}
+
+fn courtyard_rings(
+    footprint: &SexpNode,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    side: Side,
+) -> Option<Vec<Vec<CourtyardPoint>>> {
+    let layer = if side == Side::Front {
+        "F.CrtYd"
+    } else {
+        "B.CrtYd"
+    };
+    let mut chains = Vec::new();
+    for shape in footprint.children().unwrap_or(&[]) {
+        let Some(tag) = shape.head() else { continue };
+        if !FP_SHAPE_TAGS.contains(&tag) || shape.find_str("layer") != Some(layer) {
+            continue;
+        }
+        let mut points = match tag {
+            "fp_line" => vec![point(shape, "start")?, point(shape, "end")?],
+            "fp_rect" => rectangle_ring(point(shape, "start")?, point(shape, "end")?),
+            "fp_arc" => crate::geometry::flatten_arc(
+                point(shape, "start")?,
+                point(shape, "mid")?,
+                point(shape, "end")?,
+            )?,
+            "fp_circle" => {
+                let center = point(shape, "center")?;
+                let end = point(shape, "end")?;
+                let radius = (center.0 - end.0).hypot(center.1 - end.1);
+                crate::geometry::flatten_circle_arc(center, radius, 0.0, std::f64::consts::TAU)?
+            }
+            "fp_poly" => {
+                let mut points = shape
+                    .find("pts")?
+                    .find_all("xy")
+                    .into_iter()
+                    .map(|xy| Some((xy.get_f64(1)?, xy.get_f64(2)?)))
+                    .collect::<Option<Vec<_>>>()?;
+                points.push(*points.first()?);
+                points
+            }
+            _ => return None,
+        };
+        points.dedup_by(|a, b| same_endpoint(*a, *b));
+        if points.len() < 2 {
+            return None;
+        }
+        chains.push(points);
+    }
+    if chains.is_empty() {
+        return None;
+    }
+    let mut rings = Vec::new();
+    while let Some(mut ring) = chains.pop() {
+        while !same_endpoint(*ring.first()?, *ring.last()?) {
+            let at = *ring.last()?;
+            let mut matches = chains.iter().enumerate().filter_map(|(i, chain)| {
+                if same_endpoint(at, *chain.first()?) {
+                    Some((i, false))
+                } else if same_endpoint(at, *chain.last()?) {
+                    Some((i, true))
+                } else {
+                    None
+                }
+            });
+            let (i, reverse) = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            let mut next = chains.swap_remove(i);
+            if reverse {
+                next.reverse();
+            }
+            ring.extend(next.into_iter().skip(1));
+        }
+        let first = *ring.first()?;
+        *ring.last_mut()? = first;
+        if !is_simple_ring(&ring) {
+            return None;
+        }
+        rings.push(
+            ring.into_iter()
+                .map(|(lx, ly)| crate::geometry::transform_pad(lx, ly, x, y, rotation))
+                .collect(),
+        );
+    }
+    Some(rings)
+}
+
+fn is_simple_ring(ring: &[CourtyardPoint]) -> bool {
+    let area = ring
+        .windows(2)
+        .map(|pair| pair[0].0 * pair[1].1 - pair[1].0 * pair[0].1)
+        .sum::<f64>();
+    ring.len() >= 4
+        && area.abs() > f64::EPSILON
+        && ring.windows(2).enumerate().all(|(i, edge)| {
+            let [a, b] = [edge[0], edge[1]];
+            ring.windows(2).enumerate().skip(i + 2).all(|(j, other)| {
+                if i == 0 && j == ring.len() - 2 {
+                    return true;
+                }
+                let [c, d] = [other[0], other[1]];
+                crossing_y((a, b), (c, d)).is_none()
+                    && ![(a, c, d), (b, c, d), (c, a, b), (d, a, b)]
+                        .into_iter()
+                        .any(|(p, s, e)| {
+                            crate::geometry::point_on_segment(
+                                p.0,
+                                p.1,
+                                s.0,
+                                s.1,
+                                e.0,
+                                e.1,
+                                COURTYARD_ENDPOINT_TOLERANCE_MM,
+                            )
+                        })
+            })
+        })
+}
+
+fn crossing_y((a, b): Segment, (c, d): Segment) -> Option<f64> {
+    let direction = (b.0 - a.0, b.1 - a.1);
+    let other = (d.0 - c.0, d.1 - c.1);
+    let delta = (c.0 - a.0, c.1 - a.1);
+    let cross = |u: CourtyardPoint, v: CourtyardPoint| u.0 * v.1 - u.1 * v.0;
+    let determinant = cross(direction, other);
+    if determinant.abs() <= f64::EPSILON {
+        return None;
+    }
+    let t = cross(delta, other) / determinant;
+    let u = cross(delta, direction) / determinant;
+    (t > 0.0 && t < 1.0 && u > 0.0 && u < 1.0).then_some(a.1 + t * direction.1)
+}
+
+impl FootprintCourtyard {
+    /// Positive overlap area in board mm². Bounds are tested first, and a
+    /// touching boundary has zero area. Curved outlines use inscribed chords.
+    pub fn overlap_area(&self, other: &Self) -> Option<f64> {
+        let left = self.bbox.0.max(other.bbox.0);
+        let right = self.bbox.2.min(other.bbox.2);
+        let bottom = self.bbox.1.max(other.bbox.1);
+        let top = self.bbox.3.min(other.bbox.3);
+        if left >= right || bottom >= top {
+            return Some(0.0);
+        }
+        let first = self.outline.as_ref()?;
+        let second = other.outline.as_ref()?;
+        let edges = |rings: &[Vec<CourtyardPoint>]| -> Vec<Segment> {
+            rings
+                .iter()
+                .flat_map(|ring| ring.windows(2).map(|e| (e[0], e[1])))
+                .collect()
+        };
+        let first_edges = edges(first);
+        let second_edges = edges(second);
+        // The overlap width varies linearly between vertices and crossing
+        // events. One midpoint per strip therefore integrates each strip.
+        let mut levels = vec![bottom, top];
+        for &((_, y), _) in first_edges.iter().chain(&second_edges) {
+            if y > bottom && y < top {
+                levels.push(y);
+            }
+        }
+        for a in &first_edges {
+            for b in &second_edges {
+                if let Some(y) = crossing_y(*a, *b).filter(|y| *y > bottom && *y < top) {
+                    levels.push(y);
+                }
+            }
+        }
+        levels.sort_by(f64::total_cmp);
+        levels.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+
+        let intersections = |edges: &[Segment], y: f64| -> Vec<f64> {
+            let mut hits: Vec<_> = edges
+                .iter()
+                .filter(|(a, b)| (a.1 > y) != (b.1 > y))
+                .map(|&(a, b)| a.0 + (y - a.1) * (b.0 - a.0) / (b.1 - a.1))
+                .collect();
+            hits.sort_by(f64::total_cmp);
+            hits
+        };
+        let mut area = 0.0;
+        for limits in levels.windows(2) {
+            let height = limits[1] - limits[0];
+            let midpoint = limits[0] + height / 2.0;
+            let first = intersections(&first_edges, midpoint);
+            let second = intersections(&second_edges, midpoint);
+            for a in first.chunks_exact(2) {
+                for b in second.chunks_exact(2) {
+                    area += (a[1].min(b[1]) - a[0].max(b[0])).max(0.0) * height;
+                }
+            }
+        }
+        Some(area)
+    }
 }
 
 /// KiCad's lock state for a footprint, read from its **direct** children only.

@@ -239,43 +239,15 @@ pub fn arc_bbox(start: (f64, f64), mid: (f64, f64), end: (f64, f64)) -> (f64, f6
         )
     };
 
-    // Circumcenter. `d` is 4× the signed triangle area, so comparing it
-    // against the squared span makes the collinearity test scale-invariant:
-    // a hair-thin arc across a whole board and a tiny fillet both degrade to
-    // the point hull only when the circle genuinely cannot be recovered.
-    let d = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2));
-    let span = (x1 - x3)
-        .hypot(y1 - y3)
-        .max((x1 - x2).hypot(y1 - y2))
-        .max((x2 - x3).hypot(y2 - y3));
-    if !d.is_finite() || d.abs() < 1e-9 * span * span.max(1.0) {
+    let Some(((ux, uy), r, a_s, sweep)) = arc_parameters(start, mid, end) else {
         return three_point_hull();
-    }
-
-    let q1 = x1 * x1 + y1 * y1;
-    let q2 = x2 * x2 + y2 * y2;
-    let q3 = x3 * x3 + y3 * y3;
-    let ux = (q1 * (y2 - y3) + q2 * (y3 - y1) + q3 * (y1 - y2)) / d;
-    let uy = (q1 * (x3 - x2) + q2 * (x1 - x3) + q3 * (x2 - x1)) / d;
-    let r = (x1 - ux).hypot(y1 - uy);
-
-    let tau = 2.0 * PI;
-    let a_s = (y1 - uy).atan2(x1 - ux);
-    let a_m = (y2 - uy).atan2(x2 - ux);
-    let a_e = (y3 - uy).atan2(x3 - ux);
-
-    // Walk CCW from start: if mid comes before end, the arc is the CCW sweep;
-    // otherwise it is the complement. An axis extreme belongs to the bbox only
-    // when its angle lies inside that sweep.
-    let d_e = (a_e - a_s).rem_euclid(tau);
-    let d_m = (a_m - a_s).rem_euclid(tau);
-    let ccw = d_m <= d_e;
-    let on_arc = |t: f64| {
-        let dt = (t - a_s).rem_euclid(tau);
-        if ccw {
-            dt <= d_e
+    };
+    let on_arc = |angle: f64| {
+        let revolution = 2.0 * PI;
+        if sweep >= 0.0 {
+            (angle - a_s).rem_euclid(revolution) <= sweep
         } else {
-            dt >= d_e
+            (a_s - angle).rem_euclid(revolution) <= -sweep
         }
     };
 
@@ -296,6 +268,81 @@ pub fn arc_bbox(start: (f64, f64), mid: (f64, f64), end: (f64, f64)) -> (f64, f6
         }
     }
     (min_x, min_y, max_x, max_y)
+}
+
+type Point = (f64, f64);
+
+fn arc_parameters(start: Point, mid: Point, end: Point) -> Option<(Point, f64, f64, f64)> {
+    let (x1, y1) = start;
+    let (x2, y2) = mid;
+    let (x3, y3) = end;
+    // Circumcenter. `d` is 4× the signed triangle area, so comparing it
+    // against the squared span makes the collinearity test scale-invariant:
+    // a hair-thin arc across a whole board and a tiny fillet both degrade to
+    // the point hull only when the circle genuinely cannot be recovered.
+    let d = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2));
+    let span = (x1 - x3)
+        .hypot(y1 - y3)
+        .max((x1 - x2).hypot(y1 - y2))
+        .max((x2 - x3).hypot(y2 - y3));
+    if !d.is_finite() || d.abs() <= 1e-9 * span * span.max(1.0) {
+        return None;
+    }
+
+    let q1 = x1 * x1 + y1 * y1;
+    let q2 = x2 * x2 + y2 * y2;
+    let q3 = x3 * x3 + y3 * y3;
+    let ux = (q1 * (y2 - y3) + q2 * (y3 - y1) + q3 * (y1 - y2)) / d;
+    let uy = (q1 * (x3 - x2) + q2 * (x1 - x3) + q3 * (x2 - x1)) / d;
+    let r = (x1 - ux).hypot(y1 - uy);
+
+    let tau = 2.0 * PI;
+    let a_s = (y1 - uy).atan2(x1 - ux);
+    let a_m = (y2 - uy).atan2(x2 - ux);
+    let a_e = (y3 - uy).atan2(x3 - ux);
+
+    // Walk CCW from start: if mid comes before end, the arc is the CCW sweep;
+    // otherwise it is the complement. An axis extreme belongs to the bbox only
+    // when its angle lies inside that sweep.
+    let d_e = (a_e - a_s).rem_euclid(tau);
+    let d_m = (a_m - a_s).rem_euclid(tau);
+    let sweep = if d_m <= d_e { d_e } else { d_e - tau };
+    (r.is_finite() && r > 0.0).then_some(((ux, uy), r, a_s, sweep))
+}
+
+pub(crate) fn flatten_arc(start: Point, mid: Point, end: Point) -> Option<Vec<Point>> {
+    let Some((center, radius, angle, sweep)) = arc_parameters(start, mid, end) else {
+        return Some(vec![start, mid, end]);
+    };
+    let mut points = flatten_circle_arc(center, radius, angle, sweep)?;
+    points[0] = start;
+    *points.last_mut()? = end;
+    Some(points)
+}
+
+pub(crate) fn flatten_circle_arc(
+    center: Point,
+    radius: f64,
+    angle: f64,
+    sweep: f64,
+) -> Option<Vec<Point>> {
+    if !radius.is_finite() || radius <= 0.0 {
+        return None;
+    }
+    // Inscribed polygons keep the maximum chord deviation below one micron.
+    let chord_angle = 2.0 * (1.0 - (0.001 / radius).min(1.0)).acos();
+    let segments = ((sweep.abs() / chord_angle).ceil() as usize).max(4);
+    if segments > 2048 {
+        return None;
+    }
+    Some(
+        (0..=segments)
+            .map(|i| {
+                let (sin, cos) = (angle + sweep * i as f64 / segments as f64).sin_cos();
+                (center.0 + cos * radius, center.1 + sin * radius)
+            })
+            .collect(),
+    )
 }
 
 /// Round to the six decimals KiCAD writes, so arithmetic noise never reaches

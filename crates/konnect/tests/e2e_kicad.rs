@@ -151,6 +151,43 @@ fn body(result: &Value) -> Value {
 
 #[test]
 #[ignore = "requires kicad-cli; run via e2e workflow"]
+fn placement_courtyards_agree_with_real_kicad_on_rotated_demo_board() {
+    let cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
+    let dir = tempfile::tempdir().unwrap();
+    let board = dir.path().join("ecc83-pp.kicad_pcb");
+    let original = include_bytes!("../../konnect-sexp/tests/fixtures/ecc83-pp.kicad_pcb");
+    std::fs::write(&board, original).unwrap();
+    let report = dir.path().join("drc.json");
+    let native = Command::new(&cli)
+        .args(["pcb", "drc", "--format", "json", "-o"])
+        .arg(&report)
+        .arg(&board)
+        .output()
+        .unwrap();
+    assert!(native.status.success(), "{native:?}");
+    let drc: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+    assert!(drc["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|violation| violation["type"] != "courtyards_overlap"));
+
+    let mut mcp = Mcp::spawn(&cli);
+    mcp.load("placement");
+    let score = body(&mcp.tool("score_placement", json!({"board": board})));
+    assert!(
+        score["hard_failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|failure| failure["kind"] != "courtyard_overlap"),
+        "{score}"
+    );
+    assert_eq!(std::fs::read(&board).unwrap(), original);
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
 fn fabrication_and_document_exports_through_mcp() {
     let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
     let dir = tempfile::tempdir().unwrap();
