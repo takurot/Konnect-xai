@@ -146,18 +146,108 @@ async fn place(name: &str, child: &Path) -> CallToolResult {
     (tool.handler)(&args, context).await.unwrap()
 }
 
-async fn add_native_component(child: &Path, component: Value) -> CallToolResult {
-    let mut args = component;
-    args["schematic"] = json!(child.display().to_string());
+async fn call_schematic_tool(name: &str, path: &Path, mut args: Value) -> CallToolResult {
+    args["schematic"] = json!(path.display().to_string());
     let context = Arc::new(ToolContext::new(
         ServerConfig::default(),
         Arc::new(ToolRouter::new()),
     ));
-    let tool = sch_components::tools()
-        .into_iter()
-        .find(|tool| tool.name == "add_schematic_component")
-        .unwrap();
+    let mut tools = sch_components::tools();
+    tools.extend(sch_batch::tools());
+    tools.extend(templates::tools());
+    let tool = tools.into_iter().find(|tool| tool.name == name).unwrap();
     (tool.handler)(&args, context).await.unwrap()
+}
+
+async fn add_native_component(child: &Path, component: Value) -> CallToolResult {
+    call_schematic_tool("add_schematic_component", child, component).await
+}
+
+fn resistor(reference: &str, x: f64) -> Value {
+    json!({"lib_id": "complex_hierarchy:R", "reference": reference, "x": x, "y": 100.0})
+}
+
+#[tokio::test]
+async fn occupied_number_across_sheets_refuses_add_and_rename_without_writing() {
+    let (_directory, root, child) = fixture(false);
+    let root_ref = add_native_component(&root, resistor("R901", 100.0)).await;
+    assert!(!root_ref.is_error, "{root_ref:?}");
+    let child_ref = add_native_component(&child, resistor("R902", 110.0)).await;
+    assert!(!child_ref.is_error, "{child_ref:?}");
+    let before = std::fs::read(&child).unwrap();
+
+    let rejected = add_native_component(&child, resistor("R0901", 120.0)).await;
+    assert!(rejected.is_error, "{rejected:?}");
+    assert_eq!(body(&rejected)["error"]["kind"], "reference_conflict");
+    assert_eq!(std::fs::read(&child).unwrap(), before);
+
+    let rejected = call_schematic_tool(
+        "edit_schematic_component",
+        &child,
+        json!({"reference": "R902", "new_reference": "R901", "value": "22k"}),
+    )
+    .await;
+    assert!(rejected.is_error, "{rejected:?}");
+    assert_eq!(body(&rejected)["error"]["kind"], "reference_conflict");
+    assert_eq!(std::fs::read(&child).unwrap(), before);
+
+    let accepted = call_schematic_tool(
+        "edit_schematic_component",
+        &child,
+        json!({"reference": "R902", "new_reference": "R903", "value": "22k"}),
+    )
+    .await;
+    assert!(!accepted.is_error, "{accepted:?}");
+    let accepted = body(&accepted);
+    assert_eq!(accepted["unit_count"], 1);
+    assert!(accepted["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|change| {
+            change
+                .as_str()
+                .is_some_and(|message| message == "Value → 22k (1 unit(s))")
+        }));
+}
+
+#[tokio::test]
+async fn batch_keeps_first_number_and_rejects_duplicate_item() {
+    let (_directory, _root, child) = fixture(false);
+    let result = call_schematic_tool(
+        "batch_place_components",
+        &child,
+        json!({"components": [resistor("R901", 100.0), resistor("R901", 110.0)]}),
+    )
+    .await;
+    let response = body(&result);
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(response["placed_count"], 1);
+    assert_eq!(response["failures"][0]["kind"], "reference_conflict");
+    assert_eq!(
+        Schematic::load(&child)
+            .unwrap()
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.reference() == Some("R901"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn repeated_physical_symbol_cannot_use_one_number_in_two_logical_instances() {
+    let (_directory, _root, child) = fixture(true);
+    let before = std::fs::read(&child).unwrap();
+
+    let rejected = add_native_component(&child, resistor("R901", 100.0)).await;
+    assert!(rejected.is_error, "{rejected:?}");
+    assert_eq!(body(&rejected)["error"]["kind"], "reference_conflict");
+    assert_eq!(std::fs::read(&child).unwrap(), before);
+
+    let accepted = add_native_component(&child, resistor("R?", 100.0)).await;
+    assert!(!accepted.is_error, "{accepted:?}");
+    assert_eq!(body(&accepted)["instance_paths"], json!([PATH_A, PATH_B]));
 }
 
 fn body(result: &CallToolResult) -> Value {
