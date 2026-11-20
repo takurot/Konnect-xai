@@ -70,7 +70,10 @@ impl Mcp {
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
         if let Some(home) = home {
-            command.env("HOME", home).env("APPDATA", home);
+            command
+                .env("HOME", home)
+                .env("APPDATA", home)
+                .env("KICAD_CONFIG_HOME", home.join("kicad-config"));
         }
         let mut child = command
             .arg("--config")
@@ -1026,6 +1029,65 @@ fn a_written_default_netclass_still_plots_wires() {
         (after - radius).abs() < 1e-6,
         "a sparse named class changed the junction dot: {radius} -> {after}"
     );
+}
+
+#[test]
+#[ignore = "requires KiCad and its stock library templates"]
+fn library_search_works_without_global_tables_and_includes_project_footprints() {
+    let cli = find_kicad_cli().expect("stock KiCad required for library search");
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("fixture.kicad_pro");
+    let footprint_table = workspace.path().join("fp-lib-table");
+    let library = workspace.path().join("Custom.pretty");
+    let footprint = library.join("MySOT.kicad_mod");
+    std::fs::write(&project, "{}").unwrap();
+    std::fs::create_dir(&library).unwrap();
+    std::fs::write(
+        &footprint,
+        r#"(footprint "MySOT" (version 20241229) (generator "pcbnew") (layer "F.Cu"))"#,
+    )
+    .unwrap();
+    let table = r#"(fp_lib_table (version 7) (lib (name "Custom") (type "KiCad") (uri "${KIPRJMOD}/Custom.pretty") (options "") (descr "")))"#;
+    std::fs::write(&footprint_table, table).unwrap();
+
+    let mut mcp = Mcp::spawn_with_home(&cli, Some(home.path()));
+    mcp.load("library");
+    for (tool, query, expected) in [
+        ("search_symbols", "LM358", "Amplifier_Operational:LM358"),
+        (
+            "search_footprints",
+            "R_0603_1608",
+            "Resistor_SMD:R_0603_1608Metric",
+        ),
+    ] {
+        let search = body(&mcp.tool(tool, json!({"query":query})));
+        assert_eq!(search["table_source"], "template", "{search}");
+        assert!(
+            search["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["id"] == expected),
+            "{tool} should find {expected}: {search}"
+        );
+    }
+    for tool in ["list_symbol_libraries", "list_footprint_libraries"] {
+        let found = body(&mcp.tool(tool, json!({"scope":"global"})));
+        assert_eq!(found["table_source"], "template", "{found}");
+        assert!(found["count"].as_u64().unwrap() > 0, "{found}");
+    }
+    let found = body(&mcp.tool(
+        "search_footprints",
+        json!({"query":"MySOT","project":project,"limit":1}),
+    ));
+    assert_eq!(found["results"][0]["id"], "Custom:MySOT", "{found}");
+    let info = body(&mcp.tool(
+        "get_footprint_info",
+        json!({"footprint_path":"Custom:MySOT","project":project}),
+    ));
+    assert_eq!(info["name"], "MySOT");
+    assert_eq!(std::fs::read_to_string(&footprint_table).unwrap(), table);
 }
 
 #[test]
