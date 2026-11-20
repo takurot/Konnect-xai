@@ -113,10 +113,12 @@ pub(crate) async fn try_export(board: &Path) -> NativeExportAttempt {
 }
 
 fn registration_root() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("KONNECT_BRIDGE_DIR") {
-        return Some(PathBuf::from(path));
+    if let Some(value) = std::env::var_os("KONNECT_BRIDGE_DIR").filter(|v| !v.is_empty()) {
+        let path = PathBuf::from(value);
+        return path.is_absolute().then_some(path);
     }
-    dirs::data_local_dir().map(|path| path.join("konnect").join("native-bridge"))
+    let state = konnect_sexp::state::StateDir::resolve().ok()?;
+    Some(state.root().join("native-bridge"))
 }
 
 fn registrations(root: &Path) -> Result<Vec<PathBuf>> {

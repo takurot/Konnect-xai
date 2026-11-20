@@ -15,6 +15,19 @@ Starting the default stdio transport from a terminal prints usage. To serve HTTP
 with `transport = "http"` or `transport = "both"`. Run `konnect init` to
 install guidance explicitly.
 
+## Unreleased – Per-user state paths
+
+See the [Konnect state directory](KICAD_INTEGRATION.md#konnect-state-directory)
+for the defaults, legacy lookup and override precedence. On Linux and Windows,
+new call logs and run records use the shared local-data root. Historical logs
+and records stay at their original paths. Document lock defaults are unchanged.
+
+An absolute `KONNECT_STATE_DIR` now applies to the full set of state files.
+Move or copy durable files into the selected root before enabling the override
+if you want that process to use them. `KONNECT_BRIDGE_DIR` must also be an
+absolute path when set. Server configuration can disable disk call logging
+with `call_log = false`.
+
 ## v0.14.0: conditional-write failures distinguish committed uncertainty
 
 A stale source revision returns `conflict`. If the replacement has committed

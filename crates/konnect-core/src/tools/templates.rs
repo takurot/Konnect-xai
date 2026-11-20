@@ -248,17 +248,17 @@ fn builtin_templates() -> Vec<serde_json::Value> {
 
 // ─── Template storage paths ──────────────────────────────────────────────────
 
-fn user_templates_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        PathBuf::from(appdata).join("konnect").join("templates")
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".konnect").join("templates")
-    }
+fn user_templates_dir() -> Option<PathBuf> {
+    use konnect_sexp::state::{self, StateDir};
+
+    let state = StateDir::resolve().ok()?;
+    Some(state.existing_or_default("templates", || {
+        #[cfg(windows)]
+        let old = state::legacy_roaming_dir();
+        #[cfg(not(windows))]
+        let old = state::legacy_home_dir();
+        old.map(|dir| dir.join("templates"))
+    }))
 }
 
 /// Load all templates: builtins + any user-created ones from disk.
@@ -270,8 +270,7 @@ async fn load_all_templates() -> Vec<serde_json::Value> {
 
 async fn load_user_templates() -> Vec<serde_json::Value> {
     let mut templates = Vec::new();
-    let user_dir = user_templates_dir();
-    if user_dir.is_dir() {
+    if let Some(user_dir) = user_templates_dir() {
         if let Ok(mut rd) = tokio::fs::read_dir(&user_dir).await {
             while let Ok(Some(entry)) = rd.next_entry().await {
                 let path = entry.path();

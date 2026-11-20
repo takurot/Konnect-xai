@@ -504,26 +504,9 @@ fn reject_non_file_lock_path(path: &Path) -> Result<(), SexpError> {
 }
 
 fn document_lock_path(path: &Path) -> Result<PathBuf, SexpError> {
-    let state_root = match std::env::var_os("KONNECT_STATE_DIR") {
-        Some(value) if !value.is_empty() => {
-            let root = PathBuf::from(value);
-            if !root.is_absolute() {
-                return Err(SexpError::InvalidValue(
-                    "KONNECT_STATE_DIR must be an absolute path".to_owned(),
-                ));
-            }
-            root
-        }
-        _ => dirs::data_local_dir()
-            .map(|root| root.join("konnect"))
-            .ok_or_else(|| {
-                SexpError::InvalidValue(
-                    "no platform local-data directory is available; set KONNECT_STATE_DIR to an absolute path"
-                        .to_owned(),
-                )
-            })?,
-    };
-    document_lock_path_in(&state_root, path)
+    let state = crate::state::StateDir::resolve()
+        .map_err(|message| SexpError::InvalidValue(message.to_owned()))?;
+    document_lock_path_in(state.root(), path)
 }
 
 fn document_lock_path_in(state_root: &Path, path: &Path) -> Result<PathBuf, SexpError> {

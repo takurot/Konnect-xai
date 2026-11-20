@@ -4,9 +4,7 @@
 use super::error::{extract_error_kind, ToolErrorKind};
 use super::protocol::*;
 use super::server::McpServerState;
-use crate::observability::{
-    default_calls_log_path, new_call_id, unix_ms, CallObserver, CallRecord, CallStatus,
-};
+use crate::observability::{new_call_id, unix_ms, CallObserver, CallRecord, CallStatus};
 use crate::outcome::OutcomeStatus;
 use crate::router::{meta_tools, ToolRouter};
 use axum::response::sse::Event;
@@ -71,6 +69,14 @@ impl McpHandler {
         config: crate::tools::ServerConfig,
         config_resolution: crate::config_resolution::ConfigResolution,
     ) -> anyhow::Result<Self> {
+        Self::new_with_call_log(config, config_resolution, None).await
+    }
+
+    pub async fn new_with_call_log(
+        config: crate::tools::ServerConfig,
+        config_resolution: crate::config_resolution::ConfigResolution,
+        call_log: Option<std::path::PathBuf>,
+    ) -> anyhow::Result<Self> {
         let router = Arc::new(ToolRouter::new());
 
         // Load only the starter kit at startup so baseline `tools/list` stays small
@@ -86,7 +92,7 @@ impl McpHandler {
             router.load_starter_kit().await;
         }
 
-        let observer = CallObserver::new(Some(default_calls_log_path()));
+        let observer = CallObserver::new(call_log);
         let meta_input_validators = meta_tools::meta_tool_descriptions_for(cfg!(unix))
             .into_iter()
             .map(|tool| {

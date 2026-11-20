@@ -186,7 +186,11 @@ async fn main() -> Result<()> {
         auto_load_toolsets: config.auto_load_toolsets,
         eager_toolsets: config.eager_toolsets,
     };
-    let handler = McpHandler::new_with_config_resolution(server_config, config_resolution).await?;
+    let call_log = config
+        .call_log
+        .then(konnect_core::observability::default_calls_log_path)
+        .flatten();
+    let handler = McpHandler::new_with_call_log(server_config, config_resolution, call_log).await?;
     match install::InstalledGuidanceProbe::for_current_user() {
         Ok(probe) => handler.set_guidance_probe(std::sync::Arc::new(probe)),
         Err(error) => tracing::warn!("guidance drift detection unavailable: {error:#}"),
