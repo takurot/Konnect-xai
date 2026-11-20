@@ -533,12 +533,18 @@ async fn snapshot_project_at(
     let resolved_output = output_dir.canonicalize()?;
     let staging = tempfile::Builder::new()
         .prefix(".konnect-snapshot-")
-        .tempdir_in(&output_dir)?;
+        .tempdir_in(&resolved_output)?;
+    anyhow::ensure!(
+        staging.path().to_str().is_some(),
+        "snapshot staging path cannot be passed to KiCad as UTF-8"
+    );
+    let cli_directory = konnect_sexp::paths::display_path(staging.path());
+    let cli_directory = Path::new(cli_directory.as_ref());
 
     let stem = schematic.file_stem().unwrap_or_default().to_string_lossy();
     let id = uuid::Uuid::new_v4().simple();
     let pdf_name = format!("{stem}_{label}_{ts}_{id}.pdf");
-    let staged_pdf = staging.path().join(&pdf_name);
+    let staged_pdf = cli_directory.join(&pdf_name);
     let pdf_path = resolved_output.join(pdf_name);
 
     crate::tools::cli::export_schematic_pdf(
@@ -560,7 +566,7 @@ async fn snapshot_project_at(
     if let Some(pcb_str) = opt_str(args, "pcb") {
         let pcb = PathBuf::from(pcb_str);
         let pcb_pdf_name = format!("{stem}_pcb_{label}_{ts}_{id}.pdf");
-        let staged_pcb = staging.path().join(&pcb_pdf_name);
+        let staged_pcb = cli_directory.join(&pcb_pdf_name);
         let pcb_pdf_path = resolved_output.join(pcb_pdf_name);
         let layers = &["F.Cu", "B.Cu", "F.Silkscreen", "B.Silkscreen", "Edge.Cuts"];
         let pcb_export =
@@ -1242,7 +1248,17 @@ mod tests {
         let schematic = dir.path().join("voice.kicad_sch");
         std::fs::write(&schematic, "(kicad_sch)").unwrap();
         let output_dir = dir.path().join("snapshots");
-        let args = json!({"schematic":schematic, "output_dir": output_dir, "label":"checkpoint"});
+        #[cfg(unix)]
+        let requested_output = {
+            std::fs::create_dir(&output_dir).unwrap();
+            let alias = dir.path().join("snapshot-output");
+            std::os::unix::fs::symlink(&output_dir, &alias).unwrap();
+            alias
+        };
+        #[cfg(not(unix))]
+        let requested_output = output_dir.clone();
+        let args =
+            json!({"schematic":schematic, "output_dir": requested_output, "label":"checkpoint"});
         let timestamp = 1_764_000_000;
         let (a, b) = tokio::join!(
             snapshot_project_at(&args, &ctx, timestamp),
