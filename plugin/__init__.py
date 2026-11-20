@@ -277,8 +277,14 @@ class KonnectPlugin(pcbnew.ActionPlugin):
         self.icon_file_name = os.path.join(PLUGIN_DIR, "resources", "icon.png")
 
     def Run(self):
-        """Open the settings dialog. Server start/stop is handled via dialog buttons."""
+        """Open settings on the board editor that invoked the action."""
         parent = _pcb_editor_window()
+
+        def set_server_running(running, dialog):
+            if running:
+                return start_server(parent=dialog)
+            stop_server()
+            return True
 
         dlg = KonnectSettingsDialog(
             parent=parent,
@@ -287,18 +293,14 @@ class KonnectPlugin(pcbnew.ActionPlugin):
             server_running=is_server_running(),
             native_bridge_available=_native_bridge.available(),
             native_bridge_running=_native_bridge.running(),
+            server_action=set_server_running,
+            read_server_status=is_server_running,
         )
 
-        result = dlg.ShowModal()
-
-        if result == wx.ID_YES:
-            # User clicked "Start Server"
-            start_server(parent=dlg)
-        elif result == wx.ID_NO:
-            # User clicked "Stop Server"
-            stop_server()
-
-        dlg.Destroy()
+        try:
+            dlg.ShowModal()
+        finally:
+            dlg.Destroy()
         _sync_native_bridge()
 
 

@@ -8169,3 +8169,35 @@ mod helper_tests {
         assert_eq!(attributes.angle.unwrap().value_degrees, 0.0);
     }
 }
+
+#[cfg(test)]
+mod schematic_identity_contract_tests {
+    use super::*;
+    use kiapi::common::types::{
+        document_specifier::Identifier, DocumentSpecifier, DocumentType, Kiid, ProjectSpecifier,
+        SheetPath,
+    };
+
+    #[test]
+    fn a_complete_schematic_document_keeps_the_typed_sheet_identity() {
+        let target = editor_document_from_specifier(
+            IpcEditorKind::Schematic,
+            DocumentSpecifier {
+                r#type: DocumentType::DoctypeSchematic as i32,
+                project: Some(ProjectSpecifier {
+                    name: "fixture".into(),
+                    path: "/fixture".into(),
+                }),
+                identifier: Some(Identifier::SheetPath(SheetPath {
+                    path: vec![Kiid {
+                        value: "root".into(),
+                    }],
+                    path_human_readable: "/".into(),
+                })),
+            },
+        )
+        .unwrap();
+        assert_eq!(target.sheet_instance_path.unwrap().kiids, ["root"]);
+        assert_eq!(target.project.unwrap().name, "fixture");
+    }
+}

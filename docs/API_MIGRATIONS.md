@@ -2325,3 +2325,20 @@ Both tools now report a missing name as an MCP tool error with
 `error: {kind: "not_found", net, suggestions}`. Suggestions are the sorted
 known names that match case-insensitively, or an empty array. A named net
 without component pins still returns a successful result.
+
+## Unreleased KiCad platform integration
+
+A KiCad launcher that exits during startup now returns **launched: false** with
+its observed **exit_status** and a bounded **stderr_tail**. The optional **board**
+argument separates endpoint responsiveness (**ipc_ready**) from exact PCB
+readiness (**requested_open**). An unsupported or incomplete board observation
+has **requested_open: null**. A proven absence is **false**.
+
+KiCad's legacy filename-only schematic response marks schematic document
+identity unsupported in **get_editor_state**, while the PCB observation remains
+available. Selection and target tools report **unsupported_capability** for that
+specific schematic response. Malformed typed identifiers still report a stale
+target.
+
+Diagnostics present ordinary Windows canonical drive and UNC paths in their
+usual spelling. The transaction journal keeps its existing relative-path format.

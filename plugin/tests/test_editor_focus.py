@@ -26,7 +26,8 @@ class EditorFocusTests(unittest.TestCase):
         )
         plugin.KonnectSettingsDialog = mock.Mock()
         dialog = plugin.KonnectSettingsDialog.return_value
-        dialog.ShowModal.return_value = plugin.wx.ID_YES
+        dialog.ShowModal.side_effect = lambda: plugin.KonnectSettingsDialog.call_args.kwargs[
+            "server_action"](True, dialog)
         plugin.start_server = mock.Mock()
         plugin.KonnectPlugin().Run()
 
@@ -51,3 +52,32 @@ class EditorFocusTests(unittest.TestCase):
 
         self.assertIsNone(plugin.KonnectSettingsDialog.call_args.kwargs["parent"])
         manager.Raise.assert_not_called()
+
+
+class InPlaceToggleTests(unittest.TestCase):
+    def test_start_keeps_modal_open_until_running_status_is_read(self):
+        from test_kicad_detection import load_settings_dialog
+
+        module = load_settings_dialog()
+        dialog = module.KonnectSettingsDialog.__new__(module.KonnectSettingsDialog)
+        dialog._collect_settings = mock.Mock(return_value={})
+        dialog.settings_path = "fixture-settings.json"
+        dialog._server_running = False
+        dialog._server_action = mock.Mock(return_value=True)
+        dialog._read_server_status = mock.Mock(side_effect=[False, True])
+        dialog.start_stop_btn = mock.Mock()
+        dialog._pending_toggle = None
+        dialog.EndModal = mock.Mock()
+        dialog._update_server_status = mock.Mock()
+
+        with mock.patch.object(module, "save_settings"):
+            dialog._on_start_stop(None)
+        dialog._server_action.assert_called_once_with(True, dialog)
+        dialog.EndModal.assert_not_called()
+        dialog.start_stop_btn.Disable.assert_called_once()
+        self.assertFalse(dialog._server_running)
+
+        dialog._poll_server_status()
+        self.assertTrue(dialog._server_running)
+        dialog.start_stop_btn.Enable.assert_called_once()
+        dialog._update_server_status.assert_called_once()
