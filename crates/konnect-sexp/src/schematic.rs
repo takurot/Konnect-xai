@@ -864,14 +864,22 @@ pub fn extract_legacy_power_pin_labels(tree: &SexpNode) -> Vec<Label> {
         .map(|node| node.find_all("symbol"))
         .unwrap_or_default();
     let mut labels = Vec::new();
-    for instance in extract_symbol_instances(tree) {
+    for placement in tree.find_all("symbol") {
+        let Some(instance) = extract_symbol_instance(placement) else {
+            continue;
+        };
         let Some(symbol) = find_lib_symbol(&lib_syms, &instance) else {
             continue;
         };
         if symbol.find("power").is_some() {
             continue;
         }
-        visit_unit_pin_nodes(symbol, instance.unit, &mut |node| {
+        let body_style = placement
+            .find_str("body_style")
+            .or_else(|| placement.find_str("convert"))
+            .and_then(|style| style.parse().ok())
+            .unwrap_or(1);
+        visit_unit_pin_nodes(symbol, instance.unit, Some(body_style), &mut |node| {
             let hidden = node.find_str("hide").map_or_else(
                 || {
                     node.children().is_some_and(|fields| {
@@ -942,20 +950,30 @@ pub fn extract_lib_pins(sym_node: &SexpNode) -> Vec<LibPin> {
 /// suffix, are always kept).
 pub fn extract_lib_pins_for_unit(sym_node: &SexpNode, unit: u32) -> Vec<LibPin> {
     let mut out = Vec::new();
-    visit_unit_pin_nodes(sym_node, unit, &mut |node| out.extend(parse_lib_pin(node)));
+    visit_unit_pin_nodes(sym_node, unit, None, &mut |node| {
+        out.extend(parse_lib_pin(node))
+    });
     out
 }
 
-fn visit_unit_pin_nodes(sym_node: &SexpNode, unit: u32, visit: &mut impl FnMut(&SexpNode)) {
+fn visit_unit_pin_nodes(
+    sym_node: &SexpNode,
+    unit: u32,
+    body_style: Option<u32>,
+    visit: &mut impl FnMut(&SexpNode),
+) {
     for pin in sym_node.find_all("pin") {
         visit(pin);
     }
     for sub in sym_node.find_all("symbol") {
-        let sub_unit = sub
+        let variant = sub
             .get(1)
             .and_then(SexpNode::as_str)
-            .and_then(parse_subsymbol_unit);
-        if sub_unit.is_none_or(|selected| selected == 0 || selected == unit) {
+            .and_then(parse_subsymbol_variant);
+        if variant.is_none_or(|(sub_unit, sub_style)| {
+            (sub_unit == 0 || sub_unit == unit)
+                && body_style.is_none_or(|active| sub_style == 0 || sub_style == active)
+        }) {
             visit_pin_nodes(sub, visit);
         }
     }
@@ -965,11 +983,15 @@ fn visit_unit_pin_nodes(sym_node: &SexpNode, unit: u32, visit: &mut impl FnMut(&
 /// `None` when the name doesn't end in two `_`-separated integers (base names
 /// may themselves contain underscores and digits, e.g. `R_Small_1_1` → 1).
 pub fn parse_subsymbol_unit(name: &str) -> Option<u32> {
-    let mut it = name.rsplitn(3, '_');
-    let _style: u32 = it.next()?.parse().ok()?;
-    let unit: u32 = it.next()?.parse().ok()?;
-    it.next()?; // a base name must exist before the suffix
-    Some(unit)
+    parse_subsymbol_variant(name).map(|(unit, _)| unit)
+}
+
+fn parse_subsymbol_variant(name: &str) -> Option<(u32, u32)> {
+    let mut fields = name.rsplitn(3, '_');
+    let style = fields.next()?.parse().ok()?;
+    let unit = fields.next()?.parse().ok()?;
+    fields.next()?; // a base name must exist before the suffix
+    Some((unit, style))
 }
 
 fn visit_pin_nodes(node: &SexpNode, visit: &mut impl FnMut(&SexpNode)) {
