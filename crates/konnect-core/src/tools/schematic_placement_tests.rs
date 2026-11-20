@@ -1272,3 +1272,48 @@ async fn a_power_symbol_is_snapped_through_the_served_dispatch() {
     assert_eq!(placed["x"].as_f64(), Some(symbol.at.x));
     assert_eq!(placed["y"].as_f64(), Some(symbol.at.y));
 }
+
+#[tokio::test]
+async fn native_component_writes_accept_children_under_both_configured_roots() {
+    let (directory, first, first_child) = fixture(false);
+    let second = directory.path().join("second.kicad_sch");
+    let second_child = first_child.with_file_name("second-child.kicad_sch");
+    let source = std::fs::read_to_string(&first).unwrap();
+    std::fs::write(
+        &second,
+        source.replace("ampli_ht.kicad_sch", "second-child.kicad_sch"),
+    )
+    .unwrap();
+
+    let first_id = "4187d28e-1569-4eba-b9b7-e900f7d6d8e3";
+    let second_id = "ef67c491-50cc-4611-9d4c-f378bfa497c0";
+    let config_path = first.with_extension("kicad_pro");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["schematic"]["top_level_sheets"] = json!([
+        {"filename": first.file_name().unwrap().to_str().unwrap(), "uuid": first_id},
+        {"filename": second.file_name().unwrap().to_str().unwrap(), "uuid": second_id}
+    ]);
+    std::fs::write(config_path, config.to_string()).unwrap();
+
+    let child_source = std::fs::read_to_string(&first_child).unwrap();
+    let sheet_suffix = PATH_A
+        .strip_prefix("/5b9623a5-6d01-41fc-9865-e1bc779418c8")
+        .unwrap();
+    let children = [(&first_child, first_id), (&second_child, second_id)];
+    for (path, root_id) in children {
+        let expected = format!("/{root_id}{sheet_suffix}");
+        std::fs::write(path, child_source.replace(PATH_A, &expected)).unwrap();
+    }
+    for (path, root_id) in children {
+        let expected = format!("/{root_id}{sheet_suffix}");
+        let result = place("add_schematic_component", path).await;
+        assert!(!result.is_error, "{result:?}");
+        let doc = Schematic::load(path).unwrap();
+        let symbol = doc.symbols.by_reference("U999").unwrap();
+        assert_eq!(
+            symbol.instance_paths(),
+            [("complex_hierarchy".to_owned(), expected)]
+        );
+    }
+}

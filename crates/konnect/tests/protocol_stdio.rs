@@ -217,6 +217,42 @@ fn handshake_baseline_and_full_registry_loads() {
 }
 
 #[test]
+fn sheet_pages_are_not_reused_after_a_server_restart() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().join("project.kicad_sch");
+    std::fs::write(root.with_extension("kicad_pro"), "{}").unwrap();
+    let spawn = || {
+        let mut process = McpProcess::spawn_configured(Some(project.path()), true);
+        process.call_tool("load_toolset", json!({"name": "sch_hierarchy"}));
+        process
+    };
+    let add = |process: &mut McpProcess, name: &str, file: &str| {
+        let result = process.call_tool(
+            "add_hierarchical_sheet",
+            json!({
+                "schematic": root, "sheet_name": name, "sheet_file": file,
+            }),
+        );
+        assert_ne!(result["isError"], true, "{result:#?}");
+        McpProcess::tool_body(&result)["sheet"]["page"].clone()
+    };
+
+    let mut first = spawn();
+    let created = first.call_tool("create_schematic", json!({"path": root}));
+    assert_ne!(created["isError"], true, "{created:#?}");
+    assert_eq!(add(&mut first, "A", "a.kicad_sch"), "2");
+    assert_eq!(add(&mut first, "B", "b.kicad_sch"), "3");
+    let deleted = first.call_tool(
+        "delete_sheet",
+        json!({"schematic": root, "sheet_name": "B"}),
+    );
+    assert_ne!(deleted["isError"], true, "{deleted:#?}");
+    drop(first);
+
+    assert_eq!(add(&mut spawn(), "C", "c.kicad_sch"), "4");
+}
+
+#[test]
 fn installation_info_reports_the_serving_process_without_leaking_endpoint_secrets() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
