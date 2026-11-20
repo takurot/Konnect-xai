@@ -855,6 +855,54 @@ pub fn extract_power_symbol_labels(tree: &SexpNode) -> Vec<Label> {
     labels
 }
 
+/// Legacy invisible power inputs on ordinary symbols connect globally by pin
+/// name. Saved electrical analysis includes these alongside explicit power
+/// symbols.
+pub fn extract_legacy_power_pin_labels(tree: &SexpNode) -> Vec<Label> {
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
+    let mut labels = Vec::new();
+    for instance in extract_symbol_instances(tree) {
+        let Some(symbol) = find_lib_symbol(&lib_syms, &instance) else {
+            continue;
+        };
+        if symbol.find("power").is_some() {
+            continue;
+        }
+        visit_unit_pin_nodes(symbol, instance.unit, &mut |node| {
+            let hidden = node.find_str("hide").map_or_else(
+                || {
+                    node.children().is_some_and(|fields| {
+                        fields
+                            .iter()
+                            .skip(3)
+                            .any(|field| field.as_str() == Some("hide"))
+                    })
+                },
+                |value| value == "yes",
+            );
+            if !hidden || node.get(1).and_then(SexpNode::as_str) != Some("power_in") {
+                return;
+            }
+            let Some(pin) = parse_lib_pin(node).filter(|pin| !pin.name.is_empty()) else {
+                return;
+            };
+            let (x, y) = pin_endpoint(&pin, instance.pin_transform());
+            labels.push(Label {
+                kind: LabelKind::PowerSymbol,
+                net: pin.name,
+                x,
+                y,
+                rotation: instance.rotation,
+                uuid: instance.uuid.clone(),
+            });
+        });
+    }
+    labels
+}
+
 // ─── Pin in library symbol ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -879,7 +927,7 @@ pub struct LibPin {
 /// `connect_pins` ("Pin '2' not found on 'R1'").
 pub fn extract_lib_pins(sym_node: &SexpNode) -> Vec<LibPin> {
     let mut out = Vec::new();
-    collect_pins_recursive(sym_node, &mut out);
+    visit_pin_nodes(sym_node, &mut |node| out.extend(parse_lib_pin(node)));
     out
 }
 
@@ -894,23 +942,23 @@ pub fn extract_lib_pins(sym_node: &SexpNode) -> Vec<LibPin> {
 /// suffix, are always kept).
 pub fn extract_lib_pins_for_unit(sym_node: &SexpNode, unit: u32) -> Vec<LibPin> {
     let mut out = Vec::new();
+    visit_unit_pin_nodes(sym_node, unit, &mut |node| out.extend(parse_lib_pin(node)));
+    out
+}
+
+fn visit_unit_pin_nodes(sym_node: &SexpNode, unit: u32, visit: &mut impl FnMut(&SexpNode)) {
     for pin in sym_node.find_all("pin") {
-        if let Some(lib_pin) = parse_lib_pin(pin) {
-            out.push(lib_pin);
-        }
+        visit(pin);
     }
     for sub in sym_node.find_all("symbol") {
         let sub_unit = sub
             .get(1)
-            .and_then(|n| n.as_str())
+            .and_then(SexpNode::as_str)
             .and_then(parse_subsymbol_unit);
-        match sub_unit {
-            Some(n) if n != 0 && n != unit => {} // another unit's pins: skip
-            // n == 0 (common), n == unit, or an un-suffixed name: keep all.
-            _ => collect_pins_recursive(sub, &mut out),
+        if sub_unit.is_none_or(|selected| selected == 0 || selected == unit) {
+            visit_pin_nodes(sub, visit);
         }
     }
-    out
 }
 
 /// Parse the unit number `N` out of a `Name_N_M` sub-symbol name. Returns
@@ -924,15 +972,13 @@ pub fn parse_subsymbol_unit(name: &str) -> Option<u32> {
     Some(unit)
 }
 
-fn collect_pins_recursive(node: &SexpNode, out: &mut Vec<LibPin>) {
+fn visit_pin_nodes(node: &SexpNode, visit: &mut impl FnMut(&SexpNode)) {
     for pin in node.find_all("pin") {
-        if let Some(lib_pin) = parse_lib_pin(pin) {
-            out.push(lib_pin);
-        }
+        visit(pin);
     }
     // Recurse into unit/body-style sub-symbols ("R_1_1", "R_1_0", …).
     for sub in node.find_all("symbol") {
-        collect_pins_recursive(sub, out);
+        visit_pin_nodes(sub, visit);
     }
 }
 

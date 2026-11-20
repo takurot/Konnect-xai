@@ -2335,7 +2335,8 @@ generated query name receives a numbered suffix. For named pins on multi-unit
 symbols, saved-file analysis uses KiCad's default alphabetic unit suffix. An
 isolated unnamed pin still returns `null` in the pin query or `"~"` in the summary. The inventory continues to expose named
 aliases. Both `A/B` and `A{slash}B` look up the same alias; the label inventory
-continues to show the literal saved text.
+continues to show the literal saved text. Invisible power-input pins on legacy
+symbols contribute their saved pin name as a global alias.
 
 The analysis compares coordinates in KiCad's schematic internal units
 (0.0001 mm). `find_orphan_items` includes dangling wire ends, floating labels,

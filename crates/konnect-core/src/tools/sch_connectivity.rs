@@ -34,8 +34,9 @@
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_all_net_labels, extract_bus_entries, extract_junctions, extract_no_connects,
-        extract_sheet_pins, pin_endpoint, Label, LabelKind, LibPin, Wire,
+        extract_all_net_labels, extract_bus_entries, extract_junctions,
+        extract_legacy_power_pin_labels, extract_no_connects, extract_sheet_pins, pin_endpoint,
+        Label, LabelKind, LibPin, Wire,
     },
     SexpNode,
 };
@@ -735,6 +736,7 @@ pub(crate) fn analysis_net_name(name: &str) -> String {
 pub(crate) fn analysis_net_labels(tree: &SexpNode) -> Vec<Label> {
     extract_all_net_labels(tree)
         .into_iter()
+        .chain(extract_legacy_power_pin_labels(tree))
         .map(|mut label| {
             label.net = analysis_net_name(&label.net);
             label
