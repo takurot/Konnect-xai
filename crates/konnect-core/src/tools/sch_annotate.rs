@@ -1844,8 +1844,8 @@ mod tests {
         assert_eq!(placed_units, vec![1, 2, 3], "the package keeps its units");
     }
 
-    #[test]
-    fn unannotated_units_forming_two_packages_are_not_guessed() {
+    #[tokio::test]
+    async fn unannotated_units_forming_two_packages_are_not_guessed() {
         let symbols = symbols_of(MULTI_UNIT);
         let units: Vec<String> = symbols
             .iter()
@@ -1885,6 +1885,119 @@ mod tests {
         assert_eq!(body["outcome"]["status"], "partial", "{body}");
         assert_eq!(body["written"], false, "{body}");
         assert_eq!(std::fs::read(&path).unwrap(), before, "nothing is guessed");
+
+        let unresolved_body = body["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["reference"] == "U?")
+            .unwrap();
+        let recovery = &unresolved_body["recovery"][0];
+        let args = recovery["arguments"].clone();
+        assert_eq!(recovery["tool"], "edit_schematic_component", "{body}");
+        assert!(unresolved
+            .uuids
+            .iter()
+            .any(|uuid| args["uuid"].as_str() == Some(uuid.as_str())));
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            auto_load_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let edited = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": recovery["tool"], "arguments": args}
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(edited["isError"], false, "{edited}");
+        let annotated = response_json(&annotate_file(&path, AnnotateOptions::default()));
+        assert_eq!(annotated["outcome"]["status"], "complete", "{annotated}");
+        let units = symbols_of(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(
+            units
+                .iter()
+                .filter(|unit| unit.property_reference == "U?")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn native_page_order_wins_over_uuid_and_empty_root_reports_unannotated_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("multichannel_mixer.kicad_sch");
+        let child = dir.path().join("channel_strip.kicad_sch");
+        let root_source = include_str!("../../tests/fixtures/multichannel_mixer.kicad_sch");
+        let root_symbols = konnect_sexp::writer::find_direct_child_blocks(root_source, "kicad_sch")
+            .into_iter()
+            .filter(|&(start, end)| {
+                parse_sexp(&root_source[start..end]).unwrap().head() == Some("symbol")
+            })
+            .map(|(start, end)| SexpEdit::delete(start, end))
+            .collect();
+        let root_source = apply_edits(root_source.to_owned(), root_symbols);
+        std::fs::write(&root, &root_source).unwrap();
+        std::fs::write(
+            root.with_extension("kicad_pro"),
+            include_str!("../../tests/fixtures/multichannel_mixer.kicad_pro"),
+        )
+        .unwrap();
+        let symbols = symbols_of(REUSED_SHEET);
+        let resistor = symbols
+            .iter()
+            .find(|symbol| symbol.property_reference.starts_with('R'))
+            .unwrap();
+        let unannotated = set_every_reference(REUSED_SHEET, &resistor.uuid, "R?");
+        std::fs::write(&child, &unannotated).unwrap();
+
+        let report = response_json(&annotate_file(&root, AnnotateOptions::default()));
+        assert_eq!(report["project"], "multichannel_mixer", "{report}");
+        assert_eq!(report["scope"], "saved_schematic", "{report}");
+        assert_eq!(report["written"], false, "{report}");
+        assert!(
+            report["other_sheets_unannotated"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["schematic"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("channel_strip.kicad_sch")
+                    && entry["unannotated_instances"] == 4),
+            "{report}"
+        );
+        assert_eq!(std::fs::read_to_string(&root).unwrap(), root_source);
+        assert_eq!(std::fs::read_to_string(&child).unwrap(), unannotated);
+
+        let preview = response_json(&annotate_file(
+            &child,
+            AnnotateOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        ));
+        let assignment_paths: Vec<&str> = preview["assigned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap().rsplit('/').next().unwrap())
+            .collect();
+        assert_eq!(
+            assignment_paths,
+            [
+                "8b945230-5f99-4834-98ec-44a11b86c8e7", // Page 2
+                "28f12a69-adb8-432e-b16f-23450e62f642", // Page 3
+                "b924e033-d20d-4b7d-8c8a-6be6c11f2802", // Page 4
+                "eaae7191-0144-4728-9382-3abf6e7a2d68", // Page 5
+            ],
+            "{preview}"
+        );
+        assert_eq!(std::fs::read_to_string(&child).unwrap(), unannotated);
     }
 
     #[test]
