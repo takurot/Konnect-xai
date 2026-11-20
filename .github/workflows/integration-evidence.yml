@@ -74,9 +74,25 @@ jobs:
         shell: bash
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          snapshot_legacy_state() {
+            for path in "$HOME/.konnect" "$HOME/.local/share/konnect"; do
+              if [[ -e "$path" || -L "$path" ]]; then
+                find "$path" -printf '%y %p %l\n' | LC_ALL=C sort
+                find "$path" -type f -print0 | LC_ALL=C sort -z | xargs -0r sha256sum
+              else
+                printf 'absent %s\n' "$path"
+              fi
+            done
+          }
           mkdir -p evidence
           cargo fmt --all -- --check
-          cargo llvm-cov --workspace --locked --lib --tests --branch 2>&1 | tee evidence/coverage.log
+          snapshot_legacy_state > "$RUNNER_TEMP/konnect-legacy-before"
+          coverage_exit=0
+          cargo llvm-cov --workspace --locked --lib --tests --branch 2>&1 | tee evidence/coverage.log || coverage_exit=$?
+          snapshot_legacy_state > "$RUNNER_TEMP/konnect-legacy-after"
+          cmp "$RUNNER_TEMP/konnect-legacy-before" "$RUNNER_TEMP/konnect-legacy-after"
+          printf '%s\n' 'Legacy Konnect paths and file hashes unchanged' | tee -a evidence/coverage.log
+          exit "$coverage_exit"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
