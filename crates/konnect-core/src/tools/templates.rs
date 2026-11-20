@@ -756,28 +756,8 @@ fn find_next_ref_number(content: &str) -> usize {
 mod tests {
     use super::*;
     use crate::router::ToolRouter;
-    use crate::tools::{ServerConfig, KICAD_ENV_LOCK};
+    use crate::tools::ServerConfig;
     use std::sync::Arc;
-
-    struct TemplateEnvironment {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        old_appdata: Option<std::ffi::OsString>,
-        old_home: Option<std::ffi::OsString>,
-    }
-
-    impl Drop for TemplateEnvironment {
-        fn drop(&mut self) {
-            restore_env("APPDATA", self.old_appdata.take());
-            restore_env("HOME", self.old_home.take());
-        }
-    }
-
-    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
-        match value {
-            Some(value) => std::env::set_var(name, value),
-            None => std::env::remove_var(name),
-        }
-    }
 
     fn test_ctx() -> Arc<ToolContext> {
         Arc::new(ToolContext::new(
@@ -794,19 +774,28 @@ mod tests {
         ))
     }
 
-    fn template_fixture() -> (tempfile::TempDir, std::path::PathBuf, TemplateEnvironment) {
-        let guard = KICAD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("config");
-        let old_appdata = std::env::var_os("APPDATA");
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("APPDATA", &config);
-        std::env::set_var("HOME", &config);
-        let template_dir = if cfg!(target_os = "windows") {
-            config.join("konnect").join("templates")
-        } else {
-            config.join(".konnect").join("templates")
+    fn template_fixture(test_name: &str) -> Option<std::path::PathBuf> {
+        const FIXTURE_ROOT: &str = "KONNECT_TEST_TEMPLATE_ROOT";
+        let root = match std::env::var_os(FIXTURE_ROOT) {
+            Some(root) => std::path::PathBuf::from(root),
+            None => {
+                let dir = tempfile::tempdir().unwrap();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", &format!("tools::templates::tests::{test_name}")])
+                    .env(FIXTURE_ROOT, dir.path())
+                    .env("KONNECT_STATE_DIR", dir.path().join("state"))
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return None;
+            }
         };
+        let template_dir = root.join("state/templates");
         std::fs::create_dir_all(&template_dir).unwrap();
         std::fs::write(
             template_dir.join("one_resistor.json"),
@@ -827,7 +816,7 @@ mod tests {
 
         // A real KiCad schematic fixture, including a fully embedded
         // Device:R definition, makes this independent of a KiCad installation.
-        let schematic = dir.path().join("derived_lib_name.kicad_sch");
+        let schematic = root.join("derived_lib_name.kicad_sch");
         std::fs::copy(
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -836,14 +825,9 @@ mod tests {
             &schematic,
         )
         .unwrap();
-        std::fs::write(dir.path().join("derived_lib_name.kicad_pro"), "{}\n").unwrap();
+        std::fs::write(root.join("derived_lib_name.kicad_pro"), "{}\n").unwrap();
 
-        let environment = TemplateEnvironment {
-            _guard: guard,
-            old_appdata,
-            old_home,
-        };
-        (dir, schematic, environment)
+        Some(schematic)
     }
 
     async fn call_registered(
@@ -861,7 +845,11 @@ mod tests {
 
     #[tokio::test]
     async fn apply_template_uses_project_identity_and_leaves_batch_writes_usable() {
-        let (_dir, schematic, _environment) = template_fixture();
+        let Some(schematic) =
+            template_fixture("apply_template_uses_project_identity_and_leaves_batch_writes_usable")
+        else {
+            return;
+        };
         let ctx = test_ctx();
 
         let applied = call_registered(
@@ -933,7 +921,11 @@ mod tests {
 
     #[tokio::test]
     async fn apply_template_refuses_malformed_instance_metadata_without_writing() {
-        let (_dir, schematic, _environment) = template_fixture();
+        let Some(schematic) =
+            template_fixture("apply_template_refuses_malformed_instance_metadata_without_writing")
+        else {
+            return;
+        };
         let malformed = std::fs::read_to_string(&schematic).unwrap().replacen(
             "(project \"derived_lib_name\"",
             "(project \"\"",

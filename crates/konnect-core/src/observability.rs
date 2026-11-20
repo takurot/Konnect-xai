@@ -14,7 +14,7 @@
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -178,9 +178,10 @@ impl CallObserver {
         }
 
         if let Some(path) = self.inner.log_path.clone() {
-            let written =
-                tokio::task::spawn_blocking(move || append_jsonl(&path, &rec, MAX_CALL_LOG_BYTES))
-                    .await;
+            let written = crate::tools::blocking_work::spawn_tracked_blocking(move || {
+                append_jsonl(&path, &rec, MAX_CALL_LOG_BYTES)
+            })
+            .await;
             match written {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => warn!(%error, "JSONL write failed"),
@@ -292,7 +293,12 @@ fn append_jsonl(path: &Path, record: &CallRecord, limit: u64) -> std::io::Result
     } else {
         current_size
     };
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    file.seek(SeekFrom::Start(start))?;
     if let Err(error) = file.write_all(&line).and_then(|()| file.flush()) {
         file.set_len(start)?;
         return Err(error);

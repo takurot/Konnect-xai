@@ -17,6 +17,7 @@ struct Mcp {
     child: Child,
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
+    _state: tempfile::TempDir,
     next_id: i64,
 }
 
@@ -63,10 +64,9 @@ impl Mcp {
     }
 
     fn spawn_with_home(kicad_cli: &str, home: Option<&std::path::Path>) -> Self {
-        let mut config = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
-        write!(config, "{}", json!({"kicad_cli": kicad_cli})).unwrap();
-        config.flush().unwrap();
-        let (_persist, config_path) = config.keep().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let config_path = state.path().join("server.json");
+        std::fs::write(&config_path, json!({"kicad_cli": kicad_cli}).to_string()).unwrap();
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
         if let Some(home) = home {
@@ -75,6 +75,7 @@ impl Mcp {
         let mut child = command
             .arg("--config")
             .arg(&config_path)
+            .env("KONNECT_STATE_DIR", state.path().join("state"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -86,6 +87,7 @@ impl Mcp {
             child,
             stdin,
             reader,
+            _state: state,
             next_id: 1,
         };
         p.request(
