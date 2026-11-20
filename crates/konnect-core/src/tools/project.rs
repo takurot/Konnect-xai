@@ -494,16 +494,23 @@ async fn handle_snapshot_project(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    snapshot_project_at(args, ctx, timestamp).await
+}
+
+async fn snapshot_project_at(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    ts: u64,
+) -> anyhow::Result<CallToolResult> {
     let schematic = get_path(args, "schematic")?;
     let output_dir = get_path(args, "output_dir")?;
     let label = opt_str(args, "label").unwrap_or("snapshot");
 
     tokio::fs::create_dir_all(&output_dir).await?;
-
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
 
     let stem = schematic
         .file_stem()
@@ -1073,6 +1080,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_project_refuses_invalid_stems_before_directory_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        for (index, name) in ["", ".", "..", "demo.kicad_pro", "control\tname"]
+            .into_iter()
+            .enumerate()
+        {
+            let target = dir.path().join(index.to_string());
+            let result = handle_create_project(&json!({"path": target, "name": name}), &test_ctx())
+                .await
+                .unwrap();
+            assert!(result.is_error, "accepted invalid stem {name:?}");
+            assert_eq!(response_json(&result)["error"]["field"], "name");
+            assert!(
+                !target.exists(),
+                "created {target:?} before refusing the name"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_project_info_refuses_an_existing_schematic_without_parsing_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("voice.kicad_sch");
+        std::fs::write(&schematic, "(kicad_sch)").unwrap();
+        let result = handle_get_project_info(&json!({"path": schematic}), &test_ctx())
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(response_json(&result)["error"]["field"], "path");
+        assert_eq!(std::fs::read_to_string(&schematic).unwrap(), "(kicad_sch)");
+    }
+
+    #[tokio::test]
+    async fn snapshot_refuses_invalid_labels_before_directory_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx();
+        ctx.config.kicad_cli = crate::tools::cli::test_support::schematic_only_cli(dir.path())
+            .display()
+            .to_string();
+        let schematic = dir.path().join("voice.kicad_sch");
+        std::fs::write(&schematic, "(kicad_sch)").unwrap();
+
+        for (index, label) in [
+            json!(""),
+            json!("."),
+            json!(".."),
+            json!("named.kicad_pcb"),
+            json!("bad\nname"),
+            json!(5),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let output_dir = dir.path().join(index.to_string());
+            let result = handle_snapshot_project(
+                &json!({"schematic":schematic, "output_dir":output_dir, "label":label}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "accepted invalid label {label}");
+            assert_eq!(response_json(&result)["error"]["field"], "label");
+            assert!(
+                !output_dir.exists(),
+                "created {output_dir:?} before refusing the label"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn simultaneous_snapshots_at_the_same_timestamp_get_distinct_verified_pdfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx();
+        ctx.config.kicad_cli = crate::tools::cli::test_support::schematic_only_cli(dir.path())
+            .display()
+            .to_string();
+        let schematic = dir.path().join("voice.kicad_sch");
+        std::fs::write(&schematic, "(kicad_sch)").unwrap();
+        let output_dir = dir.path().join("snapshots");
+        let args = json!({"schematic":schematic, "output_dir": output_dir, "label":"checkpoint"});
+        let timestamp = 1_764_000_000;
+        let (a, b) = tokio::join!(
+            snapshot_project_at(&args, &ctx, timestamp),
+            snapshot_project_at(&args, &ctx, timestamp),
+        );
+        let paths = [a, b].map(|result| {
+            let result = result.unwrap();
+            assert!(!result.is_error, "{result:?}");
+            let body = response_json(&result);
+            assert_eq!(body["timestamp"], timestamp);
+            assert_eq!(body["label"], "checkpoint");
+            let path = PathBuf::from(body["snapshot"].as_str().unwrap());
+            assert_eq!(
+                path.parent().unwrap().canonicalize().unwrap(),
+                output_dir.canonicalize().unwrap()
+            );
+            assert!(std::fs::metadata(&path).unwrap().len() > 0);
+            path
+        });
+        assert_ne!(paths[0], paths[1]);
+        assert_eq!(std::fs::read_dir(output_dir).unwrap().count(), 2);
+    }
+
+    #[tokio::test]
     async fn get_project_info_missing_file_returns_file_not_found() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = test_ctx();
@@ -1124,9 +1239,24 @@ mod tests {
             &ctx,
         )
         .await
-        .expect_err("missing PCB PDF must fail the snapshot call");
-        assert!(error.to_string().contains("did not create"), "{error:#}");
-        assert!(error.to_string().contains("pcb"), "{error:#}");
+        .expect("missing PCB PDF must report the partial snapshot");
+        assert!(error.is_error, "{error:?}");
+        let body = response_json(&error);
+        assert_eq!(body["error"]["kind"], "handler_error");
+        assert!(body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("did not create"));
+        let saved = PathBuf::from(body["snapshot"].as_str().unwrap());
+        assert_eq!(body["artifacts_written"], json!([saved]));
+        assert!(body["pcb_snapshot"].is_null());
+        assert!(std::fs::metadata(saved).unwrap().len() > 0);
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("snapshots"))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
