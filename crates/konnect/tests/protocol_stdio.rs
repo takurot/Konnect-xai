@@ -187,12 +187,7 @@ fn handshake_baseline_and_full_registry_loads() {
 
     // list_toolboxes reports the registry; every toolset must load.
     let boxes = McpProcess::tool_body(&p.call_tool("list_toolboxes", json!({})));
-    let toolsets: Vec<String> = boxes["toolsets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["name"].as_str().unwrap().to_string())
-        .collect();
+    let toolsets = boxes["toolsets"].as_array().unwrap();
     assert!(
         toolsets.len() >= 17,
         "expected 17+ toolsets, got {}",
@@ -202,18 +197,32 @@ fn handshake_baseline_and_full_registry_loads() {
     assert!(boxes.get("license_tier").is_none());
     assert!(boxes["toolsets"][0].get("tier").is_none());
 
-    let mut total = 0u64;
-    for name in &toolsets {
-        let loaded = McpProcess::tool_body(&p.call_tool("load_toolset", json!({"name": name})));
-        let added = loaded["tools_added"].as_u64().unwrap_or(0);
-        assert!(added > 0, "toolset '{name}' loaded no tools");
-        total += added;
+    let mut initially_loaded = 0;
+    let mut newly_loaded = 0;
+    for toolset in toolsets {
+        let name = toolset["name"].as_str().unwrap();
+        let count = toolset["tool_count"].as_u64().unwrap();
+        let expected = if toolset["loaded"].as_bool().unwrap() {
+            initially_loaded += count;
+            0
+        } else {
+            count
+        };
+        let result = p.call_tool("load_toolset", json!({"name": name}));
+        assert_eq!(result["isError"], false, "{name}: {result}");
+        let response = McpProcess::tool_body(&result);
+        let added = response["tools_added"].as_u64().unwrap();
+        assert_eq!(added, expected, "{name}: {response}");
+        newly_loaded += added;
     }
     assert_eq!(
-        total,
+        initially_loaded + newly_loaded,
         boxes["total_tools"].as_u64().unwrap(),
         "sum of loaded tools disagrees with list_toolboxes total"
     );
+    let list = p.request("tools/list", json!({}));
+    let full = list["result"]["tools"].as_array().unwrap().len();
+    assert_eq!(full as u64, baseline as u64 + newly_loaded);
 }
 
 #[test]
