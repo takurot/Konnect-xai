@@ -35,6 +35,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "refill_zones": { "type": "boolean", "default": false, "description": "Refill before checking: persisted IPC fill with sync_live_board, analysis-only CLI fill otherwise." },
                     "severity": {
                         "type": "string",
+                        "enum": cli::ReportSeverity::OPTIONS,
                         "description": "Minimum violation severity to include: 'error', 'warning' (default), 'info'",
                         "default": "warning"
                     },
@@ -240,7 +241,10 @@ async fn handle_run_drc(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let severity_filter = args["severity"].as_str().unwrap_or("warning");
+    let severity_filter = match cli::ReportSeverity::from_args(args) {
+        Ok(severity) => severity.as_str(),
+        Err(error) => return Ok(error),
+    };
     let min_rank = severity_rank(severity_filter);
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 

@@ -17,6 +17,44 @@ use super::cli;
 
 // ─── Severity filter helpers ──────────────────────────────────────────────────
 
+#[derive(Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum FabricationUnits {
+    Mm,
+    In,
+}
+
+impl FabricationUnits {
+    const OPTIONS: [Self; 2] = [Self::Mm, Self::In];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mm => "mm",
+            Self::In => "in",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum OdbCompression {
+    Zip,
+    None,
+    Tgz,
+}
+
+impl OdbCompression {
+    const OPTIONS: [Self; 3] = [Self::Zip, Self::None, Self::Tgz];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Zip => "zip",
+            Self::None => "none",
+            Self::Tgz => "tgz",
+        }
+    }
+}
+
 fn severity_rank(s: &str) -> u8 {
     match s {
         "error" => 2,
@@ -425,7 +463,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "output": { "type": "string", "description": "Output file path (.xml)" },
-                    "units": { "type": "string", "description": "Output units: 'mm' (default) or 'in'", "default": "mm" },
+                    "units": { "type": "string", "enum": FabricationUnits::OPTIONS, "description": "Output units: 'mm' (default) or 'in'", "default": "mm" },
                     "compress": { "type": "boolean", "description": "Compress the output into a zip archive", "default": false }
                 },
                 "required": ["board", "output"]
@@ -441,8 +479,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "output": { "type": "string", "description": "Output file path" },
-                    "units": { "type": "string", "description": "Output units: 'mm' (default) or 'in'", "default": "mm" },
-                    "compression": { "type": "string", "description": "Compression mode: 'zip' (default), 'none', or 'tgz'", "default": "zip" }
+                    "units": { "type": "string", "enum": FabricationUnits::OPTIONS, "description": "Output units: 'mm' (default) or 'in'", "default": "mm" },
+                    "compression": { "type": "string", "enum": OdbCompression::OPTIONS, "description": "Compression mode: 'zip' (default), 'none', or 'tgz'", "default": "zip" }
                 },
                 "required": ["board", "output"]
             }),
@@ -476,6 +514,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "refill_zones": { "type": "boolean", "default": false, "description": "Refill before checking: persisted IPC fill with sync_live_board, analysis-only CLI fill otherwise." },
                     "severity": {
                         "type": "string",
+                        "enum": cli::ReportSeverity::OPTIONS,
                         "description": "Minimum severity to include: 'error', 'warning' (default), 'info'",
                         "default": "warning"
                     }
@@ -1118,7 +1157,15 @@ async fn handle_export_ipc2581(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
-    let units = args["units"].as_str().unwrap_or("mm");
+    let units = match super::optional_enum(
+        args,
+        "units",
+        &FabricationUnits::OPTIONS,
+        FabricationUnits::Mm,
+    ) {
+        Ok(units) => units.as_str(),
+        Err(error) => return Ok(error),
+    };
     let compress = args["compress"].as_bool().unwrap_or(false);
 
     let cli = &ctx.config.kicad_cli;
@@ -1141,8 +1188,24 @@ async fn handle_export_odb(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
-    let units = args["units"].as_str().unwrap_or("mm");
-    let compression = args["compression"].as_str().unwrap_or("zip");
+    let units = match super::optional_enum(
+        args,
+        "units",
+        &FabricationUnits::OPTIONS,
+        FabricationUnits::Mm,
+    ) {
+        Ok(units) => units.as_str(),
+        Err(error) => return Ok(error),
+    };
+    let compression = match super::optional_enum(
+        args,
+        "compression",
+        &OdbCompression::OPTIONS,
+        OdbCompression::Zip,
+    ) {
+        Ok(compression) => compression.as_str(),
+        Err(error) => return Ok(error),
+    };
 
     let cli = &ctx.config.kicad_cli;
     cli::export_odb(cli, &board, &output, units, compression).await?;
@@ -1183,7 +1246,10 @@ async fn handle_get_drc_violations(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let severity_filter = args["severity"].as_str().unwrap_or("warning");
+    let severity_filter = match cli::ReportSeverity::from_args(args) {
+        Ok(severity) => severity.as_str(),
+        Err(error) => return Ok(error),
+    };
     let min_rank = severity_rank(severity_filter);
 
     let (report, provenance) = match super::drc::run(ctx, &board, args).await? {

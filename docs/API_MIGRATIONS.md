@@ -1708,6 +1708,15 @@ No tool mirrors an already-placed symbol: changing a placement's reflection
 still means deleting it and placing it again. This additive change is planned
 for the next minor release; no tool or argument was renamed or removed.
 
+## Unreleased – Export and rules-check options use closed choices
+
+Pass `mm` or `in` for IPC-2581 and ODB++ units. ODB++ compression accepts
+`zip`, `none`, or `tgz`. The `severity` filter on `run_drc`,
+`get_drc_violations`, and `run_erc` accepts `error`, `warning`, or `info`.
+Defaults remain `mm`, `zip`, and `warning`, respectively. The names are
+case-sensitive. An unsupported value returns `invalid_argument` naming the
+field before starting the export or rules check.
+
 ## Unreleased: DRC checks schematic parity on every run (minor release)
 
 `run_drc`, `get_drc_violations`, `run_design_review`, `validate_for_manufacturing`
