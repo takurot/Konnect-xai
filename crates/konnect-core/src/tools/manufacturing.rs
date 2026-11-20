@@ -1561,6 +1561,45 @@ mod package_export_option_tests {
         }
     }
 
+    #[tokio::test]
+    async fn estimate_cost_names_known_lcsc_refs_when_the_catalog_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(
+            &board,
+            r#"(kicad_pcb (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+            (footprint "Pkg" (property "Reference" "R1") (property "LCSC" "C25804"))
+            (footprint "Pkg" (property "Reference" "R2")))"#,
+        )
+        .unwrap();
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig {
+                jlcpcb_db_path: Some(dir.path().join("missing.db")),
+                ..Default::default()
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_estimate_cost(&json!({"board": board}), &ctx)
+            .await
+            .unwrap();
+        let body = result_json(&result);
+        assert_eq!(
+            body["component_pricing"]["fallback_average"],
+            json!(["R1", "R2"])
+        );
+        let warnings = body["warnings"].as_array().unwrap();
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.as_str().is_some_and(|warning| {
+                    warning.contains("catalog is absent")
+                        && warning.contains("R1")
+                        && !warning.contains("R2")
+                })
+            }),
+            "{body}"
+        );
+    }
+
     #[test]
     fn package_schema_exposes_applied_gerber_and_position_options() {
         let package = tools()
