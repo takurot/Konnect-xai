@@ -275,7 +275,9 @@ new location. Claude and Codex keep their own home directories for guidance.
 Project preferences stay in the project's `.konnect/project.json`.
 
 The standalone and embedded servers rotate their JSONL call log at 5 MiB per
-file. Oversized historical logs found at those paths are preserved in sibling
+file. Stop older Konnect processes that share the same log path before
+upgrading so all writers honor the rotation lock. Oversized historical logs
+found at those paths are preserved in sibling
 `calls-legacy-*` directories. Add `call_log = false` to server TOML to keep only
 in-memory counters and recent calls. Rotating and disabling the log do not
 remove existing historical files.

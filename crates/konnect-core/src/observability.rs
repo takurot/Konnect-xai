@@ -14,7 +14,7 @@
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -279,9 +279,8 @@ fn append_jsonl(path: &Path, record: &CallRecord, limit: u64) -> std::io::Result
         retire_oversized(&archived)?;
     }
     let current_size = log_size(path)?;
-    let start = if current_size > limit {
+    if current_size > limit {
         retire_oversized(path)?;
-        0
     } else if current_size > limit - size {
         match std::fs::remove_file(&archived) {
             Ok(()) => {}
@@ -289,18 +288,13 @@ fn append_jsonl(path: &Path, record: &CallRecord, limit: u64) -> std::io::Result
             Err(error) => return Err(error),
         }
         std::fs::rename(path, &archived)?;
-        0
-    } else {
-        current_size
-    };
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(path)?;
-    file.seek(SeekFrom::Start(start))?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let start = file.metadata()?.len();
     if let Err(error) = file.write_all(&line).and_then(|()| file.flush()) {
-        file.set_len(start)?;
+        // Windows append handles cannot truncate; reopen while holding the sidecar lock.
+        drop(file);
+        OpenOptions::new().write(true).open(path)?.set_len(start)?;
         return Err(error);
     }
     Ok(())
