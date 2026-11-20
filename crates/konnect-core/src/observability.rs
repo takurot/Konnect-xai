@@ -137,10 +137,7 @@ impl CallObserver {
 
     /// Record a completed call. Never fails — logs warnings on IO issues.
     pub async fn record(&self, rec: CallRecord) {
-        let is_error = matches!(
-            rec.status,
-            CallStatus::Error | CallStatus::Uncertain | CallStatus::NotFound
-        );
+        let is_error = matches!(rec.status, CallStatus::Error | CallStatus::Uncertain);
         self.record_result(rec, is_error).await;
     }
 
