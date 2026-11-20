@@ -157,6 +157,9 @@ the distribution's GTK 3 and WebKitGTK 4.1 runtimes
 Verify: open the **PCB Editor** → **Tools → External Plugins** → you should see
 **Konnect**.
 
+KiCad uses the package identifier `com.github.mixelpixx.konnect` for upgrades.
+The fork keeps that identifier so existing installs and client paths remain compatible.
+
 For KiCad 10, the Konnect settings dialog also offers an optional **native
 Specctra bridge**. When enabled, `export_specctra_dsn` can ask the active PCB
 Editor to generate its native DSN while Konnect still binds the export to the
@@ -393,9 +396,6 @@ explicitly in the plugin settings dialog or in a file passed with
 
 ## Support
 
-- Community Discord: [join the Konnect community](https://discord.gg/NVp9RGMmDu)
-  for installation help, AI-client setup, design-workflow discussion,
-  contributor coordination, and live project-status updates
-- Issues & feature requests: [GitHub Issues](https://github.com/mixelpixx/Konnect/issues)
+- Issues & feature requests: [GitHub Issues](https://github.com/takurot/Konnect-xai/issues)
 - Roadmap: [ROADMAP.md](ROADMAP.md)
 - Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)

@@ -68,7 +68,9 @@ This repository is `takurot/Konnect-xai`, a fork of the archived
 `konnect_ipc::project_links`. `REPO_URL` is this fork and `UPSTREAM_REPO_URL`
 is upstream. Runtime error text builds doc links with `docs_url`, and a test in
 that module fails if any Rust source links to upstream docs again. Reliability
-tracking issues may cite either repository.
+tracking issues may cite either repository. Existing bare issue numbers in source comments
+usually refer to upstream. For new references, use a full issue URL; a
+`fork#NNN` reference also identifies an issue in Konnect-xai.
 
 **Decision: keep the PCM identifier `com.github.mixelpixx.konnect`.** The fork
 is a drop-in replacement for upstream. KiCad's Plugin and Content Manager keys
