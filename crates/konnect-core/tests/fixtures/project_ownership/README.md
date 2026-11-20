@@ -19,3 +19,9 @@ Original SHA-256:
 Tests relocate files or alter Sheetfile references only in temporary copies.
 Missing roots, malformed content, cycles, and ambiguous ownership are deliberate
 test corruptions. The checked-in source bytes remain unchanged.
+
+`native-nets.tsv` records net names and sorted component pin memberships from
+`kicad-cli sch export netlist --format kicadxml` using KiCad 10.0.8 on copies of
+the three files above. It excludes `unconnected-*` records from the offline
+netlist comparison. The KiCad contributors distribute the unmodified demo
+under [CC BY-SA 4.0](https://gitlab.com/kicad/code/kicad/-/blob/10.0.5/LICENSE.CC-BY-SA-4.0).

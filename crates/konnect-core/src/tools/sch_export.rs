@@ -1265,11 +1265,9 @@ mod netlist_summary_tests {
             .any(|net| net == "Net-(TP8-Pad1)"));
     }
 
-    #[tokio::test]
-    async fn ecc83_offline_summary_matches_its_frozen_native_netlist() {
+    fn assert_native_membership(result: serde_json::Value, oracle: &str) {
         use std::collections::{BTreeMap, BTreeSet};
 
-        let oracle = include_str!("../../tests/fixtures/ecc83_multiunit.native-nets.tsv");
         let expected: BTreeMap<_, BTreeSet<_>> = oracle
             .lines()
             .filter(|line| !line.starts_with('#'))
@@ -1281,7 +1279,6 @@ mod netlist_summary_tests {
                 )
             })
             .collect();
-        let result = summary(ECC83).await;
         let mut actual: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for component in result["components"].as_array().unwrap() {
             let reference = component["reference"].as_str().unwrap();
@@ -1299,6 +1296,49 @@ mod netlist_summary_tests {
             }
         }
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn ecc83_offline_summary_matches_its_frozen_native_netlist() {
+        assert_native_membership(
+            summary(ECC83).await,
+            include_str!("../../tests/fixtures/ecc83_multiunit.native-nets.tsv"),
+        );
+    }
+
+    #[tokio::test]
+    async fn project_summary_matches_both_frozen_hierarchy_netlists_offline() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let context = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        for (file, oracle) in [
+            (
+                "netlist_pic_programmer/pic_programmer.kicad_sch",
+                include_str!("../../tests/fixtures/netlist_pic_programmer/native-nets.tsv"),
+            ),
+            (
+                "project_ownership/complex_hierarchy.kicad_sch",
+                include_str!("../../tests/fixtures/project_ownership/native-nets.tsv"),
+            ),
+        ] {
+            let (result, path) = {
+                let path = fixtures.join(file);
+                let result = handle_export_netlist_summary(
+                    &json!({"schematic": path, "scope": "project"}),
+                    &context,
+                )
+                .await
+                .unwrap();
+                (result, path)
+            };
+            assert!(!result.is_error, "{}: {result:?}", path.display());
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text content");
+            };
+            assert_native_membership(serde_json::from_str(text).unwrap(), oracle);
+        }
     }
 
     /// The regression: nets came from labels alone, so a pin reached only
