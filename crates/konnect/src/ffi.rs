@@ -84,7 +84,14 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
             .call_log
             .then(konnect_core::observability::default_calls_log_path)
             .flatten();
-        match McpHandler::new_with_call_log(server_config, config_resolution, call_log).await {
+        match McpHandler::new_configured(
+            server_config,
+            config_resolution,
+            config.kicad_config_dir.clone(),
+            call_log,
+        )
+        .await
+        {
             Ok(handler) => match transports {
                 TransportPlan::Stdio => {
                     // This server is embedded in the host process. Even on

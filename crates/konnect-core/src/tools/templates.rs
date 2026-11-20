@@ -360,7 +360,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "template_id"]
             }),
             |args, ctx| async move { handle_apply_template(args, ctx).await }
-        ),
+        )
+        .with_kicad_config(),
         tool!(
             "list_template_categories",
             "List all available template categories and the number of templates in each.",

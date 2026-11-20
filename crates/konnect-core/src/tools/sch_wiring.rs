@@ -237,7 +237,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "power_net", "x", "y"]
             }),
             |args, ctx| async move { handle_add_power_symbol(args, ctx).await }
-        ),
+        )
+        .with_kicad_config(),
         tool!(
             "add_no_connect",
             "Add a no-connect flag (X marker) to an unconnected pin endpoint.",

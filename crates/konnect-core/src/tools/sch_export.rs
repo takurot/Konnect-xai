@@ -208,6 +208,7 @@ pub fn tools() -> Vec<ToolDef> {
                 super::pcb_sync::handle_update_pcb_from_schematic(args, ctx).await
             }
         )
+        .with_kicad_config()
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
     ]
 }

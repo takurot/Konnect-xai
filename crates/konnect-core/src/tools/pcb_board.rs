@@ -1294,6 +1294,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_add_mounting_hole(args, ctx).await }
         )
+        .with_kicad_config()
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "add_board_text",
