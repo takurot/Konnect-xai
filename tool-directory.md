@@ -156,7 +156,7 @@ and Windows servers do not.
 | Tool | Description |
 |------|-------------|
 | `list_schematic_wires` | List all wire segments with start/end coordinates and UUIDs. |
-| `list_schematic_nets` | List all distinct net names from net labels, global labels, and power symbols. |
+| `list_schematic_nets` | List distinct saved-sheet net aliases and generated names for unlabeled connections. |
 | `list_schematic_labels` | List all label instances (net/global/hierarchical) with positions, names, and types. |
 | `get_net_connections` | Get the component pins and labels for an exact net name on the requested schematic sheet. |
 | `get_net_connectivity` | Get the wires, labels, and T-junction locations for an exact net name on the requested schematic sheet. |
@@ -165,7 +165,7 @@ and Windows servers do not.
 | `get_component_nets` | Get all nets connected to every pin of a component. |
 | `get_net_components` | Get all components (and their pins) connected to a named net. |
 | `trace_from_point` | Trace connectivity from any (X,Y) point — returns the wires, labels, component pins and junction dots at that point, and the net it belongs to. Hierarchical sheet pins and no-connect flags are not reported, so an empty pins_here does not prove a wire dangles. |
-| `find_orphan_items` | Find dangling wire ends, floating labels, and unconnected pin endpoints. Pins, sheet pins, junctions, and no-connect flags all count as connections. |
+| `find_orphan_items` | Find dangling wire ends, floating labels, and unconnected pins at KiCad schematic precision. Reports nearby orphan candidates in `near_misses`. |
 | `find_shorted_nets` | Detect accidentally merged nets — distinct net names that KiCad nets together, through a wire path they share or through a name that joins their segments. |
 | `find_single_pin_nets` | Find nets that reach at most one pin — often a missing counterpart, an orphan label, or a stub left by a deleted component. Component pins and hierarchical sheet pins count; a power symbol's own pin names the rail rather than consuming it and does not. Reports the pin and label counts, and every label kind that named the net. Read per sheet: a net a global, hierarchical or power label can carry off this one is flagged cross_sheet_unverified. |
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
@@ -202,7 +202,7 @@ and Windows servers do not.
 | `compare_visual_baseline` | Re-render at the baseline's width and report pixel drift vs a 2% threshold, with the changed region's bounding box; "no baseline stored" is an explicit result, and a stale-renderer baseline is flagged, never silently trusted. |
 | `export_schematic_pdf` | Export a schematic to PDF using kicad-cli, optionally monochrome or limited to the root sheet. |
 | `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
-| `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. Does not require kicad-cli. |
+| `export_netlist_summary` | Return an offline JSON summary of a saved schematic sheet with components, pin counts, named aliases, and generated net names. |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. A report that is not in kicad-cli's ERC shape is an error, never zero violations. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. |

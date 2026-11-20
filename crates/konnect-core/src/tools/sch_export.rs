@@ -11,8 +11,7 @@ use konnect_sexp::{
     geometry::{point_on_segment, points_coincident, round6},
     parser::{parse_sexp, SexpNode},
     schematic::{
-        extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
-        pin_endpoint, read_schematic,
+        extract_labels, extract_symbol_instances, extract_wires, pin_endpoint, read_schematic,
     },
     writer::{apply_edits, find_direct_child_blocks, write_atomic_if_unchanged, SexpEdit},
     SexpError,
@@ -21,7 +20,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 
 use super::cli;
-use super::sch_connectivity::net_graph_for;
+use super::sch_connectivity::{analysis_net_graph, analysis_net_labels};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -131,8 +130,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "export_netlist_summary",
             "Return a human-readable JSON summary of the schematic netlist: all \
-             components, their nets, pin counts. Nets come from labels and from \
-             power symbols. Does not require kicad-cli.",
+             components, their nets, pin counts. Includes generated names for unlabeled \
+             connections. Does not require kicad-cli.",
             json!({
                 "type": "object",
                 "properties": {
@@ -540,15 +539,11 @@ async fn handle_export_netlist_summary(
 
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
+    let labels = analysis_net_labels(&tree);
     let placed = placed_pins_by_reference(&tree);
 
-    let mut g = net_graph_for(&tree, &wires, &labels);
-
-    // Collect distinct net names
-    let mut net_names: Vec<String> = labels.iter().map(|l| l.net.clone()).collect();
-    net_names.sort();
-    net_names.dedup();
+    let mut g = analysis_net_graph(&tree, &wires, &labels);
+    let net_names = g.names();
 
     // Build per-component net map
     let components: Vec<serde_json::Value> = instances
