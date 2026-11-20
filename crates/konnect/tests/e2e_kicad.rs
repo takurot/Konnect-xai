@@ -641,6 +641,66 @@ fn structural_scan_fixture_reloads_through_real_kicad() {
 }
 
 #[test]
+#[ignore = "requires kicad-cli and symbol libraries; run via e2e workflow"]
+fn normalized_schematic_rotations_load_in_real_kicad() {
+    use konnect_sexp::schematic::{extract_labels, extract_symbol_instances, read_schematic};
+
+    let kicad_cli = find_kicad_cli().expect("kicad-cli is required");
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("rotation");
+    let path = project.join("rotation.kicad_sch");
+    let mut mcp = Mcp::spawn(&kicad_cli);
+    mcp.tool(
+        "create_project",
+        json!({"name": "rotation", "path": project}),
+    );
+    mcp.load("sch_components");
+    mcp.load("sch_wiring");
+    mcp.tool(
+        "add_schematic_component",
+        json!({"schematic": path, "lib_id": "Device:R", "reference": "R1", "x": 50.8, "y": 50.8}),
+    );
+    for rotation in [-90, 270] {
+        let rotated = body(&mcp.tool(
+            "rotate_schematic_component",
+            json!({"schematic": path, "reference": "R1", "rotation": rotation}),
+        ));
+        assert_eq!(rotated["rotation"], 270.0, "{rotated}");
+    }
+    mcp.tool(
+        "add_power_symbol",
+        json!({"schematic": path, "power_net": "GND", "x": 55.88, "y": 55.88, "rotation": -90}),
+    );
+    mcp.tool(
+        "add_schematic_net_label",
+        json!({"schematic": path, "net": "SIGNAL", "label_type": "global_label",
+            "x": 76.2, "y": 76.2, "rotation": 630}),
+    );
+    let (_, tree) = read_schematic(&path).unwrap();
+    let symbols = extract_symbol_instances(&tree);
+    assert_eq!(symbols.len(), 2);
+    assert!(symbols.iter().all(|symbol| symbol.rotation == 270.0));
+    let labels = extract_labels(&tree);
+    assert_eq!(labels.len(), 1);
+    assert_eq!(labels[0].rotation, 270.0);
+
+    let report = tmp.path().join("erc.json");
+    let output = Command::new(&kicad_cli)
+        .args(["sch", "erc", "--format", "json", "--output"])
+        .arg(&report)
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "KiCad ERC rejected the schematic: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+    assert!(report["sheets"].is_array(), "{report}");
+}
+
+#[test]
 #[ignore = "requires kicad-cli + symbol libraries; run via e2e workflow"]
 fn full_design_loop_with_real_kicad() {
     let Some(kicad_cli) = find_kicad_cli() else {

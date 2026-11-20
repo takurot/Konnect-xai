@@ -8315,6 +8315,34 @@ mod multi_unit_component_tests {
         assert_eq!(placed[1].rotation, 270.0);
     }
 
+    #[tokio::test]
+    async fn noncardinal_schematic_rotation_refuses_an_invalid_sibling_result() {
+        let (_directory, path) = fixture();
+        let mut schematic = cse::Schematic::load(&path).unwrap();
+        schematic
+            .symbols
+            .iter_mut()
+            .find(|symbol| symbol.reference() == Some("U1") && symbol.unit == 2)
+            .unwrap()
+            .at
+            .rotation = Some(45.0);
+        schematic.overwrite().unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let result = handle_rotate_schematic_component(
+            &json!({ "schematic": path, "reference": "U1", "rotation": -90 }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument"),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
     /// The same real eeschema save as [`eeschema_fixture`], but written under
     /// the file stem its own instance paths name (`ecc83-pp`). Placement
     /// preflights the project name against those paths and rightly refuses a
