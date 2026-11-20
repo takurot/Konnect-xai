@@ -1407,6 +1407,55 @@ async fn handle_set_layer_constraints(
                     || character == '_'),
         "Layer name contains unsupported characters"
     );
+    let clearance = args["min_clearance"].as_f64();
+    let trace_width = args["min_trace_width"].as_f64();
+    if clearance.is_some() || trace_width.is_some() {
+        let source = match tokio::fs::read_to_string(&board).await {
+            Ok(source) => source,
+            Err(error) => {
+                return Ok(invalid_arg(
+                    "board",
+                    &format!("cannot read its saved layer table: {error}"),
+                ));
+            }
+        };
+        let parsed = match konnect_sexp::parse_sexp(&source) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return Ok(invalid_arg(
+                    "board",
+                    &format!("cannot parse its saved layer table: {error}"),
+                ));
+            }
+        };
+        if !matches!(
+            parsed.children().and_then(|nodes| nodes.first()),
+            Some(konnect_sexp::SexpNode::Atom(root)) if root == "kicad_pcb"
+        ) {
+            return Ok(invalid_arg("board", "expected a KiCad PCB document"));
+        }
+        let board_layers = konnect_sexp::layers::layers(&parsed);
+        let enabled: Vec<&str> = board_layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .filter(|name| konnect_sexp::layers::is_canonical_name(name))
+            .collect();
+        if enabled.is_empty() {
+            return Ok(invalid_arg(
+                "board",
+                "its saved layer table has no enabled layers",
+            ));
+        }
+        if !enabled.contains(&layer.as_str()) {
+            return Ok(invalid_arg(
+                "layer",
+                &format!(
+                    "'{layer}' is not enabled on the board; choose one of {}",
+                    enabled.join(", ")
+                ),
+            ));
+        }
+    }
     let rules_path = sibling_custom_rules_path(&board);
     let source = match tokio::fs::read_to_string(&rules_path).await {
         Ok(content) => Some(content),
@@ -1418,7 +1467,7 @@ async fn handle_set_layer_constraints(
         .unwrap_or_else(|| "(version 1)\n".to_string());
     let mut changed = Vec::new();
 
-    if let Some(clearance) = args["min_clearance"].as_f64() {
+    if let Some(clearance) = clearance {
         let rule_name = format!("konnect:{layer}:clearance");
         content = upsert_named_rule(
             &content,
@@ -1428,7 +1477,7 @@ async fn handle_set_layer_constraints(
         changed.push(format!("clearance = {} on {}", clearance, layer));
     }
 
-    if let Some(trace_width) = args["min_trace_width"].as_f64() {
+    if let Some(trace_width) = trace_width {
         let rule_name = format!("konnect:{layer}:track_width");
         content = upsert_named_rule(
             &content,
