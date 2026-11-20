@@ -45,6 +45,7 @@ pub mod sch_components;
 pub(crate) mod sch_connectivity;
 pub mod sch_export;
 pub mod sch_hierarchy;
+mod sch_overlap;
 pub(crate) mod sch_route_safety;
 pub mod sch_wiring;
 pub mod schematic_builder;
