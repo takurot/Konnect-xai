@@ -4,6 +4,7 @@
 //! round-trip parsing.  Pin coordinate math still delegates to
 //! `konnect_sexp::geometry::transform_pin`.
 
+use super::sch_references::{is_numbered, ReferenceInventory};
 use crate::mcp::{
     error::ToolErrorKind,
     protocol::{CallToolResult, ToolContent},
@@ -510,6 +511,15 @@ pub(crate) fn set_native_attributes(
     patch: SymbolAttributePatch,
 ) -> Result<String, CallToolResult> {
     let blocks = find_all_symbol_instance_blocks(content, reference);
+    set_native_attributes_in_blocks(content, reference, patch, blocks)
+}
+
+fn set_native_attributes_in_blocks(
+    content: &str,
+    reference: &str,
+    patch: SymbolAttributePatch,
+    blocks: Vec<(usize, usize)>,
+) -> Result<String, CallToolResult> {
     if blocks.is_empty() {
         return Err(crate::tools::invalid_arg(
             "reference",
@@ -602,8 +612,8 @@ async fn handle_add_schematic_component(
         Ok(patch) => patch,
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
-    // Load via konnect-schematic-editor
-    let mut sch = cse::Schematic::load(&sch_path)?;
+    let before = read_consistent(&sch_path)?;
+    let mut sch = cse::Schematic::from_source(&sch_path, before.clone())?;
 
     // KiCAD's netlister resolves instances against the ROOT sheet's uuid and
     // the project's name, and silently forms no wire-only nets for symbols
@@ -668,7 +678,21 @@ async fn handle_add_schematic_component(
         &placed.fields,
         unit,
     );
-    if let Err(error) = sch.overwrite() {
+    let candidate = sch.to_source();
+    let persisted = if is_numbered(&placed.reference) {
+        let inventory =
+            match ReferenceInventory::load(&sch_path, &before, &candidate, Some(&context)) {
+                Ok(inventory) => inventory,
+                Err(error) => return Ok(failed_component_placement(error, &sch_path)),
+            };
+        if let Err(error) = inventory.validate(&candidate) {
+            return Ok(failed_component_placement(error, &sch_path));
+        }
+        inventory.commit(&before, &candidate)
+    } else {
+        write_atomic_if_unchanged(&sch_path, &before, &candidate)
+    };
+    if let Err(error) = persisted {
         let uncertain = crate::tools::mutation_outcome_uncertain(
             &sch_path,
             "add_schematic_component",
@@ -1774,10 +1798,23 @@ fn commit_verified_component_mutation(
     intents: &[ComponentMutationIntent],
     operation: &str,
 ) -> anyhow::Result<Result<Vec<serde_json::Value>, CallToolResult>> {
+    commit_verified_component_mutation_with_references(
+        path, before, command, intents, operation, None,
+    )
+}
+
+fn commit_verified_component_mutation_with_references(
+    path: &std::path::Path,
+    before: &str,
+    command: &SchematicCommand,
+    intents: &[ComponentMutationIntent],
+    operation: &str,
+    inventory: Option<ReferenceInventory>,
+) -> anyhow::Result<Result<Vec<serde_json::Value>, CallToolResult>> {
     let (prospective_source, _) = prepare_command(path, before, command)?;
     #[cfg(test)]
     let prospective_source = apply_component_prospective_fault(prospective_source);
-    let prospective = match cse::Schematic::from_source(path, prospective_source) {
+    let prospective = match cse::Schematic::from_source(path, prospective_source.as_str()) {
         Ok(schematic) => schematic,
         Err(error) => {
             return Ok(Err(ComponentDeleteTargetError::stale(
@@ -1792,7 +1829,14 @@ fn commit_verified_component_mutation(
     {
         return Ok(Err(error));
     }
-    commit_command(path, command)?;
+    if let Some(inventory) = inventory {
+        if let Err(error) = inventory.validate(&prospective_source) {
+            return Ok(Err(error));
+        }
+        inventory.commit(before, &prospective_source)?;
+    } else {
+        commit_command(path, command)?;
+    }
 
     let committed = match cse::Schematic::load(path) {
         Ok(schematic) => schematic,
@@ -1949,6 +1993,7 @@ async fn handle_delete_schematic_component(
 pub(crate) struct IndexedSchematicItem {
     pub(crate) kind: String,
     source: String,
+    range: (usize, usize),
 }
 
 pub(crate) struct ComponentDeletePlan {
@@ -2040,6 +2085,7 @@ pub(crate) fn indexed_uuid_items(
         let item = IndexedSchematicItem {
             kind: node.head().unwrap_or("unknown").to_owned(),
             source: content[start..end].to_owned(),
+            range: (start, end),
         };
         if let Some(previous) = items.insert(uuid.to_owned(), item) {
             return Err(ComponentDeleteTargetError::Ambiguous {
@@ -2536,13 +2582,24 @@ pub(crate) fn set_property_value(
     new_value: &str,
     add_missing: bool,
 ) -> Result<(String, PropertyWriteCounts), String> {
+    let blocks = find_all_symbol_instance_blocks(content, reference);
+    set_property_value_in_blocks(content, reference, field, new_value, add_missing, blocks)
+}
+
+fn set_property_value_in_blocks(
+    content: &str,
+    reference: &str,
+    field: &str,
+    new_value: &str,
+    add_missing: bool,
+    blocks: Vec<(usize, usize)>,
+) -> Result<(String, PropertyWriteCounts), String> {
     if field.eq_ignore_ascii_case("DNP") {
         return Err(
             "use edit_schematic_component's native 'dnp' boolean instead of a custom DNP property"
                 .to_owned(),
         );
     }
-    let blocks = find_all_symbol_instance_blocks(content, reference);
     if blocks.is_empty() {
         return Err(format!("symbol '{reference}' not found in this schematic"));
     }
@@ -2668,6 +2725,7 @@ impl PlacementRefusal {
     }
 }
 
+#[cfg(test)]
 fn set_property_placement(
     content: &str,
     reference: &str,
@@ -2676,6 +2734,17 @@ fn set_property_placement(
     only_unit: Option<u32>,
 ) -> Result<(String, usize), PlacementRefusal> {
     let blocks = find_all_symbol_instance_blocks(content, reference);
+    set_property_placement_in_blocks(content, reference, field, placement, only_unit, blocks)
+}
+
+fn set_property_placement_in_blocks(
+    content: &str,
+    reference: &str,
+    field: &str,
+    placement: &FieldPlacement,
+    only_unit: Option<u32>,
+    blocks: Vec<(usize, usize)>,
+) -> Result<(String, usize), PlacementRefusal> {
     if blocks.is_empty() {
         return Err(PlacementRefusal::TargetMissing(format!(
             "symbol '{reference}' not found in this schematic"
@@ -2862,20 +2931,32 @@ fn set_property_placement(
 /// is placed once per unit and each placement carries its own instances block,
 /// so a rename has to reach all of them or the units disagree about their own
 /// designator.
+#[cfg(test)]
 fn rewrite_instance_references(
     content: &str,
     old_ref: &str,
     new_ref: &str,
 ) -> Result<(String, usize), String> {
     let blocks = find_all_symbol_instance_blocks(content, new_ref);
+    rewrite_instance_references_in_blocks(content, old_ref, new_ref, &blocks)
+}
+
+fn rewrite_instance_references_in_blocks(
+    content: &str,
+    old_ref: &str,
+    new_ref: &str,
+    blocks: &[(usize, usize)],
+) -> Result<(String, usize), String> {
     if blocks.is_empty() {
         return Err(format!("symbol '{old_ref}' not found after the rename"));
     }
 
-    let search = format!(r#"(reference "{old_ref}")"#);
-    let replacement = format!(r#"(reference "{new_ref}")"#);
+    let old = konnect_sexp::escaped_string(old_ref);
+    let new = konnect_sexp::escaped_string(new_ref);
+    let search = format!(r#"(reference "{old}")"#);
+    let replacement = format!(r#"(reference "{new}")"#);
     let mut edits = Vec::new();
-    for (start, end) in &blocks {
+    for (start, end) in blocks {
         let block = &content[*start..*end];
         let mut from = 0usize;
         while let Some(rel) = block[from..].find(&search) {
@@ -2920,7 +3001,20 @@ async fn handle_edit_schematic_component(
     };
     let mut changed = Vec::new();
     let mut expected_fields = BTreeMap::new();
-    let mut edit_reference = reference.as_str();
+    let bound_blocks = |source: &str| -> anyhow::Result<Vec<(usize, usize)>> {
+        let indexed = indexed_uuid_items(&sch_path, source)
+            .map_err(|error| anyhow::anyhow!("{}", tool_error_summary(&error.into_result())))?;
+        target
+            .units
+            .iter()
+            .map(|unit| {
+                indexed
+                    .get(&unit.uuid)
+                    .map(|item| item.range)
+                    .ok_or_else(|| anyhow::anyhow!("Bound component {} disappeared", unit.uuid))
+            })
+            .collect()
+    };
 
     let mut errors: Vec<String> = Vec::new();
     // A macro rather than a closure: the body also needs `changed`/`errors`
@@ -2928,7 +3022,14 @@ async fn handle_edit_schematic_component(
     // and a closure capturing them mutably would lock both for its lifetime.
     macro_rules! apply {
         ($field:expr, $new_val:expr) => {
-            match set_property_value(&content, edit_reference, $field, $new_val, false) {
+            match set_property_value_in_blocks(
+                &content,
+                &reference,
+                $field,
+                $new_val,
+                false,
+                bound_blocks(&content)?,
+            ) {
                 Ok((updated, counts)) => {
                     content = updated;
                     expected_fields.insert($field.to_owned(), $new_val.to_owned());
@@ -2942,7 +3043,8 @@ async fn handle_edit_schematic_component(
         };
     }
 
-    if let Some(new_ref) = opt_str(args, "new_reference") {
+    let new_reference = opt_str(args, "new_reference");
+    if let Some(new_ref) = new_reference {
         let before_rename = content.clone();
         let before_changes = changed.len();
         let before_expected_fields = expected_fields.clone();
@@ -2952,10 +3054,14 @@ async fn handle_edit_schematic_component(
         // reads when it builds the netlist. Rewriting only the property leaves
         // the netlist on the old designator, so the rename appears to work in
         // eeschema and is ignored everywhere it matters (#157).
-        match rewrite_instance_references(&content, &reference, new_ref) {
+        match rewrite_instance_references_in_blocks(
+            &content,
+            &reference,
+            new_ref,
+            &bound_blocks(&content)?,
+        ) {
             Ok((updated, count)) => {
                 content = updated;
-                edit_reference = new_ref;
                 changed.push(format!("instances reference → {new_ref} ({count})"));
             }
             Err(why) => {
@@ -2994,7 +3100,14 @@ async fn handle_edit_schematic_component(
                 ));
                 continue;
             }
-            match set_property_value(&content, edit_reference, name, value, true) {
+            match set_property_value_in_blocks(
+                &content,
+                &reference,
+                name,
+                value,
+                true,
+                bound_blocks(&content)?,
+            ) {
                 Ok((updated, counts)) => {
                     content = updated;
                     expected_fields.insert(name.clone(), value.to_owned());
@@ -3080,7 +3193,14 @@ async fn handle_edit_schematic_component(
                 ));
                 continue;
             }
-            match set_property_placement(&content, edit_reference, name, &placement, only_unit) {
+            match set_property_placement_in_blocks(
+                &content,
+                &reference,
+                name,
+                &placement,
+                only_unit,
+                bound_blocks(&content)?,
+            ) {
                 Ok((updated, touched)) => {
                     content = updated;
                     applied_placements.push((name.clone(), placement));
@@ -3132,7 +3252,12 @@ async fn handle_edit_schematic_component(
         )));
     }
     if !attribute_patch.is_empty() {
-        content = match set_native_attributes(&content, edit_reference, attribute_patch) {
+        content = match set_native_attributes_in_blocks(
+            &content,
+            &reference,
+            attribute_patch,
+            bound_blocks(&content)?,
+        ) {
             Ok(content) => content,
             Err(error) => return Ok(error),
         };
@@ -3155,12 +3280,24 @@ async fn handle_edit_schematic_component(
             item_ids,
             format!("Edit {reference}"),
         )?;
-        match commit_verified_component_mutation(
+        let check_references = new_reference.is_some_and(is_numbered)
+            || (is_numbered(&reference)
+                && (new_reference.is_some() || expected_fields.contains_key("Value")));
+        let inventory = if check_references {
+            match ReferenceInventory::load(&sch_path, &expected, &content, None) {
+                Ok(inventory) => Some(inventory),
+                Err(error) => return Ok(error),
+            }
+        } else {
+            None
+        };
+        match commit_verified_component_mutation_with_references(
             &sch_path,
             &expected,
             &command,
             std::slice::from_ref(&intent),
             "edit_schematic_component",
+            inventory,
         )? {
             Ok(mut observed) => observed.remove(0),
             Err(error) => return Ok(error),
@@ -4481,7 +4618,18 @@ async fn handle_replace_component(
         None => return Ok(no_connect_carry_unwritable(&sch_path)),
     };
     let (content, added, pruned) = reconcile_junctions_for_placement(&expected, content);
-    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+    if is_numbered(&reference) {
+        let inventory = match ReferenceInventory::load(&sch_path, &expected, &content, None) {
+            Ok(inventory) => inventory,
+            Err(error) => return Ok(error),
+        };
+        if let Err(error) = inventory.validate(&content) {
+            return Ok(error);
+        }
+        inventory.commit(&expected, &content)?;
+    } else {
+        write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+    }
 
     let moved_markers = match observed_no_connect_moves(&sch_path, "replace_component", &carries)? {
         Ok(moved) => moved,

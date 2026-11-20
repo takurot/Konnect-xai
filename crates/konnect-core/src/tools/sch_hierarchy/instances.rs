@@ -40,6 +40,20 @@ pub(super) struct HierarchySnapshot {
     page_history: Option<PageHistory>,
 }
 
+pub(crate) struct ProjectReferenceSources {
+    pub project_name: String,
+    pub project: Option<(PathBuf, String)>,
+    pub documents: BTreeMap<PathBuf, (String, BTreeSet<String>)>,
+}
+
+pub(crate) fn reference_sources(
+    path: &Path,
+    before_source: &str,
+    base: &str,
+) -> anyhow::Result<ProjectReferenceSources> {
+    HierarchySnapshot::reference_sources(path, before_source, base)
+}
+
 #[derive(Default)]
 pub(super) struct InstanceUpdate {
     pub files: Vec<PathBuf>,
@@ -50,6 +64,21 @@ pub(super) struct InstanceUpdate {
 
 impl HierarchySnapshot {
     pub fn load(
+        path: &Path,
+        before_source: &str,
+        base: &str,
+        requested_project: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let mut result = Self::load_forest(path, before_source, base, requested_project)?;
+        let project = result.project.as_ref().map(|(path, _)| path.as_path());
+        let page_history =
+            PageHistory::load(&result.directory, project, result.before.roots.clone())?;
+        result.max_page = result.before.max_page.max(page_history.high_water());
+        result.page_history = Some(page_history);
+        Ok(result)
+    }
+
+    fn load_forest(
         path: &Path,
         before_source: &str,
         base: &str,
@@ -87,12 +116,30 @@ impl HierarchySnapshot {
         result.parent_paths = before.placements.get(&path).cloned().ok_or_else(|| {
             anyhow::anyhow!("Project topology changed while reading {}", path.display())
         })?;
-        let project = result.project.as_ref().map(|(path, _)| path.as_path());
-        let page_history = PageHistory::load(&result.directory, project, before.roots.clone())?;
-        result.max_page = before.max_page.max(page_history.high_water());
         result.before = before;
-        result.page_history = Some(page_history);
         Ok(result)
+    }
+
+    fn reference_sources(
+        path: &Path,
+        before_source: &str,
+        base: &str,
+    ) -> anyhow::Result<ProjectReferenceSources> {
+        let snapshot = Self::load_forest(path, before_source, base, None)?;
+        let documents = snapshot
+            .before
+            .placements
+            .into_iter()
+            .map(|(path, placements)| {
+                let source = snapshot.sources[&path].clone();
+                (path, (source, placements))
+            })
+            .collect();
+        Ok(ProjectReferenceSources {
+            project_name: snapshot.project_name,
+            project: snapshot.project,
+            documents,
+        })
     }
 
     pub fn existing_source(&self, path: &Path) -> anyhow::Result<&str> {

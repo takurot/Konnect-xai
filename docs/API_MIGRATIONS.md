@@ -28,6 +28,21 @@ if you want that process to use them. `KONNECT_BRIDGE_DIR` must also be an
 absolute path when set. Server configuration can disable disk call logging
 with `call_log = false`.
 
+## Unreleased – Numbered schematic component references
+
+Component placement, editing, replacement and template application check
+numbered references against the saved schematic hierarchy. A collision
+returns `reference_conflict` with the designator, conflicting schematic paths,
+instance paths, symbol UUIDs, units and a suggested reference when available.
+Batch placement includes the conflict under the failed item's index while
+reporting any successful placements.
+
+Distinct units of a proven package may share one reference, including on
+different sheets. To place a new component in a reused sheet, omit its number
+or pass a placeholder such as `R?`, then run `annotate_schematic` to assign
+distinct references to the logical instances. Templates skip numbers already
+in use and treat `ref_start` as the first number to consider.
+
 ## v0.14.0: conditional-write failures distinguish committed uncertainty
 
 A stale source revision returns `conflict`. If the replacement has committed

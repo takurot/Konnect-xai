@@ -111,9 +111,9 @@ fn fixture(reused: bool) -> (tempfile::TempDir, PathBuf, PathBuf) {
     (directory, root, child)
 }
 
-async fn place(name: &str, child: &Path) -> CallToolResult {
+async fn place(name: &str, child: &Path, reused: bool) -> CallToolResult {
     let component = json!({
-        "lib_id": "complex_hierarchy:LM358N", "reference": "U999",
+        "lib_id": "complex_hierarchy:LM358N", "reference": if reused { "U?" } else { "U999" },
         "value": "placement readback", "x": 100.1, "y": 80.2,
         "rotation": 90.0, "unit": 2
     });
@@ -121,7 +121,7 @@ async fn place(name: &str, child: &Path) -> CallToolResult {
         "add_schematic_component" => component,
         "batch_place_components" => json!({"components": [
             component,
-            {"lib_id": "complex_hierarchy:R", "reference": "R999", "x": 110.1, "y": 80.2}
+            {"lib_id": "complex_hierarchy:R", "reference": if reused { "R?" } else { "R999" }, "x": 110.1, "y": 80.2}
         ]}),
         "add_power_symbol" => json!({"power_net": "GND", "x": 100.1, "y": 80.2, "rotation": 90.0}),
         _ => unreachable!(),
@@ -170,7 +170,9 @@ fn resistor(reference: &str, x: f64) -> Value {
 #[tokio::test]
 async fn occupied_number_across_sheets_refuses_add_and_rename_without_writing() {
     let (_directory, root, child) = fixture(false);
-    let root_ref = add_native_component(&root, resistor("R901", 100.0)).await;
+    let mut root_candidate = resistor("R901", 100.0);
+    root_candidate["lib_id"] = json!("complex_hierarchy:CP");
+    let root_ref = add_native_component(&root, root_candidate).await;
     assert!(!root_ref.is_error, "{root_ref:?}");
     let child_ref = add_native_component(&child, resistor("R902", 110.0)).await;
     assert!(!child_ref.is_error, "{child_ref:?}");
@@ -250,6 +252,95 @@ async fn repeated_physical_symbol_cannot_use_one_number_in_two_logical_instances
     assert_eq!(body(&accepted)["instance_paths"], json!([PATH_A, PATH_B]));
 }
 
+#[tokio::test]
+async fn distinct_package_units_can_share_a_reference_across_sheets() {
+    let (_directory, root, child) = fixture(false);
+    std::fs::write(
+        root.parent().unwrap().join("sym-lib-table"),
+        r#"(sym_lib_table (lib (name "complex_hierarchy") (type "KiCad") (uri "${KIPRJMOD}/sheets/deep/fixture.kicad_sym") (options "") (descr "KiCad demo definitions")))"#,
+    ).unwrap();
+    for (path, unit) in [(&root, 1), (&child, 2)] {
+        let placed = add_native_component(
+            path,
+            json!({
+                "lib_id": "complex_hierarchy:LM358N", "reference": "U991",
+                "value": "same package", "x": 100.0, "y": 100.0, "unit": unit
+            }),
+        )
+        .await;
+        assert!(!placed.is_error, "{placed:?}");
+    }
+
+    let before = std::fs::read(&child).unwrap();
+    let split = call_schematic_tool(
+        "edit_schematic_component",
+        &child,
+        json!({"reference": "U991", "new_reference": "U992"}),
+    )
+    .await;
+    assert!(split.is_error, "{split:?}");
+    assert_eq!(body(&split)["error"]["kind"], "reference_conflict");
+    let replace = call_schematic_tool(
+        "replace_component",
+        &child,
+        json!({"reference": "U991", "new_lib_id": "complex_hierarchy:R", "unit": 1}),
+    )
+    .await;
+    assert!(replace.is_error, "{replace:?}");
+    assert_eq!(body(&replace)["error"]["kind"], "reference_conflict");
+    assert_eq!(std::fs::read(&child).unwrap(), before);
+}
+
+#[tokio::test]
+async fn references_are_reserved_across_saved_top_level_sheets() {
+    let (_directory, root, child) = fixture(false);
+    let sibling = root.with_file_name("second.kicad_sch");
+    let mut other = Schematic::load(&root).unwrap();
+    let other_uuid = "cdebdb5d-a7f9-445d-93b9-c6ecdcdebef8";
+    other.uuid = Some(other_uuid.to_owned());
+    other.sheets.retain(|_| false);
+    other.symbols.retain(|_| false);
+    other.save(&sibling).unwrap();
+
+    let project_path = root.with_extension("kicad_pro");
+    let mut project: Value =
+        serde_json::from_slice(&std::fs::read(&project_path).unwrap()).unwrap();
+    project["schematic"]["top_level_sheets"] = json!([
+        {"filename": "complex_hierarchy.kicad_sch"},
+        {"filename": "second.kicad_sch", "uuid": other_uuid}
+    ]);
+    std::fs::write(project_path, serde_json::to_vec(&project).unwrap()).unwrap();
+    let mut capacitor = resistor("R901", 100.0);
+    capacitor["lib_id"] = json!("complex_hierarchy:CP");
+    let placed = add_native_component(&sibling, capacitor).await;
+    assert!(!placed.is_error, "{placed:?}");
+
+    let before = std::fs::read(&child).unwrap();
+    let refused = add_native_component(&child, resistor("R901", 110.0)).await;
+    assert!(refused.is_error, "{refused:?}");
+    assert_eq!(body(&refused)["error"]["kind"], "reference_conflict");
+    assert_eq!(std::fs::read(&child).unwrap(), before);
+}
+
+#[test]
+fn numbered_reference_commit_refuses_a_sibling_revision_race() {
+    let (_directory, root, child) = fixture(false);
+    let before = std::fs::read_to_string(&child).unwrap();
+    let inventory =
+        sch_references::ReferenceInventory::load(&child, &before, &before, None).unwrap();
+    let mut other_revision = std::fs::read_to_string(&root).unwrap();
+    other_revision.push('\n');
+    std::fs::write(&root, &other_revision).unwrap();
+    let candidate = format!("{before}\n");
+    let error = inventory.commit(&before, &candidate).unwrap_err();
+    assert!(
+        matches!(error, konnect_sexp::SexpError::Conflict { .. }),
+        "{error:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&child).unwrap(), before);
+    assert_eq!(std::fs::read_to_string(&root).unwrap(), other_revision);
+}
+
 fn body(result: &CallToolResult) -> Value {
     let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
         panic!("expected text result")
@@ -265,7 +356,7 @@ async fn native_placement_preserves_unique_and_reused_paths_with_committed_readb
             let root_before = std::fs::read(&root).unwrap();
             let project_before = std::fs::read(root.with_extension("kicad_pro")).unwrap();
             let existing = Schematic::load(&child).unwrap().symbols.into_vec();
-            let result = place(name, &child).await;
+            let result = place(name, &child, reused).await;
             assert!(!result.is_error, "{name}, reused={reused}: {result:?}");
             let response = body(&result);
             let placed = if name == "batch_place_components" {
@@ -311,7 +402,7 @@ async fn native_placement_preserves_unique_and_reused_paths_with_committed_readb
                 assert_eq!(entry["y"].as_f64(), Some(symbol.at.y));
                 assert_eq!(entry["rotation"].as_f64(), symbol.at.rotation);
                 assert_eq!(entry["unit"], symbol.unit);
-                if symbol.reference() == Some("U999") {
+                if matches!(symbol.reference(), Some("U999" | "U?")) {
                     assert_eq!(symbol.unit, 2);
                 }
                 // Every placer is handed an off-grid point (x = 100.1 or 110.1,
@@ -492,7 +583,7 @@ async fn native_placement_refuses_stale_instance_metadata_without_writing() {
             schematic.overwrite().unwrap();
             let before = std::fs::read(&child).unwrap();
             let root_before = std::fs::read(&root).unwrap();
-            let result = place(name, &child).await;
+            let result = place(name, &child, true).await;
             assert!(result.is_error, "{name}/{corruption}: {result:?}");
             assert_eq!(
                 body(&result)["error"]["kind"],
@@ -1179,7 +1270,7 @@ async fn native_placement_refuses_ambiguous_ownership_without_writing() {
         .unwrap();
         let before = std::fs::read(&child).unwrap();
         let root_before = std::fs::read(&root).unwrap();
-        let result = place(name, &child).await;
+        let result = place(name, &child, true).await;
         assert!(result.is_error, "{name}: {result:?}");
         assert_eq!(body(&result)["error"]["kind"], "conflict");
         assert_eq!(std::fs::read(&child).unwrap(), before);

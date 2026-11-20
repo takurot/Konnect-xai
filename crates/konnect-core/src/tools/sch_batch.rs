@@ -664,6 +664,7 @@ async fn handle_batch_place_components(
     let mut placements = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut failures: Vec<Value> = Vec::new();
+    let mut references = None;
 
     for (index, comp) in components.iter().enumerate() {
         let Some(lib_id) = comp["lib_id"].as_str() else {
@@ -717,21 +718,49 @@ async fn handle_batch_place_components(
             }
         };
 
-        match place_one_component(
-            &mut sch,
-            &context.instance_paths,
-            &context.project_name,
-            lib_id,
-            x,
-            y,
-            rotation,
-            mirror,
-            reference,
-            value,
-            footprint,
-            unit,
-            &src,
-        ) {
+        let placement = (|| {
+            let numbered = reference.is_some_and(super::sch_references::is_numbered);
+            let previous = numbered.then(|| sch.to_source());
+            if let Some(previous) = &previous {
+                if references.is_none() {
+                    references = Some(super::sch_references::ReferenceInventory::load(
+                        &sch_path,
+                        &before_source,
+                        previous,
+                        Some(&context),
+                    )?);
+                }
+            }
+            let placed = place_one_component(
+                &mut sch,
+                &context.instance_paths,
+                &context.project_name,
+                lib_id,
+                x,
+                y,
+                rotation,
+                mirror,
+                reference,
+                value,
+                footprint,
+                unit,
+                &src,
+            );
+            if let (Some(previous), Some(inventory)) = (previous, &references) {
+                let checked = placed.and_then(|placed| {
+                    inventory.validate(&sch.to_source())?;
+                    Ok(placed)
+                });
+                if checked.is_err() {
+                    sch = cse::Schematic::from_source(&sch_path, previous)
+                        .map_err(|error| CallToolResult::error(error.to_string()))?;
+                }
+                checked
+            } else {
+                placed
+            }
+        })();
+        match placement {
             Ok(mut placed) => {
                 super::sch_components::apply_placement_attribute_patch(
                     &mut sch,
@@ -757,13 +786,19 @@ async fn handle_batch_place_components(
                     .unwrap_or_else(|| "placement_failed".to_string());
                 let message = error_text(&error);
                 errors.push(message.clone());
-                failures.push(json!({
+                let mut failure = json!({
                     "index": index,
                     "lib_id": lib_id,
                     "reference": reference.unwrap_or("?"),
                     "kind": kind,
                     "message": message
-                }));
+                });
+                if kind == "reference_conflict" {
+                    if let Ok(mut data) = serde_json::from_str::<Value>(&message) {
+                        failure["error"] = data["error"].take();
+                    }
+                }
+                failures.push(failure);
             }
         }
     }
@@ -777,7 +812,11 @@ async fn handle_batch_place_components(
             super::sch_wiring::reconcile_junctions_for_placement(&before_source, candidate);
         junctions_added = added;
         junctions_pruned = pruned;
-        if let Err(error) = write_atomic_if_unchanged(&sch_path, &before_source, &candidate) {
+        let persisted = match references {
+            Some(inventory) => inventory.commit(&before_source, &candidate),
+            None => write_atomic_if_unchanged(&sch_path, &before_source, &candidate),
+        };
+        if let Err(error) = persisted {
             let result = super::mutation_outcome_uncertain(
                 &sch_path,
                 "batch_place_components",

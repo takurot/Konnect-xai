@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 mod instance_contract_tests;
-mod instances;
+pub(crate) mod instances;
 mod page_history;
 use instances::HierarchySnapshot;
 
