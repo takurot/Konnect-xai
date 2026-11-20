@@ -15,6 +15,8 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use super::cli;
+
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
