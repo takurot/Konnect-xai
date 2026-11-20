@@ -844,6 +844,18 @@ fn saved_audit_root(path: &Path) -> anyhow::Result<(String, String)> {
     Ok((project_name_for(path), format!("/{uuid}")))
 }
 
+/// Adapt the raw analysis tree to the editor's typed saved-symbol model.
+fn editor_symbol(node: &SexpNode) -> anyhow::Result<cse::Symbol> {
+    fn convert(node: &SexpNode) -> cse::sexp::SexpNode {
+        match node {
+            SexpNode::Atom(text) => cse::sexp::SexpNode::Atom(text.clone()),
+            SexpNode::Str(text) => cse::sexp::SexpNode::Str(text.clone()),
+            SexpNode::List(items) => cse::sexp::SexpNode::List(items.iter().map(convert).collect()),
+        }
+    }
+    Ok(cse::Symbol::from_sexp(&convert(node))?)
+}
+
 /// Update only the in-memory reference view used to generate findings.
 fn apply_saved_references(
     tree: &mut SexpNode,
@@ -858,7 +870,7 @@ fn apply_saved_references(
         .iter_mut()
         .filter(|node| node.head() == Some("symbol"))
     {
-        let symbol = cse::Symbol::from_sexp(node)?;
+        let symbol = editor_symbol(node)?;
         let rows = symbol.instances();
         if rows.is_empty() && !reused {
             continue;
@@ -1527,7 +1539,7 @@ fn check_bom_health_tree(
     let mut packages = BTreeMap::<String, Vec<cse::Symbol>>::new();
     let mut components = Vec::new();
     for node in tree.find_all("symbol") {
-        let symbol = cse::Symbol::from_sexp(node)?;
+        let symbol = editor_symbol(node)?;
         let Some(reference) = symbol.reference() else {
             continue;
         };
