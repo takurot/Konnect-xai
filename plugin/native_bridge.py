@@ -25,9 +25,21 @@ UI_TIMEOUT_SECONDS = 30
 
 def _absolute_override(name):
     value = os.environ.get(name)
-    if value and not os.path.isabs(value):
+    if value and (not os.path.isabs(value) or (os.name == "nt" and not os.path.splitdrive(value)[0])):
         raise ValueError(f"{name} must be an absolute path")
     return value
+
+
+def _unix_home():
+    import pwd
+
+    try:
+        home = os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError as error:
+        raise OSError("home directory is unavailable") from error
+    if not os.path.isabs(home):
+        raise OSError("home directory is not absolute")
+    return home
 
 
 def state_root():
@@ -46,10 +58,10 @@ def state_root():
             raise OSError("Windows Local AppData is unavailable")
         base = buffer.value
     elif sys.platform == "darwin":
-        base = os.path.expanduser("~/Library/Application Support")
+        base = os.path.join(_unix_home(), "Library", "Application Support")
     else:
         xdg = os.environ.get("XDG_DATA_HOME", "")
-        base = xdg if os.path.isabs(xdg) else os.path.expanduser("~/.local/share")
+        base = xdg if os.path.isabs(xdg) else os.path.join(_unix_home(), ".local", "share")
     if not os.path.isabs(base):
         raise OSError("no platform local-data directory is available")
     return os.path.join(base, "konnect")
@@ -63,10 +75,7 @@ def bridge_root():
 def cache_root():
     if os.environ.get("KONNECT_STATE_DIR") or os.name == "nt":
         return os.path.join(state_root(), "cache")
-    cache = os.path.expanduser("~/.cache")
-    if not os.path.isabs(cache):
-        raise OSError("no platform cache directory is available")
-    return os.path.join(cache, "konnect", "cache")
+    return os.path.join(_unix_home(), ".cache", "konnect", "cache")
 
 
 def _canonical(path):

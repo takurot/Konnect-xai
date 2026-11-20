@@ -334,6 +334,22 @@ fn missing_home_and_unavailable_state_do_not_write_into_cwd() {
     assert!(project.path().read_dir().unwrap().next().is_none());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn missing_home_uses_absolute_xdg_data_without_writing_into_cwd() {
+    let project = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+    command
+        .current_dir(project.path())
+        .env_remove("HOME")
+        .env_remove("KONNECT_STATE_DIR")
+        .env("XDG_DATA_HOME", data.path());
+    stop_server(&mut call_server(command));
+    assert!(project.path().read_dir().unwrap().next().is_none());
+    assert!(data.path().join("konnect/logs/calls.jsonl").is_file());
+}
+
 #[test]
 fn disabled_call_log_creates_no_log_or_rotation_lock() {
     let home = tempfile::tempdir().unwrap();

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 struct HttpServer {
     child: Child,
     addr: String,
-    _config: tempfile::NamedTempFile,
+    _state: tempfile::TempDir,
 }
 
 /// Spawn the binary against a temp JSON config, with `KONNECT_HTTP_TOKEN`
@@ -25,15 +25,17 @@ fn spawn_konnect(
     config_json: &str,
     env_token: Option<&str>,
     stderr: Stdio,
-) -> (Child, tempfile::NamedTempFile) {
-    let mut config = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+) -> (Child, tempfile::TempDir) {
+    let state = tempfile::tempdir().unwrap();
+    let mut config = std::fs::File::create(state.path().join("config.json")).unwrap();
     config.write_all(config_json.as_bytes()).unwrap();
     config.flush().unwrap();
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
     command
         .arg("--config")
-        .arg(config.path())
+        .arg(state.path().join("config.json"))
+        .env("KONNECT_STATE_DIR", state.path().join("state"))
         .stdin(Stdio::piped()) // piped stdin so it doesn't detect a TTY
         .stdout(Stdio::null())
         .stderr(stderr);
@@ -42,7 +44,7 @@ fn spawn_konnect(
         None => command.env_remove("KONNECT_HTTP_TOKEN"),
     };
     let child = command.spawn().expect("failed to spawn konnect binary");
-    (child, config)
+    (child, state)
 }
 
 fn free_port() -> u16 {
@@ -80,13 +82,13 @@ impl HttpServer {
         let port = free_port();
         let config_json =
             format!(r#"{{"transport":"http","http_address":"{bind_ip}:{port}"{extra_config}}}"#);
-        let (child, config) = spawn_konnect(&config_json, env_token, Stdio::null());
+        let (child, state) = spawn_konnect(&config_json, env_token, Stdio::null());
         let addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer {
             child,
             addr,
-            _config: config,
+            _state: state,
         };
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
@@ -409,7 +411,7 @@ fn refused_startup(extra_config: &str) -> (std::process::ExitStatus, String) {
         r#"{{"transport":"http","http_address":"0.0.0.0:{}"{extra_config}}}"#,
         free_port()
     );
-    let (mut child, _config) = spawn_konnect(&config_json, None, Stdio::piped());
+    let (mut child, _state) = spawn_konnect(&config_json, None, Stdio::piped());
     let deadline = Instant::now() + Duration::from_secs(15);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {

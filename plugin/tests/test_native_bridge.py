@@ -65,6 +65,32 @@ def _request(registration, path, body=None, token=None):
         return response.status, json.load(response)
 
 
+class StatePathTests(unittest.TestCase):
+    def test_state_override_and_bridge_overrides(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as root:
+            state = os.path.join(root, "state")
+            bridge = os.path.join(root, "bridge")
+            with patch.dict(os.environ, {"KONNECT_STATE_DIR": state, "KONNECT_BRIDGE_DIR": ""}):
+                self.assertEqual(native_bridge.bridge_root(), os.path.join(state, "native-bridge"))
+                self.assertEqual(native_bridge.cache_root(), os.path.join(state, "cache"))
+                with patch.dict(os.environ, {"KONNECT_BRIDGE_DIR": bridge}):
+                    self.assertEqual(native_bridge.bridge_root(), bridge)
+
+    def test_windows_rejects_relative_and_drive_relative_overrides(self):
+        import ntpath
+        from unittest.mock import patch
+
+        with patch.object(native_bridge.os, "name", "nt"), patch.object(native_bridge.os, "path", ntpath):
+            for path in (r"\konnect", r"Q:konnect", "konnect"):
+                with patch.dict(os.environ, {"KONNECT_STATE_DIR": path}):
+                    with self.assertRaisesRegex(ValueError, "absolute path"):
+                        native_bridge.state_root()
+            with patch.dict(os.environ, {"KONNECT_STATE_DIR": r"Q:\konnect"}):
+                self.assertEqual(native_bridge.state_root(), r"Q:\konnect")
+
+
 class NativeBridgeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

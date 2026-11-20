@@ -661,6 +661,13 @@ fn run_expecting_startup_failure(dir: &std::path::Path, args: &[&str]) -> (bool,
 }
 
 fn run_startup_command(mut command: Command) -> (bool, String) {
+    let state = tempfile::tempdir().unwrap();
+    if !command
+        .get_envs()
+        .any(|(key, _)| key == "KONNECT_STATE_DIR")
+    {
+        command.env("KONNECT_STATE_DIR", state.path());
+    }
     let output = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

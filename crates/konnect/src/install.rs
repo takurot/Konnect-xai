@@ -256,6 +256,14 @@ impl InstallPaths {
         current
     }
 
+    fn remove_state_file(&self, name: &str) -> Result<()> {
+        remove_if_present(&self.data_dir().join(name))?;
+        if self.use_legacy_state {
+            remove_if_present(&self.home.join(".konnect").join(name))?;
+        }
+        Ok(())
+    }
+
     fn skills_dir(&self, client: InstallClient) -> PathBuf {
         match client {
             InstallClient::Claude => self.home.join(".claude").join("skills"),
@@ -344,7 +352,7 @@ fn run_install_at(client: InstallClient, paths: &InstallPaths, verbose: bool) ->
     fs::write(paths.marker(client), env!("CARGO_PKG_VERSION"))?;
     // The recorded check described the guidance this install just replaced;
     // a same-version re-init leaves the marker unchanged, so drop it.
-    remove_if_present(&paths.guidance_checked(client))?;
+    paths.remove_state_file(client.checked_name())?;
 
     if verbose {
         match client {
@@ -465,11 +473,11 @@ fn run_uninstall_at(client: InstallClient, paths: &InstallPaths, verbose: bool) 
         if verbose {
             println!("  [-] Removed hook entries from settings.json");
         }
-        remove_if_present(&paths.legacy_marker())?;
+        paths.remove_state_file(".installed")?;
     }
 
-    remove_if_present(&paths.marker(client))?;
-    remove_if_present(&paths.guidance_checked(client))?;
+    paths.remove_state_file(client.marker_name())?;
+    paths.remove_state_file(client.checked_name())?;
     if verbose {
         println!("\nDone.");
     }
@@ -1405,6 +1413,27 @@ mod tests {
         for valid in ["1".repeat(64), "1.2.3-rc.1+build".to_owned()] {
             assert!(is_plain_version(&valid));
         }
+    }
+
+    #[test]
+    fn uninstall_removes_default_and_legacy_markers_without_crossing_an_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = test_paths(&temp);
+        paths.state = temp.path().join("state");
+        let old = paths.home.join(".konnect");
+        let marker = InstallClient::Codex.marker_name();
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(paths.data_dir()).unwrap();
+        for dir in [&old, &paths.state] {
+            fs::write(dir.join(marker), "0.16.0").unwrap();
+        }
+        run_uninstall_at(InstallClient::Codex, &paths, false).unwrap();
+        assert!(old.join(marker).exists());
+        assert!(!paths.state.join(marker).exists());
+        fs::write(paths.state.join(marker), "0.16.0").unwrap();
+        paths.use_legacy_state = true;
+        run_uninstall_at(InstallClient::Codex, &paths, false).unwrap();
+        assert!(install_marker(InstallClient::Codex, &paths).is_none());
     }
 
     fn test_paths(temp: &TempDir) -> InstallPaths {
