@@ -85,13 +85,16 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_schematic_component",
-            "Update fields and native dnp, in_bom, on_board, exclude_from_sim and in_pos_files attributes consistently across every placed unit. Omitted attributes remain unchanged. Move or hide field text.",
+            "Update fields and native dnp, in_bom, on_board, exclude_from_sim and in_pos_files attributes consistently across every placed unit. Omitted attributes remain unchanged. Move or hide field text. Use uuid with new_reference to reassign one saved symbol instance instead of editing shared fields.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
                     "reference": { "type": "string", "description": "Current reference designator" },
                     "new_reference": { "type": "string", "description": "New reference designator (optional)" },
+                    "uuid": { "type": "string", "description": "Select exactly one saved symbol for new_reference. Omit reference and any field or attribute changes." },
+                    "project": { "type": "string", "description": "Project of the selected saved instance when using uuid" },
+                    "instance_path": { "type": "string", "description": "Saved path of the selected project instance when using uuid. Required if the symbol has several saved paths in that project." },
                     "value": { "type": "string", "description": "New value (optional)" },
                     "footprint": { "type": "string", "description": "New footprint (optional)" },
                     "dnp": { "type": "boolean" },
@@ -123,7 +126,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Which placed unit field_placements applies to. Required when x or y is given and the component has more than one placed unit, because a field position is absolute and one coordinate cannot be right for several placements."
                     }
                 },
-                "required": ["schematic", "reference"]
+                "required": ["schematic"],
+                "anyOf": [
+                    { "required": ["reference"] },
+                    { "required": ["uuid", "new_reference"] }
+                ]
             }),
             |args, ctx| async move { handle_edit_schematic_component(args, ctx).await }
         ),
@@ -237,19 +244,19 @@ pub fn tools() -> Vec<ToolDef> {
             "annotate_schematic",
             "Assign reference designators in the saved schematic the way eeschema's Tools → \
              Annotate does with its defaults: every '?' designator gets the first free number \
-             for its prefix in the project, in ascending X per sheet instance, numbers used on \
+             for its prefix in the project, by saved page then hierarchy and X/Y, numbers used on \
              any sheet instance in the file are reserved, and numbered designators are kept. \
              The units of one multi-unit part (same embedded definition and value, distinct \
              units) share one designator; when which units belong together is not proven they \
              are reported in 'unresolved', never guessed. Two separate parts sharing a \
              designator are reported in 'unresolved' with a 'partial' outcome; they are \
-             renumbered only when resolve_duplicates is true (the first in ascending X keeps \
+             renumbered only when resolve_duplicates is true (the first in page and X/Y order keeps \
              the number). Annotates one project's instance records — the schematic's owner by \
              default, or 'project' — and never touches another project's. Writes both the \
              Reference property and the instances block, then reads the file back; every count \
              in the response comes from that readback. Numbers used on the project's other \
              sheets are reserved through its sheet tree ('other_sheets_consulted'); duplicates \
-             already spread across sheets are not detected here. Konnect's own implementation \
+             already spread across sheets are not detected here. Other unannotated files are reported and stay untouched. Konnect's own implementation \
              — kicad-cli has no annotate command. dry_run returns the plan without writing.",
             json!({
                 "type": "object",
@@ -257,7 +264,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Path to the .kicad_sch file" },
                     "resolve_duplicates": {
                         "type": "boolean",
-                        "description": "Renumber separate single-unit parts that share a designator in the project: the first in ascending X keeps it, the rest get the first free number. Default false: duplicates are reported, not changed. A shared designator that could be the units of one multi-unit package is never renumbered either way.",
+                        "description": "Renumber separate single-unit parts that share a designator in the project: the first in page and X/Y order keeps it, the rest get the first free number. Default false: duplicates are reported, not changed. A shared designator that could be the units of one multi-unit package is never renumbered either way.",
                         "default": false
                     },
                     "dry_run": {
@@ -2903,6 +2910,48 @@ async fn handle_edit_schematic_component(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    if let Some(uuid) = opt_str(args, "uuid") {
+        if let Some(field) = args
+            .as_object()
+            .into_iter()
+            .flat_map(|object| object.keys())
+            .find(|field| {
+                !matches!(
+                    field.as_str(),
+                    "schematic" | "uuid" | "project" | "instance_path" | "new_reference"
+                )
+            })
+        {
+            return Ok(crate::tools::invalid_arg(
+                field,
+                "only new_reference can be set with a UUID selector",
+            ));
+        }
+        let new_reference = match require_str(args, "new_reference") {
+            Ok(value) => value.to_owned(),
+            Err(error) => return Ok(error),
+        };
+        let uuid = uuid.to_owned();
+        let project = opt_str(args, "project").map(str::to_owned);
+        let instance_path = opt_str(args, "instance_path").map(str::to_owned);
+        return Ok(
+            crate::tools::blocking_work::spawn_tracked_blocking(move || {
+                super::sch_annotate::rename_instance_reference(
+                    &sch_path,
+                    &uuid,
+                    project.as_deref(),
+                    instance_path.as_deref(),
+                    &new_reference,
+                )
+            })
+            .await?,
+        );
+    }
+    for field in ["project", "instance_path"] {
+        if args.get(field).is_some() {
+            return Ok(crate::tools::invalid_arg(field, "requires a UUID selector"));
+        }
+    }
     let reference = match require_str(args, "reference") {
         Ok(r) => r.to_string(),
         Err(e) => return Ok(e),

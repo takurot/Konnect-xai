@@ -1305,10 +1305,11 @@ The response is now JSON, with the shared `outcome` envelope:
 - `unresolved` — designator groups the tool will not decide for you, each with
   its `project`, `paths`, `uuids` and a `reason`;
 - `written`, `dry_run`, `resolve_duplicates`, `remaining_unannotated`;
-- `outcome.status` is `complete` only when the committed file, read back, has
-  no `?` and no duplicate in the project; `partial` when `unresolved` is
-  non-empty; `failed` when the tool refused before writing; `uncertain` when
-  the write or the readback could not be proven.
+- `outcome.status` is `complete` when the requested file has no unresolved
+  annotation and any consulted project files were readable. It is `partial`
+  when a group is unresolved or a consulted file is unreadable, `failed` when
+  the tool refuses before writing, and `uncertain` when the write or readback
+  cannot be verified.
 
 A caller matching "Annotation complete." must update. No argument was renamed
 or removed. Persistence conflicts return `mutation_outcome_uncertain` with an
@@ -1319,10 +1320,9 @@ error. Reload and inspect the schematic before retrying; applied work is not
 known on this path and the response does not claim that nothing was written.
 Three optional arguments are added: `resolve_duplicates` (default
 false) renumbers all but the first of each group of separate parts sharing a
-designator, in ascending X, which is what eeschema's "Reset existing
-annotations" produced on the fixture; `dry_run` (default false) returns the
-plan without writing; `project` (string) names the project whose instance
-records to annotate.
+designator, in saved page, hierarchy, and X/Y order. `dry_run` (default
+false) returns the plan without writing. `project` names the project whose
+instance records to annotate.
 
 References are unique across a project (KiCad's flat list), so numbers are
 reserved per project across every sheet instance the file carries: a reused
@@ -1342,15 +1342,29 @@ When the owning project is proven, the numbers used on its other sheets are
 reserved by walking the sheet tree from the root (`other_sheets_consulted`
 lists them; `other_sheets_unreadable` names any that could not be read), so a
 child sheet annotated on its own never hands out a number the root owns.
-Duplicates that already exist across sheets are not detected or renumbered
-here; annotating a hierarchy from its root is tracked in #463.
+The response's `scope: "saved_schematic"` identifies the only file eligible
+for writes. `other_sheets_unannotated` lists each consulted file that still
+has unnumbered instance records, with the count for the selected project.
+This also works when the requested root file has no placed symbols.
+Project-wide writes are tracked in #463.
 
-Numbering now follows eeschema's Tools → Annotate defaults, measured on
-eeschema 10.0.5 rather than assumed: ascending X per sheet instance, the first
-free number for a prefix (a gap between `R1` and `R3` is filled; before, the
-next number was always the maximum plus one), and `#`-prefixed designators
-spelled `#PWR01`, `#PWR010`, `#PWR0100` as eeschema spells them (before:
-`#PWR1`). Both places a designator lives are written.
+Saved page numbers control allocation in reused sheets. Equal or missing
+page numbers use saved hierarchy order, and placements on the same sheet
+instance use ascending X then Y. Positions without a provable placement use
+the instance order in the saved file. The tool assigns the first free number
+for the prefix, including gaps, and uses KiCad's spelling for designators
+such as `#PWR01`, `#PWR010`, and `#PWR0100`.
+
+When repeated units make a group of unnumbered symbols ambiguous, its
+`unresolved[].recovery` can include a tool call for each candidate unit to
+separate. Choose a unit that belongs to its own package, pass the returned
+arguments to `edit_schematic_component`, then run `annotate_schematic`
+again. The new selector accepts `uuid` with `new_reference` and optional
+`project` and `instance_path`. Pass an explicit path when a UUID has several
+instances in the selected project. The existing `reference` selector
+continues to edit shared fields across a component's placed units.
+
+
 ## Unreleased: `rotate_schematic_component` carries field text round (patch release)
 
 `rotate_schematic_component` wrote the symbol's new angle and nothing else.
