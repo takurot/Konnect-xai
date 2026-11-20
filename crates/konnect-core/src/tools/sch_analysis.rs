@@ -1364,6 +1364,23 @@ mod orphan_item_tests {
         assert_eq!(pins[0]["pin_name"], "A");
     }
 
+    #[tokio::test]
+    async fn an_off_grid_endpoint_is_reported_as_unconnected_and_as_a_near_miss() {
+        // KiCad 10.0.8 leaves a pin unconnected when the saved wire stops
+        // 0.03 mm short, inside the previous default proximity tolerance.
+        let near = schematic("").replace("(xy 100 100)", "(xy 99.97 100)");
+        let result = call(&near, json!({})).await;
+        let orphans = result["orphans"].as_array().unwrap();
+        assert!(of_type(orphans, "unconnected_pin")
+            .iter()
+            .any(|pin| pin["reference"] == "U1"));
+        assert!(result["near_misses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pin| pin["reference"] == "U1"));
+    }
+
     /// The reported #249 case: a label directly on a pin without a wire is a
     /// legal KiCAD connection and connects both items.
     #[tokio::test]
@@ -1567,6 +1584,41 @@ mod net_query_tests {
 
     const SCH: &str = include_str!("../../tests/fixtures/single_pin_nets.kicad_sch");
     const RAIL: &str = include_str!("../../tests/fixtures/power_rail.kicad_sch");
+
+    #[tokio::test]
+    async fn raw_and_escaped_slashes_resolve_the_same_saved_net() {
+        // Real KiCad 10.0.8 emits one /A/B net with both pin members.
+        let source = r#"(kicad_sch
+          (lib_symbols (symbol "Test:P" (symbol "P_1_1"
+            (pin passive line (at 0 0 0) (length 1) (name "~") (number "1")))))
+          (label "A/B" (at 10 20 0) (uuid "plain"))
+          (label "A{slash}B" (at 30 20 0) (uuid "escaped"))
+          (symbol (lib_id "Test:P") (at 10 20 0) (unit 1) (uuid "first")
+            (property "Reference" "R1"))
+          (symbol (lib_id "Test:P") (at 30 20 0) (unit 1) (uuid "second")
+            (property "Reference" "R2"))
+        )"#;
+        let listed = call(source, "list_schematic_nets", json!({})).await;
+        assert_eq!(listed["nets"], json!(["A/B"]));
+        for net in ["A/B", "A{slash}B"] {
+            let members = call(source, "get_net_connections", json!({"net": net})).await;
+            let pins = members["pins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| {
+                    (
+                        p["reference"].as_str().unwrap(),
+                        p["pin_number"].as_str().unwrap(),
+                    )
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(pins, BTreeSet::from([("R1", "1"), ("R2", "1")]));
+            assert_eq!(members["label_count"], 2);
+        }
+        let diagnostics = call(source, "find_single_pin_nets", json!({})).await;
+        assert_eq!(diagnostics["single_pin_net_count"], 0);
+    }
 
     #[tokio::test]
     async fn named_net_reports_real_sheet_pins() {

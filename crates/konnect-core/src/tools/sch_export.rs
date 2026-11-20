@@ -1253,6 +1253,21 @@ mod netlist_summary_tests {
             .to_string()
     }
 
+    #[tokio::test]
+    async fn an_unnamed_connection_uses_its_kicad_net_name_in_the_summary() {
+        // The frozen native netlist documented in two_name_nets.README.md
+        // identifies the two pins on this generated name.
+        let source = include_str!("../../tests/fixtures/two_name_nets.kicad_sch");
+        let s = summary(source).await;
+        assert_eq!(net_of(&s, "TP8", "1"), "Net-(TP8-Pad1)");
+        assert_eq!(net_of(&s, "TP9", "1"), "Net-(TP8-Pad1)");
+        assert!(s["nets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|net| net == "Net-(TP8-Pad1)"));
+    }
+
     /// The regression: nets came from labels alone, so a pin reached only
     /// through a power symbol reported `"~"` and the rail was absent from
     /// `nets` — the summary showed every power connection as unconnected.
