@@ -937,7 +937,7 @@ const LAUNCH_STDERR_LIMIT: usize = 4096;
 
 struct GuiExit {
     status: std::io::Result<std::process::ExitStatus>,
-    stderr_tail: String,
+    stderr_tail: Option<tokio::sync::oneshot::Receiver<String>>,
 }
 
 fn supervise_gui(mut child: tokio::process::Child) -> tokio::sync::oneshot::Receiver<GuiExit> {
@@ -961,6 +961,11 @@ fn supervise_gui(mut child: tokio::process::Child) -> tokio::sync::oneshot::Rece
     let (send, receive) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let status = child.wait().await;
+        let (send_tail, stderr_tail) = tokio::sync::oneshot::channel();
+        let _ = send.send(GuiExit {
+            status,
+            stderr_tail: Some(stderr_tail),
+        });
         let mut drain = drain;
         if tokio::time::timeout(LAUNCH_GRACE, &mut drain)
             .await
@@ -975,10 +980,7 @@ fn supervise_gui(mut child: tokio::process::Child) -> tokio::sync::oneshot::Rece
             .copied()
             .collect();
         let stderr_tail = String::from_utf8_lossy(&bytes).trim().to_owned();
-        let _ = send.send(GuiExit {
-            status,
-            stderr_tail,
-        });
+        let _ = send_tail.send(stderr_tail);
     });
     receive
 }
@@ -987,13 +989,17 @@ async fn early_gui_exit(child: &mut Option<tokio::sync::oneshot::Receiver<GuiExi
     match child {
         Some(child) => child.await.unwrap_or_else(|error| GuiExit {
             status: Err(std::io::Error::other(error)),
-            stderr_tail: String::new(),
+            stderr_tail: None,
         }),
         None => std::future::pending().await,
     }
 }
 
-fn launch_exit_result(exit: GuiExit, requested_board: Option<&Path>) -> CallToolResult {
+async fn launch_exit_result(exit: GuiExit, requested_board: Option<&Path>) -> CallToolResult {
+    let stderr_tail = match exit.stderr_tail {
+        Some(tail) => tail.await.unwrap_or_default(),
+        None => String::new(),
+    };
     let (exit_status, note) = match exit.status {
         Ok(status) => (
             status.code(),
@@ -1007,10 +1013,10 @@ fn launch_exit_result(exit: GuiExit, requested_board: Option<&Path>) -> CallTool
     CallToolResult::json(&json!({
         "launched": false,
         "ipc_ready": null,
-        "requested_board": requested_board,
+        "requested_board": requested_board.map(konnect_sexp::paths::display_path),
         "requested_open": null,
         "exit_status": exit_status,
-        "stderr_tail": exit.stderr_tail,
+        "stderr_tail": stderr_tail,
         "note": note,
     }))
 }
@@ -1039,7 +1045,16 @@ fn observe_launch(address: &str, board: Option<&Path>) -> LaunchObservation {
         },
         Err(error) => LaunchObservation {
             ipc_ready,
-            requested_open: Some(false),
+            requested_open: error
+                .downcast_ref::<konnect_ipc::BoardTargetError>()
+                .filter(|error| {
+                    matches!(
+                        error,
+                        konnect_ipc::BoardTargetError::NoOpenDocuments { .. }
+                            | konnect_ipc::BoardTargetError::WrongDocument { .. }
+                    )
+                })
+                .map(|_| false),
             unsupported: konnect_ipc::ApiStatusError::from_error(&error)
                 .is_some_and(konnect_ipc::ApiStatusError::is_unsupported),
         },
@@ -1103,7 +1118,7 @@ async fn handle_launch_kicad_ui(args: &Value, ctx: &ToolContext) -> anyhow::Resu
     if child.is_some() {
         tokio::select! {
             biased;
-            exit = early_gui_exit(&mut child) => return Ok(launch_exit_result(exit, board.as_deref())),
+            exit = early_gui_exit(&mut child) => return Ok(launch_exit_result(exit, board.as_deref()).await),
             () = sleep(LAUNCH_GRACE) => {}
         }
     }
@@ -1115,7 +1130,7 @@ async fn handle_launch_kicad_ui(args: &Value, ctx: &ToolContext) -> anyhow::Resu
             loop {
                 let address = ctx.config.ipc_address.clone();
                 let requested = board.clone();
-                observed = crate::tools::blocking_work::spawn_tracked_blocking(move || {
+                observed = crate::tools::blocking_work::spawn_read_only_blocking(move || {
                     observe_launch(&address, requested.as_deref())
                 })
                 .await?;
@@ -1130,7 +1145,7 @@ async fn handle_launch_kicad_ui(args: &Value, ctx: &ToolContext) -> anyhow::Resu
         };
         tokio::select! {
             biased;
-            exit = early_gui_exit(&mut child) => return Ok(launch_exit_result(exit, board.as_deref())),
+            exit = early_gui_exit(&mut child) => return Ok(launch_exit_result(exit, board.as_deref()).await),
             result = timeout_at(deadline, observation) => match result {
                 Ok(result) => result?,
                 Err(_) => timed_out = true,
@@ -1151,7 +1166,7 @@ async fn handle_launch_kicad_ui(args: &Value, ctx: &ToolContext) -> anyhow::Resu
     Ok(CallToolResult::json(&json!({
         "launched": child.is_some(),
         "ipc_ready": wait_ready.then_some(observed.ipc_ready),
-        "requested_board": board,
+        "requested_board": board.as_deref().map(konnect_sexp::paths::display_path),
         "requested_open": observed.requested_open,
         "timed_out": timed_out,
         "note": note,
@@ -1880,7 +1895,14 @@ mod tests {
             };
             let result: Value = serde_json::from_str(text).unwrap();
             assert_eq!(result["ipc_ready"], true);
-            assert_eq!(result["requested_open"], !manager_only);
+            assert_eq!(
+                result["requested_open"],
+                if manager_only {
+                    Value::Null
+                } else {
+                    json!(true)
+                }
+            );
             assert_eq!(
                 calls.load(Ordering::Relaxed),
                 if manager_only { 1 } else { 2 }

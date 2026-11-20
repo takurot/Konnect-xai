@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use konnect_sexp::paths::display_path;
 use konnect_sexp::{
     abandon_file_transaction, inspect_file_transactions, recover_file_transactions,
     TransactionTargetState,
@@ -25,22 +26,30 @@ fn exact_project_path<'a>(args: &'a [String], command: &str) -> Result<&'a Path>
 }
 
 fn status(project: &Path) -> Result<()> {
-    let statuses = inspect_file_transactions(project)
-        .with_context(|| format!("failed to inspect transactions in {}", project.display()))?;
+    let statuses = inspect_file_transactions(project).with_context(|| {
+        format!(
+            "failed to inspect transactions in {}",
+            display_path(project)
+        )
+    })?;
     if statuses.is_empty() {
         println!("No active transaction journals.");
         return Ok(());
     }
 
     for status in statuses {
-        println!("Transaction {} ({})", status.id, status.journal.display());
+        println!(
+            "Transaction {} ({})",
+            status.id,
+            display_path(&status.journal)
+        );
         for target in status.targets {
             let state = match target.state {
                 TransactionTargetState::Pending => "pending",
                 TransactionTargetState::Applied => "applied",
                 TransactionTargetState::Divergent => "divergent",
             };
-            println!("  {state:9} {}", target.path.display());
+            println!("  {state:9} {}", display_path(&target.path));
         }
     }
     println!("Journal contents are redacted because they contain complete schematic images.");
@@ -48,8 +57,12 @@ fn status(project: &Path) -> Result<()> {
 }
 
 fn recover(project: &Path) -> Result<()> {
-    let outcomes = recover_file_transactions(project)
-        .with_context(|| format!("failed to recover transactions in {}", project.display()))?;
+    let outcomes = recover_file_transactions(project).with_context(|| {
+        format!(
+            "failed to recover transactions in {}",
+            display_path(project)
+        )
+    })?;
     if outcomes.is_empty() {
         println!("No active transaction journals.");
     } else {
@@ -72,7 +85,7 @@ fn abandon(args: &[String]) -> Result<()> {
         format!(
             "failed to abandon transaction '{}' in {}",
             args[2],
-            project.display()
+            display_path(project)
         )
     })?;
     println!(
@@ -81,7 +94,7 @@ fn abandon(args: &[String]) -> Result<()> {
     );
     println!(
         "Evidence retained at {}.",
-        outcome.abandoned_journal.display()
+        display_path(&outcome.abandoned_journal)
     );
     println!("Warning: the abandoned journal contains complete before/after schematic images.");
     Ok(())
