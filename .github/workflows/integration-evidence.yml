@@ -1,0 +1,85 @@
+name: v0.17 integration evidence
+
+on:
+  push:
+    branches: [v017/integration]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v017-integration-evidence
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  KONNECT_BUILD_COMMIT: ${{ github.sha }}
+
+jobs:
+  macos-binary:
+    name: macOS arm64 runtime candidate
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install --no-self-update
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: protoc@3.23.4
+          fallback: none
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: v017-integration-release
+      - name: Build and identify the runtime candidate
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(uname -m)" = arm64
+          cargo build --release --locked -p konnect --bin konnect
+          target/release/konnect --version
+          file target/release/konnect
+          mkdir -p evidence/darwin-arm64
+          cp target/release/konnect evidence/darwin-arm64/
+          printf '%s\n' "$GITHUB_SHA" > evidence/darwin-arm64/COMMIT
+          (cd evidence/darwin-arm64 && shasum -a 256 konnect > SHA256SUMS)
+          tar -C evidence/darwin-arm64 -czf "evidence/konnect-${GITHUB_SHA}-darwin-arm64.tar.gz" konnect COMMIT SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: konnect-${{ github.sha }}-darwin-arm64
+          path: evidence/konnect-*-darwin-arm64.tar.gz
+          if-no-files-found: error
+
+  coverage:
+    name: Workspace line and branch coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUSTC_BOOTSTRAP: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install --no-self-update --component llvm-tools-preview
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: protoc@3.23.4,cargo-llvm-cov@0.8.7
+          fallback: none
+      - name: Run the instrumented workspace
+        env:
+          KONNECT_STATE_DIR: ${{ runner.temp }}/konnect-integration-state
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          mkdir -p evidence
+          cargo fmt --all -- --check
+          cargo llvm-cov --workspace --locked --lib --tests --branch 2>&1 | tee evidence/coverage.log
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: coverage-${{ github.sha }}
+          path: evidence/coverage.log
+          if-no-files-found: warn
