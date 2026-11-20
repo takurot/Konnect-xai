@@ -122,7 +122,7 @@ and Windows servers do not.
 | `delete_schematic_wire` | Delete a wire segment by UUID or by matching start/end coordinates, pruning the junction dots it leaves unjustified. |
 | `batch_delete_schematic_wire` | Delete multiple wire segments in a single file read/write cycle, pruning the junction dots they leave unjustified. |
 | `split_wire_at_point` | Split a wire at a given point, creating two segments and a junction. |
-| `add_schematic_net_label` | Add a net label (`net_label`, `global_label`, or `hierarchical_label`). |
+| `add_schematic_net_label` | Add a net label (`net_label`, `global_label`, or `hierarchical_label`). Global and hierarchical labels support `input` (default), `output`, `bidirectional`, `tri_state`, and `passive`. |
 | `delete_schematic_net_label` | Delete a net label by net name and position. |
 | `rotate_schematic_label` | Rotate a net label to a new angle and update its justify direction. |
 | `move_labels_by_offset` | Move all labels matching a net name by a given X/Y offset. |
