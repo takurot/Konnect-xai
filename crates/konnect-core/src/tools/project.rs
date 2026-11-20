@@ -125,7 +125,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "label": {
                         "type": "string",
-                        "description": "Optional label to include in the filename"
+                        "description": "Optional bare label to include in the filename"
                     }
                 },
                 "required": ["schematic", "output_dir"]
@@ -211,6 +211,9 @@ async fn handle_create_project(
         Ok(n) => n.to_string(),
         Err(e) => return Ok(e),
     };
+    if let Err(reason) = validate_project_name(&name) {
+        return Ok(invalid_arg("name", reason));
+    }
     if path
         .file_name()
         .and_then(|name| name.to_str())
@@ -425,6 +428,13 @@ async fn handle_get_project_info(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let path = get_path(args, "path")?;
+    if !path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("kicad_pro"))
+    {
+        return Ok(invalid_arg("path", "must name a .kicad_pro file"));
+    }
 
     // Demonstration of the structured-error pattern: returning a FileNotFound
     // kind lets clients branch (e.g. show a file picker) without string-parsing
@@ -508,45 +518,114 @@ async fn snapshot_project_at(
 ) -> anyhow::Result<CallToolResult> {
     let schematic = get_path(args, "schematic")?;
     let output_dir = get_path(args, "output_dir")?;
-    let label = opt_str(args, "label").unwrap_or("snapshot");
+    let label = match args.get("label") {
+        Some(value) => match value.as_str() {
+            Some(label) => label,
+            None => return Ok(invalid_arg("label", "must be a string")),
+        },
+        None => "snapshot",
+    };
+    if let Err(reason) = validate_project_name(label) {
+        return Ok(invalid_arg("label", reason));
+    }
 
     tokio::fs::create_dir_all(&output_dir).await?;
+    let resolved_output = output_dir.canonicalize()?;
+    let staging = tempfile::Builder::new()
+        .prefix(".konnect-snapshot-")
+        .tempdir_in(&output_dir)?;
 
-    let stem = schematic
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    let pdf_name = format!("{}_{}_{}.pdf", stem, label, ts);
-    let pdf_path = output_dir.join(&pdf_name);
+    let stem = schematic.file_stem().unwrap_or_default().to_string_lossy();
+    let id = uuid::Uuid::new_v4().simple();
+    let pdf_name = format!("{stem}_{label}_{ts}_{id}.pdf");
+    let staged_pdf = staging.path().join(&pdf_name);
+    let pdf_path = resolved_output.join(pdf_name);
 
     crate::tools::cli::export_schematic_pdf(
         &ctx.config.kicad_cli,
         &schematic,
-        &pdf_path,
+        &staged_pdf,
         &crate::tools::cli::SchematicPdfOptions::default(),
     )
     .await?;
+    publish_snapshot_pdf(&staged_pdf, &pdf_path, &resolved_output)?;
 
+    let schematic_result = konnect_sexp::paths::display_path(&pdf_path);
     let mut result = json!({
-        "snapshot": pdf_path.display().to_string(),
+        "snapshot": schematic_result,
         "label": label,
         "timestamp": ts
     });
 
-    // Optionally snapshot PCB too
     if let Some(pcb_str) = opt_str(args, "pcb") {
         let pcb = PathBuf::from(pcb_str);
-        let pcb_pdf_name = format!("{}_pcb_{}_{}.pdf", stem, label, ts);
-        let pcb_pdf_path = output_dir.join(&pcb_pdf_name);
+        let pcb_pdf_name = format!("{stem}_pcb_{label}_{ts}_{id}.pdf");
+        let staged_pcb = staging.path().join(&pcb_pdf_name);
+        let pcb_pdf_path = resolved_output.join(pcb_pdf_name);
         let layers = &["F.Cu", "B.Cu", "F.Silkscreen", "B.Silkscreen", "Edge.Cuts"];
-        crate::tools::cli::export_pdf(&ctx.config.kicad_cli, &pcb, &pcb_pdf_path, layers, false)
-            .await?;
-        result["pcb_snapshot"] = json!(pcb_pdf_path.display().to_string());
+        let pcb_export =
+            crate::tools::cli::export_pdf(&ctx.config.kicad_cli, &pcb, &staged_pcb, layers, false)
+                .await
+                .and_then(|()| publish_snapshot_pdf(&staged_pcb, &pcb_pdf_path, &resolved_output));
+        if let Err(error) = pcb_export {
+            result["artifacts_written"] = json!([schematic_result]);
+            result["message"] = json!("Schematic snapshot was saved, but the PCB snapshot failed.");
+            result["error"] = match error.downcast_ref::<SexpError>() {
+                Some(SexpError::MutationOutcomeUncertain { path, reason }) => {
+                    json!(ToolErrorKind::MutationOutcomeUncertain {
+                        operation: "snapshot_project".to_string(),
+                        path: konnect_sexp::paths::display_path(path).into_owned(),
+                        reason: reason.clone(),
+                    })
+                }
+                _ => json!(ToolErrorKind::HandlerError {
+                    reason: error.to_string(),
+                }),
+            };
+            let mut partial = CallToolResult::json(&result);
+            partial.is_error = true;
+            return Ok(partial);
+        }
+        result["pcb_snapshot"] = json!(konnect_sexp::paths::display_path(&pcb_pdf_path));
     }
 
     Ok(CallToolResult::json(&result))
+}
+
+/// Publish only a verified direct child of the resolved snapshot directory.
+fn publish_snapshot_pdf(
+    staged: &Path,
+    destination: &Path,
+    output_dir: &Path,
+) -> anyhow::Result<()> {
+    let staged_parent = staged
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok());
+    let destination_parent = destination
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok());
+    anyhow::ensure!(
+        destination_parent.as_deref() == Some(output_dir)
+            && staged_parent.as_deref().and_then(Path::parent) == Some(output_dir),
+        "snapshot paths no longer share the requested output directory"
+    );
+    let expected = std::fs::symlink_metadata(staged)?;
+    anyhow::ensure!(
+        expected.is_file() && expected.len() > 0,
+        "snapshot PDF is not a regular nonempty file"
+    );
+    konnect_sexp::rename_noreplace(staged, destination)?;
+    if std::fs::symlink_metadata(destination)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == expected.len())
+    {
+        Ok(())
+    } else {
+        Err(SexpError::MutationOutcomeUncertain {
+            path: destination.to_path_buf(),
+            reason: "published snapshot did not read back as the staged PDF".to_string(),
+        }
+        .into())
+    }
 }
 
 async fn handle_open_viewer(
@@ -1202,6 +1281,24 @@ mod tests {
             extract_error_kind(&result).as_deref(),
             Some("file_not_found")
         );
+    }
+
+    #[test]
+    fn snapshot_publication_refuses_an_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().canonicalize().unwrap();
+        let staging = tempfile::tempdir_in(&output).unwrap();
+        let source = staging.path().join("staged.pdf");
+        let destination = output.join("snapshot.pdf");
+        std::fs::write(&source, "new PDF").unwrap();
+        std::fs::write(&destination, "original PDF").unwrap();
+
+        assert!(publish_snapshot_pdf(&source, &destination, &output).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "original PDF"
+        );
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "new PDF");
     }
 
     #[tokio::test]
