@@ -793,9 +793,7 @@ async fn handle_place_decoupling(
             "the plan does not improve the score ({before_num} \u{2192} {after_num})"
         ));
     }
-    if score_after["verdict"] == "courtyard_unproven" {
-        applicability.block("courtyard overlap could not be evaluated for the planned placement");
-    }
+    guard_proven_courtyards(&score_after, &mut applicability);
     if score_after["verdict"] == "hard_fail" && score_before["verdict"] != "hard_fail" {
         applicability.block(format!(
             "the plan introduces a hard failure the board did not have \
@@ -1400,10 +1398,16 @@ fn force_directed_applicability(
     if verdict_after == "hard_fail" {
         applicability.block("the planned placement has a hard-fail verdict");
     }
-    if verdict_after == "courtyard_unproven" {
+    applicability
+}
+
+fn guard_proven_courtyards(score: &serde_json::Value, applicability: &mut PlanApplicability) {
+    if score["unproven_courtyards"]
+        .as_array()
+        .is_some_and(|references| !references.is_empty())
+    {
         applicability.block("courtyard overlap could not be evaluated for the planned placement");
     }
-    applicability
 }
 
 async fn handle_force_directed(
@@ -1693,7 +1697,7 @@ async fn handle_force_directed(
         score_before["score"].as_i64().unwrap_or(i64::MIN),
         score_after["score"].as_i64().unwrap_or(i64::MIN),
     );
-    let applicability = force_directed_applicability(
+    let mut applicability = force_directed_applicability(
         max_displacement_mm,
         converged,
         iterations_run,
@@ -1702,6 +1706,7 @@ async fn handle_force_directed(
         score_after["verdict"].as_str().unwrap_or("unavailable"),
         &move_safety,
     );
+    guard_proven_courtyards(&score_after, &mut applicability);
     let (plan_status, blocking_reasons) = applicability.to_json();
 
     if dry_run {
@@ -4784,6 +4789,32 @@ mod placement_boundary_contract_tests {
                 "{value}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_courtyards_block_application_even_with_a_different_hard_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("ambiguous.kicad_pcb");
+        let rect = courtyard("F");
+        let content = outline(
+            &[
+                footprint("A1", 15.0, 15.0, "F", &format!("{rect}{rect}")),
+                footprint("A2", 15.5, 15.0, "F", &rect),
+                footprint("A3", 40.0, 40.0, "F", &rect),
+            ]
+            .concat(),
+        );
+        std::fs::write(&board, content).unwrap();
+        let response =
+            handle_score_placement(&json!({"board": board}), &ctx_talking_to(String::new()))
+                .await
+                .unwrap();
+        let score = body(&response);
+        assert_eq!(score["verdict"], "hard_fail", "{score}");
+        assert_eq!(score["unproven_courtyards"], json!(["A1", "A2"]));
+        let mut applicability = PlanApplicability::new();
+        guard_proven_courtyards(&score, &mut applicability);
+        assert!(applicability.is_blocked());
     }
 
     #[tokio::test]

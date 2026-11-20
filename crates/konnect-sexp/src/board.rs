@@ -895,7 +895,7 @@ fn courtyard_rings(
     if chains.is_empty() {
         return None;
     }
-    let mut rings = Vec::new();
+    let mut rings: Vec<Vec<CourtyardPoint>> = Vec::new();
     while let Some(mut ring) = chains.pop() {
         while !same_endpoint(*ring.first()?, *ring.last()?) {
             let at = *ring.last()?;
@@ -929,6 +929,17 @@ fn courtyard_rings(
                 .collect(),
         );
     }
+    for (index, ring) in rings.iter().enumerate() {
+        for other in &rings[index + 1..] {
+            if ring.windows(2).any(|edge| {
+                other.windows(2).any(|candidate| {
+                    boundaries_intersect((edge[0], edge[1]), (candidate[0], candidate[1]))
+                })
+            }) {
+                return None;
+            }
+        }
+    }
     Some(rings)
 }
 
@@ -945,23 +956,26 @@ fn is_simple_ring(ring: &[CourtyardPoint]) -> bool {
                 if i == 0 && j == ring.len() - 2 {
                     return true;
                 }
-                let [c, d] = [other[0], other[1]];
-                crossing_y((a, b), (c, d)).is_none()
-                    && ![(a, c, d), (b, c, d), (c, a, b), (d, a, b)]
-                        .into_iter()
-                        .any(|(p, s, e)| {
-                            crate::geometry::point_on_segment(
-                                p.0,
-                                p.1,
-                                s.0,
-                                s.1,
-                                e.0,
-                                e.1,
-                                COURTYARD_ENDPOINT_TOLERANCE_MM,
-                            )
-                        })
+                !boundaries_intersect((a, b), (other[0], other[1]))
             })
         })
+}
+
+fn boundaries_intersect((a, b): Segment, (c, d): Segment) -> bool {
+    crossing_y((a, b), (c, d)).is_some()
+        || [(a, c, d), (b, c, d), (c, a, b), (d, a, b)]
+            .into_iter()
+            .any(|(p, s, e)| {
+                crate::geometry::point_on_segment(
+                    p.0,
+                    p.1,
+                    s.0,
+                    s.1,
+                    e.0,
+                    e.1,
+                    COURTYARD_ENDPOINT_TOLERANCE_MM,
+                )
+            })
 }
 
 fn crossing_y((a, b): Segment, (c, d): Segment) -> Option<f64> {
