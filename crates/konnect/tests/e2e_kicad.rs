@@ -218,6 +218,7 @@ fn fabrication_and_document_exports_through_mcp() {
         ),
     ] {
         let output = dir.path().join(filename);
+        std::fs::write(&output, b"previous ordinary export").unwrap();
         let mut args = json!({"board":board,"output":output});
         if let Some(format) = format {
             args["format"] = json!(format);
@@ -236,14 +237,43 @@ fn fabrication_and_document_exports_through_mcp() {
         }
     }
 
+    let compressed_ipc = dir.path().join("packed-ipc.xml");
+    mcp.tool(
+        "export_ipc2581",
+        json!({"board":board,"output":compressed_ipc,"compress":true}),
+    );
+    assert!(std::fs::read(compressed_ipc)
+        .unwrap()
+        .starts_with(b"PK\x03\x04"));
+
+    let odb_dir = dir.path().join("odb-directory");
+    std::fs::create_dir(&odb_dir).unwrap();
+    mcp.tool(
+        "export_odb",
+        json!({"board":board,"output":odb_dir,"compression":"none"}),
+    );
+    assert!(odb_dir.join("steps/pcb/profile").is_file());
+
     let dxf_dir = dir.path().join("dxf");
+    std::fs::create_dir(&dxf_dir).unwrap();
+    let keep = dxf_dir.join("keep.txt");
+    std::fs::write(&keep, b"unrelated output directory contents").unwrap();
     let response = body(&mcp.tool(
         "export_dxf",
         json!({"board":board,"output_dir":dxf_dir,"layers":["Edge.Cuts"]}),
     ));
     let files = response["files"].as_array().expect("DXF file inventory");
-    assert_eq!(files.len(), 1);
-    let dxf = std::fs::read_to_string(dxf_dir.join(files[0].as_str().unwrap())).unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(
+        std::fs::read(&keep).unwrap(),
+        b"unrelated output directory contents"
+    );
+    let dxf_name = files
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|name| name.ends_with(".dxf"))
+        .expect("DXF layer file");
+    let dxf = std::fs::read_to_string(dxf_dir.join(dxf_name)).unwrap();
     assert!(dxf.lines().any(|line| line.trim() == "ENTITIES"));
     assert_eq!(dxf.lines().filter(|line| line.trim() == "LINE").count(), 4);
 

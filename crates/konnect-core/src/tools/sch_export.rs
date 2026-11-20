@@ -288,11 +288,7 @@ async fn handle_render_png(
         }
     };
 
-    if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    cli::ensure_export_destination_is_not_design_file(&output_path)?;
-    std::fs::write(&output_path, &rendered.png)?;
+    cli::publish_verified_bytes(&output_path, &rendered.png, "schematic PNG").await?;
 
     // Dimensions come from the produced image, never echoed from the request.
     let mut response = json!({
@@ -747,8 +743,18 @@ async fn handle_run_erc(
     // another tool or another person, and a coordinate must not travel
     // without the `coordinates` block saying what it is worth.
     if let Some(path) = output {
-        cli::ensure_export_destination_is_not_design_file(path)?;
-        std::fs::write(path, serde_json::to_string_pretty(&response)?)?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            anyhow::ensure!(
+                parent.is_dir(),
+                "ERC report directory {} does not exist",
+                parent.display()
+            );
+        }
+        let contents = serde_json::to_vec_pretty(&response)?;
+        cli::publish_verified_bytes(path, &contents, "ERC report").await?;
     }
 
     Ok(CallToolResult::json(&response))
