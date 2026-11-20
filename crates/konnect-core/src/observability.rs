@@ -137,9 +137,19 @@ impl CallObserver {
 
     /// Record a completed call. Never fails — logs warnings on IO issues.
     pub async fn record(&self, rec: CallRecord) {
+        let is_error = matches!(
+            rec.status,
+            CallStatus::Error | CallStatus::Uncertain | CallStatus::NotFound
+        );
+        self.record_result(rec, is_error).await;
+    }
+
+    /// Use the served error flag for counters while preserving the separate
+    /// status classification and the JSONL record format.
+    pub(crate) async fn record_result(&self, rec: CallRecord, is_error: bool) {
         // Update counters.
         self.inner.total_calls.fetch_add(1, Ordering::Relaxed);
-        if matches!(rec.status, CallStatus::Error | CallStatus::Uncertain) {
+        if is_error {
             self.inner.error_calls.fetch_add(1, Ordering::Relaxed);
         }
         if matches!(rec.status, CallStatus::Partial) {
@@ -156,7 +166,7 @@ impl CallObserver {
             entry.total += 1;
             entry.total_duration_ms += rec.dur_ms;
             entry.last_status = Some(rec.status.as_str().to_string());
-            if matches!(rec.status, CallStatus::Error | CallStatus::Uncertain) {
+            if is_error {
                 entry.errors += 1;
                 entry.last_error = rec.error_kind.clone();
             }
