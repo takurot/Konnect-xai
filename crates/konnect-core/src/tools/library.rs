@@ -20,7 +20,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 
 const PAD_TYPES: &[&str] = &["smd", "thru_hole", "np_thru_hole"];
-const PAD_SHAPES: &[&str] = &["rect", "oval", "circle", "roundrect"];
+const PAD_SHAPES: &[&str] = &["circle", "rect", "oval", "roundrect"];
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
