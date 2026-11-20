@@ -1821,6 +1821,113 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn target_readiness_retries_not_ready_but_refuses_a_manager_only_endpoint() {
+        use crate::tools::pcb_board::board_mock::{board_document, ctx_talking_to};
+        use konnect_ipc::{builders, gen::kiapi};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "saved").unwrap();
+        for manager_only in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let requests = calls.clone();
+            let document = board_document(&board.to_string_lossy());
+            let server =
+                crate::test_support::MockIpcServer::spawn("target-readiness", move |request| {
+                    use kiapi::common::ApiStatusCode;
+                    let inventory = request
+                        .message
+                        .unwrap()
+                        .type_url
+                        .ends_with("GetOpenDocuments");
+                    let (status, message) = if !inventory {
+                        (ApiStatusCode::AsOk, None)
+                    } else if manager_only {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        (ApiStatusCode::AsUnhandled, None)
+                    } else if requests.fetch_add(1, Ordering::Relaxed) == 0 {
+                        (ApiStatusCode::AsNotReady, None)
+                    } else {
+                        (
+                            ApiStatusCode::AsOk,
+                            Some(builders::pack_any(
+                                &kiapi::common::commands::GetOpenDocumentsResponse {
+                                    documents: vec![document.clone()],
+                                },
+                                "kiapi.common.commands.GetOpenDocumentsResponse",
+                            )),
+                        )
+                    };
+                    kiapi::common::ApiResponse {
+                        status: Some(kiapi::common::ApiResponseStatus {
+                            status: status as i32,
+                            error_message: String::new(),
+                        }),
+                        header: None,
+                        message,
+                    }
+                });
+            let result = handle_launch_kicad_ui(
+                &json!({"board": board, "timeout_seconds": 3}),
+                &ctx_talking_to(server.address().to_owned()),
+            )
+            .await
+            .unwrap();
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected readiness report");
+            };
+            let result: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(result["ipc_ready"], true);
+            assert_eq!(result["requested_open"], !manager_only);
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                if manager_only { 1 } else { 2 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_board_observation_cannot_exceed_the_launch_wait_budget() {
+        use konnect_ipc::gen::kiapi;
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        let server =
+            crate::test_support::MockIpcServer::spawn("slow-launch-observation", |request| {
+                if request
+                    .message
+                    .unwrap()
+                    .type_url
+                    .ends_with("GetOpenDocuments")
+                {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+                kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: None,
+                }
+            });
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_owned());
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_millis(1700),
+            handle_launch_kicad_ui(&json!({"board": board, "timeout_seconds": 1}), &ctx),
+        )
+        .await
+        .expect("the full observation honors the deadline")
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &answer.content[0] else {
+            panic!("expected readiness report");
+        };
+        let result: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(result["timed_out"], true);
+        assert!(result["requested_open"].is_null());
+    }
+
     #[test]
     fn health_timeout_is_bounded_and_typed() {
         assert_eq!(health_timeout_seconds(&json!({})).unwrap(), 5);

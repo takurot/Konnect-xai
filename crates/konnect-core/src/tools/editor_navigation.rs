@@ -928,7 +928,7 @@ mod tests {
         }
     }
 
-    fn spawn_observation_mock() -> String {
+    fn spawn_observation_mock(legacy_schematic: bool) -> String {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let url = format!(
             "inproc://editor-state-core-{}",
@@ -958,10 +958,31 @@ mod tests {
                         "kiapi.common.commands.GetVersionResponse",
                     )
                 } else {
+                    use kiapi::common::types::{
+                        document_specifier::Identifier, DocumentSpecifier, DocumentType,
+                    };
+                    let request =
+                        kiapi::common::commands::GetOpenDocuments::decode(command.value.as_slice())
+                            .unwrap();
+                    let documents = if legacy_schematic {
+                        if request.r#type == DocumentType::DoctypeSchematic as i32 {
+                            vec![DocumentSpecifier {
+                                r#type: DocumentType::DoctypeSchematic as i32,
+                                project: None,
+                                identifier: Some(Identifier::BoardFilename(
+                                    "legacy.kicad_sch".into(),
+                                )),
+                            }]
+                        } else {
+                            vec![crate::tools::pcb_board::board_mock::board_document(
+                                "fixture.kicad_pcb",
+                            )]
+                        }
+                    } else {
+                        Vec::new()
+                    };
                     builders::pack_any(
-                        &kiapi::common::commands::GetOpenDocumentsResponse {
-                            documents: Vec::new(),
-                        },
+                        &kiapi::common::commands::GetOpenDocumentsResponse { documents },
                         "kiapi.common.commands.GetOpenDocumentsResponse",
                     )
                 };
@@ -1308,6 +1329,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_schematic_identity_is_unsupported_without_hiding_the_pcb_editor() {
+        let result = handle_get_editor_state(&json!({}), &context(spawn_observation_mock(true)))
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected editor observation");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        let schematic = &body["editors"][0];
+        assert_eq!(schematic["addressable"], false);
+        assert_eq!(
+            schematic["capabilities"]["observe_documents"]["availability"],
+            "unsupported"
+        );
+        assert!(schematic["unavailable_reason"]
+            .as_str()
+            .unwrap()
+            .contains("10.0.5"));
+        assert_eq!(body["editors"][1]["addressable"], true);
+        assert_eq!(body["editors"][1]["documents"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn unconfigured_endpoint_is_a_structured_editor_unavailable_refusal() {
         let result = handle_get_editor_state(&json!({}), &context(String::new()))
             .await
@@ -1321,7 +1366,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_result_is_derived_from_typed_ipc_observation() {
-        let result = handle_get_editor_state(&json!({}), &context(spawn_observation_mock()))
+        let result = handle_get_editor_state(&json!({}), &context(spawn_observation_mock(false)))
             .await
             .expect("handler result");
         assert!(!result.is_error);
