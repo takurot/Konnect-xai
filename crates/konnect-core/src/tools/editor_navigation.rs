@@ -285,6 +285,25 @@ fn parse_selection_target(args: &serde_json::Value) -> Result<IpcEditorDocument,
 }
 
 fn selection_error_result(error: anyhow::Error) -> CallToolResult {
+    if let Some(unsupported) = error.downcast_ref::<konnect_ipc::IpcSchematicIdentityUnsupported>()
+    {
+        return CallToolResult::error_kind(
+            ToolErrorKind::UnsupportedCapability {
+                capability: "schematic_editor_document_identity".to_owned(),
+                kicad_version: unsupported.kicad_version.clone(),
+            },
+            unsupported.to_string(),
+        );
+    }
+    if let Some(document_error) = error.downcast_ref::<konnect_ipc::IpcDocumentObservationError>() {
+        return CallToolResult::error_kind(
+            ToolErrorKind::StaleTarget {
+                target: format!("{} editor document state", document_error.editor.as_str()),
+                reason: document_error.reason.clone(),
+            },
+            document_error.to_string(),
+        );
+    }
     if let Some(selection) = konnect_ipc::IpcSelectionObservationError::from_error(&error) {
         let kind = match selection.kind {
             IpcSelectionObservationErrorKind::WrongProject => ToolErrorKind::WrongProject {

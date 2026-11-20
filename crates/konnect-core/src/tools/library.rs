@@ -2055,9 +2055,7 @@ async fn handle_list_footprint_libraries(
 /// Credit to @anyn99 (#163), whose PR carried this and the lexical fallback
 /// below.
 fn portable_uri(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
-    stripped.replace('\\', "/")
+    konnect_sexp::paths::strip_windows_verbatim(&path.to_string_lossy()).replace('\\', "/")
 }
 
 /// A lib-table URI for `lib_path`: `${KIPRJMOD}/…` when it lives inside the

@@ -183,11 +183,10 @@ class KonnectSettingsDialog(wx.Dialog):
         # No fixed pixel size: on high-DPI/scaled Windows displays a fixed
         # (520, 480) clipped the Save/Close buttons off-screen (issue #18).
         # The dialog is sized to fit its content after _build_ui instead.
-        super().__init__(
-            parent,
-            title="Konnect Settings",
-            style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
-        )
+        style = wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER
+        if parent is None:
+            style |= wx.DIALOG_NO_PARENT
+        super().__init__(parent, title="Konnect Settings", style=style)
         self.plugin_dir = plugin_dir
         self.binary_path = binary_path
         self.settings_path = os.path.join(plugin_dir, "settings.json")
@@ -203,7 +202,10 @@ class KonnectSettingsDialog(wx.Dialog):
         # path fields aren't cramped. FromDIP scales with the display.
         self.SetMinClientSize(self.FromDIP(wx.Size(520, 0)))
         self.Fit()
-        self.CenterOnParent()
+        if parent is None:
+            self.Centre()
+        else:
+            self.CenterOnParent()
 
     def _build_ui(self):
         panel = wx.Panel(self)
@@ -367,7 +369,7 @@ class KonnectSettingsDialog(wx.Dialog):
     def _on_save(self, event):
         self.settings = self._collect_settings()
         save_settings(self.settings_path, self.settings)
-        wx.MessageBox("Settings saved.", "Konnect", wx.OK | wx.ICON_INFORMATION)
+        wx.MessageBox("Settings saved.", "Konnect", wx.OK | wx.ICON_INFORMATION, parent=self)
 
     def _on_start_stop(self, event):
         """Toggle server — delegates to parent plugin via return value."""

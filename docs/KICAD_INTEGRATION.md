@@ -313,3 +313,18 @@ must stay green in the light theme. Inspect `#schematic-image` and confirm that
 it is an HTML image and that the sheet's SVG elements are absent from the
 viewer document. The Rust viewer tests also validate the static CSP and reject
 non-schematic startup paths.
+
+### KiCad startup and PCB readiness
+
+Call **launch_kicad_ui** with **project** to start the KiCad Project Manager.
+With **wait_ready** enabled, generic project launch waits for IPC. A child
+that exits during startup returns **launched: false**, its **exit_status**
+when available, and a bounded **stderr_tail**. Konnect reaps the child even
+if the caller stops waiting.
+
+Supply an exact **board** path to wait for that PCB in the configured IPC
+endpoint. **ipc_ready** describes the endpoint. **requested_open** describes
+whether that PCB was observed there. When only **board** is supplied, Konnect
+observes the existing endpoint without spawning a project manager. Open the
+board in PCB Editor if it is absent, then call **open_project** to confirm the
+same path. A timeout reports the most recent observation.

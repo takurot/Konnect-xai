@@ -2182,9 +2182,7 @@ mod tests {
         let export = export_dsn(&board_path, source, &rules()).unwrap();
         std::fs::write(&dsn_path, export.dsn).expect("write DSN");
 
-        let output = std::process::Command::new("java")
-            .arg("-jar")
-            .arg(jar)
+        let output = crate::freerouting_mcp::java_command(Path::new(&jar))
             .arg("-de")
             .arg(&dsn_path)
             .arg("-do")
@@ -2228,9 +2226,7 @@ mod tests {
         let export = adopt_native_dsn(baseline, native.to_string()).unwrap();
         std::fs::write(&dsn_path, &export.dsn).expect("write native DSN");
 
-        let output = std::process::Command::new("java")
-            .arg("-jar")
-            .arg(jar)
+        let output = crate::freerouting_mcp::java_command(Path::new(&jar))
             .arg("-de")
             .arg(&dsn_path)
             .arg("-do")

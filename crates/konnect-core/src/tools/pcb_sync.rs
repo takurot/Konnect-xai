@@ -59,7 +59,10 @@ impl SchematicIdentity {
         ) -> Result<Option<String>> {
             let file = file.canonicalize()?;
             if !active.insert(file.clone()) {
-                bail!("schematic hierarchy contains a cycle at {}", file.display());
+                bail!(
+                    "schematic hierarchy contains a cycle at {}",
+                    konnect_sexp::paths::display_path(&file)
+                );
             }
             if !sheet_paths.insert(sheet_path.to_string()) {
                 bail!("saved hierarchy contains duplicate sheet identity {sheet_path}");
@@ -68,7 +71,10 @@ impl SchematicIdentity {
             let parent = file.parent().unwrap_or_else(|| Path::new("."));
             for sheet in schematic.sheets.iter() {
                 if sheet.uuid.is_empty() {
-                    bail!("saved hierarchy sheet in {} has no UUID", file.display());
+                    bail!(
+                        "saved hierarchy sheet in {} has no UUID",
+                        konnect_sexp::paths::display_path(&file)
+                    );
                 }
                 visit(
                     &parent.join(sheet.file()),
@@ -552,7 +558,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                     command: "PCB sync post-commit readback".to_owned(),
                     reason: format!(
                         "PCB sync commit succeeded on {}; readback failed, inspect the board before retrying",
-                        ipc_board.display()
+                        konnect_sexp::paths::display_path(&ipc_board)
                     ),
                 })
             })?;
@@ -2043,13 +2049,16 @@ fn saved_hierarchy_files(root: &Path) -> Result<Vec<PathBuf>> {
         active: &mut HashSet<PathBuf>,
         files: &mut Vec<PathBuf>,
     ) -> Result<()> {
-        let canonical = path
-            .canonicalize()
-            .with_context(|| format!("cannot resolve schematic {}", path.display()))?;
+        let canonical = path.canonicalize().with_context(|| {
+            format!(
+                "cannot resolve schematic {}",
+                konnect_sexp::paths::display_path(path)
+            )
+        })?;
         if active.contains(&canonical) {
             bail!(
                 "schematic hierarchy contains a cycle at {}",
-                canonical.display()
+                konnect_sexp::paths::display_path(&canonical)
             );
         }
         if !seen.insert(canonical.clone()) {
@@ -2064,11 +2073,16 @@ fn saved_hierarchy_files(root: &Path) -> Result<Vec<PathBuf>> {
         if lock.exists() {
             bail!(
                 "{} is open in the schematic editor; save and close the hierarchy before syncing",
-                canonical.display()
+                konnect_sexp::paths::display_path(&canonical)
             );
         }
-        let schematic = konnect_schematic_editor::Schematic::load(&canonical)
-            .with_context(|| format!("cannot load schematic {}", canonical.display()))?;
+        let schematic =
+            konnect_schematic_editor::Schematic::load(&canonical).with_context(|| {
+                format!(
+                    "cannot load schematic {}",
+                    konnect_sexp::paths::display_path(&canonical)
+                )
+            })?;
         files.push(canonical.clone());
         let parent = canonical.parent().unwrap_or_else(|| Path::new("."));
         for sheet in schematic.sheets.iter() {
@@ -2076,8 +2090,8 @@ fn saved_hierarchy_files(root: &Path) -> Result<Vec<PathBuf>> {
             if !child.exists() {
                 bail!(
                     "hierarchical sheet {} referenced by {} does not exist",
-                    child.display(),
-                    canonical.display()
+                    konnect_sexp::paths::display_path(&child),
+                    konnect_sexp::paths::display_path(&canonical)
                 );
             }
             visit(&child, seen, active, files)?;
@@ -2629,7 +2643,10 @@ fn prepare_footprint(
     let source = std::fs::read_to_string(&path).map_err(|error| {
         (
             "footprint_library_read_failed",
-            format!("failed to read {}: {error}", path.display()),
+            format!(
+                "failed to read {}: {error}",
+                konnect_sexp::paths::display_path(&path)
+            ),
         )
     })?;
     prepare_footprint_source(&source)
