@@ -87,6 +87,16 @@ where
     })
 }
 
+/// Run a non-mutating observation that may outlive its request's deadline.
+/// It must never hold a write/FIFO barrier after that deadline.
+pub(crate) fn spawn_read_only_blocking<F, R>(work: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

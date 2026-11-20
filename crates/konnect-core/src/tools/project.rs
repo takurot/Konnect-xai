@@ -171,7 +171,7 @@ fn existing_project_paths(paths: &[PathBuf]) -> std::io::Result<Vec<PathBuf>> {
 fn project_conflict(paths: Vec<PathBuf>) -> CallToolResult {
     let paths: Vec<String> = paths
         .into_iter()
-        .map(|path| path.display().to_string())
+        .map(|path| konnect_sexp::paths::display_path(&path).into_owned())
         .collect();
     CallToolResult::error_kind(
         ToolErrorKind::Conflict {
@@ -316,7 +316,7 @@ async fn handle_open_project(
             Ok(paths) => (
                 paths
                     .into_iter()
-                    .map(|path| path.display().to_string())
+                    .map(|path| konnect_sexp::paths::display_path(&path).into_owned())
                     .collect::<Vec<_>>(),
                 None,
             ),
@@ -331,21 +331,21 @@ async fn handle_open_project(
                 ctx.board_session.observe_live(&board);
                 (
                     Some(project_or_board),
-                    Some(board.display().to_string()),
+                    Some(konnect_sexp::paths::display_path(&board).into_owned()),
                     Some(true),
                     None,
                 )
             }
             Err(error) => (
                 Some(project_or_board),
-                Some(board.display().to_string()),
+                Some(konnect_sexp::paths::display_path(&board).into_owned()),
                 Some(false),
                 Some(format!("{error:#}")),
             ),
         },
         Some((project_or_board, board)) => (
             Some(project_or_board),
-            Some(board.display().to_string()),
+            Some(konnect_sexp::paths::display_path(&board).into_owned()),
             None,
             None,
         ),

@@ -421,3 +421,9 @@ fn a_project_root_is_the_directory_holding_a_library_table() {
 fn sexp_path(path: &std::path::Path) -> String {
     path.display().to_string().replace('\\', "\\\\")
 }
+
+#[test]
+fn library_code_uses_the_shared_verbatim_path_normalizer() {
+    let raw_prefix = ["strip_prefix(", r#"r"\\\\?\\""#].concat();
+    assert!(!include_str!("library.rs").contains(&raw_prefix));
+}

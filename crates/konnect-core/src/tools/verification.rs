@@ -136,14 +136,15 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "launch_kicad_ui",
-            "Launch the KiCAD GUI application and optionally open a project file.",
+            "Launch the KiCad project manager, optionally with a project, and observe IPC readiness. When given a board, wait for that exact PCB.",
             json!({
                 "type": "object",
                 "properties": {
                     "project": { "type": "string", "description": "Path to .kicad_pro file to open (optional)" },
+                    "board": { "type": "string", "description": "Exact .kicad_pcb path to observe. Open it in PCB Editor if the project manager does not open it." },
                     "wait_ready": {
                         "type": "boolean",
-                        "description": "Wait until KiCAD IPC is responsive before returning",
+                        "description": "Wait until IPC responds, or until the exact PCB is listed when board is supplied",
                         "default": true
                     },
                     "timeout_seconds": {
@@ -930,86 +931,246 @@ async fn handle_check_kicad_ui(
     }
 }
 
-async fn handle_launch_kicad_ui(
-    args: &serde_json::Value,
-    ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    let wait_ready = args["wait_ready"].as_bool().unwrap_or(true);
-    let timeout_secs = args["timeout_seconds"].as_u64().unwrap_or(30);
-    let binary = find_kicad_binary(&ctx.config.kicad_binary, &ctx.config.kicad_cli);
+const LAUNCH_GRACE: std::time::Duration = std::time::Duration::from_millis(125);
+const LAUNCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+const LAUNCH_STDERR_LIMIT: usize = 4096;
 
-    let mut cmd = tokio::process::Command::new(&binary);
-    // KiCad can outlive this server. It must not keep carrying the MCP pipes
-    // or receive terminal interrupts meant for the caller's process group.
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    cmd.process_group(0);
-    #[cfg(windows)]
-    {
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        cmd.creation_flags(DETACHED_PROCESS);
-    }
-    if let Some(project) = args["project"].as_str() {
-        cmd.arg(project);
-    }
+struct GuiExit {
+    status: std::io::Result<std::process::ExitStatus>,
+    stderr_tail: Option<tokio::sync::oneshot::Receiver<String>>,
+}
 
-    // Spawn detached — we don't wait for the process to exit
-    match cmd.spawn() {
-        Ok(_child) => {
-            if wait_ready {
-                // Poll IPC until responsive or timeout
-                let addr = ctx.config.ipc_address.clone();
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+fn supervise_gui(mut child: tokio::process::Child) -> tokio::sync::oneshot::Receiver<GuiExit> {
+    use tokio::io::AsyncReadExt;
 
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let addr2 = addr.clone();
-                    let ok = crate::tools::blocking_work::spawn_tracked_blocking(move || {
-                        konnect_ipc::client::KiCadIpcClient::new(&addr2)
-                            .ping()
-                            .unwrap_or(false)
-                    })
-                    .await
-                    .unwrap_or(false);
-
-                    if ok {
-                        return Ok(CallToolResult::text(
-                            serde_json::to_string(&json!({
-                                "launched": true,
-                                "ipc_ready": true
-                            }))
-                            .unwrap(),
-                        ));
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        return Ok(CallToolResult::text(
-                            serde_json::to_string(&json!({
-                                "launched": true,
-                                "ipc_ready": false,
-                                "note": "KiCAD launched but IPC not yet responsive within timeout"
-                            }))
-                            .unwrap(),
-                        ));
-                    }
-                }
-            }
-
-            Ok(CallToolResult::text(
-                serde_json::to_string(&json!({
-                    "launched": true,
-                    "ipc_ready": null
-                }))
-                .unwrap(),
-            ))
+    let stderr = child.stderr.take();
+    let tail = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let output = tail.clone();
+    let drain = tokio::spawn(async move {
+        let Some(mut stderr) = stderr else { return };
+        let mut buffer = [0; LAUNCH_STDERR_LIMIT];
+        while let Ok(size @ 1..) = stderr.read(&mut buffer).await {
+            let mut tail = output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let overflow = (tail.len() + size).saturating_sub(LAUNCH_STDERR_LIMIT);
+            tail.drain(..overflow);
+            tail.extend(&buffer[..size]);
         }
-        Err(e) => Ok(CallToolResult::error(format!(
-            "Failed to launch KiCAD ({}): {}",
-            binary, e
-        ))),
+    });
+    let (send, receive) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let status = child.wait().await;
+        let (send_tail, stderr_tail) = tokio::sync::oneshot::channel();
+        let _ = send.send(GuiExit {
+            status,
+            stderr_tail: Some(stderr_tail),
+        });
+        let mut drain = drain;
+        if tokio::time::timeout(LAUNCH_GRACE, &mut drain)
+            .await
+            .is_err()
+        {
+            drain.abort();
+        }
+        let bytes: Vec<_> = tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect();
+        let stderr_tail = String::from_utf8_lossy(&bytes).trim().to_owned();
+        let _ = send_tail.send(stderr_tail);
+    });
+    receive
+}
+
+async fn early_gui_exit(child: &mut Option<tokio::sync::oneshot::Receiver<GuiExit>>) -> GuiExit {
+    match child {
+        Some(child) => child.await.unwrap_or_else(|error| GuiExit {
+            status: Err(std::io::Error::other(error)),
+            stderr_tail: None,
+        }),
+        None => std::future::pending().await,
     }
+}
+
+async fn launch_exit_result(exit: GuiExit, requested_board: Option<&Path>) -> CallToolResult {
+    let stderr_tail = match exit.stderr_tail {
+        Some(tail) => tail.await.unwrap_or_default(),
+        None => String::new(),
+    };
+    let (exit_status, note) = match exit.status {
+        Ok(status) => (
+            status.code(),
+            format!("KiCad's launcher exited during startup ({status})."),
+        ),
+        Err(error) => (
+            None,
+            format!("KiCad's launcher exit could not be read: {error}."),
+        ),
+    };
+    CallToolResult::json(&json!({
+        "launched": false,
+        "ipc_ready": null,
+        "requested_board": requested_board.map(konnect_sexp::paths::display_path),
+        "requested_open": null,
+        "exit_status": exit_status,
+        "stderr_tail": stderr_tail,
+        "note": note,
+    }))
+}
+
+#[derive(Default)]
+struct LaunchObservation {
+    ipc_ready: bool,
+    requested_open: Option<bool>,
+    unsupported: bool,
+}
+
+fn observe_launch(address: &str, board: Option<&Path>) -> LaunchObservation {
+    let ipc = konnect_ipc::client::KiCadIpcClient::new(address);
+    let ipc_ready = ipc.ping().unwrap_or(false);
+    let Some(board) = board.filter(|_| ipc_ready) else {
+        return LaunchObservation {
+            ipc_ready,
+            ..LaunchObservation::default()
+        };
+    };
+    match ipc.find_open_board(board) {
+        Ok(_) => LaunchObservation {
+            ipc_ready,
+            requested_open: Some(true),
+            unsupported: false,
+        },
+        Err(error) => LaunchObservation {
+            ipc_ready,
+            requested_open: error
+                .downcast_ref::<konnect_ipc::BoardTargetError>()
+                .filter(|error| {
+                    matches!(
+                        error,
+                        konnect_ipc::BoardTargetError::NoOpenDocuments { .. }
+                            | konnect_ipc::BoardTargetError::WrongDocument { .. }
+                    )
+                })
+                .map(|_| false),
+            unsupported: konnect_ipc::ApiStatusError::from_error(&error)
+                .is_some_and(konnect_ipc::ApiStatusError::is_unsupported),
+        },
+    }
+}
+
+async fn handle_launch_kicad_ui(args: &Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+    use std::time::Duration;
+    use tokio::time::{sleep, timeout_at, Instant};
+
+    let wait_ready = args["wait_ready"].as_bool().unwrap_or(true);
+    let timeout = if args["timeout_seconds"].is_null() {
+        30
+    } else {
+        match health_timeout_seconds(args) {
+            Ok(timeout) => timeout,
+            Err(error) => return Ok(error),
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    let board = args["board"].as_str().map(PathBuf::from);
+    if board.as_ref().is_some_and(|path| {
+        !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pcb"))
+    }) {
+        return Ok(invalid_arg("board", "expected a .kicad_pcb path"));
+    }
+
+    // The project manager cannot reliably open a board supplied on its command
+    // line. In board-only mode use the configured endpoint for observation.
+    let project = args["project"].as_str();
+    let mut child = if board.is_some() && project.is_none() {
+        None
+    } else {
+        let binary = find_kicad_binary(&ctx.config.kicad_binary, &ctx.config.kicad_cli);
+        let mut cmd = tokio::process::Command::new(&binary);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        cmd.process_group(0);
+        #[cfg(windows)]
+        {
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            cmd.creation_flags(DETACHED_PROCESS);
+        }
+        if let Some(project) = project {
+            cmd.arg(project);
+        }
+        match cmd.spawn() {
+            Ok(child) => Some(supervise_gui(child)),
+            Err(error) => {
+                return Ok(CallToolResult::error(format!(
+                    "Failed to launch KiCad ({binary}): {error}"
+                )))
+            }
+        }
+    };
+
+    if child.is_some() {
+        tokio::select! {
+            biased;
+            exit = early_gui_exit(&mut child) => return Ok(launch_exit_result(exit, board.as_deref()).await),
+            () = sleep(LAUNCH_GRACE) => {}
+        }
+    }
+
+    let mut observed = LaunchObservation::default();
+    let mut timed_out = false;
+    if wait_ready {
+        let observation = async {
+            loop {
+                let address = ctx.config.ipc_address.clone();
+                let requested = board.clone();
+                observed = crate::tools::blocking_work::spawn_read_only_blocking(move || {
+                    observe_launch(&address, requested.as_deref())
+                })
+                .await?;
+                if observed.unsupported
+                    || (board.is_none() && observed.ipc_ready)
+                    || observed.requested_open == Some(true)
+                {
+                    return Ok::<(), tokio::task::JoinError>(());
+                }
+                sleep(LAUNCH_POLL_INTERVAL).await;
+            }
+        };
+        tokio::select! {
+            biased;
+            exit = early_gui_exit(&mut child) => return Ok(launch_exit_result(exit, board.as_deref()).await),
+            result = timeout_at(deadline, observation) => match result {
+                Ok(result) => result?,
+                Err(_) => timed_out = true,
+            }
+        }
+    }
+    if observed.requested_open == Some(true) {
+        if let Some(board) = &board {
+            ctx.board_session.observe_live(board);
+        }
+    }
+    let note = match (board.is_some(), child.is_some(), observed.requested_open, timed_out) {
+        (true, _, Some(true), _) => Some("The requested PCB is open in KiCad."),
+        (true, _, _, _) => Some("Open the requested PCB in KiCad's PCB Editor, then call open_project with the same path to verify it. The project manager cannot open a PCB by path."),
+        (false, true, _, true) => Some("KiCad launched but IPC did not respond within the timeout."),
+        _ => None,
+    };
+    Ok(CallToolResult::json(&json!({
+        "launched": child.is_some(),
+        "ipc_ready": wait_ready.then_some(observed.ipc_ready),
+        "requested_board": board.as_deref().map(konnect_sexp::paths::display_path),
+        "requested_open": observed.requested_open,
+        "timed_out": timed_out,
+        "note": note,
+    })))
 }
 
 // ─── Copy routing pattern ─────────────────────────────────────────────────────
@@ -1607,6 +1768,186 @@ mod tests {
             },
             Arc::new(ToolRouter::new()),
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launching_an_immediately_failed_process_reports_exit_and_diagnostic() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let gui = dir.path().join("failing-kicad");
+        std::fs::write(
+            &gui,
+            "#!/bin/sh\nprintf '%s\\n' 'synthetic launch error' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gui, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut ctx = test_ctx();
+        ctx.config.kicad_binary = gui.display().to_string();
+        ctx.config.ipc_address = format!("ipc://{}", dir.path().join("absent").display());
+
+        for wait_ready in [true, false] {
+            let result = handle_launch_kicad_ui(
+                &json!({"timeout_seconds": 1, "wait_ready": wait_ready}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected launch status");
+            };
+            let response: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(response["launched"], false, "{response}");
+            assert_eq!(response["exit_status"], 1, "{response}");
+            assert_eq!(
+                response["stderr_tail"], "synthetic launch error",
+                "{response}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn requested_pcb_readiness_needs_the_exact_document() {
+        use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target").join("board.kicad_pcb");
+        let other = dir.path().join("other").join("board.kicad_pcb");
+        for path in [&board, &other] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "saved board bytes").unwrap();
+        }
+        for (open, expected) in [(&board, true), (&other, false)] {
+            let endpoint = spawn_kicad_holding_board(open, |_| None);
+            let ctx = ctx_talking_to(endpoint.address().to_owned());
+            let response =
+                handle_launch_kicad_ui(&json!({"board": board, "timeout_seconds": 1}), &ctx)
+                    .await
+                    .unwrap();
+            let crate::mcp::protocol::ToolContent::Text { text } = &response.content[0] else {
+                panic!("expected readiness report");
+            };
+            let response: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(response["launched"], false);
+            assert_eq!(response["ipc_ready"], true);
+            assert_eq!(response["requested_open"], expected);
+            assert_eq!(response["timed_out"], !expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn target_readiness_retries_not_ready_but_refuses_a_manager_only_endpoint() {
+        use crate::tools::pcb_board::board_mock::{board_document, ctx_talking_to};
+        use konnect_ipc::{builders, gen::kiapi};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "saved").unwrap();
+        for manager_only in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let requests = calls.clone();
+            let document = board_document(&board.to_string_lossy());
+            let server =
+                crate::test_support::MockIpcServer::spawn("target-readiness", move |request| {
+                    use kiapi::common::ApiStatusCode;
+                    let inventory = request
+                        .message
+                        .unwrap()
+                        .type_url
+                        .ends_with("GetOpenDocuments");
+                    let (status, message) = if !inventory {
+                        (ApiStatusCode::AsOk, None)
+                    } else if manager_only {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        (ApiStatusCode::AsUnhandled, None)
+                    } else if requests.fetch_add(1, Ordering::Relaxed) == 0 {
+                        (ApiStatusCode::AsNotReady, None)
+                    } else {
+                        (
+                            ApiStatusCode::AsOk,
+                            Some(builders::pack_any(
+                                &kiapi::common::commands::GetOpenDocumentsResponse {
+                                    documents: vec![document.clone()],
+                                },
+                                "kiapi.common.commands.GetOpenDocumentsResponse",
+                            )),
+                        )
+                    };
+                    kiapi::common::ApiResponse {
+                        status: Some(kiapi::common::ApiResponseStatus {
+                            status: status as i32,
+                            error_message: String::new(),
+                        }),
+                        header: None,
+                        message,
+                    }
+                });
+            let result = handle_launch_kicad_ui(
+                &json!({"board": board, "timeout_seconds": 3}),
+                &ctx_talking_to(server.address().to_owned()),
+            )
+            .await
+            .unwrap();
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected readiness report");
+            };
+            let result: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(result["ipc_ready"], true);
+            assert_eq!(
+                result["requested_open"],
+                if manager_only {
+                    Value::Null
+                } else {
+                    json!(true)
+                }
+            );
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                if manager_only { 1 } else { 2 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_board_observation_cannot_exceed_the_launch_wait_budget() {
+        use konnect_ipc::gen::kiapi;
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        let server =
+            crate::test_support::MockIpcServer::spawn("slow-launch-observation", |request| {
+                if request
+                    .message
+                    .unwrap()
+                    .type_url
+                    .ends_with("GetOpenDocuments")
+                {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+                kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: None,
+                }
+            });
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_owned());
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_millis(1700),
+            handle_launch_kicad_ui(&json!({"board": board, "timeout_seconds": 1}), &ctx),
+        )
+        .await
+        .expect("the full observation honors the deadline")
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &answer.content[0] else {
+            panic!("expected readiness report");
+        };
+        let result: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(result["timed_out"], true);
+        assert!(result["requested_open"].is_null());
     }
 
     #[test]

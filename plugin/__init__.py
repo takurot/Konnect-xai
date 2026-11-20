@@ -204,13 +204,17 @@ def _run_server():
             _clear_pid_file(pid)
 
 
-def start_server():
+def start_server(parent=None):
     """Start the MCP server in a background thread."""
     global _server_thread
 
     if _CACHE_DIR is None:
-        wx.MessageBox("Konnect state path is unavailable. Check KONNECT_STATE_DIR.",
-                      "Konnect", wx.OK | wx.ICON_ERROR)
+        wx.MessageBox(
+            "Konnect state path is unavailable. Check KONNECT_STATE_DIR.",
+            "Konnect",
+            wx.OK | wx.ICON_ERROR,
+            parent=parent,
+        )
         return False
 
     if not os.path.exists(BINARY_PATH):
@@ -219,6 +223,7 @@ def start_server():
             "Please reinstall the plugin.",
             "Konnect",
             wx.OK | wx.ICON_ERROR,
+            parent=parent,
         )
         return False
 
@@ -249,6 +254,21 @@ def is_server_running():
 
 # ─── KiCAD Action Plugin entry point ─────────────────────────────────────────
 
+def _pcb_editor_window():
+    """Choose the focused PCB frame, or the only recognizable PCB frame."""
+    windows = [
+        window for window in wx.GetTopLevelWindows()
+        if "pcb editor" in window.GetTitle().casefold()
+        or window.GetName().casefold().startswith("pcbnew")
+    ]
+    focus = wx.Window.FindFocus()
+    if focus is not None:
+        active = wx.GetTopLevelParent(focus)
+        if active in windows:
+            return active
+    return windows[0] if len(windows) == 1 else None
+
+
 class KonnectPlugin(pcbnew.ActionPlugin):
     def defaults(self):
         self.name = "Konnect"
@@ -261,9 +281,14 @@ class KonnectPlugin(pcbnew.ActionPlugin):
         self.icon_file_name = os.path.join(PLUGIN_DIR, "resources", "icon.png")
 
     def Run(self):
-        """Open the settings dialog. Server start/stop is handled via dialog buttons."""
-        # Get the KiCAD main window as parent for the dialog
-        parent = wx.GetTopLevelWindows()[0] if wx.GetTopLevelWindows() else None
+        """Open settings on the board editor that invoked the action."""
+        parent = _pcb_editor_window()
+
+        def set_server_running(running, dialog):
+            if running:
+                return start_server(parent=dialog)
+            stop_server()
+            return True
 
         dlg = KonnectSettingsDialog(
             parent=parent,
@@ -272,18 +297,14 @@ class KonnectPlugin(pcbnew.ActionPlugin):
             server_running=is_server_running(),
             native_bridge_available=_native_bridge.available(),
             native_bridge_running=_native_bridge.running(),
+            server_action=set_server_running,
+            read_server_status=is_server_running,
         )
 
-        result = dlg.ShowModal()
-
-        if result == wx.ID_YES:
-            # User clicked "Start Server"
-            start_server()
-        elif result == wx.ID_NO:
-            # User clicked "Stop Server"
-            stop_server()
-
-        dlg.Destroy()
+        try:
+            dlg.ShowModal()
+        finally:
+            dlg.Destroy()
         _sync_native_bridge()
 
 

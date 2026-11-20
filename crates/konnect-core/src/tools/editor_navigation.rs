@@ -285,6 +285,25 @@ fn parse_selection_target(args: &serde_json::Value) -> Result<IpcEditorDocument,
 }
 
 fn selection_error_result(error: anyhow::Error) -> CallToolResult {
+    if let Some(unsupported) = error.downcast_ref::<konnect_ipc::IpcSchematicIdentityUnsupported>()
+    {
+        return CallToolResult::error_kind(
+            ToolErrorKind::UnsupportedCapability {
+                capability: "schematic_editor_document_identity".to_owned(),
+                kicad_version: unsupported.kicad_version.clone(),
+            },
+            unsupported.to_string(),
+        );
+    }
+    if let Some(document_error) = error.downcast_ref::<konnect_ipc::IpcDocumentObservationError>() {
+        return CallToolResult::error_kind(
+            ToolErrorKind::StaleTarget {
+                target: format!("{} editor document state", document_error.editor.as_str()),
+                reason: document_error.reason.clone(),
+            },
+            document_error.to_string(),
+        );
+    }
     if let Some(selection) = konnect_ipc::IpcSelectionObservationError::from_error(&error) {
         let kind = match selection.kind {
             IpcSelectionObservationErrorKind::WrongProject => ToolErrorKind::WrongProject {
@@ -909,7 +928,7 @@ mod tests {
         }
     }
 
-    fn spawn_observation_mock() -> String {
+    fn spawn_observation_mock(legacy_schematic: bool) -> String {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let url = format!(
             "inproc://editor-state-core-{}",
@@ -939,10 +958,31 @@ mod tests {
                         "kiapi.common.commands.GetVersionResponse",
                     )
                 } else {
+                    use kiapi::common::types::{
+                        document_specifier::Identifier, DocumentSpecifier, DocumentType,
+                    };
+                    let request =
+                        kiapi::common::commands::GetOpenDocuments::decode(command.value.as_slice())
+                            .unwrap();
+                    let documents = if legacy_schematic {
+                        if request.r#type == DocumentType::DoctypeSchematic as i32 {
+                            vec![DocumentSpecifier {
+                                r#type: DocumentType::DoctypeSchematic as i32,
+                                project: None,
+                                identifier: Some(Identifier::BoardFilename(
+                                    "legacy.kicad_sch".into(),
+                                )),
+                            }]
+                        } else {
+                            vec![crate::tools::pcb_board::board_mock::board_document(
+                                "fixture.kicad_pcb",
+                            )]
+                        }
+                    } else {
+                        Vec::new()
+                    };
                     builders::pack_any(
-                        &kiapi::common::commands::GetOpenDocumentsResponse {
-                            documents: Vec::new(),
-                        },
+                        &kiapi::common::commands::GetOpenDocumentsResponse { documents },
                         "kiapi.common.commands.GetOpenDocumentsResponse",
                     )
                 };
@@ -1289,6 +1329,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schematic_filename_only_response_is_typed_even_without_a_version() {
+        use kiapi::common::types::{
+            document_specifier::Identifier, DocumentSpecifier, DocumentType, ProjectSpecifier,
+        };
+        for has_project in [false, true] {
+            let mock = crate::test_support::MockIpcServer::spawn(
+                "legacy-schema-selection",
+                move |request| {
+                    let command = request.message.expect("command");
+                    let (status, message) = if command.type_url.ends_with("GetOpenDocuments") {
+                        let document = DocumentSpecifier {
+                            r#type: DocumentType::DoctypeSchematic as i32,
+                            project: has_project.then(|| ProjectSpecifier {
+                                name: "project".into(),
+                                path: "/project".into(),
+                            }),
+                            identifier: Some(Identifier::BoardFilename("legacy.kicad_sch".into())),
+                        };
+                        (
+                            kiapi::common::ApiStatusCode::AsOk,
+                            Some(builders::pack_any(
+                                &kiapi::common::commands::GetOpenDocumentsResponse {
+                                    documents: vec![document],
+                                },
+                                "kiapi.common.commands.GetOpenDocumentsResponse",
+                            )),
+                        )
+                    } else {
+                        assert!(
+                            command.type_url.ends_with("GetVersion"),
+                            "identity must be checked before selection"
+                        );
+                        (kiapi::common::ApiStatusCode::AsUnhandled, None)
+                    };
+                    kiapi::common::ApiResponse {
+                        status: Some(kiapi::common::ApiResponseStatus {
+                            status: status as i32,
+                            error_message: String::new(),
+                        }),
+                        header: None,
+                        message,
+                    }
+                },
+            );
+            let result = handle_get_editor_selection(
+                &json!({"editor":"schematic", "project_name":"project", "project_path":"/project", "sheet_instance_path":["root"]}),
+                &context(mock.address().to_owned()),
+            )
+            .await
+            .unwrap();
+            let kind = crate::mcp::error::extract_error_kind(&result).unwrap();
+            assert_eq!(
+                kind,
+                if has_project {
+                    "stale_target"
+                } else {
+                    "unsupported_capability"
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_schematic_identity_is_unsupported_without_hiding_the_pcb_editor() {
+        let result = handle_get_editor_state(&json!({}), &context(spawn_observation_mock(true)))
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected editor observation");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        let schematic = &body["editors"][0];
+        assert_eq!(schematic["addressable"], false);
+        assert_eq!(
+            schematic["capabilities"]["observe_documents"]["availability"],
+            "unsupported"
+        );
+        assert!(schematic["unavailable_reason"]
+            .as_str()
+            .unwrap()
+            .contains("10.0.5"));
+        assert_eq!(body["editors"][1]["addressable"], true);
+        assert_eq!(body["editors"][1]["documents"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn unconfigured_endpoint_is_a_structured_editor_unavailable_refusal() {
         let result = handle_get_editor_state(&json!({}), &context(String::new()))
             .await
@@ -1302,7 +1429,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_result_is_derived_from_typed_ipc_observation() {
-        let result = handle_get_editor_state(&json!({}), &context(spawn_observation_mock()))
+        let result = handle_get_editor_state(&json!({}), &context(spawn_observation_mock(false)))
             .await
             .expect("handler result");
         assert!(!result.is_error);

@@ -605,7 +605,7 @@ fn mutation_uncertain_result(error: &anyhow::Error, operation: &str) -> Option<C
         }
         None
     })?;
-    let path = path.display().to_string();
+    let path = konnect_sexp::paths::display_path(path).into_owned();
     let result = CallToolResult::error_kind(
         ToolErrorKind::MutationOutcomeUncertain { operation: operation.into(), path: path.clone(), reason: reason.clone() },
         format!("Saved-file mutation outcome is uncertain for '{path}': {reason}. Reload and inspect the document before retrying; do not repeat the mutation blindly."),
@@ -633,7 +633,7 @@ fn revision_conflict_result(error: &anyhow::Error) -> Option<CallToolResult> {
         }
         None
     })?;
-    let path = path.display().to_string();
+    let path = konnect_sexp::paths::display_path(path).into_owned();
     Some(CallToolResult::error_kind(
         ToolErrorKind::Conflict { paths: vec![path.clone()] },
         format!("Revision conflict for '{path}'. Reload and inspect the current document state before retrying; the requested result was not verified."),

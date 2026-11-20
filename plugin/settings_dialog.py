@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 import wx
 
@@ -179,15 +180,16 @@ class KonnectSettingsDialog(wx.Dialog):
         server_running=False,
         native_bridge_available=False,
         native_bridge_running=False,
+        server_action=None,
+        read_server_status=None,
     ):
         # No fixed pixel size: on high-DPI/scaled Windows displays a fixed
         # (520, 480) clipped the Save/Close buttons off-screen (issue #18).
         # The dialog is sized to fit its content after _build_ui instead.
-        super().__init__(
-            parent,
-            title="Konnect Settings",
-            style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
-        )
+        style = wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER
+        if parent is None:
+            style |= wx.DIALOG_NO_PARENT
+        super().__init__(parent, title="Konnect Settings", style=style)
         self.plugin_dir = plugin_dir
         self.binary_path = binary_path
         self.settings_path = os.path.join(plugin_dir, "settings.json")
@@ -195,15 +197,25 @@ class KonnectSettingsDialog(wx.Dialog):
         self._server_running = server_running
         self._native_bridge_available = native_bridge_available
         self._native_bridge_running = native_bridge_running
+        self._server_action = server_action
+        self._read_server_status = read_server_status
+        self._pending_toggle = None
 
         self._build_ui()
         self._populate_fields()
+        if read_server_status is not None:
+            self._status_timer = wx.Timer(self)
+            self.Bind(wx.EVT_TIMER, self._poll_server_status, self._status_timer)
+            self._status_timer.Start(250)
 
         # Size to content (DPI-aware), with a sensible minimum width so the
         # path fields aren't cramped. FromDIP scales with the display.
         self.SetMinClientSize(self.FromDIP(wx.Size(520, 0)))
         self.Fit()
-        self.CenterOnParent()
+        if parent is None:
+            self.Centre()
+        else:
+            self.CenterOnParent()
 
     def _build_ui(self):
         panel = wx.Panel(self)
@@ -367,13 +379,32 @@ class KonnectSettingsDialog(wx.Dialog):
     def _on_save(self, event):
         self.settings = self._collect_settings()
         save_settings(self.settings_path, self.settings)
-        wx.MessageBox("Settings saved.", "Konnect", wx.OK | wx.ICON_INFORMATION)
+        wx.MessageBox("Settings saved.", "Konnect", wx.OK | wx.ICON_INFORMATION, parent=self)
 
     def _on_start_stop(self, event):
-        """Toggle server — delegates to parent plugin via return value."""
+        """Toggle the server from this dialog and wait for PID status readback."""
         self.settings = self._collect_settings()
         save_settings(self.settings_path, self.settings)
-        self.EndModal(wx.ID_YES if not self._server_running else wx.ID_NO)
+        if self._server_action is None:
+            self.EndModal(wx.ID_YES if not self._server_running else wx.ID_NO)
+            return
+        desired = not self._server_running
+        if self._server_action(desired, self):
+            self._pending_toggle = (desired, time.monotonic() + 3)
+            self.start_stop_btn.Disable()
+            self._poll_server_status()
+
+    def _poll_server_status(self, _event=None):
+        running = self._read_server_status()
+        if self._pending_toggle is not None:
+            desired, deadline = self._pending_toggle
+            if running != desired and time.monotonic() < deadline:
+                return
+            self._pending_toggle = None
+            self.start_stop_btn.Enable()
+        if running != self._server_running:
+            self._server_running = running
+            self._update_server_status()
 
     def _on_close(self, event):
         self.EndModal(wx.ID_CLOSE)

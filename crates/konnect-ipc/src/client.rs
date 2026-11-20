@@ -798,6 +798,27 @@ impl std::fmt::Display for IpcDocumentObservationError {
 
 impl std::error::Error for IpcDocumentObservationError {}
 
+/// The schematic endpoint replied with the legacy filename-only KiCad shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcSchematicIdentityUnsupported {
+    pub kicad_version: Option<String>,
+}
+
+impl std::fmt::Display for IpcSchematicIdentityUnsupported {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kicad = self.kicad_version.as_ref().map_or_else(
+            || "This KiCad endpoint".to_owned(),
+            |version| format!("KiCad {version}"),
+        );
+        write!(
+            formatter,
+            "{kicad} reports a schematic filename without project or sheet identity"
+        )
+    }
+}
+
+impl std::error::Error for IpcSchematicIdentityUnsupported {}
+
 /// A board-bearing operation could not resolve one exact live KiCad document.
 ///
 /// `NoOpenDocuments` and `WrongDocument` positively prove that the requested
@@ -1727,7 +1748,20 @@ impl KiCadIpcClient {
         let raw_documents = self.get_open_documents_for(requested.editor)?;
         let mut documents = Vec::with_capacity(raw_documents.len());
         for raw in raw_documents {
-            let observed = editor_document_from_specifier(requested.editor, raw.clone())?;
+            let observed =
+                editor_document_from_specifier(requested.editor, raw.clone()).map_err(|error| {
+                    if error.is::<IpcSchematicIdentityUnsupported>() {
+                        IpcSchematicIdentityUnsupported {
+                            kicad_version: self
+                                .get_kicad_version()
+                                .ok()
+                                .map(|version| version.full_version),
+                        }
+                        .into()
+                    } else {
+                        error
+                    }
+                })?;
             documents.push((raw, observed));
         }
 
@@ -1807,7 +1841,33 @@ impl KiCadIpcClient {
         let documents = documents
             .into_iter()
             .map(|document| editor_document_from_specifier(editor, document))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>();
+        let documents = match documents {
+            Ok(documents) => documents,
+            Err(error) if error.is::<IpcSchematicIdentityUnsupported>() => {
+                let reason = IpcSchematicIdentityUnsupported {
+                    kicad_version: Some(version.full_version.clone()),
+                }
+                .to_string();
+                let mut capabilities = editor_capabilities(editor, version, false);
+                for capability in [
+                    &mut capabilities.observe_documents,
+                    &mut capabilities.read_selection,
+                    &mut capabilities.mutate_selection,
+                    &mut capabilities.cross_probe,
+                ] {
+                    capability.reason = Some(reason.clone());
+                }
+                return Ok(IpcEditorObservation {
+                    editor,
+                    addressable: false,
+                    documents: Vec::new(),
+                    capabilities,
+                    unavailable_reason: Some(reason),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         Ok(IpcEditorObservation {
             editor,
             addressable: true,
@@ -1856,7 +1916,7 @@ impl KiCadIpcClient {
                     | BoardTargetError::UnresolvedDocumentIdentities { .. }),
                 ) => Err(anyhow::Error::new(error)),
                 Err(_) => Err(anyhow::Error::new(BoardTargetError::StaleDocument {
-                    requested: bound.requested.display().to_string(),
+                    requested: konnect_sexp::paths::display_path(&bound.requested).into_owned(),
                     previously_bound: board_document_label(&bound.document),
                     open_documents: board_document_labels(&docs),
                 })),
@@ -1912,7 +1972,7 @@ impl KiCadIpcClient {
         if let Some(previous) = bound.as_ref() {
             if previous.document != document {
                 return Err(anyhow::Error::new(BoardTargetError::StaleDocument {
-                    requested: requested.display().to_string(),
+                    requested: konnect_sexp::paths::display_path(&requested).into_owned(),
                     previously_bound: board_document_label(&previous.document),
                     open_documents: vec![board_document_label(&document)],
                 }));
@@ -5096,7 +5156,8 @@ fn editor_document_from_specifier(
     let (document_path, sheet_instance_path) = match (expected, document.identifier.as_ref()) {
         (IpcEditorKind::Pcb, Some(Identifier::BoardFilename(filename))) if !filename.is_empty() => {
             (
-                board_document_path(&document).map(|path| path.display().to_string()),
+                board_document_path(&document)
+                    .map(|path| konnect_sexp::paths::display_path(&path).into_owned()),
                 None,
             )
         }
@@ -5110,6 +5171,14 @@ fn editor_document_from_specifier(
                     human_readable: path.path_human_readable.clone(),
                 }),
             )
+        }
+        (IpcEditorKind::Schematic, Some(Identifier::BoardFilename(filename)))
+            if document.project.is_none() && !filename.is_empty() =>
+        {
+            return Err(IpcSchematicIdentityUnsupported {
+                kicad_version: None,
+            }
+            .into());
         }
         _ => {
             return Err(anyhow::Error::new(IpcDocumentObservationError {
@@ -5463,7 +5532,7 @@ fn editor_capabilities(
 
 fn board_document_label(document: &kiapi::common::types::DocumentSpecifier) -> String {
     board_document_identity(document)
-        .map(|path| path.display().to_string())
+        .map(|path| konnect_sexp::paths::display_path(&path).into_owned())
         .unwrap_or_else(|reason| format!("<unidentified PCB document: {reason}>"))
 }
 
@@ -5477,7 +5546,7 @@ fn select_requested_board(
     documents: &[kiapi::common::types::DocumentSpecifier],
     requested: &Path,
 ) -> std::result::Result<kiapi::common::types::DocumentSpecifier, BoardTargetError> {
-    let requested_label = requested.display().to_string();
+    let requested_label = konnect_sexp::paths::display_path(requested).into_owned();
     if documents.is_empty() {
         return Err(BoardTargetError::NoOpenDocuments {
             requested: requested_label,
@@ -5611,13 +5680,19 @@ fn board_document_identity(
 /// might not, which is exactly the case that must fail closed rather than
 /// resolve to "different".
 fn comparable_identity(path: &Path) -> std::result::Result<PathBuf, String> {
-    match path.canonicalize() {
-        Ok(resolved) => Ok(resolved),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(lexically_normalized(path))
+    let resolved = match path.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => lexically_normalized(path),
+        Err(error) => return Err(format!("cannot be resolved on this filesystem: {error}")),
+    };
+    #[cfg(windows)]
+    if let Some(text) = resolved.to_str() {
+        let comparable = konnect_sexp::paths::strip_windows_verbatim(text);
+        if comparable != text {
+            return Ok(PathBuf::from(comparable.as_ref()));
         }
-        Err(error) => Err(format!("cannot be resolved on this filesystem: {error}")),
     }
+    Ok(resolved)
 }
 
 /// `.` and `..` removed without touching the filesystem. Only used for paths
@@ -8092,5 +8167,37 @@ mod helper_tests {
         let decoded = kiapi::board::types::BoardText::decode(item.value.as_slice()).unwrap();
         let attributes = decoded.text.unwrap().attributes.unwrap();
         assert_eq!(attributes.angle.unwrap().value_degrees, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod schematic_identity_contract_tests {
+    use super::*;
+    use kiapi::common::types::{
+        document_specifier::Identifier, DocumentSpecifier, DocumentType, Kiid, ProjectSpecifier,
+        SheetPath,
+    };
+
+    #[test]
+    fn a_complete_schematic_document_keeps_the_typed_sheet_identity() {
+        let target = editor_document_from_specifier(
+            IpcEditorKind::Schematic,
+            DocumentSpecifier {
+                r#type: DocumentType::DoctypeSchematic as i32,
+                project: Some(ProjectSpecifier {
+                    name: "fixture".into(),
+                    path: "/fixture".into(),
+                }),
+                identifier: Some(Identifier::SheetPath(SheetPath {
+                    path: vec![Kiid {
+                        value: "root".into(),
+                    }],
+                    path_human_readable: "/".into(),
+                })),
+            },
+        )
+        .unwrap();
+        assert_eq!(target.sheet_instance_path.unwrap().kiids, ["root"]);
+        assert_eq!(target.project.unwrap().name, "fixture");
     }
 }
