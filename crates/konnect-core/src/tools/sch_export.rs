@@ -1263,6 +1263,42 @@ mod netlist_summary_tests {
             .any(|net| net == "Net-(TP8-Pad1)"));
     }
 
+    #[tokio::test]
+    async fn ecc83_offline_summary_matches_its_frozen_native_netlist() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let oracle = include_str!("../../tests/fixtures/ecc83_multiunit.native-nets.tsv");
+        let expected: BTreeMap<_, BTreeSet<_>> = oracle
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|row| {
+                let (name, pins) = row.split_once('\t').unwrap();
+                (
+                    name.to_owned(),
+                    pins.split_whitespace().map(str::to_owned).collect(),
+                )
+            })
+            .collect();
+        let result = summary(ECC83).await;
+        let mut actual: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for component in result["components"].as_array().unwrap() {
+            let reference = component["reference"].as_str().unwrap();
+            if reference.starts_with('#') {
+                continue;
+            }
+            for pin in component["pins"].as_array().unwrap() {
+                let net = pin["net"].as_str().unwrap();
+                if net != "~" {
+                    actual
+                        .entry(net.to_owned())
+                        .or_default()
+                        .insert(format!("{reference}.{}", pin["number"].as_str().unwrap()));
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
     /// The regression: nets came from labels alone, so a pin reached only
     /// through a power symbol reported `"~"` and the rail was absent from
     /// `nets` — the summary showed every power connection as unconnected.
