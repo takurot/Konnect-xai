@@ -1654,6 +1654,25 @@ mod net_query_tests {
     }
 
     #[tokio::test]
+    async fn a_generated_net_does_not_merge_with_an_explicit_label_of_the_same_text() {
+        let source = include_str!("../../tests/fixtures/two_name_nets.kicad_sch")
+            .replace(r#"(label "AAA""#, r#"(label "Net-(TP8-Pad1)""#);
+        for (net, expected) in [
+            ("Net-(TP8-Pad1)", ["TP2", "TP3"]),
+            ("Net-(TP8-Pad1)#2", ["TP8", "TP9"]),
+        ] {
+            let body = call(&source, "get_net_connections", json!({"net": net})).await;
+            let references: BTreeSet<_> = body["pins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["reference"].as_str().unwrap())
+                .collect();
+            assert_eq!(references, BTreeSet::from(expected));
+        }
+    }
+
+    #[tokio::test]
     async fn named_net_reports_real_sheet_pins() {
         let ground = call(SCH, "get_net_connections", json!({ "net": "GND" })).await;
         let pins = ground["pins"].as_array().unwrap();
