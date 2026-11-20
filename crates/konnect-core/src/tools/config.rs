@@ -525,6 +525,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "value": {
                         "type": ["string", "number", "array", "object", "boolean", "null"],
+                        "additionalProperties": true,
                         "description": "Value for the specified key, or null to delete an existing key"
                     }
                 },
@@ -562,6 +563,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "key_path": { "type": "string", "description": "Dot-notation config key" },
                     "value": {
                         "type": ["string", "number", "array", "object", "boolean", "null"],
+                        "additionalProperties": true,
                         "description": "Value for the specified key, or null to delete an existing key"
                     }
                 },

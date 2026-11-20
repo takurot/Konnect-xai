@@ -986,6 +986,16 @@ fn effective_configuration_combines_rules_with_scope_and_keeps_override_preceden
         body["effective_config"]["sourcing"]["avl"],
         json!(["Murata"])
     );
+    let result = p.call_tool(
+        "save_project_config",
+        json!({"project_dir":project,"key_path":"fab_constraints","value":{"fab_house":"PCBWay"}}),
+    );
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let result = p.call_tool("get_effective_config", json!({"project_dir":project}));
+    assert_eq!(
+        McpProcess::tool_body(&result)["effective_config"]["fab_constraints"]["fab_house"],
+        "PCBWay"
+    );
 }
 
 #[test]
