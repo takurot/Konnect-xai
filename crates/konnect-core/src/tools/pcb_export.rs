@@ -1267,6 +1267,130 @@ mod new_export_format_tests {
         )
     }
 
+    #[tokio::test]
+    async fn registered_export_and_rule_options_refuse_values_outside_their_enum() {
+        use crate::mcp::handler::McpHandler;
+        use crate::router::registry::tools_for;
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("source.kicad_pcb");
+        let schematic = dir.path().join("source.kicad_sch");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        std::fs::write(&schematic, crate::tools::blank_schematic_template()).unwrap();
+        let output = dir.path().join("output");
+        let fake_cli = cli::test_support::write_script(
+            dir.path(),
+            "unexpected-cli",
+            "#!/bin/sh\nprintf started > \"$0.started\"\nexit 3\n",
+            "@echo off\r\necho started>\"%~f0.started\"\r\nexit /b 3\r\n",
+        );
+        let marker = PathBuf::from(format!("{}.started", fake_cli.display()));
+        let mut config = test_ctx().config;
+        config.kicad_cli = fake_cli.display().to_string();
+        config.eager_toolsets = true;
+        let handler = McpHandler::new(config.clone()).await.unwrap();
+        let direct_ctx = Arc::new(ToolContext::new(config, Arc::new(ToolRouter::new())));
+
+        let units = &["mm", "in"][..];
+        let severity = &["error", "warning", "info"][..];
+        for (toolset, name, field, choices, default, unknown) in [
+            (
+                "pcb_export",
+                "export_ipc2581",
+                "units",
+                units,
+                "mm",
+                "furlong",
+            ),
+            ("pcb_export", "export_odb", "units", units, "mm", "furlong"),
+            (
+                "pcb_export",
+                "export_odb",
+                "compression",
+                &["zip", "none", "tgz"],
+                "zip",
+                "rar",
+            ),
+            (
+                "pcb_export",
+                "get_drc_violations",
+                "severity",
+                severity,
+                "warning",
+                "bogus",
+            ),
+            (
+                "verification",
+                "run_drc",
+                "severity",
+                severity,
+                "warning",
+                "bogus",
+            ),
+            (
+                "sch_export",
+                "run_erc",
+                "severity",
+                severity,
+                "warning",
+                "bogus",
+            ),
+        ] {
+            let tool = tools_for(toolset)
+                .unwrap()
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .unwrap();
+            let option = &tool.input_schema["properties"][field];
+            assert_eq!(option["enum"], json!(choices), "{name}.{field}");
+            assert_eq!(option["default"], default, "{name}.{field}");
+            let mut args = if toolset == "sch_export" {
+                json!({"schematic": schematic, "output": output})
+            } else {
+                json!({"board": board, "output": output})
+            };
+            assert!(
+                tool.input_validator.is_valid(&args),
+                "{name}.{field} default"
+            );
+            for choice in choices {
+                args[field] = json!(choice);
+                assert!(
+                    tool.input_validator.is_valid(&args),
+                    "{name}.{field} {choice}"
+                );
+            }
+            for bad in [json!(unknown), json!(null), json!(7)] {
+                args[field] = bad;
+                let direct = (tool.handler)(&args, direct_ctx.clone()).await.unwrap();
+                let served = handler
+                    .handle_message(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": name, "arguments": args},
+                    }))
+                    .await
+                    .unwrap()
+                    .result
+                    .unwrap();
+                for result in [serde_json::to_value(direct).unwrap(), served] {
+                    assert_eq!(result["isError"], true, "{name}.{field}: {result}");
+                    let details: serde_json::Value =
+                        serde_json::from_str(result["content"][0]["text"].as_str().unwrap())
+                            .unwrap();
+                    assert_eq!(
+                        details["error"]["kind"], "invalid_argument",
+                        "{name}: {details}"
+                    );
+                    assert_eq!(details["error"]["field"], field, "{name}: {details}");
+                }
+                assert!(!marker.exists(), "{name} attempted to invoke KiCad");
+                assert!(!output.exists(), "{name} published an artifact");
+            }
+        }
+    }
+
     #[test]
     fn specctra_manifest_defaults_beside_dsn() {
         assert_eq!(
