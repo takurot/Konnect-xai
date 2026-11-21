@@ -2391,7 +2391,7 @@ async fn handle_place_component(
             Ok(CallToolResult::json(&json!({
                 "placed": reference,
                 "footprint": footprint,
-                "x": round6(x), "y": round6(y), "rotation": rotation, "layer": layer,
+                "x": round6(x), "y": round6(y), "rotation": normalize_root_angle(round6(rotation)), "layer": layer,
                 "source": "file",
                 "fallback_reason": reason.evidence(),
                 "warning": reason.warning()
@@ -2521,7 +2521,7 @@ async fn handle_rotate_component(
         Err(e) => return Ok(e),
     };
     // KiCad keeps a footprint root angle in (-180, 180]; report that spelling.
-    let stored_rotation = round6(normalize_root_angle(rotation));
+    let stored_rotation = normalize_root_angle(round6(rotation));
 
     let ref_ipc = reference.clone();
     match attempt_ipc_write(ctx, &board, "rotation", move |c| {

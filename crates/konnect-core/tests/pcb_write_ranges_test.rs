@@ -131,6 +131,24 @@ async fn board_coordinates_outside_kicad_range_are_refused() {
                    "start_y": 0.0, "count_x": 3, "spacing_x": 100.0}),
             "spacing_x",
         ),
+        (
+            "route_differential_pair",
+            json!({"board": b, "net_pos": "P", "net_neg": "N",
+                   "x1": 2147.4, "y1": 0.0, "x2": 2147.4, "y2": 10.0, "gap": 1.0}),
+            "x1",
+        ),
+        (
+            "route_differential_pair",
+            json!({"board": b, "net_pos": "P", "net_neg": "N",
+                   "x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 0.0, "gap": -1.0}),
+            "gap",
+        ),
+        (
+            "route_differential_pair",
+            json!({"board": b, "net_pos": "P", "net_neg": "N",
+                   "x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 0.0, "width": 1e-7}),
+            "width",
+        ),
     ];
     for (name, args, field) in cases {
         assert_refused_unchanged(&p, &p.board, name, args, field).await;
@@ -177,6 +195,7 @@ async fn create_netclass_refuses_non_physical_dimensions() {
         (json!({"via_diameter": -0.8}), "via_diameter"),
         (json!({"diff_pair_width": 0.0}), "diff_pair_width"),
         (json!({"trace_width": "wide"}), "trace_width"),
+        (json!({"trace_width": 1e-7}), "trace_width"),
         (json!({"clearance": 2147.483648}), "clearance"),
     ] {
         let mut args = args;
@@ -225,6 +244,10 @@ async fn add_board_text_refuses_empty_text_and_non_positive_size() {
         ),
         (
             json!({"text": "T", "x": 1.0, "y": 1.0, "size": 0.0}),
+            "size",
+        ),
+        (
+            json!({"text": "T", "x": 1.0, "y": 1.0, "size": 1e-7}),
             "size",
         ),
     ] {

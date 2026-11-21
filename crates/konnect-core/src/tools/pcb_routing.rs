@@ -1433,12 +1433,12 @@ async fn handle_create_netclass(
         let zero_allowed = matches!(key, "clearance" | "diff_pair_gap" | "diff_pair_via_gap");
         let value = match args.get(arg) {
             None => None,
-            Some(_) => match require_f64(args, arg) {
+            Some(_) => match require_f64(args, arg).map(round6) {
                 Ok(value)
                     if value <= MAX_NETCLASS_MM
                         && (value > 0.0 || zero_allowed && value == 0.0) =>
                 {
-                    Some(round6(value))
+                    Some(value)
                 }
                 Ok(_) if zero_allowed => {
                     return Ok(invalid_arg(
@@ -2085,8 +2085,23 @@ async fn handle_route_diff_pair(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let width = args["width"].as_f64().unwrap_or(0.1);
-    let gap = args["gap"].as_f64().unwrap_or(0.1);
+    let width = match super::opt_positive_f64(args, "width")
+        .and_then(|width| super::checked_board_mm(width.unwrap_or(0.1), "width"))
+    {
+        Ok(width) if width > 0.0 => width,
+        Ok(_) => return Ok(invalid_arg("width", "must be at least 1 nm")),
+        Err(error) => return Ok(error),
+    };
+    let gap = match args.get("gap") {
+        None => 0.1,
+        Some(_) => {
+            match require_f64(args, "gap").and_then(|gap| super::checked_board_mm(gap, "gap")) {
+                Ok(gap) if gap >= 0.0 => gap,
+                Ok(_) => return Ok(invalid_arg("gap", "must not be negative")),
+                Err(error) => return Ok(error),
+            }
+        }
+    };
     let offset = (gap + width) / 2.0;
 
     // Route two parallel traces offset perpendicular to the direction
@@ -2095,6 +2110,18 @@ async fn handle_route_diff_pair(
     let len = (dx * dx + dy * dy).sqrt().max(1e-9);
     let perp_x = -dy / len * offset;
     let perp_y = dx / len * offset;
+    for (field, base, delta) in [
+        ("x1", x1, perp_x),
+        ("y1", y1, perp_y),
+        ("x2", x2, perp_x),
+        ("y2", y2, perp_y),
+    ] {
+        for value in [base + delta, base - delta] {
+            if let Err(error) = super::checked_board_mm(value, field) {
+                return Ok(error);
+            }
+        }
+    }
 
     let np_ipc = net_pos.clone();
     let nn_ipc = net_neg.clone();

@@ -2594,7 +2594,8 @@ async fn handle_add_board_text(
     let size = match super::opt_positive_f64(args, "size")
         .and_then(|size| super::checked_board_mm(size.unwrap_or(1.0), "size"))
     {
-        Ok(value) => value,
+        Ok(value) if value > 0.0 => value,
+        Ok(_) => return Ok(super::invalid_arg("size", "must be at least 1 nm")),
         Err(error) => return Ok(error),
     };
     // pcbnew mirrors every back-layer text; KiCad's DRC flags one that is not.
