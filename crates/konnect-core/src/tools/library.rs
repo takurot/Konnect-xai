@@ -6865,11 +6865,13 @@ mod tests {
 
     #[test]
     fn a_bare_relative_table_uri_is_never_equivalent() {
+        // `Cargo.toml` resolves from cargo test's working directory (the crate
+        // root), so only the absolute-path filter keeps it from matching.
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("parts.kicad_sym"), "").unwrap();
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         assert!(!same_library_uri(
-            "parts.kicad_sym",
-            "${KIPRJMOD}/parts.kicad_sym",
+            "Cargo.toml",
+            &manifest.to_string_lossy(),
             Some(tmp.path())
         ));
     }
