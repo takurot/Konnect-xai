@@ -931,6 +931,29 @@ pub(crate) fn invalid_arg(field: &str, reason: &str) -> CallToolResult {
     )
 }
 
+/// Parse an optional schema enum consistently even when invoked without MCP
+/// validation. An explicit non-string value does not select the default.
+pub(crate) fn optional_enum<T: serde::de::DeserializeOwned + serde::Serialize + PartialEq>(
+    args: &Value,
+    field: &str,
+    choices: &[T],
+    default: T,
+) -> Result<T, CallToolResult> {
+    let Some(value) = args.get(field) else {
+        return Ok(default);
+    };
+    value
+        .as_str()
+        .and_then(|_| serde_json::from_value::<T>(value.clone()).ok())
+        .filter(|value| choices.contains(value))
+        .ok_or_else(|| {
+            invalid_arg(
+                field,
+                &format!("must be one of {}", serde_json::json!(choices)),
+            )
+        })
+}
+
 /// Report that a write completed but its immediate readback could not prove
 /// the requested state. Callers must not turn this into a stale-target refusal:
 /// the file may already contain the mutation or an external follow-up edit.

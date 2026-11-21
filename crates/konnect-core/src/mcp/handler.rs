@@ -317,7 +317,8 @@ impl McpHandler {
             "tool_call_start"
         );
 
-        let (result, status, error_kind) = self.dispatch_tool(&params.name, &args).await;
+        let (result, status, _) = self.dispatch_tool(&params.name, &args).await;
+        let error_kind = extract_error_kind(&result);
 
         let dur_ms = started.elapsed().as_millis() as u64;
         let result_bytes = result_content_bytes(&result);
@@ -331,17 +332,20 @@ impl McpHandler {
         );
 
         self.observer
-            .record(CallRecord {
-                call_id,
-                ts,
-                tool: params.name.clone(),
-                toolset,
-                dur_ms,
-                status,
-                error_kind,
-                args_bytes,
-                result_bytes,
-            })
+            .record_result(
+                CallRecord {
+                    call_id,
+                    ts,
+                    tool: params.name.clone(),
+                    toolset,
+                    dur_ms,
+                    status,
+                    error_kind,
+                    args_bytes,
+                    result_bytes,
+                },
+                result.is_error,
+            )
             .await;
 
         result
@@ -360,14 +364,15 @@ impl McpHandler {
                 return schema_argument_error(&error);
             }
         }
-        if let Some(result) =
-            meta_tools::handle_meta_tool_with_reload(name, args, &self.ctx, &self.reload).await
+        if let Some((result, catalogue_changed)) =
+            meta_tools::dispatch_meta_tool(name, args, &self.ctx, &self.reload).await
         {
-            if name == "load_toolset" || name == "unload_toolset" {
+            if catalogue_changed {
                 self.notify_tools_list_changed().await;
             }
             let status = call_status(&result);
-            return (result, status, None);
+            let error_kind = extract_error_kind(&result);
+            return (result, status, error_kind);
         }
 
         // Loaded domain tool? If not and auto-load is enabled (opt-in, off by
@@ -376,8 +381,15 @@ impl McpHandler {
         let mut tool_def = self.ctx.router.get_tool(name).await;
         if tool_def.is_none() && self.ctx.config.auto_load_toolsets {
             if let Some(toolset) = self.ctx.router.find_toolset_for_tool(name) {
-                self.ctx.router.load(toolset).await;
-                self.notify_tools_list_changed().await;
+                if self
+                    .ctx
+                    .router
+                    .load(toolset)
+                    .await
+                    .is_some_and(|added| !added.is_empty())
+                {
+                    self.notify_tools_list_changed().await;
+                }
                 tool_def = self.ctx.router.get_tool(name).await;
             }
         }
@@ -409,6 +421,15 @@ impl McpHandler {
             }
             if let Err(error) = tool_def.input_validator.validate(args) {
                 return schema_argument_error(&error);
+            }
+            if let Some(path) = args["schematic"]
+                .as_str()
+                .filter(|_| tool_def.input_schema["properties"]["schematic"]["type"] == "string")
+            {
+                if let Some(error) = schematic_path_error(std::path::Path::new(path)).await {
+                    let kind = extract_error_kind(&error);
+                    return (error, CallStatus::Error, kind);
+                }
             }
             let call = async { (tool_def.handler)(args, self.ctx.clone()).await };
             let result = if tool_def.uses_kicad_config {
@@ -726,6 +747,46 @@ fn result_content_bytes(result: &CallToolResult) -> usize {
             ToolContent::Image { data, .. } => data.len(),
         })
         .sum()
+}
+
+/// Every registered string argument named `schematic` refers to a saved
+/// schematic. An absent file keeps the individual tool's existing response.
+async fn schematic_path_error(path: &std::path::Path) -> Option<CallToolResult> {
+    use konnect_sexp::schematic::{has_schematic_extension, has_schematic_root};
+
+    let wrong_type = || crate::tools::invalid_arg("schematic", "not_a_schematic");
+    if !has_schematic_extension(path) {
+        return Some(wrong_type());
+    }
+    let probe_path = path.to_path_buf();
+    match crate::tools::blocking_work::spawn_read_only_blocking(move || {
+        if !probe_path.metadata()?.is_file() {
+            return Ok(false);
+        }
+        let file = std::fs::File::open(probe_path)?;
+        has_schematic_root(std::io::BufReader::new(file))
+    })
+    .await
+    {
+        Ok(Ok(true)) => None,
+        Ok(Ok(false)) => Some(wrong_type()),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(Err(error)) => {
+            let path = konnect_sexp::paths::display_path(path).into_owned();
+            Some(CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: error.to_string(),
+                },
+                format!("Could not read schematic '{path}': {error}"),
+            ))
+        }
+        Err(error) => Some(CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: error.to_string(),
+            },
+            format!("Could not check schematic file type: {error}"),
+        )),
+    }
 }
 
 /// A missing *path* argument must reach the caller as `invalid_argument`
@@ -1090,6 +1151,155 @@ mod required_argument_dispatch_tests {
         assert_eq!(body["error"]["reason"], "kicad_lock_present");
         assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
         assert!(lock.exists());
+    }
+}
+
+#[cfg(test)]
+mod schematic_document_boundary_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn schema_example(schema: &Value, fallback: &Path) -> Value {
+        if let Some(value) = schema["enum"].get(0).or_else(|| schema.get("default")) {
+            return value.clone();
+        }
+        match schema["type"].as_str() {
+            Some("string") => json!(fallback),
+            Some("boolean") => json!(false),
+            Some("number" | "integer") => json!(10),
+            Some("array") => Value::Array(
+                (0..schema["minItems"].as_u64().unwrap_or_default())
+                    .map(|_| schema_example(&schema["items"], fallback))
+                    .collect(),
+            ),
+            Some("object") => Value::Object(
+                schema["required"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|field| {
+                        let field = field.as_str().unwrap();
+                        (
+                            field.to_owned(),
+                            schema_example(&schema["properties"][field], fallback),
+                        )
+                    })
+                    .collect(),
+            ),
+            other => panic!("no example for schema type {other:?} in {schema}"),
+        }
+    }
+
+    async fn assert_invalid_schematic(handler: &McpHandler, tool: &str, args: Value, field: &str) {
+        let (result, status, kind) = handler.dispatch_tool(tool, &args).await;
+        assert!(
+            result.is_error,
+            "{tool}: wrong document type must be refused"
+        );
+        assert_eq!(status, CallStatus::Error, "{tool}");
+        assert_eq!(
+            kind.as_deref(),
+            Some("invalid_argument"),
+            "{tool}: {result:?}"
+        );
+        let Some(ToolContent::Text { text }) = result.content.first() else {
+            panic!("{tool}: missing structured error payload");
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["field"], field, "{tool}: {body}");
+        assert_eq!(body["error"]["reason"], "not_a_schematic", "{tool}: {body}");
+    }
+
+    #[tokio::test]
+    async fn schematic_tools_refuse_other_documents_without_changing_their_bytes() {
+        let handler = McpHandler::new(crate::tools::ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let board = "(kicad_pcb (version 20240108) (paper \"A4\"))";
+        let inputs = [
+            ("unrelated.kicad_pcb", board),
+            (
+                "unrelated.kicad_pro",
+                r#"{"meta":{"filename":"unrelated.kicad_pro"}}"#,
+            ),
+            ("mislabeled.kicad_sch", board),
+        ];
+        let mut tools = handler.ctx.router.active_tools().await;
+        tools.sort_by_key(|tool| tool.name);
+        let mut checked = 0;
+
+        for tool in tools {
+            let schema = &tool.input_schema;
+            if schema["properties"]["schematic"]["type"] != "string" {
+                continue;
+            }
+            checked += 1;
+
+            for (filename, source) in inputs {
+                let path = dir.path().join(filename);
+                std::fs::write(&path, source).unwrap();
+                let fallback = dir.path().join("unused");
+                let mut args = schema_example(schema, &fallback);
+                args["schematic"] = json!(path);
+                for alternatives in schema["allOf"].as_array().into_iter().flatten() {
+                    for field in alternatives["anyOf"][0]["required"].as_array().unwrap() {
+                        let field = field.as_str().unwrap();
+                        args[field] = schema_example(&schema["properties"][field], &fallback);
+                    }
+                }
+                assert!(
+                    tool.input_validator.is_valid(&args),
+                    "{}: {args}",
+                    tool.name
+                );
+                assert_invalid_schematic(&handler, tool.name, args, "schematic").await;
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    source.as_bytes(),
+                    "{}",
+                    tool.name
+                );
+            }
+        }
+        assert!(checked > 80, "covered only {checked} registered tools");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn schematic_probe_preserves_missing_paths_and_classifies_other_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.kicad_sch");
+        assert!(schematic_path_error(&missing).await.is_none());
+
+        // This parent is a regular file, so looking beneath it fails even
+        // when the tests run with permission to read every fixture.
+        let parent = dir.path().join("not-a-directory");
+        std::fs::write(&parent, b"fixture").unwrap();
+        let unobservable = parent.join("sheet.kicad_sch");
+        let result = schematic_path_error(&unobservable).await.unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("handler_error")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_schematic_refuses_other_extensions_before_creating_a_file() {
+        let handler = McpHandler::new(crate::tools::ServerConfig {
+            eager_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-schematic.txt");
+        assert_invalid_schematic(&handler, "create_schematic", json!({"path": path}), "path").await;
+        assert!(!path.exists());
     }
 }
 

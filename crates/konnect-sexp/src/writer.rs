@@ -902,7 +902,14 @@ pub fn find_direct_child_blocks(content: &str, parent_tag: &str) -> Vec<(usize, 
     let Some(parent_start) = find_block_starts(content, parent_tag).into_iter().next() else {
         return Vec::new();
     };
-    let Some((_, parent_end)) = find_balanced_block(content, parent_start) else {
+    find_direct_child_blocks_at(content, parent_start)
+}
+
+/// Byte ranges of direct child blocks of the list at the supplied position.
+/// Use this when the document root is already known, independently of any
+/// nested list or whitespace around its tag.
+pub fn find_direct_child_blocks_at(content: &str, parent_start: usize) -> Vec<(usize, usize)> {
+    let Some((parent_start, parent_end)) = find_balanced_block(content, parent_start) else {
         return Vec::new();
     };
 
