@@ -690,3 +690,120 @@ async fn connect_to_net_refuses_an_incomplete_pin_and_a_route_onto_another_net()
     }
     assert_eq!(read(&path), before);
 }
+
+#[tokio::test]
+async fn connect_to_net_checks_the_endpoint_net_before_writing() {
+    let (_dir, path) = sheet("");
+    let before = read(&path).replace(
+        "\t(lib_symbols)\n",
+        r#"
+  (lib_symbols (symbol "Fixture:P" (symbol "P_1_1"
+    (pin passive line (at 0 0 0) (length 1) (name "P") (number "1")))))
+  (wire (pts (xy 10 20) (xy 20 20)) (stroke (width 0) (type default)) (uuid "wire"))
+  (label "EXISTING" (at 20 20 0) (uuid "local"))
+  (global_label "WINNING" (shape input) (at 20 20 0) (uuid "global"))
+  (symbol (lib_id "Fixture:P") (at 10 20 0) (unit 1) (uuid "22222222-2222-2222-2222-222222222222")
+    (property "Reference" "R1") (property "Value" "P"))
+"#,
+    );
+    std::fs::write(&path, &before).unwrap();
+    for selector in [
+        json!({"reference": "R1", "pin_number": "1"}),
+        json!({"uuid": "22222222-2222-2222-2222-222222222222", "pin_number": "1"}),
+        json!({"pin_x": 10.0, "pin_y": 20.0}),
+    ] {
+        let mut args = selector;
+        args["schematic"] = json!(p(&path));
+        args["net"] = json!("OTHER");
+        args["direction"] = json!("left");
+        let refusal = handle_connect_to_net(&args, &ctx()).await.unwrap();
+        assert!(refusal.is_error, "unexpected success: {args}");
+        let error = &body(&refusal)["error"];
+        assert_eq!(error["kind"], "would_join_nets");
+        assert_eq!(error["nets"], json!(["EXISTING", "OTHER", "WINNING"]));
+        assert_eq!(error["at"], json!([[10.0, 20.0]]));
+        assert_eq!(read(&path), before);
+
+        // The requested alias is present even when another label wins naming.
+        args["net"] = json!("EXISTING");
+        args["allow_join"] = json!(true);
+        let same = handle_connect_to_net(&args, &ctx()).await.unwrap();
+        assert!(!same.is_error, "{}", text(&same));
+        assert_eq!(
+            body(&same),
+            json!({"connected": "EXISTING", "already_connected": true})
+        );
+        assert_eq!(read(&path), before);
+    }
+
+    let allowed = handle_connect_to_net(
+        &json!({
+            "schematic": p(&path), "reference": "R1", "pin_number": "1",
+            "net": "OTHER", "direction": "left", "allow_join": true
+        }),
+        &ctx(),
+    )
+    .await
+    .unwrap();
+    assert!(!allowed.is_error, "{}", text(&allowed));
+    assert_eq!(body(&allowed)["connected"], "OTHER");
+    assert_ne!(read(&path), before);
+}
+
+#[tokio::test]
+async fn connect_to_net_repeating_a_stub_leaves_only_one_wire_and_label() {
+    let (_dir, path) = sheet("");
+    let args = json!({
+        "schematic": p(&path), "pin_x": 10.0, "pin_y": 20.0,
+        "net": "TARGET", "direction": "right"
+    });
+    let first = handle_connect_to_net(&args, &ctx()).await.unwrap();
+    assert!(!first.is_error, "{}", text(&first));
+    assert!(body(&first)["wire"].is_object());
+    let connected = read(&path);
+    let tree = parse_sexp(&connected).unwrap();
+    assert_eq!(tree.find_all("wire").len(), 1);
+    assert_eq!(tree.find_all("label").len(), 1);
+
+    let second = handle_connect_to_net(&args, &ctx()).await.unwrap();
+    assert!(!second.is_error, "{}", text(&second));
+    assert_eq!(body(&second)["already_connected"], true);
+    assert_eq!(read(&path), connected);
+}
+
+#[tokio::test]
+async fn connect_to_net_does_not_conflate_same_text_label_scopes() {
+    let (_dir, path) = sheet(concat!(
+        "  (label \"SIG\" (at 10 20 0) (uuid \"local\"))\n",
+        "  (global_label \"SIG\" (shape input) (at 31.27 30 0) (uuid \"global\"))\n",
+    ));
+    let before = read(&path);
+    let mut at_local = json!({
+        "schematic": p(&path), "pin_x": 10.0, "pin_y": 20.0,
+        "net": "SIG", "label_type": "global_label", "direction": "left"
+    });
+    let at_unrelated_global = json!({
+        "schematic": p(&path), "pin_x": 30.0, "pin_y": 30.0,
+        "net": "SIG", "label_type": "net_label", "direction": "right"
+    });
+    for args in [&at_local, &at_unrelated_global] {
+        let refusal = handle_connect_to_net(args, &ctx()).await.unwrap();
+        assert!(refusal.is_error, "{}", text(&refusal));
+        assert_eq!(body(&refusal)["error"]["kind"], "would_join_nets");
+        assert_eq!(read(&path), before);
+    }
+
+    at_local["allow_join"] = json!(true);
+    let joined = handle_connect_to_net(&at_local, &ctx()).await.unwrap();
+    assert!(!joined.is_error, "{}", text(&joined));
+    assert!(body(&joined)["wire"].is_object());
+    let after = read(&path);
+    assert_ne!(before, after);
+    let parsed = parse_sexp(&after).unwrap();
+    assert_eq!(parsed.find_all("global_label").len(), 2);
+
+    let repeated = handle_connect_to_net(&at_local, &ctx()).await.unwrap();
+    assert!(!repeated.is_error, "{}", text(&repeated));
+    assert_eq!(body(&repeated)["already_connected"], true);
+    assert_eq!(read(&path), after);
+}
