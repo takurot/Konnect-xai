@@ -9,7 +9,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
     find_all_symbol_instance_blocks, get_path, invalid_arg, opt_f64, opt_str, opt_u32,
-    require_array, require_f64, require_str, ToolDef,
+    require_array, require_f64, require_str, schematic_rotation_arg, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -115,7 +115,7 @@ pub fn tools() -> Vec<ToolDef> {
                             "properties": {
                                 "lib_id": { "type": "string" },
                                 "x": { "type": "number" }, "y": { "type": "number" },
-                                "rotation": { "type": "number", "default": 0 },
+                                "rotation": { "type": "number", "description": "Multiple of 90 degrees, normalized modulo 360", "default": 0 },
                                 "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric." },
                                 "reference": { "type": "string" },
                                 "dnp": { "type": "boolean" },
@@ -648,6 +648,22 @@ async fn handle_batch_place_components(
         None => return Ok(CallToolResult::error("Missing 'components' array")),
     };
 
+    let rotations = components
+        .iter()
+        .enumerate()
+        .map(|(index, component)| {
+            schematic_rotation_arg(
+                component.get("rotation"),
+                &format!("components[{index}].rotation"),
+                Some(0.0),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let rotations = match rotations {
+        Ok(rotations) => rotations,
+        Err(error) => return Ok(error),
+    };
+
     let before_source = read_consistent(&sch_path)?;
     let mut sch = cse::Schematic::from_source(&sch_path, before_source.clone())?;
     let context = match crate::tools::sheet_instance_context(&sch_path, &mut sch) {
@@ -667,7 +683,7 @@ async fn handle_batch_place_components(
     let mut errors: Vec<String> = Vec::new();
     let mut failures: Vec<Value> = Vec::new();
 
-    for (index, comp) in components.iter().enumerate() {
+    for (index, (comp, rotation)) in components.iter().zip(rotations).enumerate() {
         let Some(lib_id) = comp["lib_id"].as_str() else {
             let message = "Missing 'lib_id' in component spec".to_string();
             errors.push(message.clone());
@@ -680,7 +696,6 @@ async fn handle_batch_place_components(
             failures.push(json!({"index": index, "lib_id": lib_id, "kind": "invalid_item", "message": message}));
             continue;
         };
-        let rotation = comp["rotation"].as_f64().unwrap_or(0.0);
         // One malformed entry refuses only itself, as every other per-entry
         // problem in this loop does; the batch is not abandoned because a
         // caller misspelled one axis.

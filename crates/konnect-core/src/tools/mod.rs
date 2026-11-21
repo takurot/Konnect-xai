@@ -1030,6 +1030,29 @@ pub fn require_f64(args: &Value, key: &str) -> Result<f64, CallToolResult> {
         .ok_or_else(|| invalid_arg(key, "missing or not a number"))
 }
 
+/// Cardinal angles are the rotations written for schematic symbols and labels.
+pub(crate) fn normalize_schematic_rotation(angle: f64) -> Option<f64> {
+    match angle.rem_euclid(360.0) {
+        0.0 => Some(0.0),
+        angle @ (90.0 | 180.0 | 270.0) => Some(angle),
+        _ => None,
+    }
+}
+
+pub(crate) fn schematic_rotation_arg(
+    value: Option<&Value>,
+    field: &str,
+    default: Option<f64>,
+) -> Result<f64, CallToolResult> {
+    let angle = match value {
+        Some(value) => value.as_f64(),
+        None => default,
+    }
+    .ok_or_else(|| invalid_arg(field, "missing or not a number"))?;
+    normalize_schematic_rotation(angle)
+        .ok_or_else(|| invalid_arg(field, "expected a multiple of 90 degrees"))
+}
+
 /// Validate a millimetre value before a coordinate is written or reported.
 pub(crate) fn checked_mm(value: f64, key: &str) -> Result<f64, CallToolResult> {
     konnect_ipc::builders::mm_to_nm(value)
