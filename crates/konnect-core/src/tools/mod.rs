@@ -13,6 +13,7 @@ pub mod config;
 pub(crate) mod cross_probe;
 pub mod design_review;
 pub(crate) mod drc;
+mod edge_cuts_outline;
 pub mod editor_navigation;
 mod footprint_graphics;
 mod footprint_metadata;

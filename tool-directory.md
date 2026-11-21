@@ -239,7 +239,7 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
-| `set_board_size` | Add a rectangular board outline of the given dimensions on the Edge.Cuts layer. Appends — clear the old edges with `delete_graphics` first. |
+| `set_board_size` | Replace the outer Edge.Cuts outline with a rectangle of positive width and height. Closed line cutouts inside the old outline are kept; refuses untouched if a cutout would not fit or the outline has arcs or other non-line shapes. |
 | `get_board_info` | Return metadata about the PCB: title, revision, company, paper size (with `paper_size_mm` dimensions on a custom User size), `layer_count`, `copper_layer_count`, and `net_count` (IPC, falls back to a file parse that counts from the tree, so KiCad 10 boards report real numbers instead of 0). |
 | `get_board_extents` | Return the box enclosing the board's items, footprint text excluded. Reads the live board where it can (`board_source`); a saved-file answer names what it could not measure, and a live answer reports each refused class or the count of items returned without a bundled decoder. A successful empty listing needs no unavailable entry. |
 | `get_layer_list` | Return the board's enabled layers: `name`, `display_name` and a `copper` flag, plus the file-backed `id`, `type` and optional `user_name`. IPC-first, so an unsaved stackup change in a live KiCad is visible; `board_source` (`auto`/`live`/`saved`) selects the board state and `sources` names where each part of the answer came from. |
