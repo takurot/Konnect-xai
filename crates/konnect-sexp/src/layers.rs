@@ -139,6 +139,129 @@ pub fn is_canonical_name(name: &str) -> bool {
     false
 }
 
+/// Which ordinal scheme a board file numbers its layers with.
+///
+/// KiCad 9 renumbered every layer (`B.Cu` 31 → 2, `In1.Cu` 1 → 4, `F.Mask`
+/// 39 → 1). KiCad reads a layer by its name and rewrites the ordinal on save,
+/// so a writer has to number a new entry in the scheme the file already uses,
+/// or its ordinal collides with one the file gives to another layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerNumbering {
+    /// KiCad 8 and earlier: `In<n>.Cu` is `n`, `B.Cu` is 31.
+    Legacy,
+    /// KiCad 9 and later: `In<n>.Cu` is `2n + 2`, `B.Cu` is 2.
+    KiCad9,
+}
+
+/// The scheme a stackup is numbered in, read from its `F.Cu` and `B.Cu`
+/// entries. `None` when either is missing or numbered in neither scheme.
+pub fn numbering(stack: &[Layer]) -> Option<LayerNumbering> {
+    let id_of = |name: &str| stack.iter().find(|l| l.name == name).map(|l| l.id);
+    match (id_of("F.Cu")?, id_of("B.Cu")?) {
+        (0, 31) => Some(LayerNumbering::Legacy),
+        (0, 2) => Some(LayerNumbering::KiCad9),
+        _ => None,
+    }
+}
+
+/// The fixed layers in KiCad 9's ordinal order after the copper pair: `F.Mask`
+/// is 1, `B.Mask` 3, … `Rescue` 37 (`layer_ids.h`, `PCB_LAYER_ID`).
+const KICAD9_ODD_IDS: &[&str] = &[
+    "F.Mask",
+    "B.Mask",
+    "F.SilkS",
+    "B.SilkS",
+    "F.Adhes",
+    "B.Adhes",
+    "F.Paste",
+    "B.Paste",
+    "Dwgs.User",
+    "Cmts.User",
+    "Eco1.User",
+    "Eco2.User",
+    "Edge.Cuts",
+    "Margin",
+    "B.CrtYd",
+    "F.CrtYd",
+    "B.Fab",
+    "F.Fab",
+    "Rescue",
+];
+
+/// The fixed layers in KiCad 8's ordinal order from 31 (`B.Cu`) to 49 (`F.Fab`).
+const LEGACY_FROM_31: &[&str] = &[
+    "B.Cu",
+    "B.Adhes",
+    "F.Adhes",
+    "B.Paste",
+    "F.Paste",
+    "B.SilkS",
+    "F.SilkS",
+    "B.Mask",
+    "F.Mask",
+    "Dwgs.User",
+    "Cmts.User",
+    "Eco1.User",
+    "Eco2.User",
+    "Edge.Cuts",
+    "Margin",
+    "B.CrtYd",
+    "F.CrtYd",
+    "B.Fab",
+    "F.Fab",
+];
+
+/// KiCad 8 defined only `User.1`..`User.9`.
+const LEGACY_MAX_USER: u32 = 9;
+
+/// The ordinal KiCad gives a canonical layer name under `numbering`, or `None`
+/// for a name that scheme does not define.
+///
+/// ```
+/// use konnect_sexp::layers::{canonical_id, LayerNumbering::*};
+/// assert_eq!(canonical_id("In2.Cu", KiCad9), Some(6));
+/// assert_eq!(canonical_id("In2.Cu", Legacy), Some(2));
+/// assert_eq!(canonical_id("User.1", KiCad9), Some(39));
+/// assert_eq!(canonical_id("User.10", Legacy), None);
+/// ```
+pub fn canonical_id(name: &str, numbering: LayerNumbering) -> Option<i32> {
+    if !is_canonical_name(name) {
+        return None;
+    }
+    let inner = inner_copper_index(name);
+    let user = name
+        .strip_prefix("User.")
+        .and_then(|n| n.parse::<u32>().ok());
+    let position = |table: &[&str]| table.iter().position(|t| *t == name);
+    let id = match numbering {
+        LayerNumbering::KiCad9 => match name {
+            "F.Cu" => 0,
+            "B.Cu" => 2,
+            _ => match (inner, user) {
+                (Some(n), _) => 2 * n + 2,
+                (_, Some(n)) => 37 + 2 * n,
+                _ => 2 * position(KICAD9_ODD_IDS)? as u32 + 1,
+            },
+        },
+        LayerNumbering::Legacy => match (name, inner, user) {
+            ("F.Cu", _, _) => 0,
+            ("Rescue", _, _) => 59,
+            (_, Some(n), _) => n,
+            (_, _, Some(n)) if n <= LEGACY_MAX_USER => 49 + n,
+            (_, _, Some(_)) => return None,
+            _ => 31 + position(LEGACY_FROM_31)? as u32,
+        },
+    };
+    i32::try_from(id).ok()
+}
+
+/// `n` for `In<n>.Cu`, `None` for every other name.
+pub fn inner_copper_index(name: &str) -> Option<u32> {
+    is_canonical_name(name)
+        .then(|| name.strip_prefix("In")?.strip_suffix(".Cu")?.parse().ok())
+        .flatten()
+}
+
 fn layer_from(node: &SexpNode) -> Option<Layer> {
     // `(0 "F.Cu" signal "Top Layer")` — the ordinal is child 0, being the head
     // of the list, so every field sits one place earlier than in a tagged node.
@@ -295,6 +418,110 @@ mod tests {
         for name in ["In31.Cu", "User.46", "In01.Cu", "User.01", "In.Cu", "User."] {
             assert!(!is_canonical_name(name), "{name} should not be canonical");
         }
+    }
+
+    /// KiCad 10's own layer table, as `demos/jetson-agx-thor-baseboard`
+    /// writes it, plus the `User.45` end of the range.
+    const KICAD10_TABLE: &[(i32, &str)] = &[
+        (0, "F.Cu"),
+        (4, "In1.Cu"),
+        (6, "In2.Cu"),
+        (18, "In8.Cu"),
+        (62, "In30.Cu"),
+        (2, "B.Cu"),
+        (9, "F.Adhes"),
+        (11, "B.Adhes"),
+        (13, "F.Paste"),
+        (15, "B.Paste"),
+        (5, "F.SilkS"),
+        (7, "B.SilkS"),
+        (1, "F.Mask"),
+        (3, "B.Mask"),
+        (17, "Dwgs.User"),
+        (19, "Cmts.User"),
+        (21, "Eco1.User"),
+        (23, "Eco2.User"),
+        (25, "Edge.Cuts"),
+        (27, "Margin"),
+        (31, "F.CrtYd"),
+        (29, "B.CrtYd"),
+        (35, "F.Fab"),
+        (33, "B.Fab"),
+        (37, "Rescue"),
+        (39, "User.1"),
+        (55, "User.9"),
+        (127, "User.45"),
+    ];
+
+    /// KiCad 8's table (`ecc83` before KiCad 9 renumbered it).
+    const LEGACY_TABLE: &[(i32, &str)] = &[
+        (0, "F.Cu"),
+        (1, "In1.Cu"),
+        (30, "In30.Cu"),
+        (31, "B.Cu"),
+        (32, "B.Adhes"),
+        (33, "F.Adhes"),
+        (34, "B.Paste"),
+        (35, "F.Paste"),
+        (36, "B.SilkS"),
+        (37, "F.SilkS"),
+        (38, "B.Mask"),
+        (39, "F.Mask"),
+        (40, "Dwgs.User"),
+        (41, "Cmts.User"),
+        (42, "Eco1.User"),
+        (43, "Eco2.User"),
+        (44, "Edge.Cuts"),
+        (45, "Margin"),
+        (46, "B.CrtYd"),
+        (47, "F.CrtYd"),
+        (48, "B.Fab"),
+        (49, "F.Fab"),
+        (50, "User.1"),
+        (58, "User.9"),
+    ];
+
+    #[test]
+    fn canonical_ids_match_kicads_own_tables() {
+        for (numbering, table) in [
+            (LayerNumbering::KiCad9, KICAD10_TABLE),
+            (LayerNumbering::Legacy, LEGACY_TABLE),
+        ] {
+            for (id, name) in table {
+                assert_eq!(
+                    canonical_id(name, numbering),
+                    Some(*id),
+                    "{name} {numbering:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn names_a_scheme_does_not_define_have_no_id() {
+        assert_eq!(canonical_id("User.10", LayerNumbering::Legacy), None);
+        assert_eq!(canonical_id("Custom.Cu", LayerNumbering::KiCad9), None);
+        assert_eq!(canonical_id("In31.Cu", LayerNumbering::KiCad9), None);
+    }
+
+    #[test]
+    fn numbering_is_read_from_the_copper_pair() {
+        let kicad9 = layers(&board(r#"(0 "F.Cu" signal) (2 "B.Cu" signal)"#));
+        let legacy = layers(&board(r#"(0 "F.Cu" signal) (31 "B.Cu" signal)"#));
+        let odd = layers(&board(r#"(1 "F.Cu" signal) (2 "B.Cu" signal)"#));
+        let no_back = layers(&board(r#"(0 "F.Cu" signal)"#));
+        assert_eq!(numbering(&kicad9), Some(LayerNumbering::KiCad9));
+        assert_eq!(numbering(&legacy), Some(LayerNumbering::Legacy));
+        assert_eq!(numbering(&odd), None);
+        assert_eq!(numbering(&no_back), None);
+    }
+
+    #[test]
+    fn inner_copper_index_reads_only_inner_copper() {
+        assert_eq!(inner_copper_index("In7.Cu"), Some(7));
+        assert_eq!(inner_copper_index("F.Cu"), None);
+        assert_eq!(inner_copper_index("In07.Cu"), None);
+        assert_eq!(inner_copper_index("User.7"), None);
     }
 
     #[test]

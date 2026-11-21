@@ -830,23 +830,23 @@ fn blank_kicad_pcb() -> &'static str {
         "\t(paper \"A4\")\n",
         "\t(layers\n",
         "\t\t(0 \"F.Cu\" signal)\n",
-        "\t\t(31 \"B.Cu\" signal)\n",
-        "\t\t(32 \"B.Adhes\" user \"B.Adhesive\")\n",
-        "\t\t(33 \"F.Adhes\" user \"F.Adhesive\")\n",
-        "\t\t(34 \"B.Paste\" user)\n",
-        "\t\t(35 \"F.Paste\" user)\n",
-        "\t\t(36 \"B.SilkS\" user \"B.Silkscreen\")\n",
-        "\t\t(37 \"F.SilkS\" user \"F.Silkscreen\")\n",
-        "\t\t(38 \"B.Mask\" user)\n",
-        "\t\t(39 \"F.Mask\" user)\n",
-        "\t\t(40 \"Dwgs.User\" user \"User.Drawings\")\n",
-        "\t\t(41 \"Cmts.User\" user \"User.Comments\")\n",
-        "\t\t(44 \"Edge.Cuts\" user)\n",
-        "\t\t(45 \"Margin\" user)\n",
-        "\t\t(46 \"B.CrtYd\" user \"B.Courtyard\")\n",
-        "\t\t(47 \"F.CrtYd\" user \"F.Courtyard\")\n",
-        "\t\t(48 \"B.Fab\" user)\n",
-        "\t\t(49 \"F.Fab\" user)\n",
+        "\t\t(2 \"B.Cu\" signal)\n",
+        "\t\t(9 \"F.Adhes\" user \"F.Adhesive\")\n",
+        "\t\t(11 \"B.Adhes\" user \"B.Adhesive\")\n",
+        "\t\t(13 \"F.Paste\" user)\n",
+        "\t\t(15 \"B.Paste\" user)\n",
+        "\t\t(5 \"F.SilkS\" user \"F.Silkscreen\")\n",
+        "\t\t(7 \"B.SilkS\" user \"B.Silkscreen\")\n",
+        "\t\t(1 \"F.Mask\" user)\n",
+        "\t\t(3 \"B.Mask\" user)\n",
+        "\t\t(17 \"Dwgs.User\" user \"User.Drawings\")\n",
+        "\t\t(19 \"Cmts.User\" user \"User.Comments\")\n",
+        "\t\t(25 \"Edge.Cuts\" user)\n",
+        "\t\t(27 \"Margin\" user)\n",
+        "\t\t(31 \"F.CrtYd\" user \"F.Courtyard\")\n",
+        "\t\t(29 \"B.CrtYd\" user \"B.Courtyard\")\n",
+        "\t\t(35 \"F.Fab\" user)\n",
+        "\t\t(33 \"B.Fab\" user)\n",
         "\t)\n",
         "\t(setup\n",
         "\t\t(pad_to_mask_clearance 0.05)\n",
@@ -916,6 +916,23 @@ mod tests {
         assert!(content.contains("\"F.Cu\""));
         assert!(content.contains("\"B.Cu\""));
         assert!(content.contains("\"Edge.Cuts\""));
+    }
+
+    #[test]
+    fn blank_kicad_pcb_numbers_layers_as_kicad_10_does() {
+        // Under a KiCad 10 version header, KiCad 8's ordinals (B.Cu 31,
+        // F.Mask 39) collide with KiCad 10's (User.1 is 39) (#127).
+        use konnect_sexp::layers::{canonical_id, layers, numbering, LayerNumbering};
+        let stack = layers(&konnect_sexp::parse_sexp(blank_kicad_pcb()).unwrap());
+        assert_eq!(numbering(&stack), Some(LayerNumbering::KiCad9));
+        for layer in &stack {
+            assert_eq!(
+                canonical_id(&layer.name, LayerNumbering::KiCad9),
+                Some(layer.id),
+                "{}",
+                layer.name
+            );
+        }
     }
 
     #[test]

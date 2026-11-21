@@ -1324,13 +1324,17 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "add_layer",
-            "Add a new inner copper or technical layer to the board layer stack.",
+            "Add a new inner copper or technical layer to the board layer stack, numbered with \
+             KiCad's ordinal for that name. Inner copper is added as the next pair in front of \
+             B.Cu so the copper count stays even; a layer already present, a layer_type that \
+             does not fit the layer, and a copper, mask, paste or silkscreen layer on a board \
+             that defines a stackup are refused.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":       { "type": "string" },
                     "layer_name":  { "type": "string", "description": "KiCAD layer name (e.g. 'In1.Cu')" },
-                    "layer_type":  { "type": "string", "description": "KiCad layer type", "enum":["signal", "power", "mixed", "jumper", "user"], "default": "signal" }
+                    "layer_type":  { "type": "string", "description": "KiCad layer type: signal, power, mixed or jumper for copper (default signal), user for every other layer (the default there)", "enum":["signal", "power", "mixed", "jumper", "user"] }
                 },
                 "required": ["board", "layer_name"]
             }),
@@ -2264,14 +2268,14 @@ async fn handle_add_layer(
         Err(e) => return Ok(e),
     };
     let layer_type = match args.get("layer_type") {
-        None => "signal",
+        None => None,
         Some(serde_json::Value::String(kind))
             if matches!(
                 kind.as_str(),
                 "signal" | "power" | "mixed" | "jumper" | "user"
             ) =>
         {
-            kind.as_str()
+            Some(kind.as_str())
         }
         Some(_) => {
             return Ok(crate::tools::invalid_arg(
@@ -2296,36 +2300,32 @@ async fn handle_add_layer(
         )));
     }
 
-    let content = std::fs::read_to_string(&board_path)?;
+    let is_copper = konnect_sexp::layers::is_copper_name(&layer_name);
+    let layer_type = match (layer_type, is_copper) {
+        (None, true) => "signal",
+        (None, false) => "user",
+        (Some("user"), true) => {
+            return Ok(crate::tools::invalid_arg(
+                "layer_type",
+                "a copper layer is signal, power, mixed, or jumper",
+            ))
+        }
+        (Some(kind), false) if kind != "user" => {
+            return Ok(crate::tools::invalid_arg(
+                "layer_type",
+                "a non-copper layer is user",
+            ))
+        }
+        (Some(kind), _) => kind,
+    };
 
-    // Find the (layers ...) block and insert before its closing paren
+    let content = std::fs::read_to_string(&board_path)?;
     let layers_pos = match content.find("(layers") {
         Some(p) => p,
         None => return Ok(CallToolResult::error("No (layers) section found")),
     };
-
-    // Determine the next available inner copper ID (first unused ID in 1-30 range).
-    // The ids have to be read by shape — see konnect_sexp::layers. Reading them
-    // with find_all("") returned nothing, so every call allocated id 1 and
-    // duplicated In1.Cu on any board that already had an inner layer.
-    let tree = parse_sexp(&content)?;
-    let used_ids: std::collections::HashSet<i32> = konnect_sexp::layers::layers(&tree)
-        .iter()
-        .map(|l| l.id)
-        .collect();
-    let new_id = match (1..=30).find(|id| !used_ids.contains(id)) {
-        Some(id) => id,
-        None => {
-            return Ok(CallToolResult::error(
-                "No free inner copper layer id: 1-30 are all in use",
-            ))
-        }
-    };
-
-    // Close of the layers block, by paren balance. The previous probe looked for
-    // a literal "\n  )", which a tab-indented KiCad 10 file never contains; the
-    // fallback then found the first ')' in the block — the close of the *first
-    // layer entry* — and the new layer was written inside it.
+    // Close of the layers block, by paren balance. A probe for a literal
+    // "\n  )" misses every tab-indented KiCad 10 file.
     let close = match close_of_block(&content, layers_pos) {
         Some(p) => p,
         None => {
@@ -2334,24 +2334,238 @@ async fn handle_add_layer(
             ))
         }
     };
-    // Insert after the last entry rather than immediately before the close, so
-    // the newline and indent that already sit in front of `)` stay in front of
-    // it and the block keeps KiCad's own layout.
-    let insert_pos = content[..close].trim_end().len();
+    let tree = parse_sexp(&content)?;
+    let plan = match plan_add_layer(&tree, &layer_name, layer_type) {
+        Ok(plan) => plan,
+        Err(reason) => return Ok(CallToolResult::error(reason)),
+    };
 
-    // Match whatever the file already indents entries with, rather than
-    // hardcoding spaces into a file that may be tab-indented.
-    let indent = entry_indent(&content, layers_pos).unwrap_or_else(|| "    ".to_string());
-    let new_layer = format!("\n{indent}({new_id} \"{layer_name}\" {layer_type})");
-    let new_content = apply_edits(
-        content.clone(),
-        vec![SexpEdit::insert(insert_pos, new_layer)],
-    );
+    let starts = layer_entry_starts(&content, layers_pos, close);
+    // Match whatever the file already separates entries with; a one-line
+    // table has no indent to copy.
+    let separator = entry_indent(&content, layers_pos)
+        .map(|indent| format!("\n{indent}"))
+        .unwrap_or_else(|| " ".to_string());
+    let entry = |l: &Layer| format!("({} \"{}\" {})", l.id, l.name, l.kind);
+    let edit = match plan.back_copper_index {
+        Some(index) => match starts.get(index) {
+            Some(&pos) => SexpEdit::insert(
+                pos,
+                plan.added
+                    .iter()
+                    .map(|l| format!("{}{separator}", entry(l)))
+                    .collect::<String>(),
+            ),
+            None => {
+                return Ok(CallToolResult::error(
+                    "Could not locate the B.Cu entry in the (layers) block; refusing to write",
+                ))
+            }
+        },
+        // After the last entry rather than immediately before the close, so
+        // the newline and indent in front of `)` stay in front of it.
+        None => SexpEdit::insert(
+            content[..close].trim_end().len(),
+            plan.added
+                .iter()
+                .map(|l| format!("{separator}{}", entry(l)))
+                .collect::<String>(),
+        ),
+    };
+    let new_content = apply_edits(content.clone(), vec![edit]);
+    if let Err(reason) = layer_table_reads_back(&new_content, &plan.table) {
+        return Ok(CallToolResult::error(format!(
+            "The edited layer table did not read back as planned ({reason}); nothing was written."
+        )));
+    }
     write_atomic_if_unchanged(&board_path, &content, &new_content)?;
 
+    let requested = plan
+        .added
+        .iter()
+        .find(|l| l.name == layer_name)
+        .map(|l| l.id);
     Ok(CallToolResult::json(&json!({
-        "added_layer": layer_name, "id": new_id, "type": layer_type
+        "added_layer": layer_name,
+        "id": requested,
+        "type": layer_type,
+        "added_layers": plan.added.iter()
+            .map(|l| json!({"name": l.name, "id": l.id, "type": l.kind}))
+            .collect::<Vec<_>>(),
+        "copper_layer_count": konnect_sexp::layers::copper(&plan.table).len(),
     })))
+}
+
+use konnect_sexp::layers::Layer;
+
+/// The non-copper layers a KiCad stackup lists (`BOARD_STACKUP::BuildDefaultStackupList`).
+const STACKUP_LAYERS: &[&str] = &[
+    "F.SilkS", "F.Paste", "F.Mask", "B.Mask", "B.Paste", "B.SilkS",
+];
+
+/// What `add_layer` will write: the new entries, where they go, and the whole
+/// table as it must read back afterwards.
+#[derive(Debug)]
+struct AddLayerPlan {
+    added: Vec<Layer>,
+    /// Inner copper goes in front of `B.Cu`, the entry at this index: KiCad
+    /// reads copper in file order, and inner copper listed after `B.Cu` is
+    /// dropped on load. `None` appends at the end of the table.
+    back_copper_index: Option<usize>,
+    table: Vec<Layer>,
+}
+
+/// Decide the entries `add_layer` writes, or why it must not write.
+///
+/// Every rule here was measured with `kicad-cli pcb upgrade` 10.0.8 (#127):
+/// KiCad will not load a board with an odd copper count, silently drops a
+/// repeated name or an inner layer past a gap, and keeps a written `(stackup …)`
+/// as it was, so a copper, mask, paste or silkscreen layer added to such a
+/// board is missing from its stackup. Konnect does not write stackups (#716).
+fn plan_add_layer(tree: &SexpNode, name: &str, kind: &str) -> Result<AddLayerPlan, String> {
+    use konnect_sexp::layers::{
+        canonical_id, copper, inner_copper_index, layers, numbering, LayerNumbering,
+    };
+    let stack = layers(tree);
+    if stack.iter().any(|l| l.name == name) {
+        return Err(format!(
+            "'{name}' is already on the board; nothing was written."
+        ));
+    }
+    let scheme = numbering(&stack).ok_or(
+        "The layer table does not number F.Cu and B.Cu as KiCad does (0 and 2, or 0 and 31 \
+         before KiCad 9), so a new layer's ordinal cannot be chosen; nothing was written.",
+    )?;
+    if let Some(odd) = stack
+        .iter()
+        .find(|l| canonical_id(&l.name, scheme) != Some(l.id))
+    {
+        return Err(format!(
+            "The board numbers '{}' as {}, which is not KiCad's ordinal for it in this file's \
+             scheme; re-save the board in KiCad first. Nothing was written.",
+            odd.name, odd.id
+        ));
+    }
+    let in_stackup = STACKUP_LAYERS.contains(&name) || inner_copper_index(name).is_some();
+    if in_stackup && tree.find("setup").and_then(|s| s.find("stackup")).is_some() {
+        return Err(format!(
+            "The board defines a stackup, and Konnect cannot add '{name}' to it (#716). \
+             Add the layer in KiCad's Board Setup, under Board Stackup. Nothing was written."
+        ));
+    }
+    let layer = |n: &str, kind: &str| -> Result<Layer, String> {
+        Ok(Layer {
+            id: canonical_id(n, scheme).ok_or(format!(
+                "'{n}' has no ordinal in this board's {} numbering; re-save the board in \
+                 KiCad 10 first. Nothing was written.",
+                match scheme {
+                    LayerNumbering::Legacy => "KiCad 8",
+                    LayerNumbering::KiCad9 => "KiCad 9",
+                }
+            ))?,
+            name: n.to_string(),
+            kind: kind.to_string(),
+            user_name: None,
+        })
+    };
+
+    let (added, back_copper_index) = match inner_copper_index(name) {
+        None => (vec![layer(name, kind)?], None),
+        Some(n) => {
+            let present: Vec<&str> = copper(&stack).iter().map(|l| l.name.as_str()).collect();
+            let inner = present.len().saturating_sub(2) as u32;
+            let expected: Vec<String> = std::iter::once("F.Cu".to_string())
+                .chain((1..=inner).map(|i| format!("In{i}.Cu")))
+                .chain(std::iter::once("B.Cu".to_string()))
+                .collect();
+            if present != expected || inner % 2 == 1 {
+                return Err(format!(
+                    "The board's copper layers are listed as {present:?}; KiCad needs an even \
+                     count listed F.Cu, In1.Cu.., B.Cu. Re-save the board in KiCad first. \
+                     Nothing was written."
+                ));
+            }
+            if n != inner + 1 && n != inner + 2 {
+                return Err(format!(
+                    "Inner copper is added in pairs, next to the existing ones: this board's \
+                     next pair is In{}.Cu and In{}.Cu. Nothing was written.",
+                    inner + 1,
+                    inner + 2
+                ));
+            }
+            // The caller typed only the layer it named; its partner is a
+            // plain signal layer.
+            let pair = [inner + 1, inner + 2]
+                .iter()
+                .map(|&i| {
+                    let partner = format!("In{i}.Cu");
+                    layer(&partner, if i == n { kind } else { "signal" })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let back = stack.iter().position(|l| l.name == "B.Cu");
+            (pair, back)
+        }
+    };
+    let insert_at = back_copper_index.unwrap_or(stack.len());
+    let table = stack[..insert_at]
+        .iter()
+        .chain(&added)
+        .chain(&stack[insert_at..])
+        .cloned()
+        .collect();
+    Ok(AddLayerPlan {
+        added,
+        back_copper_index,
+        table,
+    })
+}
+
+/// Byte offset of each entry's `(` inside the `(layers …)` block, in file
+/// order, which is the order `konnect_sexp::layers::layers` returns them in.
+fn layer_entry_starts(content: &str, open_pos: usize, close: usize) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, c) in content[open_pos..close].char_indices() {
+        if in_str {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' => {
+                if depth == 1 {
+                    starts.push(open_pos + i);
+                }
+                depth += 1;
+            }
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    starts
+}
+
+/// Re-read the edited file's layer table and compare it with the plan, so a
+/// misplaced insert is refused instead of written.
+fn layer_table_reads_back(new_content: &str, planned: &[Layer]) -> Result<(), String> {
+    let tree = parse_sexp(new_content).map_err(|e| format!("the board no longer parses: {e}"))?;
+    let read = konnect_sexp::layers::layers(&tree);
+    let key = |l: &Layer| (l.id, l.name.clone(), l.kind.clone());
+    if read.iter().map(key).eq(planned.iter().map(key)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "read {:?}",
+            read.iter().map(|l| &l.name).collect::<Vec<_>>()
+        ))
+    }
 }
 
 async fn handle_set_active_layer(
@@ -3200,20 +3414,6 @@ mod layers_block_tests {
         }
         // Cheap guard against the loop silently matching nothing.
         assert!(checked > 90, "only {checked} layers checked");
-    }
-
-    #[test]
-    fn ids_in_use_are_seen_so_a_new_layer_does_not_collide() {
-        // The regression this PR is about: with the ids unreadable, the free-id
-        // search always returned 1 and duplicated an existing In1.Cu.
-        let four_layer = "(kicad_pcb\n\t(layers\n\t\t(0 \"F.Cu\" signal)\n\t\t(1 \"In1.Cu\" signal)\n\t\t(2 \"B.Cu\" signal)\n\t)\n)";
-        let tree = parse_sexp(four_layer).unwrap();
-        let used: std::collections::HashSet<i32> = konnect_sexp::layers::layers(&tree)
-            .iter()
-            .map(|l| l.id)
-            .collect();
-        assert!(used.contains(&1));
-        assert_eq!((1..=30).find(|id| !used.contains(id)), Some(3));
     }
 }
 
@@ -6991,3 +7191,7 @@ mod board_boundary_contract_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "add_layer_tests.rs"]
+mod add_layer_tests;
