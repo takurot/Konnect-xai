@@ -28,6 +28,8 @@ use konnect_sexp::{
 use serde_json::json;
 use std::path::Path;
 
+use super::edge_cuts_outline::{mm_to_nm, split_outline, NmBox, NmPoint};
+
 // Build the 4 Edge.Cuts segments forming a rectangle, packed as Any for create_items.
 fn rect_outline_items(
     x1: f64,
@@ -1233,10 +1235,13 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "set_board_size",
-            "Add a rectangular board outline of the given dimensions on the Edge.Cuts layer. \
-             This appends: on a board that already has an outline it leaves two overlapping \
-             rectangles and a DRC failure, so resizing means calling \
-             delete_graphics(layer='Edge.Cuts') first.",
+            "Set the board outline to a rectangle of the given positive width and height on \
+             the Edge.Cuts layer. This replaces the existing outer outline: its Edge.Cuts \
+             lines are deleted and the new rectangle is drawn. Closed line loops fully inside \
+             the old outline are kept as cutouts, and the call refuses before writing if one \
+             would not fit inside the new rectangle. An Edge.Cuts arc, circle, rectangle, or \
+             polygon (including a rounded or circular cutout) makes it refuse untouched. \
+             'replaced_segments' and 'preserved_cutout_segments' report what happened.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1364,9 +1369,9 @@ pub fn tools() -> Vec<ToolDef> {
              deleting anything, and the UUIDs it reports can be passed straight back as 'uuids'. \
              Footprints, zones, tracks, vias, and graphics belonging to a footprint are never \
              touched, and neither are reference images (KiCad's API cannot identify one). \
-             This is how a board outline is resized: add_board_outline and set_board_size \
-             append, so calling one twice without deleting the old Edge.Cuts graphics first \
-             leaves two overlapping outlines. Acts on the board open in KiCad when it is \
+             add_board_outline appends, so calling it twice without deleting the old \
+             Edge.Cuts graphics first leaves two overlapping outlines; set_board_size \
+             replaces the outer outline itself. Acts on the board open in KiCad when it is \
              reachable, else on the file — 'source' says which.",
             json!({
                 "type": "object",
@@ -1481,11 +1486,20 @@ pub fn tools() -> Vec<ToolDef> {
 
 /// What replacing the board outline over IPC found and did.
 enum OutlineIpcOutcome {
-    /// Outline replaced; carries how many old Edge.Cuts segments were removed.
-    Replaced(usize),
+    /// Outline replaced; carries how many old Edge.Cuts segments were removed
+    /// and how many cutout segments were kept.
+    Replaced { removed: usize, preserved: usize },
     /// The existing outline holds something a rectangle cannot honestly
     /// replace (an arc, polygon, rounded rect…). Nothing was written.
     NotPlainSegments(String),
+    /// A cutout would fall outside the new rectangle. Nothing was written.
+    Refused(CallToolResult),
+}
+
+/// A live board's Edge.Cuts segment: its KIID and endpoints.
+struct LiveEdgeSegment {
+    id: String,
+    ends: (NmPoint, NmPoint),
 }
 
 /// Partition a live board's `KotPcbShape` items into Edge.Cuts segment KIIDs
@@ -1494,11 +1508,13 @@ enum OutlineIpcOutcome {
 /// Pure so it can be tested without a live KiCAD; the decode is guarded by the
 /// type URL per the #244 rule — a pad-shaped `Any` must not be mistaken for a
 /// shape.
-fn partition_edge_cuts_shapes(items: &[prost_types::Any]) -> (Vec<String>, Vec<&'static str>) {
+fn partition_edge_cuts_shapes(
+    items: &[prost_types::Any],
+) -> (Vec<LiveEdgeSegment>, Vec<&'static str>) {
     use konnect_ipc::gen::kiapi;
     use prost::Message;
 
-    let mut segment_ids = Vec::new();
+    let mut segments = Vec::new();
     let mut other_kinds = Vec::new();
     for item in items {
         if !builders::any_is(item, "kiapi.board.types.BoardGraphicShape") {
@@ -1513,9 +1529,17 @@ fn partition_edge_cuts_shapes(items: &[prost_types::Any]) -> (Vec<String>, Vec<&
         }
         use kiapi::common::types::graphic_shape::Geometry;
         match shape.shape.as_ref().and_then(|s| s.geometry.as_ref()) {
-            Some(Geometry::Segment(_)) => {
-                if let Some(id) = shape.id.as_ref().filter(|id| !id.value.is_empty()) {
-                    segment_ids.push(id.value.clone());
+            Some(Geometry::Segment(seg)) => {
+                let Some(id) = shape.id.as_ref().filter(|id| !id.value.is_empty()) else {
+                    other_kinds.push("segment without id");
+                    continue;
+                };
+                match (seg.start.as_ref(), seg.end.as_ref()) {
+                    (Some(a), Some(b)) => segments.push(LiveEdgeSegment {
+                        id: id.value.clone(),
+                        ends: ((a.x_nm, a.y_nm), (b.x_nm, b.y_nm)),
+                    }),
+                    _ => other_kinds.push("segment without endpoints"),
                 }
             }
             Some(Geometry::Rectangle(_)) => other_kinds.push("rectangle"),
@@ -1526,7 +1550,57 @@ fn partition_edge_cuts_shapes(items: &[prost_types::Any]) -> (Vec<String>, Vec<&
             None => other_kinds.push("unknown shape"),
         }
     }
-    (segment_ids, other_kinds)
+    (segments, other_kinds)
+}
+
+/// The segment indices a resize to `new_box` deletes, or the refusal when a
+/// cutout that stays would not fit inside the new rectangle (#130).
+fn outline_segments_to_replace(
+    segments: &[(NmPoint, NmPoint)],
+    new_box: NmBox,
+) -> Result<Vec<usize>, CallToolResult> {
+    let split = split_outline(segments);
+    let Some(cutout) = split.cutouts.iter().find(|c| !c.strictly_inside(&new_box)) else {
+        return Ok(split.replaced);
+    };
+    let mm = |v: i64| round6(v as f64 / 1e6);
+    let reason = format!(
+        "an Edge.Cuts cutout spans ({}, {})-({}, {}) mm, which does not fit strictly \
+         inside the new outline ({}, {})-({}, {}) mm",
+        mm(cutout.min.0),
+        mm(cutout.min.1),
+        mm(cutout.max.0),
+        mm(cutout.max.1),
+        mm(new_box.min.0),
+        mm(new_box.min.1),
+        mm(new_box.max.0),
+        mm(new_box.max.1),
+    );
+    Err(CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::InvalidArgument {
+            field: "origin_x/origin_y/width/height".to_string(),
+            reason: reason.clone(),
+        },
+        format!(
+            "Konnect refused before writing anything: {reason}. Enlarge or move the \
+             board, or delete the cutout first."
+        ),
+    ))
+}
+
+/// `width` or `height` as a positive, finite size in mm.
+fn positive_dimension(args: &serde_json::Value, key: &str) -> Result<f64, CallToolResult> {
+    let value = require_f64(args, key)?;
+    if value.is_finite() && value > 0.0 {
+        return Ok(value);
+    }
+    Err(CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::InvalidArgument {
+            field: key.to_string(),
+            reason: "must be greater than 0".to_string(),
+        },
+        format!("Argument '{key}' must be greater than 0 mm, got {value}"),
+    ))
 }
 
 /// The refusal both write paths share when the outline is not plain segments.
@@ -1544,11 +1618,11 @@ async fn handle_set_board_size(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
-    let width = match require_f64(args, "width") {
+    let width = match positive_dimension(args, "width") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let height = match require_f64(args, "height") {
+    let height = match positive_dimension(args, "height") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -1558,6 +1632,30 @@ async fn handle_set_board_size(
     let x2 = ox + width;
     let y2 = oy + height;
     let w = 0.05_f64;
+    let (Some(nx1), Some(ny1), Some(nx2), Some(ny2)) =
+        (mm_to_nm(ox), mm_to_nm(oy), mm_to_nm(x2), mm_to_nm(y2))
+    else {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "origin_x/origin_y/width/height".to_string(),
+                reason: "the outline must lie within KiCad's coordinate range".to_string(),
+            },
+            "The requested outline lies outside KiCad's coordinate range (about ±2147 mm)",
+        ));
+    };
+    if nx2 <= nx1 || ny2 <= ny1 {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "width/height".to_string(),
+                reason: "must be at least 1 nm".to_string(),
+            },
+            "Arguments 'width' and 'height' must each be at least 1 nm (0.000001 mm)",
+        ));
+    }
+    let new_box = NmBox {
+        min: (nx1, ny1),
+        max: (nx2, ny2),
+    };
 
     // Try IPC first (live board in KiCAD, undo-aware); fall through to file
     // edit. Both paths REPLACE the existing outline: since the first release
@@ -1568,24 +1666,33 @@ async fn handle_set_board_size(
     let fallback_reason = match attempt_ipc_write(ctx, &board_path, "board size", move |c| {
         let existing =
             c.get_items(konnect_ipc::gen::kiapi::common::types::KiCadObjectType::KotPcbShape)?;
-        let (segment_ids, other_kinds) = partition_edge_cuts_shapes(&existing);
+        let (segments, other_kinds) = partition_edge_cuts_shapes(&existing);
         if !other_kinds.is_empty() {
             return Ok(OutlineIpcOutcome::NotPlainSegments(other_kinds.join(", ")));
         }
-        let removed = segment_ids.len();
+        let ends: Vec<_> = segments.iter().map(|s| s.ends).collect();
+        let replaced = match outline_segments_to_replace(&ends, new_box) {
+            Ok(replaced) => replaced,
+            Err(refusal) => return Ok(OutlineIpcOutcome::Refused(refusal)),
+        };
+        let segment_ids: Vec<String> = replaced.iter().map(|&i| segments[i].id.clone()).collect();
         c.run_commit("Set board size", |c| {
             c.delete_items(segment_ids.clone())?;
             c.create_items(items.clone()).map(|_| ())
         })?;
-        Ok(OutlineIpcOutcome::Replaced(removed))
+        Ok(OutlineIpcOutcome::Replaced {
+            removed: replaced.len(),
+            preserved: segments.len() - replaced.len(),
+        })
     })
     .await?
     {
-        BoardWrite::Ipc(OutlineIpcOutcome::Replaced(removed)) => {
+        BoardWrite::Ipc(OutlineIpcOutcome::Replaced { removed, preserved }) => {
             return Ok(CallToolResult::json(&json!({
                 "width": width, "height": height,
                 "x1": round6(ox), "y1": round6(oy), "x2": round6(x2), "y2": round6(y2),
                 "replaced_segments": removed,
+                "preserved_cutout_segments": preserved,
                 "source": "ipc"
             })))
         }
@@ -1594,17 +1701,18 @@ async fn handle_set_board_size(
         BoardWrite::Ipc(OutlineIpcOutcome::NotPlainSegments(kinds)) => {
             return Ok(outline_not_replaceable(&kinds))
         }
+        BoardWrite::Ipc(OutlineIpcOutcome::Refused(refusal)) => return Ok(refusal),
         BoardWrite::Refused(err) => return Ok(err),
         BoardWrite::File(reason) => reason,
     };
 
     let content = std::fs::read_to_string(&board_path)?;
 
-    // Locate every existing top-level Edge.Cuts graphic. Plain `gr_line`s are
-    // replaced; anything else refuses, because silently deleting an arc or
+    // Locate every existing top-level Edge.Cuts graphic. The outer outline's
+    // `gr_line`s are replaced and closed loops inside it (cutouts) are kept;
+    // anything but a plain line refuses, because silently deleting an arc or
     // polygon outline would be guessing at design intent.
-    let mut edits = Vec::new();
-    let mut removed = 0usize;
+    let mut lines_found: Vec<((usize, usize), (NmPoint, NmPoint))> = Vec::new();
     let mut other_kinds: Vec<String> = Vec::new();
     for (start, end) in find_direct_child_blocks(&content, "kicad_pcb") {
         let block = &content[start..end];
@@ -1617,10 +1725,10 @@ async fn handle_set_board_size(
             continue;
         }
         if tag == "gr_line" {
-            let (ws_start, _) =
-                find_block_with_leading_whitespace(&content, start).unwrap_or((start, end));
-            edits.push(SexpEdit::replace(ws_start, end, String::new()));
-            removed += 1;
+            match gr_line_ends(block) {
+                Some(ends) => lines_found.push(((start, end), ends)),
+                None => other_kinds.push("line with missing or out-of-range endpoints".to_string()),
+            }
         } else {
             other_kinds.push(tag.trim_start_matches("gr_").to_string());
         }
@@ -1628,6 +1736,22 @@ async fn handle_set_board_size(
     if !other_kinds.is_empty() {
         return Ok(outline_not_replaceable(&other_kinds.join(", ")));
     }
+    let ends: Vec<_> = lines_found.iter().map(|&(_, ends)| ends).collect();
+    let replaced = match outline_segments_to_replace(&ends, new_box) {
+        Ok(replaced) => replaced,
+        Err(refusal) => return Ok(refusal),
+    };
+    let removed = replaced.len();
+    let preserved = lines_found.len() - removed;
+    let mut edits: Vec<SexpEdit> = replaced
+        .iter()
+        .map(|&i| {
+            let (start, end) = lines_found[i].0;
+            let (ws_start, _) =
+                find_block_with_leading_whitespace(&content, start).unwrap_or((start, end));
+            SexpEdit::replace(ws_start, end, String::new())
+        })
+        .collect();
 
     let lines = format!(
         "{}{}{}{}",
@@ -1645,10 +1769,22 @@ async fn handle_set_board_size(
         "width": width, "height": height,
         "x1": round6(ox), "y1": round6(oy), "x2": round6(x2), "y2": round6(y2),
         "replaced_segments": removed,
+        "preserved_cutout_segments": preserved,
         "source": "file",
         "fallback_reason": fallback_reason.evidence(),
         "warning": fallback_reason.warning()
     })))
+}
+
+/// A `gr_line` block's endpoints in nm, or `None` when either is missing or
+/// outside KiCad's coordinate range.
+fn gr_line_ends(block: &str) -> Option<(NmPoint, NmPoint)> {
+    let node = parse_sexp(block).ok()?;
+    let point = |tag: &str| {
+        let p = node.find(tag)?;
+        Some((mm_to_nm(p.get_f64(1)?)?, mm_to_nm(p.get_f64(2)?)?))
+    };
+    Some((point("start")?, point("end")?))
 }
 
 /// The board file, read and parsed — `None` when either fails. The paper
@@ -5763,6 +5899,131 @@ mod board_size_tests {
         assert!(text.contains("arc"), "the refusal names the shape: {text}");
     }
 
+    fn gr_line(x1: f64, y1: f64, x2: f64, y2: f64) -> String {
+        format!(
+            "\t(gr_line\n\t\t(start {x1} {y1})\n\t\t(end {x2} {y2})\n\t\t\
+             (stroke (width 0.05) (type default))\n\t\t(layer \"Edge.Cuts\")\n\t)\n"
+        )
+    }
+
+    fn rect_lines(x1: f64, y1: f64, x2: f64, y2: f64) -> String {
+        [
+            gr_line(x1, y1, x2, y1),
+            gr_line(x2, y1, x2, y2),
+            gr_line(x2, y2, x1, y2),
+            gr_line(x1, y2, x1, y1),
+        ]
+        .concat()
+    }
+
+    /// #130: an inner slot is a cutout, not part of the perimeter being
+    /// resized, so it must survive.
+    #[tokio::test]
+    async fn resizing_keeps_an_inner_cutout() {
+        let board = format!(
+            "(kicad_pcb\n\t(version 20260206)\n{}{})",
+            rect_lines(100.0, 100.0, 150.0, 140.0),
+            rect_lines(120.0, 115.0, 130.0, 125.0),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, &board).unwrap();
+        let result = handle_set_board_size(
+            &serde_json::json!({
+                "board": path.to_str().unwrap(),
+                "width": 60, "height": 45, "origin_x": 100, "origin_y": 100
+            }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text_of_result(&result));
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(edge_cuts_lines(&after), 8, "{after}");
+        for slot_side in [
+            "(start 120 115)",
+            "(start 130 115)",
+            "(start 130 125)",
+            "(start 120 125)",
+        ] {
+            assert!(
+                after.contains(slot_side),
+                "slot side {slot_side} lost: {after}"
+            );
+        }
+        assert!(
+            !after.contains("(end 150 100)"),
+            "old outline survived: {after}"
+        );
+        assert!(
+            after.contains("(end 160 100)"),
+            "new outline missing: {after}"
+        );
+        let output: serde_json::Value = serde_json::from_str(&text_of_result(&result)).unwrap();
+        assert_eq!(output["replaced_segments"], 4);
+        assert_eq!(output["preserved_cutout_segments"], 4);
+    }
+
+    #[tokio::test]
+    async fn non_positive_dimensions_are_rejected_untouched() {
+        for (w, h) in [
+            (serde_json::json!(-5), serde_json::json!(10)),
+            (serde_json::json!(10), serde_json::json!(0)),
+            (serde_json::json!(0), serde_json::json!(0)),
+            // Positive but beyond KiCad's coordinate range.
+            (serde_json::json!(1e308), serde_json::json!(10)),
+            // Positive but below 1 nm, so it would round to a zero-width outline.
+            (serde_json::json!(1e-7), serde_json::json!(10)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("board.kicad_pcb");
+            std::fs::write(&path, BOARD_WITH_OUTLINE).unwrap();
+            let result = handle_set_board_size(
+                &serde_json::json!({ "board": path.to_str().unwrap(), "width": w, "height": h }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{w}x{h} accepted");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), BOARD_WITH_OUTLINE);
+        }
+    }
+
+    /// Shrinking past a cutout would leave it outside or across the new
+    /// outline, an invalid board reported as success.
+    #[tokio::test]
+    async fn a_resize_that_would_cut_through_a_cutout_refuses_untouched() {
+        let board = format!(
+            "(kicad_pcb\n\t(version 20260206)\n{}{})",
+            rect_lines(100.0, 100.0, 150.0, 140.0),
+            rect_lines(120.0, 115.0, 130.0, 125.0),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, &board).unwrap();
+        let result = handle_set_board_size(
+            &serde_json::json!({
+                "board": path.to_str().unwrap(),
+                "width": 25, "height": 45, "origin_x": 100, "origin_y": 100
+            }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(text_of_result(&result).contains("cutout"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), board);
+    }
+
+    #[tokio::test]
+    async fn an_edge_cuts_line_without_endpoints_refuses_untouched() {
+        let board = "(kicad_pcb\n\t(version 20260206)\n\t(gr_line\n\t\t(start 0 0)\n\t\t\
+                     (layer \"Edge.Cuts\")\n\t)\n)";
+        let (result, after) = resize(board, 45.0, 30.0).await;
+        assert!(result.is_error);
+        assert_eq!(after, board);
+    }
+
     /// The live-path classifier: a pad-typed `Any` must not be counted, a
     /// non-Edge.Cuts segment must not be deleted, and non-segment Edge.Cuts
     /// geometry is reported by kind (#244's type-URL rule applied here).
@@ -5792,11 +6053,26 @@ mod board_size_tests {
             "kiapi.board.types.Pad",
         );
 
-        let (ids, other) = partition_edge_cuts_shapes(&[edge_segment, silk_segment, edge_arc, pad]);
-        // The plain Edge.Cuts segment has no KIID here (builder does not set
-        // one), so ids stays empty — but the arc is still detected by kind.
-        assert!(ids.is_empty());
-        assert_eq!(other, vec!["arc"]);
+        let mut no_ends = builders::board_segment("Edge.Cuts", 0.05, 0.0, 0.0, 1.0, 0.0).unwrap();
+        no_ends.id = Some(kiapi::common::types::Kiid {
+            value: "no-ends".into(),
+        });
+        if let Some(kiapi::common::types::graphic_shape::Geometry::Segment(seg)) =
+            no_ends.shape.as_mut().and_then(|s| s.geometry.as_mut())
+        {
+            seg.start = None;
+        }
+        let no_ends = builders::pack_any(&no_ends, "kiapi.board.types.BoardGraphicShape");
+
+        let (segments, other) =
+            partition_edge_cuts_shapes(&[edge_segment, silk_segment, edge_arc, pad, no_ends]);
+        // The builder sets no KIID, and a segment that cannot be deleted by id
+        // must refuse rather than be silently left out of the outline.
+        assert!(segments.is_empty());
+        assert_eq!(
+            other,
+            vec!["segment without id", "arc", "segment without endpoints"]
+        );
     }
 }
 
@@ -6380,6 +6656,64 @@ mod board_boundary_contract_tests {
         assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
     }
 
+    /// #130: a live resize that would cut through a kept cutout refuses before
+    /// any commit, and does not fall back to editing the file.
+    #[tokio::test]
+    async fn live_resize_through_a_cutout_refuses_before_mutation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let source = "(kicad_pcb (version 20240108))";
+        std::fs::write(&board, source).unwrap();
+        let items: Vec<prost_types::Any> = [
+            ("edge-a", (0.0, 0.0, 10.0, 0.0)),
+            ("edge-b", (10.0, 0.0, 10.0, 10.0)),
+            ("edge-c", (10.0, 10.0, 0.0, 10.0)),
+            ("edge-d", (0.0, 10.0, 0.0, 0.0)),
+            ("slot-a", (2.0, 2.0, 4.0, 2.0)),
+            ("slot-b", (4.0, 2.0, 4.0, 3.0)),
+            ("slot-c", (4.0, 3.0, 2.0, 3.0)),
+            ("slot-d", (2.0, 3.0, 2.0, 2.0)),
+        ]
+        .into_iter()
+        .map(|(id, (x1, y1, x2, y2))| {
+            let mut shape = builders::board_segment("Edge.Cuts", 0.05, x1, y1, x2, y2).unwrap();
+            shape.id = Some(kiapi::common::types::Kiid { value: id.into() });
+            builders::pack_any(&shape, "kiapi.board.types.BoardGraphicShape")
+        })
+        .collect();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let observed = writes.clone();
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                Some(builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: items.clone(),
+                        ..Default::default()
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ))
+            } else {
+                observed.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+        });
+        let result = handle_set_board_size(
+            &json!({"board":board,"width":3.0,"height":10.0}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(text(&result).contains("cutout"), "{}", text(&result));
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+
     #[tokio::test]
     async fn pcb_fidelity3_project_mounting_hole_library_preserves_its_fields_and_geometry() {
         let dir = tempfile::tempdir().unwrap();
@@ -6420,12 +6754,19 @@ mod board_boundary_contract_tests {
         let source = "(kicad_pcb (version 20240108))";
         std::fs::write(&board, source).unwrap();
         let mut items = Vec::new();
-        for (id, layer) in [
-            ("edge-a", "Edge.Cuts"),
-            ("edge-b", "Edge.Cuts"),
-            ("silk", "F.SilkS"),
+        // #130: a 10x10 outline with a slot inside; only the outline goes.
+        for (id, layer, (x1, y1, x2, y2)) in [
+            ("edge-a", "Edge.Cuts", (0.0, 0.0, 10.0, 0.0)),
+            ("edge-b", "Edge.Cuts", (10.0, 0.0, 10.0, 10.0)),
+            ("slot-a", "Edge.Cuts", (2.0, 2.0, 4.0, 2.0)),
+            ("slot-b", "Edge.Cuts", (4.0, 2.0, 4.0, 3.0)),
+            ("slot-c", "Edge.Cuts", (4.0, 3.0, 2.0, 3.0)),
+            ("slot-d", "Edge.Cuts", (2.0, 3.0, 2.0, 2.0)),
+            ("edge-c", "Edge.Cuts", (10.0, 10.0, 0.0, 10.0)),
+            ("edge-d", "Edge.Cuts", (0.0, 10.0, 0.0, 0.0)),
+            ("silk", "F.SilkS", (0.0, 0.0, 10.0, 0.0)),
         ] {
-            let mut shape = builders::board_segment(layer, 0.05, 0.0, 0.0, 10.0, 0.0).unwrap();
+            let mut shape = builders::board_segment(layer, 0.05, x1, y1, x2, y2).unwrap();
             shape.id = Some(kiapi::common::types::Kiid { value: id.into() });
             items.push(builders::pack_any(
                 &shape,
@@ -6523,10 +6864,11 @@ mod board_boundary_contract_tests {
         assert!(!result.is_error, "{}", text(&result));
         let body: serde_json::Value = serde_json::from_str(text(&result)).unwrap();
         assert_eq!(body["source"], "ipc");
-        assert_eq!(body["replaced_segments"], 2);
+        assert_eq!(body["replaced_segments"], 4);
+        assert_eq!(body["preserved_cutout_segments"], 4);
         let capture = capture.lock().unwrap();
         assert_eq!(capture.0, ["begin", "delete", "create", "end"]);
-        assert_eq!(capture.1, ["edge-a", "edge-b"]);
+        assert_eq!(capture.1, ["edge-a", "edge-b", "edge-c", "edge-d"]);
         assert_eq!(capture.2.len(), 4);
         let shapes = capture
             .2
