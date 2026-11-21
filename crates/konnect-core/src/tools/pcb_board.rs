@@ -1407,6 +1407,7 @@ fn partition_edge_cuts_shapes(
         match shape.shape.as_ref().and_then(|s| s.geometry.as_ref()) {
             Some(Geometry::Segment(seg)) => {
                 let Some(id) = shape.id.as_ref().filter(|id| !id.value.is_empty()) else {
+                    other_kinds.push("segment without id");
                     continue;
                 };
                 match (seg.start.as_ref(), seg.end.as_ref()) {
@@ -1453,7 +1454,7 @@ fn outline_segments_to_replace(
     );
     Err(CallToolResult::error_kind(
         crate::mcp::error::ToolErrorKind::InvalidArgument {
-            field: "width".to_string(),
+            field: "origin_x/origin_y/width/height".to_string(),
             reason: reason.clone(),
         },
         format!(
@@ -1507,9 +1508,20 @@ async fn handle_set_board_size(
     let x2 = ox + width;
     let y2 = oy + height;
     let w = 0.05_f64;
+    let (Some(nx1), Some(ny1), Some(nx2), Some(ny2)) =
+        (mm_to_nm(ox), mm_to_nm(oy), mm_to_nm(x2), mm_to_nm(y2))
+    else {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "origin_x/origin_y/width/height".to_string(),
+                reason: "the outline must lie within KiCad's coordinate range".to_string(),
+            },
+            "The requested outline lies outside KiCad's coordinate range (about ±2147 mm)",
+        ));
+    };
     let new_box = NmBox {
-        min: (mm_to_nm(ox), mm_to_nm(oy)),
-        max: (mm_to_nm(x2), mm_to_nm(y2)),
+        min: (nx1, ny1),
+        max: (nx2, ny2),
     };
 
     // Try IPC first (live board in KiCAD, undo-aware); fall through to file
@@ -1631,12 +1643,13 @@ async fn handle_set_board_size(
     })))
 }
 
-/// A `gr_line` block's endpoints in nm, or `None` when either is missing.
+/// A `gr_line` block's endpoints in nm, or `None` when either is missing or
+/// outside KiCad's coordinate range.
 fn gr_line_ends(block: &str) -> Option<(NmPoint, NmPoint)> {
     let node = parse_sexp(block).ok()?;
     let point = |tag: &str| {
         let p = node.find(tag)?;
-        Some((mm_to_nm(p.get_f64(1)?), mm_to_nm(p.get_f64(2)?)))
+        Some((mm_to_nm(p.get_f64(1)?)?, mm_to_nm(p.get_f64(2)?)?))
     };
     Some((point("start")?, point("end")?))
 }
@@ -5675,11 +5688,13 @@ mod board_size_tests {
     }
 
     #[tokio::test]
-    async fn non_positive_or_non_finite_dimensions_are_rejected_untouched() {
+    async fn non_positive_dimensions_are_rejected_untouched() {
         for (w, h) in [
             (serde_json::json!(-5), serde_json::json!(10)),
             (serde_json::json!(10), serde_json::json!(0)),
             (serde_json::json!(0), serde_json::json!(0)),
+            // Positive but beyond KiCad's coordinate range.
+            (serde_json::json!(1e308), serde_json::json!(10)),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("board.kicad_pcb");
@@ -5759,11 +5774,26 @@ mod board_size_tests {
             "kiapi.board.types.Pad",
         );
 
-        let (ids, other) = partition_edge_cuts_shapes(&[edge_segment, silk_segment, edge_arc, pad]);
-        // The plain Edge.Cuts segment has no KIID here (builder does not set
-        // one), so ids stays empty — but the arc is still detected by kind.
-        assert!(ids.is_empty());
-        assert_eq!(other, vec!["arc"]);
+        let mut no_ends = builders::board_segment("Edge.Cuts", 0.05, 0.0, 0.0, 1.0, 0.0).unwrap();
+        no_ends.id = Some(kiapi::common::types::Kiid {
+            value: "no-ends".into(),
+        });
+        if let Some(kiapi::common::types::graphic_shape::Geometry::Segment(seg)) =
+            no_ends.shape.as_mut().and_then(|s| s.geometry.as_mut())
+        {
+            seg.start = None;
+        }
+        let no_ends = builders::pack_any(&no_ends, "kiapi.board.types.BoardGraphicShape");
+
+        let (segments, other) =
+            partition_edge_cuts_shapes(&[edge_segment, silk_segment, edge_arc, pad, no_ends]);
+        // The builder sets no KIID, and a segment that cannot be deleted by id
+        // must refuse rather than be silently left out of the outline.
+        assert!(segments.is_empty());
+        assert_eq!(
+            other,
+            vec!["segment without id", "arc", "segment without endpoints"]
+        );
     }
 }
 
@@ -6343,6 +6373,64 @@ mod board_boundary_contract_tests {
         .unwrap();
         assert!(result.is_error);
         assert!(text(&result).contains("rectangle"));
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+
+    /// #130: a live resize that would cut through a kept cutout refuses before
+    /// any commit, and does not fall back to editing the file.
+    #[tokio::test]
+    async fn live_resize_through_a_cutout_refuses_before_mutation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let source = "(kicad_pcb (version 20240108))";
+        std::fs::write(&board, source).unwrap();
+        let items: Vec<prost_types::Any> = [
+            ("edge-a", (0.0, 0.0, 10.0, 0.0)),
+            ("edge-b", (10.0, 0.0, 10.0, 10.0)),
+            ("edge-c", (10.0, 10.0, 0.0, 10.0)),
+            ("edge-d", (0.0, 10.0, 0.0, 0.0)),
+            ("slot-a", (2.0, 2.0, 4.0, 2.0)),
+            ("slot-b", (4.0, 2.0, 4.0, 3.0)),
+            ("slot-c", (4.0, 3.0, 2.0, 3.0)),
+            ("slot-d", (2.0, 3.0, 2.0, 2.0)),
+        ]
+        .into_iter()
+        .map(|(id, (x1, y1, x2, y2))| {
+            let mut shape = builders::board_segment("Edge.Cuts", 0.05, x1, y1, x2, y2).unwrap();
+            shape.id = Some(kiapi::common::types::Kiid { value: id.into() });
+            builders::pack_any(&shape, "kiapi.board.types.BoardGraphicShape")
+        })
+        .collect();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let observed = writes.clone();
+        let server = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                Some(builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: items.clone(),
+                        ..Default::default()
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ))
+            } else {
+                observed.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+        });
+        let result = handle_set_board_size(
+            &json!({"board":board,"width":3.0,"height":10.0}),
+            &ctx_talking_to(server.address().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(text(&result).contains("cutout"), "{}", text(&result));
         assert_eq!(writes.load(Ordering::SeqCst), 0);
         assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
     }

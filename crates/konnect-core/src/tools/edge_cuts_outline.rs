@@ -37,7 +37,8 @@ impl NmBox {
     }
 
     fn area(&self) -> i128 {
-        i128::from(self.max.0 - self.min.0) * i128::from(self.max.1 - self.min.1)
+        (i128::from(self.max.0) - i128::from(self.min.0))
+            * (i128::from(self.max.1) - i128::from(self.min.1))
     }
 
     pub fn strictly_inside(&self, outer: &NmBox) -> bool {
@@ -56,8 +57,11 @@ pub(crate) struct OutlineSplit {
     pub cutouts: Vec<NmBox>,
 }
 
-pub(crate) fn mm_to_nm(mm: f64) -> i64 {
-    (mm * 1e6).round() as i64
+/// `mm` in whole nanometres, or `None` when it is not finite or lies outside
+/// KiCad's 32-bit nanometre coordinate range.
+pub(crate) fn mm_to_nm(mm: f64) -> Option<i64> {
+    let nm = (mm * 1e6).round();
+    (nm.is_finite() && nm.abs() <= f64::from(i32::MAX)).then_some(nm as i64)
 }
 
 pub(crate) fn split_outline(segments: &[(NmPoint, NmPoint)]) -> OutlineSplit {
@@ -216,7 +220,35 @@ mod tests {
 
     #[test]
     fn mm_rounds_to_whole_nanometres() {
-        assert_eq!(mm_to_nm(120.0000004), 120_000_000);
-        assert_eq!(mm_to_nm(-0.5), -500_000);
+        assert_eq!(mm_to_nm(120.0000004), Some(120_000_000));
+        assert_eq!(mm_to_nm(-0.5), Some(-500_000));
+    }
+
+    #[test]
+    fn mm_outside_kicads_range_has_no_nanometre_value() {
+        for mm in [f64::NAN, f64::INFINITY, 5e12, -2147.5] {
+            assert_eq!(mm_to_nm(mm), None, "{mm}");
+        }
+    }
+
+    /// A cutout touching the new outline's edge does not fit strictly inside.
+    #[test]
+    fn strict_containment_excludes_shared_edges() {
+        let outer = NmBox {
+            min: (0, 0),
+            max: (40, 40),
+        };
+        let touching = NmBox {
+            min: (0, 10),
+            max: (20, 20),
+        };
+        assert!(!touching.strictly_inside(&outer));
+    }
+
+    #[test]
+    fn area_does_not_overflow_at_kicads_coordinate_limits() {
+        let limit = i64::from(i32::MAX);
+        let segments = rect(-limit, -limit, limit, limit);
+        assert_eq!(split_outline(&segments).replaced, vec![0, 1, 2, 3]);
     }
 }
