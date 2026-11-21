@@ -1519,6 +1519,15 @@ async fn handle_set_board_size(
             "The requested outline lies outside KiCad's coordinate range (about ±2147 mm)",
         ));
     };
+    if nx2 <= nx1 || ny2 <= ny1 {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "width/height".to_string(),
+                reason: "must be at least 1 nm".to_string(),
+            },
+            "Arguments 'width' and 'height' must each be at least 1 nm (0.000001 mm)",
+        ));
+    }
     let new_box = NmBox {
         min: (nx1, ny1),
         max: (nx2, ny2),
@@ -1594,7 +1603,7 @@ async fn handle_set_board_size(
         if tag == "gr_line" {
             match gr_line_ends(block) {
                 Some(ends) => lines_found.push(((start, end), ends)),
-                None => other_kinds.push("line without endpoints".to_string()),
+                None => other_kinds.push("line with missing or out-of-range endpoints".to_string()),
             }
         } else {
             other_kinds.push(tag.trim_start_matches("gr_").to_string());
@@ -5695,6 +5704,8 @@ mod board_size_tests {
             (serde_json::json!(0), serde_json::json!(0)),
             // Positive but beyond KiCad's coordinate range.
             (serde_json::json!(1e308), serde_json::json!(10)),
+            // Positive but below 1 nm, so it would round to a zero-width outline.
+            (serde_json::json!(1e-7), serde_json::json!(10)),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("board.kicad_pcb");
