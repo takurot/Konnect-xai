@@ -360,6 +360,15 @@ fn package_identity(members: &[&PlacedSymbol]) -> Identity {
     }
 }
 
+/// Verify the common package identity for placements sharing one number.
+pub(crate) fn one_package(members: &[&PlacedSymbol]) -> bool {
+    let first = members.first();
+    members
+        .iter()
+        .all(|item| first.is_none_or(|first| first.unit_count == item.unit_count))
+        && package_identity(members) == Identity::OnePackage
+}
+
 /// eeschema's annotation order: ascending X, then Y; the uuid only breaks an
 /// exact tie so the result is deterministic.
 fn kicad_order(a: &PlacedSymbol, b: &PlacedSymbol) -> std::cmp::Ordering {

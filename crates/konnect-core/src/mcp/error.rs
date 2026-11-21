@@ -33,6 +33,15 @@
 use super::protocol::{CallToolResult, ToolContent};
 use serde::Serialize;
 
+/// One physical and logical placement claiming a numbered schematic reference.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReferencePlacement {
+    pub(crate) schematic: String,
+    pub(crate) instance_path: String,
+    pub(crate) uuid: String,
+    pub(crate) unit: u32,
+}
+
 /// Structured error for tool call failures.
 ///
 /// Serializes with `kind` as a stable discriminant — the single field a client
@@ -68,6 +77,12 @@ pub enum ToolErrorKind {
     AmbiguousReference {
         reference: String,
         uuids: Vec<String>,
+    },
+    /// One numbered reference would name incompatible component placements.
+    ReferenceConflict {
+        reference: String,
+        placements: Vec<ReferencePlacement>,
+        suggested_reference: Option<String>,
     },
     AmbiguousTarget {
         target: String,
@@ -177,6 +192,7 @@ impl ToolErrorKind {
             Self::Conflict { .. } => "conflict",
             Self::WouldJoinNets { .. } => "would_join_nets",
             Self::AmbiguousReference { .. } => "ambiguous_reference",
+            Self::ReferenceConflict { .. } => "reference_conflict",
             Self::AmbiguousTarget { .. } => "ambiguous_target",
             Self::WrongDocument { .. } => "wrong_document",
             Self::WrongProject { .. } => "wrong_project",
