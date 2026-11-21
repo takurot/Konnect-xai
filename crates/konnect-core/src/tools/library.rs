@@ -217,7 +217,7 @@ pub fn tools() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
-                    "project": { "type": "string", "description": "Path to .kicad_pro to include project libraries (optional)" },
+                    "project": { "type": "string", "description": "Path to the .kicad_pro file, or to the project directory that holds it, to include project libraries (optional)" },
                     "scope": {
                         "type": "string",
                         "description": "Scope: 'global', 'project', or 'all'",
@@ -351,7 +351,7 @@ pub fn tools() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
-                    "project": { "type": "string", "description": "Path to .kicad_pro to include project libraries (optional)" },
+                    "project": { "type": "string", "description": "Path to the .kicad_pro file, or to the project directory that holds it, to include project libraries (optional)" },
                     "scope": {
                         "type": "string",
                         "description": "Scope: 'global', 'project', or 'all'",
@@ -398,7 +398,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "footprint_path": { "type": "string", "description": "Path to .kicad_mod file, OR 'Library:Footprint' identifier" },
-                    "project": { "type": "string", "description": "Path to a .kicad_pro used to resolve project libraries (optional)" },
+                    "project": { "type": "string", "description": "Path to the .kicad_pro file, or to the project directory that holds it, used to resolve project libraries (optional)" },
                     "include_pads": { "type": "boolean", "description": "Include typed pad geometry in footprint-local coordinates", "default": false },
                     "include_graphics": { "type": "boolean", "description": "Include supported top-level footprint graphics in the response", "default": false },
                     "graphics_layer": { "type": "string", "description": "Return graphics only from this canonical KiCad layer; implies include_graphics" }
@@ -2250,6 +2250,9 @@ async fn handle_register_footprint_library(
         },
     };
 
+    if let Err(error) = validate_library_path(&lib_path, LibraryKind::Footprint) {
+        return Ok(error);
+    }
     let (table_path, uri) = match lib_table_target(
         scope,
         args["project"].as_str(),
@@ -2274,17 +2277,12 @@ async fn handle_register_footprint_library(
         Err(error) => return Ok(invalid_library_argument(&error.field, error.reason)),
     };
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "nickname": nickname,
-            "scope": scope,
-            "table": table_path.to_str().unwrap_or(""),
-            "uri": uri,
-            "state": registration.state.as_str(),
-            "repaired_table_root": registration.repaired_root
-        }))
-        .unwrap(),
+    Ok(registration_result(
+        nickname,
+        scope,
+        &table_path,
+        &uri,
+        &registration,
     ))
 }
 
@@ -2324,9 +2322,9 @@ fn project_relative_uri(lib_path: &Path, table_dir: &Path) -> String {
 
     // Canonicalising both sides is the accurate comparison — it resolves
     // symlinks, `..` and case differences — but it only works for paths that
-    // already exist. Registering a library before creating it is normal, so a
-    // failure here falls through to a lexical compare rather than giving up on
-    // portability.
+    // already exist. The library is checked to exist before registration, but
+    // the project directory may not be created yet, so a failure here falls
+    // through to a lexical compare rather than giving up on portability.
     if let (Ok(lib), Ok(dir)) = (
         std::fs::canonicalize(lib_path),
         std::fs::canonicalize(table_dir),
@@ -2344,19 +2342,7 @@ fn project_relative_uri(lib_path: &Path, table_dir: &Path) -> String {
     }
 }
 
-fn repository_relative_uri(
-    lib_path: &Path,
-    table_dir: &Path,
-    project_path: &Path,
-) -> Option<String> {
-    if !project_path.is_file()
-        || project_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            != Some("kicad_pro")
-    {
-        return None;
-    }
+fn repository_relative_uri(lib_path: &Path, table_dir: &Path) -> Option<String> {
     let repository = table_dir
         .ancestors()
         .find(|ancestor| ancestor.join(".git").exists())?;
@@ -2437,6 +2423,99 @@ fn project_table_dir(project: &str) -> Result<PathBuf, CallToolResult> {
     )))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibraryKind {
+    Symbol,
+    Footprint,
+}
+
+/// Refuse a library KiCad could not load before it reaches a table: a symbol
+/// library is a `.kicad_sym` file, a footprint library a `.pretty` directory.
+/// A relative path is refused because it would resolve against the server's
+/// working directory, which is unrelated to the project.
+fn validate_library_path(path: &Path, kind: LibraryKind) -> Result<(), CallToolResult> {
+    let (extension, is_right_shape, expected) = match kind {
+        LibraryKind::Symbol => ("kicad_sym", path.is_file(), "an existing .kicad_sym file"),
+        LibraryKind::Footprint => ("pretty", path.is_dir(), "an existing .pretty directory"),
+    };
+    let has_extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(extension));
+    if !path.is_absolute() {
+        return Err(invalid_library_argument(
+            "library_path",
+            format!(
+                "must be an absolute path (KiCad variables such as ${{KICAD9_SYMBOL_DIR}} \
+                 are not expanded), got: {}",
+                path.display()
+            ),
+        ));
+    }
+    if has_extension && is_right_shape {
+        return Ok(());
+    }
+    let found = if !path.exists() {
+        "nothing exists there"
+    } else if is_right_shape {
+        "its extension is wrong"
+    } else if path.is_dir() {
+        "it is a directory"
+    } else {
+        "it is a file"
+    };
+    Err(invalid_library_argument(
+        "library_path",
+        format!("must be {expected}, but {found}: {}", path.display()),
+    ))
+}
+
+/// The response for a registration: success for inserted/unchanged/updated,
+/// an error carrying the table's own URI when the nickname is taken.
+fn registration_result(
+    nickname: &str,
+    scope: &str,
+    table_path: &Path,
+    requested_uri: &str,
+    registration: &LibTableRegistration,
+) -> CallToolResult {
+    let table = table_path.to_str().unwrap_or("");
+    if registration.state != LibTableRegistrationState::Conflict {
+        return CallToolResult::text(
+            json!({
+                "success": true,
+                "nickname": nickname,
+                "scope": scope,
+                "table": table,
+                "uri": registration.table_uri,
+                "state": registration.state.as_str(),
+                "repaired_table_root": registration.repaired_root
+            })
+            .to_string(),
+        );
+    }
+    CallToolResult::error(
+        json!({
+            "success": false,
+            "nickname": nickname,
+            "scope": scope,
+            "table": table,
+            "uri": registration.table_uri,
+            "requested_uri": requested_uri,
+            "state": registration.state.as_str(),
+            "message": format!(
+                "Nickname '{nickname}' already points at '{}'; the table was not changed. \
+                 Pass replace_existing=true to point it at '{requested_uri}'.",
+                registration.table_uri
+            ),
+            "error": ToolErrorKind::Conflict {
+                paths: vec![table.to_string()]
+            }
+        })
+        .to_string(),
+    )
+}
+
 fn lib_table_target(
     scope: &str,
     project: Option<&str>,
@@ -2449,7 +2528,7 @@ fn lib_table_target(
     }
     let Some(proj) = project else {
         return Err(CallToolResult::error(
-            "For project scope, provide 'project' path to .kicad_pro file",
+            "For project scope, provide 'project' as a .kicad_pro file or project directory",
         ));
     };
     let table_dir = project_table_dir(proj)?;
@@ -2457,7 +2536,7 @@ fn lib_table_target(
     let uri = if uri.starts_with("${KIPRJMOD}") {
         uri
     } else {
-        repository_relative_uri(lib_path, &table_dir, Path::new(proj)).unwrap_or(uri)
+        repository_relative_uri(lib_path, &table_dir).unwrap_or(uri)
     };
     Ok((table_dir.join(table_filename), uri))
 }
@@ -2485,6 +2564,9 @@ async fn handle_register_symbol_library(
         },
     };
 
+    if let Err(error) = validate_library_path(&lib_path, LibraryKind::Symbol) {
+        return Ok(error);
+    }
     let (table_path, uri) = match lib_table_target(
         scope,
         args["project"].as_str(),
@@ -2512,17 +2594,12 @@ async fn handle_register_symbol_library(
         Err(error) => return Ok(invalid_library_argument(&error.field, error.reason)),
     };
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "nickname": nickname,
-            "scope": scope,
-            "table": table_path.to_str().unwrap_or(""),
-            "uri": uri,
-            "state": registration.state.as_str(),
-            "repaired_table_root": registration.repaired_root
-        }))
-        .unwrap(),
+    Ok(registration_result(
+        nickname,
+        scope,
+        &table_path,
+        &uri,
+        &registration,
     ))
 }
 
@@ -2586,6 +2663,8 @@ enum LibTableRegistrationState {
     Inserted,
     Unchanged,
     Updated,
+    /// The nickname is bound to another URI and replacement was not asked for.
+    Conflict,
 }
 
 impl LibTableRegistrationState {
@@ -2594,6 +2673,7 @@ impl LibTableRegistrationState {
             Self::Inserted => "inserted",
             Self::Unchanged => "unchanged",
             Self::Updated => "updated",
+            Self::Conflict => "conflict",
         }
     }
 }
@@ -2602,6 +2682,8 @@ impl LibTableRegistrationState {
 struct LibTableRegistration {
     state: LibTableRegistrationState,
     repaired_root: bool,
+    /// The URI the table holds for the nickname once the call is done.
+    table_uri: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2674,7 +2756,8 @@ async fn register_in_lib_table_with_policy(
         );
     }
 
-    if prepared.content != source {
+    let conflict = prepared.registration.state == LibTableRegistrationState::Conflict;
+    if !conflict && prepared.content != source {
         if let Some(parent) = table_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -2725,42 +2808,40 @@ fn prepare_lib_table_registration(
         });
     }
 
-    let (content, state) = if let Some((start, end)) = matches.first().copied() {
-        if !replace_existing {
-            (content, LibTableRegistrationState::Unchanged)
+    let (content, state, table_uri) = if let Some((start, end)) = matches.first().copied() {
+        let block = &content[start..end];
+        let current_uri = parse_sexp(block)
+            .ok()
+            .and_then(|node| node.find_str("uri").map(str::to_string))
+            .ok_or_else(|| LibTableRegistrationError {
+                field: "table".to_string(),
+                reason: format!("entry '{nickname}' has no valid uri"),
+            })?;
+        if current_uri == uri {
+            (content, LibTableRegistrationState::Unchanged, current_uri)
+        } else if !replace_existing {
+            (content, LibTableRegistrationState::Conflict, current_uri)
         } else {
-            let block = &content[start..end];
-            let current_uri = parse_sexp(block)
-                .ok()
-                .and_then(|node| node.find_str("uri").map(str::to_string))
+            let uri_range = find_direct_child_blocks(block, "lib")
+                .into_iter()
+                .find(|(child_start, child_end)| {
+                    parse_sexp(&block[*child_start..*child_end])
+                        .is_ok_and(|node| node.head() == Some("uri"))
+                })
                 .ok_or_else(|| LibTableRegistrationError {
                     field: "table".to_string(),
-                    reason: format!("entry '{nickname}' has no valid uri"),
+                    reason: format!("entry '{nickname}' has no uri block"),
                 })?;
-            if current_uri == uri {
-                (content, LibTableRegistrationState::Unchanged)
-            } else {
-                let uri_range = find_direct_child_blocks(block, "lib")
-                    .into_iter()
-                    .find(|(child_start, child_end)| {
-                        parse_sexp(&block[*child_start..*child_end])
-                            .is_ok_and(|node| node.head() == Some("uri"))
-                    })
-                    .ok_or_else(|| LibTableRegistrationError {
-                        field: "table".to_string(),
-                        reason: format!("entry '{nickname}' has no uri block"),
-                    })?;
-                let replacement = format!("(uri {})", quote_lib_table_string(uri));
-                let updated = apply_edits(
-                    content,
-                    vec![SexpEdit::replace(
-                        start + uri_range.0,
-                        start + uri_range.1,
-                        replacement,
-                    )],
-                );
-                (updated, LibTableRegistrationState::Updated)
-            }
+            let replacement = format!("(uri {})", quote_lib_table_string(uri));
+            let updated = apply_edits(
+                content,
+                vec![SexpEdit::replace(
+                    start + uri_range.0,
+                    start + uri_range.1,
+                    replacement,
+                )],
+            );
+            (updated, LibTableRegistrationState::Updated, uri.to_string())
         }
     } else {
         let root_end = find_balanced_block(&content, 0)
@@ -2778,6 +2859,7 @@ fn prepare_lib_table_registration(
         (
             apply_edits(content, vec![SexpEdit::insert(root_end, entry)]),
             LibTableRegistrationState::Inserted,
+            uri.to_string(),
         )
     };
 
@@ -2790,6 +2872,7 @@ fn prepare_lib_table_registration(
         registration: LibTableRegistration {
             state,
             repaired_root,
+            table_uri,
         },
     })
 }
@@ -5185,10 +5268,10 @@ async fn handle_get_footprint_info(
 
     // Resolve "Library:Footprint" against the project's fp-lib-table as well
     // as the global one, when the caller says which project they mean.
-    let project_dir = args["project"]
-        .as_str()
-        .map(PathBuf::from)
-        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let project_dir = match args["project"].as_str().map(project_table_dir).transpose() {
+        Ok(project_dir) => project_dir,
+        Err(error) => return Ok(error),
+    };
     let path = match resolve_footprint_path(fp_path_str, project_dir.as_deref()) {
         Ok(p) => p,
         Err(msg) => return Ok(CallToolResult::error(msg)),
@@ -6132,10 +6215,13 @@ mod tests {
 )
 ";
         std::fs::write(&table, original).unwrap();
+        let library = tmp.path().join("lib").join("Parts.kicad_sym");
+        std::fs::create_dir_all(library.parent().unwrap()).unwrap();
+        std::fs::write(&library, "(kicad_symbol_lib)").unwrap();
 
         let result = handle_register_symbol_library(
             &json!({
-                "library_path": tmp.path().join("lib").join("Parts.kicad_sym"),
+                "library_path": library,
                 "nickname": "Parts",
                 "project": project
             }),
@@ -6144,12 +6230,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!result.is_error, "{:?}", result.content);
+        assert!(result.is_error, "a taken nickname must not read as success");
         let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
         assert_eq!(
-            output["state"], "unchanged",
-            "a no-op must say so rather than reporting a bare success: {output}"
+            output["state"], "conflict",
+            "a no-op must say why rather than reporting a bare success: {output}"
         );
+        assert_eq!(output["uri"], "C:/stale/Parts.kicad_sym", "{output}");
         assert_eq!(std::fs::read_to_string(&table).unwrap(), original);
     }
 
@@ -6158,10 +6245,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("test").join("board.kicad_pro");
         std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        let library = tmp.path().join("lib").join("Parts.kicad_sym");
+        std::fs::create_dir_all(library.parent().unwrap()).unwrap();
+        std::fs::write(&library, "(kicad_symbol_lib)").unwrap();
 
         let result = handle_register_symbol_library(
             &json!({
-                "library_path": tmp.path().join("lib").join("Parts.kicad_sym"),
+                "library_path": library,
                 "nickname": "Parts",
                 "project": project
             }),
@@ -6244,17 +6334,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_footprint_library_keeps_existing_uri_by_default() {
+    async fn register_footprint_library_keeps_existing_uri_by_default_and_reports_a_conflict() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("test").join("board.kicad_pro");
         std::fs::create_dir_all(project.parent().unwrap()).unwrap();
         let table = project.parent().unwrap().join("fp-lib-table");
         let original = "(fp_lib_table\n  (version 7)\n  (lib (name \"Parts\") (type \"KiCad\") (uri \"C:/stale/Parts.pretty\") (options \"keep=1\") (descr \"keep me\"))\n)\n";
         std::fs::write(&table, original).unwrap();
+        let library = tmp.path().join("lib").join("Parts.pretty");
+        std::fs::create_dir_all(&library).unwrap();
 
         let result = handle_register_footprint_library(
             &json!({
-                "library_path": tmp.path().join("lib").join("Parts.pretty"),
+                "library_path": library,
                 "nickname": "Parts",
                 "project": project
             }),
@@ -6263,9 +6355,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!result.is_error, "{:?}", result.content);
+        assert!(result.is_error);
         let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
-        assert_eq!(output["state"], "unchanged");
+        assert_eq!(output["state"], "conflict");
         assert_eq!(std::fs::read_to_string(table).unwrap(), original);
     }
 
@@ -6387,6 +6479,277 @@ mod tests {
         assert!(!tmp.path().join("sym-lib-table").exists());
     }
 
+    /// #135: `get_footprint_info` took `parent()` of the project argument, so a
+    /// project directory resolved `Library:Footprint` against the folder above.
+    #[tokio::test]
+    async fn get_footprint_info_resolves_a_project_directory_like_its_kicad_pro() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("board");
+        let pretty = project_dir.join("minilib.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        std::fs::write(
+            pretty.join("MySOT.kicad_mod"),
+            "(footprint \"MySOT\" (version 20240108) (generator \"pcbnew\") (layer \"F.Cu\"))\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join("fp-lib-table"),
+            kicad_style_table(
+                "fp_lib_table",
+                &[("minilib", "KiCad", &pretty.to_string_lossy())],
+            ),
+        )
+        .unwrap();
+
+        for project in [project_dir.clone(), project_dir.join("board.kicad_pro")] {
+            let result = handle_get_footprint_info(
+                &json!({"footprint_path": "minilib:MySOT", "project": project}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{project:?}: {:?}", result.content);
+            let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+            assert_eq!(output["name"], "MySOT", "{project:?}: {output}");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_symbol_libraries_reads_the_same_table_for_a_directory_and_its_kicad_pro() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("parts.kicad_sym");
+        std::fs::write(&library, "(kicad_symbol_lib)\n").unwrap();
+        std::fs::write(
+            tmp.path().join("sym-lib-table"),
+            kicad_style_table(
+                "sym_lib_table",
+                &[("Parts", "KiCad", &library.to_string_lossy())],
+            ),
+        )
+        .unwrap();
+
+        for project in [tmp.path().to_path_buf(), tmp.path().join("board.kicad_pro")] {
+            let result = handle_list_symbol_libraries(
+                &json!({"project": project, "scope": "project"}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{project:?}: {:?}", result.content);
+            let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+            assert_eq!(output["count"], 1, "{project:?}: {output}");
+            assert_eq!(output["libraries"][0]["nickname"], "Parts");
+        }
+    }
+
+    /// #135: a nickname already bound to another library used to report
+    /// `unchanged` while echoing the *requested* URI, hiding that the table
+    /// still pointed elsewhere.
+    #[tokio::test]
+    async fn register_symbol_library_reports_a_nickname_conflict_with_the_table_uri() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.kicad_sym");
+        let b = tmp.path().join("b.kicad_sym");
+        std::fs::write(&a, "(kicad_symbol_lib)\n").unwrap();
+        std::fs::write(&b, "(kicad_symbol_lib)\n").unwrap();
+        let register = |library: &Path| {
+            let args = json!({"library_path": library, "nickname": "nick", "project": tmp.path()});
+            async move {
+                handle_register_symbol_library(&args, &test_ctx())
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let first = register(&a).await;
+        assert!(!first.is_error, "{:?}", first.content);
+        let table = tmp.path().join("sym-lib-table");
+        let before = std::fs::read_to_string(&table).unwrap();
+
+        let second = register(&b).await;
+        assert!(second.is_error, "a conflict must not read as success");
+        let output: serde_json::Value = serde_json::from_str(&result_text(&second)).unwrap();
+        assert_eq!(output["state"], "conflict", "{output}");
+        assert_eq!(output["uri"], "${KIPRJMOD}/a.kicad_sym", "{output}");
+        assert_eq!(
+            output["requested_uri"], "${KIPRJMOD}/b.kicad_sym",
+            "{output}"
+        );
+        assert_eq!(output["error"]["kind"], "conflict", "{output}");
+        assert_eq!(std::fs::read_to_string(&table).unwrap(), before);
+
+        let again = register(&a).await;
+        assert!(!again.is_error, "{:?}", again.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&again)).unwrap();
+        assert_eq!(output["state"], "unchanged", "{output}");
+    }
+
+    #[tokio::test]
+    async fn register_footprint_library_reports_a_nickname_conflict_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("b.pretty");
+        std::fs::create_dir_all(&library).unwrap();
+        let table = tmp.path().join("fp-lib-table");
+        let original = "(fp_lib_table\n  (version 7)\n  (lib (name \"nick\") (type \"KiCad\") (uri \"${KIPRJMOD}/a.pretty\") (options \"\") (descr \"\"))\n)\n";
+        std::fs::write(&table, original).unwrap();
+
+        let result = handle_register_footprint_library(
+            &json!({"library_path": library, "nickname": "nick", "project": tmp.path()}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["state"], "conflict", "{output}");
+        assert_eq!(output["uri"], "${KIPRJMOD}/a.pretty", "{output}");
+        assert_eq!(std::fs::read_to_string(&table).unwrap(), original);
+    }
+
+    /// #135: missing paths and libraries of the wrong kind were registered as
+    /// `inserted`, leaving a table entry KiCad cannot load.
+    #[tokio::test]
+    async fn registration_rejects_a_missing_or_wrong_kind_library_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let footprint = tmp.path().join("R.kicad_mod");
+        std::fs::write(&footprint, "(footprint \"R\")\n").unwrap();
+        let symbols = tmp.path().join("parts.kicad_sym");
+        std::fs::write(&symbols, "(kicad_symbol_lib)\n").unwrap();
+        let file_named_pretty = tmp.path().join("fake.pretty");
+        std::fs::write(&file_named_pretty, "").unwrap();
+        let dir_named_sym = tmp.path().join("dir.kicad_sym");
+        std::fs::create_dir_all(&dir_named_sym).unwrap();
+
+        for library in [
+            tmp.path().join("missing.kicad_sym"),
+            footprint.clone(),
+            dir_named_sym,
+        ] {
+            let result = handle_register_symbol_library(
+                &json!({"library_path": library, "nickname": "X", "project": tmp.path()}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{library:?} must be refused");
+            let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+            assert_eq!(output["error"]["field"], "library_path", "{output}");
+        }
+        for library in [
+            tmp.path().join("missing.pretty"),
+            symbols,
+            file_named_pretty,
+        ] {
+            let result = handle_register_footprint_library(
+                &json!({"library_path": library, "nickname": "X", "project": tmp.path()}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{library:?} must be refused");
+            let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+            assert_eq!(output["error"]["field"], "library_path", "{output}");
+        }
+        assert!(!tmp.path().join("sym-lib-table").exists());
+        assert!(!tmp.path().join("fp-lib-table").exists());
+    }
+
+    #[tokio::test]
+    async fn a_conflict_leaves_a_table_with_a_wrong_root_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = tmp.path().join("sym-lib-table");
+        std::fs::write(&table, BROKEN_SYM_TABLE).unwrap();
+        let library = tmp.path().join("new.kicad_sym");
+        std::fs::write(&library, "(kicad_symbol_lib)\n").unwrap();
+
+        let result = handle_register_symbol_library(
+            &json!({"library_path": library, "nickname": "Old", "project": tmp.path()}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("conflict")
+        );
+        assert_eq!(std::fs::read_to_string(&table).unwrap(), BROKEN_SYM_TABLE);
+    }
+
+    /// The URI recorded for a library outside the project but inside its
+    /// repository must not depend on how `project` was spelled, or the second
+    /// spelling reports a false conflict.
+    #[tokio::test]
+    async fn a_directory_and_its_kicad_pro_record_the_same_uri() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let project_dir = tmp.path().join("board");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project = project_dir.join("board.kicad_pro");
+        std::fs::write(&project, "{}").unwrap();
+        let library = tmp.path().join("libs").join("a.kicad_sym");
+        std::fs::create_dir_all(library.parent().unwrap()).unwrap();
+        std::fs::write(&library, "(kicad_symbol_lib)\n").unwrap();
+
+        let mut outputs = Vec::new();
+        for spelling in [project_dir.clone(), project] {
+            let result = handle_register_symbol_library(
+                &json!({"library_path": library, "nickname": "A", "project": spelling}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{:?}", result.content);
+            outputs.push(serde_json::from_str::<serde_json::Value>(&result_text(&result)).unwrap());
+        }
+        assert_eq!(outputs[0]["state"], "inserted");
+        assert_eq!(outputs[1]["state"], "unchanged", "{}", outputs[1]);
+        assert_eq!(outputs[0]["uri"], "${KIPRJMOD}/../libs/a.kicad_sym");
+        assert_eq!(outputs[1]["uri"], outputs[0]["uri"]);
+    }
+
+    #[tokio::test]
+    async fn registration_refuses_a_relative_library_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = handle_register_symbol_library(
+            &json!({
+                "library_path": "${KICAD9_SYMBOL_DIR}/Device.kicad_sym",
+                "nickname": "Device",
+                "project": tmp.path()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["error"]["field"], "library_path", "{output}");
+        assert!(!tmp.path().join("sym-lib-table").exists());
+    }
+
+    #[tokio::test]
+    async fn get_footprint_info_refuses_a_project_that_names_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = handle_get_footprint_info(
+            &json!({
+                "footprint_path": "minilib:MySOT",
+                "project": tmp.path().join("no-such-project")
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(
+            result_text(&result).contains("'project'"),
+            "{}",
+            result_text(&result)
+        );
+    }
+
     #[tokio::test]
     async fn register_footprint_library_rejects_duplicate_nicknames_without_writing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6394,10 +6757,12 @@ mod tests {
         let table = tmp.path().join("fp-lib-table");
         let duplicate = "(fp_lib_table\n  (version 7)\n  (lib (name \"Parts\") (type \"KiCad\") (uri \"/one\") (options \"\") (descr \"\"))\n  (lib (name \"Parts\") (type \"KiCad\") (uri \"/two\") (options \"\") (descr \"\"))\n)\n";
         std::fs::write(&table, duplicate).unwrap();
+        let library = tmp.path().join("Parts.pretty");
+        std::fs::create_dir_all(&library).unwrap();
 
         let result = handle_register_footprint_library(
             &json!({
-                "library_path": tmp.path().join("Parts.pretty"),
+                "library_path": library,
                 "nickname": "Parts",
                 "project": project,
                 "replace_existing": true
@@ -10725,6 +11090,10 @@ mod library_write_contract_tests {
         let old_footprint_table = "(fp_lib_table (version 7))";
         std::fs::write(&symbol_table, old_symbol_table).unwrap();
         std::fs::write(&footprint_table, old_footprint_table).unwrap();
+        let registered_symbols = area.path().join("Registered.kicad_sym");
+        std::fs::write(&registered_symbols, "(kicad_symbol_lib)\n").unwrap();
+        let pads = area.path().join("Pads.pretty");
+        std::fs::create_dir_all(&pads).unwrap();
 
         for invalid in ["Bad:Name", "Bad\"Name", "  "] {
             let result = handle_create_symbol(&symbol_args(&symbols, invalid), &ctx)
@@ -10733,14 +11102,14 @@ mod library_write_contract_tests {
             assert_refusal(result, "name");
             assert!(!symbols.exists());
             let result = handle_register_symbol_library(
-                &json!({"library_path":symbols, "nickname":invalid, "project":area.path()}),
+                &json!({"library_path":registered_symbols, "nickname":invalid, "project":area.path()}),
                 &ctx,
             )
             .await
             .unwrap();
             assert_refusal(result, "nickname");
             let result = handle_register_footprint_library(
-                &json!({"library_path":area.path().join("Pads.pretty"), "nickname":invalid, "project":area.path()}),
+                &json!({"library_path":pads, "nickname":invalid, "project":area.path()}),
                 &ctx,
             )
             .await
