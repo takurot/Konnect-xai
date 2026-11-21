@@ -223,7 +223,11 @@ mod tests {
                         "edit_schematic_component/properties/field_placements" |
                         "batch_edit_schematic_components/properties/edits/items/properties/fields" |
                         "copy_routing_pattern/properties/net_map" |
-                        "apply_template/properties/net_mappings"
+                        "apply_template/properties/net_mappings" |
+                        // A config value's object shape depends on key_path and
+                        // is checked before either save can persist it.
+                        "save_user_config/properties/value" |
+                        "save_project_config/properties/value"
                     ),
                         "unreviewed open input record: {path}"
                     );

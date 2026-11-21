@@ -872,6 +872,26 @@ defaults in place of one that cannot be used.
 No argument changed. A caller that relied on a broken preferences file being
 silently reset must now repair or remove it.
 
+## Unreleased: configuration writes validate settings and the effective view combines design rules
+
+`get_effective_config` returns user rules followed by project rules as strings
+in `effective_config.design_rules`. The top-level `design_rule_sources` list
+provides the same order with entries `{rule, source}`, where `source` is
+`"user"` or `"project"`. Other preferences retain project override semantics,
+including replacement of arrays such as `sourcing.avl`. An absent project
+configuration adds no overrides.
+
+`save_user_config` and `save_project_config` validate key paths and incoming
+values against known settings. They reject unknown keys, malformed paths,
+incorrect types, and values outside supported ranges with `invalid_argument`.
+Pass `value: null` to remove an existing known key from the selected file.
+Removing a project override exposes the corresponding user setting when it
+exists. Project-scoped writes require an existing directory.
+
+`add_design_rule` accepts `scope: "user"` or `scope: "project"` and defaults to
+project scope. It trims the requested rule and rejects a blank rule or a
+duplicate in that scope. Existing rules and unrelated settings are preserved.
+
 ## Unreleased: `get_schematic_component` and `list_schematic_components` return every property (minor release)
 
 Both tools answered from a fixed list of keys, so neither reported a custom
