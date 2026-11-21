@@ -70,6 +70,76 @@ fn read(path: &std::path::Path) -> String {
 }
 
 #[tokio::test]
+async fn add_net_label_rejects_invalid_keywords_and_preserves_the_sheet() {
+    let (_dir, path) = sheet(LABELS);
+    let before = std::fs::read(&path).unwrap();
+    let schema = tools()
+        .into_iter()
+        .find(|tool| tool.name == "add_schematic_net_label")
+        .unwrap();
+    for (field, value, label_type) in [
+        ("shape", json!("unknown_shape"), "global_label"),
+        ("shape", json!("unknown_shape"), "hierarchical_label"),
+        ("shape", json!("unknown_shape"), "net_label"),
+        ("shape", json!(null), "global_label"),
+        ("label_type", json!("unknown_type"), "net_label"),
+        ("label_type", json!(3), "net_label"),
+    ] {
+        let mut args = json!({
+            "schematic": p(&path), "net": "NEW",
+            "x": 140.0, "y": 100.0, "label_type": label_type,
+        });
+        args[field] = value;
+        let result = handle_add_net_label(&args, &ctx()).await.unwrap();
+        assert!(result.is_error, "unexpected success for {args}");
+        let error = &body(&result)["error"];
+        assert_eq!(error["kind"], "invalid_argument");
+        assert_eq!(error["field"], field);
+        assert!(!schema.input_validator.is_valid(&args));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn add_net_label_writes_each_supported_shape_and_file_loads_again() {
+    let schema = tools()
+        .into_iter()
+        .find(|tool| tool.name == "add_schematic_net_label")
+        .unwrap();
+    let shapes = ["input", "output", "bidirectional", "tri_state", "passive"];
+    assert_eq!(
+        schema.input_schema["properties"]["shape"]["enum"],
+        json!(shapes)
+    );
+    for label_type in ["global_label", "hierarchical_label"] {
+        let (_dir, path) = sheet("");
+        for (index, shape) in shapes.into_iter().map(Some).chain([None]).enumerate() {
+            let mut args = json!({
+                "schematic": p(&path), "net": format!("NET{index}"),
+                "x": 150.0, "y": 100.0 + index as f64, "label_type": label_type,
+            });
+            if let Some(shape) = shape {
+                args["shape"] = json!(shape);
+            }
+            assert!(schema.input_validator.is_valid(&args));
+            let result = handle_add_net_label(&args, &ctx()).await.unwrap();
+            assert!(!result.is_error, "{:?}", result.content);
+            let schematic = cse::Schematic::load(&path).unwrap();
+            let written_shape = match label_type {
+                "global_label" => Some(schematic.global_labels.get(index).unwrap().shape.as_str()),
+                _ => schematic
+                    .hierarchical_labels
+                    .get(index)
+                    .unwrap()
+                    .shape
+                    .as_deref(),
+            };
+            assert_eq!(written_shape, Some(shape.unwrap_or("input")));
+        }
+    }
+}
+
+#[tokio::test]
 async fn delete_wire_by_uuid_removes_it_and_its_orphaned_junction() {
     let (_d, path) = wired();
     let r = handle_delete_wire(&json!({"schematic": p(&path), "uuid": "wire-b"}), &ctx())
