@@ -159,6 +159,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output":    { "type": "string", "description": "Optional path to write this tool's response as JSON, violations and coordinate provenance together (not KiCad's own ERC report)" },
                     "severity":  {
                         "type": "string",
+                        "enum": cli::ReportSeverity::OPTIONS,
                         "description": "Minimum severity to report: 'error', 'warning', 'info'",
                         "default": "warning"
                     }
@@ -704,7 +705,10 @@ async fn handle_run_erc(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let min_severity = args["severity"].as_str().unwrap_or("warning");
+    let min_severity = match cli::ReportSeverity::from_args(args) {
+        Ok(severity) => severity.as_str(),
+        Err(error) => return Ok(error),
+    };
 
     let owning_root = match owning_project_root(&sch_path) {
         Ok(root) => root,
