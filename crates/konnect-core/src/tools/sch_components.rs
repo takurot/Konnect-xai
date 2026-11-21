@@ -6479,6 +6479,15 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
+        let refused_dry = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "references": ["R1"],
+                     "allow_pin_moves": true, "dry_run": true }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(refused_dry.is_error, "{refused_dry:?}");
+
         let named_both = handle_update_symbols_from_library(
             &json!({ "schematic": path.display().to_string(), "references": ["R1", "R2"],
                      "allow_pin_moves": true, "dry_run": true }),
@@ -6486,7 +6495,17 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!named_both.is_error, "{named_both:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &named_both.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["updated"], json!(["Device:R"]), "{body}");
+        assert_eq!(
+            body["affected"],
+            json!([{ "lib_id": "Device:R", "references": ["R1", "R2"] }]),
+            "{body}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
         let forced = handle_update_symbols_from_library(
             &json!({ "schematic": path.display().to_string(), "references": ["R1"],
