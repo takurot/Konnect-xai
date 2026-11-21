@@ -9,13 +9,18 @@ use crate::tool;
 use crate::tools::{get_path, require_array, require_str, ToolContext, ToolDef};
 use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::geometry::round6;
-use konnect_sexp::parser::{parse_sexp, SexpNode};
+use konnect_sexp::parser::{has_bare_list_root, parse_sexp, SexpNode};
+use konnect_sexp::paths::has_document_extension;
 use konnect_sexp::writer::{
-    apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks, read_consistent,
-    write_atomic_if_unchanged, write_new_atomic, SexpEdit,
+    apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks,
+    find_direct_child_blocks_at, read_consistent, write_atomic_if_unchanged, write_new_atomic,
+    SexpEdit,
 };
 use serde_json::json;
 use std::path::{Path, PathBuf};
+
+const PAD_TYPES: &[&str] = &["smd", "thru_hole", "np_thru_hole"];
+const PAD_SHAPES: &[&str] = &["circle", "rect", "oval", "roundrect"];
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -105,13 +110,13 @@ pub fn tools() -> Vec<ToolDef> {
                             "type": "object",
                             "properties": {
                                 "number": { "type": "string" },
-                                "type": { "type": "string", "description": "'smd', 'thru_hole', 'np_thru_hole'" },
-                                "shape": { "type": "string", "description": "'rect', 'oval', 'circle', 'roundrect'" },
+                                "type": { "type": "string", "enum": PAD_TYPES },
+                                "shape": { "type": "string", "enum": PAD_SHAPES },
                                 "x": { "type": "number" },
                                 "y": { "type": "number" },
-                                "width": { "type": "number" },
-                                "height": { "type": "number" },
-                                "drill": { "type": "number", "description": "Drill diameter for thru-hole pads" },
+                                "width": { "type": "number", "exclusiveMinimum": 0 },
+                                "height": { "type": "number", "exclusiveMinimum": 0 },
+                                "drill": { "type": "number", "exclusiveMinimum": 0, "description": "Drill diameter for thru-hole pads" },
                                 "layers": {
                                     "type": "array",
                                     "items": { "type": "string" },
@@ -163,14 +168,14 @@ pub fn tools() -> Vec<ToolDef> {
                     "match_all": { "type": "boolean", "description": "Edit every direct-child pad with pad_number instead of only the first match", "default": false },
                     "x": { "type": "number", "description": "New X position in mm (optional)" },
                     "y": { "type": "number", "description": "New Y position in mm (optional)" },
-                    "width": { "type": "number", "description": "New pad width in mm (optional)" },
-                    "height": { "type": "number", "description": "New pad height in mm (optional)" },
+                    "width": { "type": "number", "exclusiveMinimum": 0, "description": "New pad width in mm (optional)" },
+                    "height": { "type": "number", "exclusiveMinimum": 0, "description": "New pad height in mm (optional)" },
                     "shape": {
                         "type": "string",
-                        "enum": ["circle", "rect", "oval", "roundrect"],
+                        "enum": PAD_SHAPES,
                         "description": "New standard pad shape (optional). roundrect gets a valid default corner ratio when needed."
                     },
-                    "drill": { "type": "number", "description": "New drill diameter in mm (optional)" },
+                    "drill": { "type": "number", "exclusiveMinimum": 0, "description": "New drill diameter in mm (optional)" },
                     "zone_connect": {
                         "type": "string",
                         "enum": ["inherited", "solid", "thermal", "none"],
@@ -405,12 +410,13 @@ pub fn tools() -> Vec<ToolDef> {
         .with_kicad_config(),
         tool!(
             "search_footprints",
-            "Search for footprints across all registered libraries by name or keyword.",
+            "Search global and project footprint libraries by name or keyword.",
             json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search string (partial name or keyword)" },
-                    "limit": { "type": "integer", "description": "Maximum number of results to return", "default": 50 }
+                    "limit": { "type": "integer", "description": "Maximum number of results to return", "default": 50 },
+                    "project": { "type": "string", "description": "Path to a .kicad_pro file or project directory. Defaults to the configured project_dir." }
                 },
                 "required": ["query"]
             }),
@@ -734,6 +740,9 @@ async fn handle_create_footprint(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let output = get_path(args, "output")?;
+    if let Err(error) = require_library_extension(&output, "kicad_mod", "output") {
+        return Ok(error);
+    }
     // Both are schema-required. Defaulting them meant a call with neither
     // wrote `(footprint "Footprint" …)` with no pads, no courtyard, no
     // silkscreen and no fab outline — through `write_atomic`, which replaces
@@ -874,7 +883,9 @@ async fn handle_create_footprint(
         konnect_sexp::escaped_string(name), konnect_sexp::escaped_string(description), attr, pad_sexp, graphics, model_sexp
     );
 
-    parse_sexp(&content)?;
+    if let Err(error) = parse_library_document(&content, "footprint", "output") {
+        return Ok(error);
+    }
     let expected = match std::fs::read_to_string(&output) {
         Ok(content) if overwrite => Some(content),
         Ok(_) => {
@@ -885,6 +896,11 @@ async fn handle_create_footprint(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
+    if let Some(expected) = &expected {
+        if let Err(error) = parse_library_document(expected, "footprint", "output") {
+            return Ok(error);
+        }
+    }
     // Creating a directory is deferred until the input and overwrite policy pass.
     if let Some(parent) = output.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -892,7 +908,7 @@ async fn handle_create_footprint(
     if let Some(expected) = expected {
         write_atomic_if_unchanged(&output, &expected, &content)?;
     } else {
-        write_new_atomic(&output, &content)?;
+        write_new_library_document(&output, &content)?;
     }
 
     Ok(CallToolResult::text(
@@ -909,9 +925,17 @@ async fn handle_create_footprint(
     ))
 }
 
-/// Enforce the nested `pads.items.required` schema before any output file is
-/// created or replaced. Top-level MCP validation is deliberately shallow, so
-/// handlers that own nested objects must preserve this invariant themselves.
+fn checked_pad_dimension(value: f64, field: &str) -> Result<(), CallToolResult> {
+    if crate::tools::checked_mm(value, field)? <= 0.0 {
+        return Err(invalid_library_argument(
+            field,
+            "must remain greater than zero at KiCad's nanometre precision",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate nested pad arguments before formatting their KiCad representation.
 fn validate_footprint_pad_items(pads: &[serde_json::Value]) -> Result<(), CallToolResult> {
     for (index, pad) in pads.iter().enumerate() {
         if !pad.is_object() {
@@ -928,13 +952,30 @@ fn validate_footprint_pad_items(pads: &[serde_json::Value]) -> Result<(), CallTo
                 ));
             }
         }
-        for field in ["x", "y", "width", "height"] {
-            if pad[field].as_f64().is_none() {
+        for (field, allowed) in [("type", PAD_TYPES), ("shape", PAD_SHAPES)] {
+            let value = pad[field].as_str().expect("validated");
+            if !allowed.contains(&value) {
                 return Err(invalid_library_argument(
                     &format!("pads[{index}].{field}"),
-                    "missing or not a number",
+                    format!("expected one of {}", allowed.join(", ")),
                 ));
             }
+        }
+        for field in ["x", "y", "width", "height"] {
+            let key = format!("pads[{index}].{field}");
+            let value = pad[field]
+                .as_f64()
+                .ok_or_else(|| invalid_library_argument(&key, "missing or not a number"))?;
+            if matches!(field, "width" | "height") {
+                checked_pad_dimension(value, &key)?;
+            }
+        }
+        if let Some(drill) = pad.get("drill") {
+            let field = format!("pads[{index}].drill");
+            let value = drill
+                .as_f64()
+                .ok_or_else(|| invalid_library_argument(&field, "must be a number"))?;
+            checked_pad_dimension(value, &field)?;
         }
     }
     Ok(())
@@ -945,6 +986,20 @@ async fn handle_edit_footprint_pad(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let path = get_path(args, "footprint_path")?;
+    if let Err(error) = require_library_extension(&path, "kicad_mod", "footprint_path") {
+        return Ok(error);
+    }
+    for field in ["width", "height", "drill"] {
+        let dimension = match crate::tools::opt_positive_f64(args, field) {
+            Ok(dimension) => dimension,
+            Err(error) => return Ok(error),
+        };
+        if let Some(dimension) = dimension {
+            if let Err(error) = checked_pad_dimension(dimension, field) {
+                return Ok(error);
+            }
+        }
+    }
     let pad_number = match require_str(args, "pad_number") {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -976,9 +1031,7 @@ async fn handle_edit_footprint_pad(
     let shape = match args.get("shape") {
         None | Some(serde_json::Value::Null) => None,
         Some(value) => match value.as_str() {
-            Some(shape) if matches!(shape, "circle" | "rect" | "oval" | "roundrect") => {
-                Some(shape)
-            }
+            Some(shape) if PAD_SHAPES.contains(&shape) => Some(shape),
             Some(shape) => {
                 return Ok(invalid_library_argument(
                     "shape",
@@ -1020,26 +1073,16 @@ async fn handle_edit_footprint_pad(
     };
 
     let content = read_consistent(&path)?;
-    match parse_sexp(&content) {
-        Ok(root) if root.head() == Some("footprint") => {}
-        Ok(root) => {
-            return Ok(invalid_library_argument(
-                "footprint_path",
-                crate::tools::footprint_root_reason(root.head()),
-            ))
-        }
-        Err(error) => {
-            return Ok(invalid_library_argument(
-                "footprint_path",
-                format!("footprint is malformed: {error}"),
-            ))
-        }
-    }
+    let (_, document_start) = match parse_library_document(&content, "footprint", "footprint_path")
+    {
+        Ok(document) => document,
+        Err(error) => return Ok(error),
+    };
 
     let mut edits = Vec::new();
     let mut matched_count = 0usize;
     let mut observed_zone_connects = Vec::new();
-    for (start, end) in find_direct_child_blocks(&content, "footprint") {
+    for (start, end) in find_direct_child_blocks_at(&content, document_start) {
         let block = &content[start..end];
         let Ok(node) = parse_sexp(block) else {
             return Ok(invalid_library_argument(
@@ -1077,6 +1120,9 @@ async fn handle_edit_footprint_pad(
     }
 
     let new_content = apply_edits(content.clone(), edits);
+    if let Err(error) = parse_library_document(&new_content, "footprint", "footprint_path") {
+        return Ok(error);
+    }
     write_atomic_if_unchanged(&path, &content, &new_content)?;
 
     let mut response = json!({
@@ -1242,6 +1288,79 @@ fn set_pad_zone_connect(pad_block: String, zone_connect: PadZoneConnect) -> Stri
         }
     }
     apply_edits(pad_block, edits)
+}
+
+fn require_library_extension(
+    path: &Path,
+    extension: &str,
+    field: &str,
+) -> Result<(), CallToolResult> {
+    if !has_document_extension(path, extension) {
+        return Err(invalid_library_argument(
+            field,
+            format!("must end in .{extension}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Recognize and parse exactly one document before using either its structure
+/// or byte ranges for an edit, including on replacement candidates.
+fn parse_library_document(
+    source: &str,
+    expected_root: &str,
+    field: &str,
+) -> Result<(SexpNode, usize), CallToolResult> {
+    let root_error =
+        || invalid_library_argument(field, format!("expected a {expected_root} document"));
+    if !has_bare_list_root(source.as_bytes(), expected_root).unwrap_or(false) {
+        if expected_root == "footprint"
+            && has_bare_list_root(source.as_bytes(), "module").unwrap_or(false)
+        {
+            return Err(invalid_library_argument(
+                field,
+                crate::tools::footprint_root_reason(Some("module")),
+            ));
+        }
+        return Err(root_error());
+    }
+    let start = source.len() - source.trim_start().len();
+    let (_, end) = find_balanced_block(source, start)
+        .filter(|(_, end)| source[*end..].trim().is_empty())
+        .ok_or_else(|| {
+            invalid_library_argument(
+                field,
+                format!("malformed {expected_root} document or trailing data"),
+            )
+        })?;
+    let tree = parse_sexp(&source[start..end]).map_err(|error| {
+        invalid_library_argument(
+            field,
+            format!("malformed {expected_root} document: {error}"),
+        )
+    })?;
+    Ok((tree, start))
+}
+
+fn valid_library_identifier(name: &str) -> bool {
+    !name.trim().is_empty() && !name.contains([':', '"'])
+}
+
+const LIBRARY_IDENTIFIER_REQUIREMENT: &str = "must not be empty or contain a colon or double quote";
+
+/// Atomic create already refuses an existing destination. Verify the bytes
+/// after publication so a concurrent replacement cannot appear successful.
+fn write_new_library_document(path: &Path, source: &str) -> Result<(), konnect_sexp::SexpError> {
+    write_new_atomic(path, source)?;
+    let reason = match std::fs::read_to_string(path) {
+        Ok(observed) if observed == source => return Ok(()),
+        Ok(_) => "created library bytes changed before readback".to_string(),
+        Err(error) => format!("could not read the created library: {error}"),
+    };
+    Err(konnect_sexp::SexpError::MutationOutcomeUncertain {
+        path: path.to_path_buf(),
+        reason,
+    })
 }
 
 fn invalid_library_argument(field: &str, reason: impl Into<String>) -> CallToolResult {
@@ -1632,7 +1751,16 @@ fn kicad_user_path_vars() -> std::collections::HashMap<String, String> {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
+    expand_catalogue_uri(uri, kiprjmod, None)
+}
+
+fn expand_catalogue_uri(
+    uri: &str,
+    kiprjmod: Option<&Path>,
+    template_share: Option<&Path>,
+) -> Option<PathBuf> {
     let Some(rest) = uri.strip_prefix("${") else {
         return (!uri.is_empty()).then(|| PathBuf::from(uri));
     };
@@ -1684,6 +1812,10 @@ fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
         return None;
     };
 
+    if let Some(share) = template_share {
+        let path = share.join(kind).join(tail);
+        return path.exists().then_some(path);
+    }
     super::find_kicad_library_dirs(kind)
         .into_iter()
         .map(|base| base.join(tail))
@@ -1712,6 +1844,15 @@ fn flatten_lib_table(
     depth: usize,
     kiprjmod: Option<&Path>,
 ) -> Vec<serde_json::Value> {
+    flatten_catalogue_table(content, depth, kiprjmod, None)
+}
+
+fn flatten_catalogue_table(
+    content: &str,
+    depth: usize,
+    kiprjmod: Option<&Path>,
+    template_share: Option<&Path>,
+) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
 
     for mut entry in parse_lib_table(content) {
@@ -1727,14 +1868,20 @@ fn flatten_lib_table(
                 );
                 continue;
             }
-            match expand_lib_uri(&uri, kiprjmod).map(std::fs::read_to_string) {
-                Some(Ok(nested)) => out.extend(flatten_lib_table(&nested, depth + 1, kiprjmod)),
+            match expand_catalogue_uri(&uri, kiprjmod, template_share).map(std::fs::read_to_string)
+            {
+                Some(Ok(nested)) => out.extend(flatten_catalogue_table(
+                    &nested,
+                    depth + 1,
+                    kiprjmod,
+                    template_share,
+                )),
                 _ => tracing::warn!("nested lib-table '{}' could not be read", uri),
             }
             continue;
         }
 
-        if let Some(path) = expand_lib_uri(&uri, kiprjmod) {
+        if let Some(path) = expand_catalogue_uri(&uri, kiprjmod, template_share) {
             entry["path"] = json!(path.to_string_lossy());
         }
         out.push(entry);
@@ -1777,6 +1924,146 @@ fn read_flat_lib_table(path: &Path) -> Vec<serde_json::Value> {
             tracing::warn!("{msg}");
             Vec::new()
         }
+    }
+}
+
+/// The two available scopes of a read-only library catalogue.
+#[derive(Default)]
+struct LibraryCatalogue {
+    global: Vec<serde_json::Value>,
+    project: Vec<serde_json::Value>,
+    used_template: bool,
+}
+
+impl LibraryCatalogue {
+    fn load(
+        configured_cli: &str,
+        filename: &str,
+        include_global: bool,
+        project_dir: Option<&Path>,
+    ) -> Result<Self, CallToolResult> {
+        let mut catalogue = Self::default();
+        let project = project_dir
+            .map(|dir| catalogue_table(&dir.join(filename), None))
+            .transpose()?
+            .flatten();
+        let global_path = super::kicad_config_dir().join(filename);
+        let mut global = None;
+        if include_global {
+            global = catalogue_table(&global_path, None)?;
+            if global.is_none() {
+                for template in
+                    crate::kicad_install::library_template_candidates(configured_cli, filename)
+                {
+                    let share = template.parent().and_then(Path::parent);
+                    if let Some(entries) = catalogue_table(&template, share)? {
+                        global = Some(entries);
+                        catalogue.used_template = true;
+                        break;
+                    }
+                }
+            }
+            if global.is_none() && project.is_none() {
+                return Err(CallToolResult::error_kind(
+                    ToolErrorKind::LibraryTableUnavailable { table: filename.into() },
+                    format!(
+                        "No {filename} is available in the selected KiCad configuration, its installed templates, or the requested project"
+                    ),
+                ));
+            }
+        }
+        catalogue.global = global.unwrap_or_default();
+        catalogue.project = project.unwrap_or_default();
+        Ok(catalogue)
+    }
+
+    fn global_search_entries(&self) -> impl Iterator<Item = &serde_json::Value> {
+        let project_names: std::collections::HashSet<_> = self
+            .project
+            .iter()
+            .filter_map(|entry| entry["nickname"].as_str())
+            .collect();
+        self.global.iter().filter(move |entry| {
+            !entry["nickname"]
+                .as_str()
+                .is_some_and(|name| project_names.contains(name))
+        })
+    }
+
+    fn response(&self, mut body: serde_json::Value) -> CallToolResult {
+        if self.used_template {
+            body["table_source"] = json!("template");
+        }
+        CallToolResult::json(&body)
+    }
+
+    fn listing(&self) -> CallToolResult {
+        let libraries: Vec<_> = [("global", &self.global), ("project", &self.project)]
+            .into_iter()
+            .flat_map(|(scope, entries)| {
+                entries.iter().cloned().map(move |mut entry| {
+                    entry["scope"] = json!(scope);
+                    entry
+                })
+            })
+            .collect();
+        self.response(json!({"count": libraries.len(), "libraries": libraries}))
+    }
+}
+
+fn catalogue_table(
+    table: &Path,
+    template_share: Option<&Path>,
+) -> Result<Option<Vec<serde_json::Value>>, CallToolResult> {
+    let trouble = |detail: &str| {
+        let reason = format!("Cannot read lib-table {}: {detail}", table.display());
+        CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: reason.clone(),
+            },
+            reason,
+        )
+    };
+    let text = match std::fs::read_to_string(table) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(trouble(&error.to_string())),
+    };
+    let text = text.trim();
+    if find_balanced_block(text, 0) != Some((0, text.len())) {
+        return Err(trouble("expected one complete library table"));
+    }
+    let root = parse_sexp(text).map_err(|error| trouble(&error.to_string()))?;
+    let expected = table_root_element(table);
+    if !matches!(root.get(0), Some(SexpNode::Atom(head)) if head == expected) {
+        return Err(trouble(&format!("expected '{expected}' root")));
+    }
+    Ok(Some(flatten_catalogue_table(
+        text,
+        0,
+        table.parent(),
+        template_share,
+    )))
+}
+
+fn list_catalogue(args: &serde_json::Value, ctx: &ToolContext, filename: &str) -> CallToolResult {
+    let scope = args["scope"].as_str().unwrap_or("all");
+    let project_dir = if matches!(scope, "project" | "all") {
+        match args["project"].as_str().map(project_table_dir).transpose() {
+            Ok(project_dir) => project_dir,
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
+    match LibraryCatalogue::load(
+        &ctx.config.kicad_cli,
+        filename,
+        matches!(scope, "global" | "all"),
+        project_dir.as_deref(),
+    ) {
+        Ok(catalogue) => catalogue.listing(),
+        Err(error) => error,
     }
 }
 
@@ -2003,45 +2290,9 @@ async fn handle_register_footprint_library(
 
 async fn handle_list_footprint_libraries(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let scope = args["scope"].as_str().unwrap_or("all");
-    let mut all_libs = Vec::new();
-
-    // A table that exists but cannot be read is reported rather than counted
-    // as zero libraries — "0" is the symptom of the bug this PR fixes, so the
-    // two must not look alike.
-    if scope == "global" || scope == "all" {
-        let mut libs = match read_lib_table_checked(&global_fp_lib_table()) {
-            Ok(libs) => libs,
-            Err(msg) => return Ok(CallToolResult::error(msg)),
-        };
-        for lib in &mut libs {
-            lib["scope"] = json!("global");
-        }
-        all_libs.extend(libs);
-    }
-
-    if (scope == "project" || scope == "all") && args["project"].is_string() {
-        let proj = PathBuf::from(args["project"].as_str().unwrap());
-        let table = proj.parent().unwrap_or(Path::new(".")).join("fp-lib-table");
-        let mut libs = match read_lib_table_checked(&table) {
-            Ok(libs) => libs,
-            Err(msg) => return Ok(CallToolResult::error(msg)),
-        };
-        for lib in &mut libs {
-            lib["scope"] = json!("project");
-        }
-        all_libs.extend(libs);
-    }
-
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "count": all_libs.len(),
-            "libraries": all_libs
-        }))
-        .unwrap(),
-    ))
+    Ok(list_catalogue(args, ctx, "fp-lib-table"))
 }
 
 /// A lib-table path written the way KiCad writes one: forward slashes on every
@@ -2277,47 +2528,9 @@ async fn handle_register_symbol_library(
 
 async fn handle_list_symbol_libraries(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let scope = args["scope"].as_str().unwrap_or("all");
-    let mut all_libs = Vec::new();
-
-    // Same as the footprint listing: an unreadable table is an error, not a
-    // zero count.
-    if scope == "global" || scope == "all" {
-        let mut libs = match read_lib_table_checked(&global_sym_lib_table()) {
-            Ok(libs) => libs,
-            Err(msg) => return Ok(CallToolResult::error(msg)),
-        };
-        for lib in &mut libs {
-            lib["scope"] = json!("global");
-        }
-        all_libs.extend(libs);
-    }
-
-    if (scope == "project" || scope == "all") && args["project"].is_string() {
-        let proj = PathBuf::from(args["project"].as_str().unwrap());
-        let table = proj
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("sym-lib-table");
-        let mut libs = match read_lib_table_checked(&table) {
-            Ok(libs) => libs,
-            Err(msg) => return Ok(CallToolResult::error(msg)),
-        };
-        for lib in &mut libs {
-            lib["scope"] = json!("project");
-        }
-        all_libs.extend(libs);
-    }
-
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "count": all_libs.len(),
-            "libraries": all_libs
-        }))
-        .unwrap(),
-    ))
+    Ok(list_catalogue(args, ctx, "sym-lib-table"))
 }
 
 /// Root S-expression element for a lib-table file, decided by its filename:
@@ -2430,6 +2643,12 @@ async fn register_in_lib_table_with_policy(
     lib_type: &str,
     replace_existing: bool,
 ) -> anyhow::Result<Result<LibTableRegistration, LibTableRegistrationError>> {
+    if !valid_library_identifier(nickname) {
+        return Ok(Err(LibTableRegistrationError {
+            field: "nickname".to_string(),
+            reason: LIBRARY_IDENTIFIER_REQUIREMENT.to_string(),
+        }));
+    }
     let root = table_root_element(table_path);
     let existing = table_path.exists();
     let source = if existing {
@@ -2462,7 +2681,7 @@ async fn register_in_lib_table_with_policy(
         if existing {
             persist_lib_table_registration(table_path, &source, &prepared.content)?;
         } else {
-            write_new_atomic(table_path, &prepared.content)?;
+            write_new_library_document(table_path, &prepared.content)?;
         }
     }
     Ok(Ok(prepared.registration))
@@ -4250,6 +4469,9 @@ async fn handle_create_symbol(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
+    if let Err(error) = require_library_extension(&lib_path, "kicad_sym", "library_path") {
+        return Ok(error);
+    }
     // Schema-required. Defaulting them appended `(symbol "Symbol" …)` with
     // reference `U` to the library — and there is no duplicate-name guard, so
     // repeated calls stacked identically-named entries in one file (#218).
@@ -4261,6 +4483,12 @@ async fn handle_create_symbol(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    if !valid_library_identifier(name) {
+        return Ok(invalid_library_argument(
+            "name",
+            LIBRARY_IDENTIFIER_REQUIREMENT,
+        ));
+    }
     let value_str = args["value"].as_str().unwrap_or(name);
     // `~` is KiCAD's legacy "no datasheet" placeholder. Its library loader
     // normalises it to the empty string and its schematic lib_symbols loader
@@ -4580,10 +4808,15 @@ async fn handle_create_symbol(
         Err(error) => return Err(error.into()),
     };
     if let Some(source) = &expected {
+        let (root, _) = match parse_library_document(source, "kicad_symbol_lib", "library_path") {
+            Ok(document) => document,
+            Err(error) => return Ok(error),
+        };
         anyhow::ensure!(
-            !top_level_symbol_names(source)?
+            !root
+                .find_all("symbol")
                 .iter()
-                .any(|existing| existing == name),
+                .any(|symbol| symbol.get(1).and_then(SexpNode::as_str) == Some(name)),
             "Symbol '{name}' already exists in library"
         );
     }
@@ -4606,18 +4839,24 @@ async fn handle_create_symbol(
             .to_string()
     };
 
-    // Insert before closing paren of root expression
-    let insert_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = format!("{}{}\n)", &content[..insert_pos], symbol_sexp);
-
+    // The existing or generated root was validated above. Locate its
+    // closing delimiter after updating the format metadata.
+    let (_, end) = find_balanced_block(&content, 0)
+        .ok_or_else(|| anyhow::anyhow!("unbalanced symbol library root"))?;
+    let new_content = apply_edits(
+        content,
+        vec![SexpEdit::insert(end - 1, format!("{symbol_sexp}\n"))],
+    );
+    if let Err(error) = parse_library_document(&new_content, "kicad_symbol_lib", "library_path") {
+        return Ok(error);
+    }
     if let Some(parent) = lib_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    parse_sexp(&new_content)?;
     if let Some(expected) = expected {
         write_atomic_if_unchanged(&lib_path, &expected, &new_content)?;
     } else {
-        write_new_atomic(&lib_path, &new_content)?;
+        write_new_library_document(&lib_path, &new_content)?;
     }
 
     let mut result = json!({
@@ -4642,6 +4881,9 @@ async fn handle_delete_symbol(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
+    if let Err(error) = require_library_extension(&lib_path, "kicad_sym", "library_path") {
+        return Ok(error);
+    }
     let symbol_name = match require_str(args, "symbol_name") {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -4649,12 +4891,11 @@ async fn handle_delete_symbol(
 
     let content = tokio::fs::read_to_string(&lib_path).await?;
 
-    let root = parse_sexp(&content)?;
-    anyhow::ensure!(
-        root.head() == Some("kicad_symbol_lib"),
-        "Expected a KiCad symbol library"
-    );
-    let matches = find_direct_child_blocks(&content, "kicad_symbol_lib")
+    let (root, start) = match parse_library_document(&content, "kicad_symbol_lib", "library_path") {
+        Ok(document) => document,
+        Err(error) => return Ok(error),
+    };
+    let matches = find_direct_child_blocks_at(&content, start)
         .into_iter()
         .filter(|&(start, end)| {
             parse_sexp(&content[start..end]).ok().is_some_and(|node| {
@@ -4667,8 +4908,26 @@ async fn handle_delete_symbol(
         matches.len() == 1,
         "Symbol '{symbol_name}' not found or ambiguous in library"
     );
+    let dependents: std::collections::BTreeSet<_> = root
+        .find_all("symbol")
+        .into_iter()
+        .filter(|symbol| symbol.find_str("extends") == Some(symbol_name))
+        .filter_map(|symbol| symbol.get(1).and_then(SexpNode::as_str))
+        .collect();
+    if !dependents.is_empty() {
+        return Ok(invalid_library_argument(
+            "symbol_name",
+            format!(
+                "cannot delete '{symbol_name}'; derived symbols: {}",
+                dependents.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        ));
+    }
     let (start, end) = matches[0];
     let new_content = apply_edits(content.clone(), vec![SexpEdit::delete(start, end)]);
+    if let Err(error) = parse_library_document(&new_content, "kicad_symbol_lib", "library_path") {
+        return Ok(error);
+    }
     write_atomic_if_unchanged(&lib_path, &content, &new_content)?;
 
     Ok(CallToolResult::text(
@@ -4840,36 +5099,29 @@ async fn handle_search_symbols(
         .map(PathBuf::from)
         .or_else(|| ctx.config.project_dir.clone());
 
-    // Gather (nickname, path) entries from the global sym-lib-table and, when a
-    // project dir is supplied, the project's own sym-lib-table too — this is
-    // what makes project-attached libraries searchable. Nested `(type "Table")`
-    // references are followed and `${KICAD*_DIR}` URIs expanded, so the
-    // libraries KiCad ships are included.
-    let mut entries: Vec<(String, String)> = Vec::new();
-    let mut tables = vec![global_sym_lib_table()];
-    if let Some(pd) = &project_dir {
-        tables.push(pd.join("sym-lib-table"));
-    }
-    for table in &tables {
-        for lib in read_flat_lib_table(table) {
-            if let (Some(nick), Some(path)) = (lib["nickname"].as_str(), lib["path"].as_str()) {
-                entries.push((nick.to_string(), path.to_string()));
-            }
-        }
-    }
-
+    let catalogue = match LibraryCatalogue::load(
+        &ctx.config.kicad_cli,
+        "sym-lib-table",
+        true,
+        project_dir.as_deref(),
+    ) {
+        Ok(catalogue) => catalogue,
+        Err(error) => return Ok(error),
+    };
     let mut results = Vec::new();
-    // `entries` holds resolved filesystem paths, not the raw uris they came
-    // from — read_flat_lib_table does that expansion now.
-    'outer: for (nickname, resolved) in entries {
-        let lib_path = PathBuf::from(&resolved);
+    'outer: for entry in catalogue.global_search_entries().chain(&catalogue.project) {
+        let (Some(nickname), Some(path)) = (entry["nickname"].as_str(), entry["path"].as_str())
+        else {
+            continue;
+        };
+        let lib_path = PathBuf::from(path);
         if !lib_path.exists() {
             continue;
         }
         let Ok(lib_content) = tokio::fs::read_to_string(&lib_path).await else {
             continue;
         };
-        for hit in search_lib_symbols(&nickname, &lib_content, &query) {
+        for hit in search_lib_symbols(nickname, &lib_content, &query) {
             results.push(hit);
             if results.len() >= limit {
                 break 'outer;
@@ -4877,14 +5129,11 @@ async fn handle_search_symbols(
         }
     }
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "query": query,
-            "count": results.len(),
-            "results": results
-        }))
-        .unwrap(),
-    ))
+    Ok(catalogue.response(json!({
+        "query": query,
+        "count": results.len(),
+        "results": results
+    })))
 }
 
 async fn handle_list_library_footprints(
@@ -5060,7 +5309,7 @@ async fn handle_get_footprint_info(
 
 async fn handle_search_footprints(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let query = match require_str(args, "query") {
         Ok(v) => v.to_lowercase(),
@@ -5068,12 +5317,25 @@ async fn handle_search_footprints(
     };
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
-    // Walk global fp-lib-table
-    let fp_lib_table_path = super::kicad_config_dir().join("fp-lib-table");
-
+    let project_dir = match args["project"].as_str().map(project_table_dir).transpose() {
+        Ok(project_dir) => project_dir.or_else(|| ctx.config.project_dir.clone()),
+        Err(error) => return Ok(error),
+    };
+    let catalogue = match LibraryCatalogue::load(
+        &ctx.config.kicad_cli,
+        "fp-lib-table",
+        true,
+        project_dir.as_deref(),
+    ) {
+        Ok(catalogue) => catalogue,
+        Err(error) => return Ok(error),
+    };
     let mut results = Vec::new();
-
-    'outer: for lib in read_flat_lib_table(&fp_lib_table_path) {
+    'outer: for lib in catalogue
+        .project
+        .iter()
+        .chain(catalogue.global_search_entries())
+    {
         let nickname = lib["nickname"].as_str().unwrap_or("").to_string();
         let Some(dir) = lib["path"].as_str().map(PathBuf::from) else {
             continue;
@@ -5100,14 +5362,11 @@ async fn handle_search_footprints(
         }
     }
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "query": args["query"].as_str().unwrap_or(""),
-            "count": results.len(),
-            "results": results
-        }))
-        .unwrap(),
-    ))
+    Ok(catalogue.response(json!({
+        "query": args["query"].as_str().unwrap_or(""),
+        "count": results.len(),
+        "results": results
+    })))
 }
 
 // ─── get_symbol_info (moved from verification toolset) ───────────────────────
@@ -10355,10 +10614,188 @@ mod file_safety_tests {
 }
 
 #[cfg(test)]
+mod library_write_contract_tests {
+    use super::*;
+
+    fn context() -> ToolContext {
+        ToolContext::new(
+            Default::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn symbol_args(path: &Path, name: &str) -> serde_json::Value {
+        json!({
+            "library_path": path, "name": name, "reference_prefix": "U",
+            "pins": [{"number":"1","name":"IN","type":"input","x":-5.08,"y":0,"angle":0}]
+        })
+    }
+
+    fn pad_args() -> serde_json::Value {
+        json!({"number":"1","type":"smd","shape":"rect","x":0,"y":0,"width":2,"height":2})
+    }
+
+    fn assert_refusal(result: CallToolResult, field: &str) {
+        assert!(result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected structured tool error");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["error"]["kind"], "invalid_argument", "{body}");
+        assert_eq!(body["error"]["field"], field, "{body}");
+    }
+
+    #[tokio::test]
+    async fn library_creation_refuses_wrong_extensions_and_disguised_designs() {
+        let area = tempfile::tempdir().unwrap();
+        let ctx = context();
+        for (basename, source) in [
+            ("project.kicad_pcb", "(kicad_pcb (version 20240108))"),
+            ("project.kicad_sch", "(kicad_sch (version 20250610))"),
+            ("disguised.kicad_sym", "(kicad_sch (version 20250610))"),
+        ] {
+            let path = area.path().join(basename);
+            std::fs::write(&path, source).unwrap();
+            let result = handle_create_symbol(&symbol_args(&path, "Valid"), &ctx)
+                .await
+                .unwrap();
+            assert_refusal(result, "library_path");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        }
+
+        for (basename, source) in [
+            ("project.kicad_pcb", "(kicad_pcb (version 20240108))"),
+            ("project.kicad_sch", "(kicad_sch (version 20250610))"),
+            ("disguised.kicad_mod", "(kicad_pcb (version 20240108))"),
+        ] {
+            let path = area.path().join(basename);
+            std::fs::write(&path, source).unwrap();
+            let result = handle_create_footprint(
+                &json!({"output":path, "name":"Valid", "pads":[pad_args()], "overwrite":true}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert_refusal(result, "output");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        }
+    }
+
+    #[tokio::test]
+    async fn symbol_deletion_preserves_the_parent_and_names_its_dependents() {
+        let area = tempfile::tempdir().unwrap();
+        let path = area.path().join("Parts.kicad_sym");
+        let original = r#"(kicad_symbol_lib
+          (symbol "Parent")
+          (symbol "LeafB" (extends "Parent"))
+          (symbol "LeafA" (extends "Parent")))"#;
+        std::fs::write(&path, original).unwrap();
+        let ctx = context();
+        let result =
+            handle_delete_symbol(&json!({"library_path":path, "symbol_name":"Parent"}), &ctx)
+                .await
+                .unwrap();
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected dependency evidence");
+        };
+        assert!(text.contains("LeafA") && text.contains("LeafB"), "{text}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let result =
+            handle_delete_symbol(&json!({"library_path":path, "symbol_name":"LeafA"}), &ctx)
+                .await
+                .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let surviving = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            top_level_symbol_names(&surviving).unwrap(),
+            ["LeafB", "Parent"]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_identifiers_do_not_create_or_modify_library_files() {
+        let area = tempfile::tempdir().unwrap();
+        let ctx = context();
+        let symbols = area.path().join("Symbols.kicad_sym");
+        let symbol_table = area.path().join("sym-lib-table");
+        let footprint_table = area.path().join("fp-lib-table");
+        let old_symbol_table = "(sym_lib_table (version 7))";
+        let old_footprint_table = "(fp_lib_table (version 7))";
+        std::fs::write(&symbol_table, old_symbol_table).unwrap();
+        std::fs::write(&footprint_table, old_footprint_table).unwrap();
+
+        for invalid in ["Bad:Name", "Bad\"Name", "  "] {
+            let result = handle_create_symbol(&symbol_args(&symbols, invalid), &ctx)
+                .await
+                .unwrap();
+            assert_refusal(result, "name");
+            assert!(!symbols.exists());
+            let result = handle_register_symbol_library(
+                &json!({"library_path":symbols, "nickname":invalid, "project":area.path()}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert_refusal(result, "nickname");
+            let result = handle_register_footprint_library(
+                &json!({"library_path":area.path().join("Pads.pretty"), "nickname":invalid, "project":area.path()}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert_refusal(result, "nickname");
+            assert_eq!(
+                std::fs::read_to_string(&symbol_table).unwrap(),
+                old_symbol_table
+            );
+            assert_eq!(
+                std::fs::read_to_string(&footprint_table).unwrap(),
+                old_footprint_table
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_pad_keywords_and_dimensions_are_refused_before_writing() {
+        let area = tempfile::tempdir().unwrap();
+        let path = area.path().join("Pads.pretty").join("Fixture.kicad_mod");
+        let ctx = context();
+        let args = json!({"output":path, "name":"Fixture", "pads":[pad_args()]});
+        for (field, invalid) in [
+            ("type", json!("smt")),
+            ("shape", json!("blob")),
+            ("width", json!(0)),
+            ("height", json!(-2)),
+            ("drill", json!(0)),
+            ("width", json!(0.0000001)),
+        ] {
+            let mut malformed = args.clone();
+            malformed["pads"][0][field] = invalid;
+            assert_refusal(
+                handle_create_footprint(&malformed, &ctx).await.unwrap(),
+                &format!("pads[0].{field}"),
+            );
+            assert!(!path.parent().unwrap().exists());
+        }
+
+        assert!(!handle_create_footprint(&args, &ctx).await.unwrap().is_error);
+        let original = std::fs::read(&path).unwrap();
+        for (field, invalid) in [("width", -2.0), ("height", 0.0000001), ("drill", 0.0)] {
+            let mut edit = json!({"footprint_path":path, "pad_number":"1"});
+            edit[field] = json!(invalid);
+            assert_refusal(handle_edit_footprint_pad(&edit, &ctx).await.unwrap(), field);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+}
+
+#[cfg(test)]
 mod quoted_symbol_readback_tests {
     use super::*;
     #[tokio::test]
-    async fn symbol_names_properties_and_pin_text_roundtrip_escaping() {
+    async fn symbol_properties_and_pin_text_roundtrip_escaping() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("quoted.kicad_sym");
         let value = "a\"b\\c";
@@ -10366,12 +10803,12 @@ mod quoted_symbol_readback_tests {
             Default::default(),
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         );
-        let result=handle_create_symbol(&json!({"library_path":path,"name":value,"value":value,"datasheet":value,"reference_prefix":"U","pins":[{"number":"1","name":value,"type":"input","x":-5.08,"y":0,"angle":0,"length":2.54}]}),&ctx).await.unwrap();
+        let result=handle_create_symbol(&json!({"library_path":path,"name":"TestSymbol","value":value,"datasheet":value,"reference_prefix":"U","pins":[{"number":"1","name":value,"type":"input","x":-5.08,"y":0,"angle":0,"length":2.54}]}),&ctx).await.unwrap();
         assert!(!result.is_error);
         let text = std::fs::read_to_string(path).unwrap();
         let root = parse_sexp(&text).unwrap();
         let sym = root.find("symbol").unwrap();
-        assert_eq!(sym.get(1).unwrap().as_str(), Some(value));
+        assert_eq!(sym.get(1).unwrap().as_str(), Some("TestSymbol"));
         for name in ["Value", "Datasheet"] {
             let prop = sym
                 .find_all("property")
@@ -10770,6 +11207,141 @@ mod project_catalog_contract_tests {
             crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
             other => panic!("expected JSON, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn catalogue_fallback_does_not_replace_empty_or_malformed_global_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let cli = dir.path().join("selected/bin/kicad-cli");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&cli, "").unwrap();
+        let share = dir.path().join("selected/share/kicad");
+        let symbols = share.join("symbols");
+        let templates = share.join("template");
+        std::fs::create_dir_all(&symbols).unwrap();
+        std::fs::create_dir_all(&templates).unwrap();
+        std::fs::write(
+            symbols.join("Test.kicad_sym"),
+            r#"(kicad_symbol_lib (symbol "KonnectCatalogueFixture"))"#,
+        )
+        .unwrap();
+        std::fs::write(
+            templates.join("sym-lib-table"),
+            r#"(sym_lib_table (lib (name "Selected") (type "KiCad") (uri "${KICAD94999_SYMBOL_DIR}/Test.kicad_sym")))"#,
+        )
+        .unwrap();
+        let other = dir.path().join("unselected");
+        let other_cli = other.join("bin/kicad-cli");
+        let other_share = other.join("share/kicad");
+        let other_symbols = other_share.join("symbols");
+        let other_templates = other_share.join("template");
+        for folder in [
+            other_cli.parent().unwrap(),
+            &other_symbols,
+            &other_templates,
+        ] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        std::fs::write(&other_cli, "").unwrap();
+        std::fs::copy(
+            templates.join("sym-lib-table"),
+            other_templates.join("sym-lib-table"),
+        )
+        .unwrap();
+        std::fs::write(
+            other_symbols.join("Test.kicad_sym"),
+            r#"(kicad_symbol_lib (symbol "KonnectCatalogueFixtureUnselected"))"#,
+        )
+        .unwrap();
+
+        let global = config.join("sym-lib-table");
+        let mut ctx = context();
+        ctx.config.kicad_cli = cli.to_string_lossy().into_owned();
+        let args = json!({"query":"KonnectCatalogueFixture"});
+        crate::kicad_install::REQUEST_CONFIG_DIR
+            .scope(config.clone(), async {
+                let fallback = body(handle_search_symbols(&args, &ctx).await.unwrap());
+                assert_eq!(fallback["count"], 1, "{fallback}");
+                assert_eq!(
+                    fallback["results"][0]["id"],
+                    "Selected:KonnectCatalogueFixture"
+                );
+                assert_eq!(fallback["table_source"], "template");
+                assert!(!global.exists(), "a search must never create a user table");
+                ctx.config.kicad_cli = other_cli.to_string_lossy().into_owned();
+                let other = body(handle_search_symbols(&args, &ctx).await.unwrap());
+                assert_eq!(other["count"], 1, "{other}");
+                assert_eq!(
+                    other["results"][0]["id"],
+                    "Selected:KonnectCatalogueFixtureUnselected"
+                );
+                ctx.config.kicad_cli = cli.to_string_lossy().into_owned();
+
+                std::fs::write(&global, "(sym_lib_table (version 7))").unwrap();
+                let empty = body(handle_search_symbols(&args, &ctx).await.unwrap());
+                assert_eq!(empty["count"], 0, "{empty}");
+                assert!(empty.get("table_source").is_none(), "{empty}");
+
+                std::fs::write(&global, "(fp_lib_table)").unwrap();
+                let malformed = handle_search_symbols(&args, &ctx).await.unwrap();
+                assert!(malformed.is_error);
+                assert_eq!(body(malformed)["error"]["kind"], "handler_error");
+                assert_eq!(std::fs::read_to_string(&global).unwrap(), "(fp_lib_table)");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn footprint_search_distinguishes_absence_and_uses_the_exact_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let project = dir.path().join("project");
+        let project_table = project.join("fp-lib-table");
+        let footprint_lib = project.join("Local.pretty");
+        std::fs::create_dir_all(&footprint_lib).unwrap();
+        std::fs::write(footprint_lib.join("ProjectOnly.kicad_mod"), "").unwrap();
+        std::fs::write(
+            &project_table,
+            r#"(fp_lib_table (lib (name "Local") (type "KiCad") (uri "${KIPRJMOD}/Local.pretty")))"#,
+        )
+        .unwrap();
+        let mut ctx = context();
+        ctx.config.kicad_cli = dir
+            .path()
+            .join("missing/bin/kicad-cli")
+            .to_string_lossy()
+            .into_owned();
+        crate::kicad_install::REQUEST_CONFIG_DIR
+            .scope(config, async {
+                let missing = handle_search_footprints(&json!({"query":"ProjectOnly"}), &ctx)
+                    .await
+                    .unwrap();
+                assert!(missing.is_error);
+                assert_eq!(body(missing)["error"]["kind"], "library_table_unavailable");
+
+                for reference in [project.clone(), project.join("fixture.kicad_pro")] {
+                    let args = json!({"query":"ProjectOnly","project":reference});
+                    let found = body(handle_search_footprints(&args, &ctx).await.unwrap());
+                    assert_eq!(found["results"][0]["id"], "Local:ProjectOnly", "{found}");
+                    assert!(found.get("table_source").is_none(), "{found}");
+                }
+                ctx.config.project_dir = Some(project.clone());
+                let args = json!({"query":"Different"});
+                let available = body(handle_search_footprints(&args, &ctx).await.unwrap());
+                assert_eq!(available["count"], 0, "{available}");
+
+                let invalid = handle_search_footprints(
+                    &json!({"query":"ProjectOnly","project":dir.path().join("wrong.txt")}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+                assert!(invalid.is_error);
+            })
+            .await;
     }
 
     #[tokio::test]

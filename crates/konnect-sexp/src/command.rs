@@ -713,6 +713,9 @@ struct DocumentItem<'a> {
 }
 
 fn document_items(source: &str) -> Result<Vec<DocumentItem<'_>>, SexpError> {
+    if !crate::schematic::has_schematic_root(source.as_bytes())? {
+        return Err(SexpError::MissingNode(SCHEMATIC_ROOT.to_owned()));
+    }
     let ranges = find_direct_child_blocks(source, SCHEMATIC_ROOT);
     if ranges.is_empty() {
         return Err(SexpError::MissingNode(SCHEMATIC_ROOT.to_owned()));

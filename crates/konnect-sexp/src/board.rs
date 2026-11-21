@@ -723,6 +723,10 @@ pub struct FootprintCourtyard {
     pub bbox: (f64, f64, f64, f64),
     /// What the bbox actually bounds.
     pub bbox_source: CourtyardSource,
+    /// Closed polygons in board coordinates. None means authored geometry
+    /// could not be assembled into simple, closed rings.
+    outline: Option<Vec<Vec<CourtyardPoint>>>,
+    curved: bool,
     /// KiCad's own lock state for this footprint, from a direct `(locked yes)`
     /// child (or the legacy bare `locked` token). A locked footprint is one the
     /// user has pinned in the editor: automated placement must treat it as an
@@ -759,6 +763,7 @@ fn footprint_courtyard(fp: &SexpNode) -> Option<FootprintCourtyard> {
     // Hull of the courtyard artwork in footprint-local coordinates.
     // All-or-nothing: one unreadable courtyard shape poisons the footprint.
     let mut local: Option<(f64, f64, f64, f64)> = None;
+    let mut curved = false;
     for child in fp.children().unwrap_or(&[]) {
         let Some(head) = child.head() else { continue };
         if !FP_SHAPE_TAGS.contains(&head) {
@@ -769,6 +774,7 @@ fn footprint_courtyard(fp: &SexpNode) -> Option<FootprintCourtyard> {
             _ => continue,
         }
         let bb = fp_shape_bbox(child, head)?;
+        curved |= matches!(head, "fp_arc" | "fp_circle");
         local = Some(merge_bbox(local, bb));
     }
 
@@ -817,8 +823,257 @@ fn footprint_courtyard(fp: &SexpNode) -> Option<FootprintCourtyard> {
         layer_side,
         bbox,
         bbox_source,
+        outline: match bbox_source {
+            CourtyardSource::Courtyard => courtyard_rings(fp, fx, fy, rot, layer_side),
+            CourtyardSource::PadsFallback => {
+                Some(vec![rectangle_ring((bbox.0, bbox.1), (bbox.2, bbox.3))])
+            }
+            CourtyardSource::AnchorOnly => Some(Vec::new()),
+        },
+        curved,
         locked: footprint_locked(fp),
     })
+}
+
+type CourtyardPoint = (f64, f64);
+const COURTYARD_ENDPOINT_TOLERANCE_MM: f64 = 0.000_001;
+
+fn rectangle_ring(start: CourtyardPoint, end: CourtyardPoint) -> Vec<CourtyardPoint> {
+    vec![start, (end.0, start.1), end, (start.0, end.1), start]
+}
+
+fn same_endpoint(a: CourtyardPoint, b: CourtyardPoint) -> bool {
+    (a.0 - b.0).hypot(a.1 - b.1) <= COURTYARD_ENDPOINT_TOLERANCE_MM
+}
+
+fn courtyard_rings(
+    footprint: &SexpNode,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    side: Side,
+) -> Option<Vec<Vec<CourtyardPoint>>> {
+    let layer = if side == Side::Front {
+        "F.CrtYd"
+    } else {
+        "B.CrtYd"
+    };
+    let mut chains = Vec::new();
+    for shape in footprint.children().unwrap_or(&[]) {
+        let Some(tag) = shape.head() else { continue };
+        if !FP_SHAPE_TAGS.contains(&tag) || shape.find_str("layer") != Some(layer) {
+            continue;
+        }
+        let mut points = match tag {
+            "fp_line" => vec![point(shape, "start")?, point(shape, "end")?],
+            "fp_rect" => rectangle_ring(point(shape, "start")?, point(shape, "end")?),
+            "fp_arc" => crate::geometry::flatten_arc(
+                point(shape, "start")?,
+                point(shape, "mid")?,
+                point(shape, "end")?,
+            )?,
+            "fp_circle" => {
+                let center = point(shape, "center")?;
+                let end = point(shape, "end")?;
+                let radius = (center.0 - end.0).hypot(center.1 - end.1);
+                crate::geometry::flatten_circle_arc(center, radius, 0.0, std::f64::consts::TAU)?
+            }
+            "fp_poly" => {
+                let mut points = shape
+                    .find("pts")?
+                    .find_all("xy")
+                    .into_iter()
+                    .map(|xy| Some((xy.get_f64(1)?, xy.get_f64(2)?)))
+                    .collect::<Option<Vec<_>>>()?;
+                points.push(*points.first()?);
+                points
+            }
+            _ => return None,
+        };
+        points.dedup_by(|a, b| same_endpoint(*a, *b));
+        if points.len() < 2 {
+            return None;
+        }
+        chains.push(points);
+    }
+    if chains.is_empty() {
+        return None;
+    }
+    let mut rings: Vec<Vec<CourtyardPoint>> = Vec::new();
+    while let Some(mut ring) = chains.pop() {
+        while !same_endpoint(*ring.first()?, *ring.last()?) {
+            let at = *ring.last()?;
+            let mut matches = chains.iter().enumerate().filter_map(|(i, chain)| {
+                if same_endpoint(at, *chain.first()?) {
+                    Some((i, false))
+                } else if same_endpoint(at, *chain.last()?) {
+                    Some((i, true))
+                } else {
+                    None
+                }
+            });
+            let (i, reverse) = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            let mut next = chains.swap_remove(i);
+            if reverse {
+                next.reverse();
+            }
+            ring.extend(next.into_iter().skip(1));
+        }
+        let first = *ring.first()?;
+        *ring.last_mut()? = first;
+        if !is_simple_ring(&ring) {
+            return None;
+        }
+        rings.push(
+            ring.into_iter()
+                .map(|(lx, ly)| crate::geometry::transform_pad(lx, ly, x, y, rotation))
+                .collect(),
+        );
+    }
+    for (index, ring) in rings.iter().enumerate() {
+        for other in &rings[index + 1..] {
+            if ring.windows(2).any(|edge| {
+                other.windows(2).any(|candidate| {
+                    boundaries_intersect((edge[0], edge[1]), (candidate[0], candidate[1]))
+                })
+            }) {
+                return None;
+            }
+        }
+    }
+    Some(rings)
+}
+
+fn is_simple_ring(ring: &[CourtyardPoint]) -> bool {
+    let area = ring
+        .windows(2)
+        .map(|pair| pair[0].0 * pair[1].1 - pair[1].0 * pair[0].1)
+        .sum::<f64>();
+    ring.len() >= 4
+        && area.abs() > f64::EPSILON
+        && ring.windows(2).enumerate().all(|(i, edge)| {
+            let [a, b] = [edge[0], edge[1]];
+            ring.windows(2).enumerate().skip(i + 2).all(|(j, other)| {
+                if i == 0 && j == ring.len() - 2 {
+                    return true;
+                }
+                !boundaries_intersect((a, b), (other[0], other[1]))
+            })
+        })
+}
+
+fn boundaries_intersect(first: Segment, second: Segment) -> bool {
+    crossing_y(first, second).is_some()
+        || endpoints_within(first, second, COURTYARD_ENDPOINT_TOLERANCE_MM)
+}
+
+fn endpoints_within((a, b): Segment, (c, d): Segment, tolerance: f64) -> bool {
+    [(a, c, d), (b, c, d), (c, a, b), (d, a, b)]
+        .into_iter()
+        .any(|(p, s, e)| {
+            let dx = e.0 - s.0;
+            let dy = e.1 - s.1;
+            let length_sq = dx * dx + dy * dy;
+            let fraction = if length_sq > 0.0 {
+                (((p.0 - s.0) * dx + (p.1 - s.1) * dy) / length_sq).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (p.0 - s.0 - fraction * dx).hypot(p.1 - s.1 - fraction * dy) <= tolerance
+        })
+}
+
+fn crossing_y((a, b): Segment, (c, d): Segment) -> Option<f64> {
+    let direction = (b.0 - a.0, b.1 - a.1);
+    let other = (d.0 - c.0, d.1 - c.1);
+    let delta = (c.0 - a.0, c.1 - a.1);
+    let cross = |u: CourtyardPoint, v: CourtyardPoint| u.0 * v.1 - u.1 * v.0;
+    let determinant = cross(direction, other);
+    if determinant.abs() <= f64::EPSILON {
+        return None;
+    }
+    let t = cross(delta, other) / determinant;
+    let u = cross(delta, direction) / determinant;
+    (t > 0.0 && t < 1.0 && u > 0.0 && u < 1.0).then_some(a.1 + t * direction.1)
+}
+
+impl FootprintCourtyard {
+    /// Positive overlap area in board mm². Bounds are tested first, and a
+    /// touching boundary has zero area. Curved outlines use inscribed chords.
+    pub fn overlap_area(&self, other: &Self) -> Option<f64> {
+        let left = self.bbox.0.max(other.bbox.0);
+        let right = self.bbox.2.min(other.bbox.2);
+        let bottom = self.bbox.1.max(other.bbox.1);
+        let top = self.bbox.3.min(other.bbox.3);
+        if left >= right || bottom >= top {
+            return Some(0.0);
+        }
+        let first = self.outline.as_ref()?;
+        let second = other.outline.as_ref()?;
+        let edges = |rings: &[Vec<CourtyardPoint>]| -> Vec<Segment> {
+            rings
+                .iter()
+                .flat_map(|ring| ring.windows(2).map(|e| (e[0], e[1])))
+                .collect()
+        };
+        let first_edges = edges(first);
+        let second_edges = edges(second);
+        // The overlap width varies linearly between vertices and crossing
+        // events. One midpoint per strip therefore integrates each strip.
+        let mut levels = vec![bottom, top];
+        for &((_, y), _) in first_edges.iter().chain(&second_edges) {
+            if y > bottom && y < top {
+                levels.push(y);
+            }
+        }
+        for a in &first_edges {
+            for b in &second_edges {
+                if let Some(y) = crossing_y(*a, *b).filter(|y| *y > bottom && *y < top) {
+                    levels.push(y);
+                }
+            }
+        }
+        levels.sort_by(f64::total_cmp);
+        levels.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+
+        let intersections = |edges: &[Segment], y: f64| -> Vec<f64> {
+            let mut hits: Vec<_> = edges
+                .iter()
+                .filter(|(a, b)| (a.1 > y) != (b.1 > y))
+                .map(|&(a, b)| a.0 + (y - a.1) * (b.0 - a.0) / (b.1 - a.1))
+                .collect();
+            hits.sort_by(f64::total_cmp);
+            hits
+        };
+        let mut area = 0.0;
+        for limits in levels.windows(2) {
+            let height = limits[1] - limits[0];
+            let midpoint = limits[0] + height / 2.0;
+            let first = intersections(&first_edges, midpoint);
+            let second = intersections(&second_edges, midpoint);
+            for a in first.chunks_exact(2) {
+                for b in second.chunks_exact(2) {
+                    area += (a[1].min(b[1]) - a[0].max(b[0])).max(0.0) * height;
+                }
+            }
+        }
+        let curve_error = f64::from(u8::from(self.curved) + u8::from(other.curved))
+            * crate::geometry::CURVE_MAX_CHORD_ERROR_MM;
+        if area <= 1e-9
+            && curve_error > 0.0
+            && first_edges.iter().any(|&a| {
+                second_edges
+                    .iter()
+                    .any(|&b| crossing_y(a, b).is_some() || endpoints_within(a, b, curve_error))
+            })
+        {
+            return None;
+        }
+        Some(area)
+    }
 }
 
 /// KiCad's lock state for a footprint, read from its **direct** children only.
@@ -1263,6 +1518,40 @@ fn index_into(node: &SexpNode, owner: &ItemOwner, out: &mut HashMap<String, Uuid
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn crossing_and_pinch_are_distinguished_from_separate_diagonal_boundaries() {
+        assert!(boundaries_intersect(
+            ((0.0, 0.0), (2.0, 2.0)),
+            ((1.0, 1.0), (2.0, 0.0))
+        ));
+        assert!(!boundaries_intersect(
+            ((0.0, 0.0), (2.0, 2.0)),
+            ((1.0, 0.99), (2.0, 0.0))
+        ));
+    }
+
+    #[test]
+    fn near_chord_contact_is_unproven_even_when_polygon_overlap_is_zero() {
+        let root = crate::parse_sexp(
+            r#"(kicad_pcb
+            (footprint "A" (layer "F.Cu") (at 0 0)
+                (fp_circle (center 0 0) (end 1 0) (layer "F.CrtYd"))))"#,
+        )
+        .unwrap();
+        let circle = footprint_courtyard(root.find("footprint").unwrap()).unwrap();
+        let ring = &circle.outline.as_ref().unwrap()[0];
+        let midpoint = ((ring[0].0 + ring[1].0) / 2.0, (ring[0].1 + ring[1].1) / 2.0);
+        let start = (midpoint.0 + 0.0002, midpoint.1 - 0.00005);
+        let end = (start.0 + 0.0001, start.1 + 0.0001);
+        let probe = FootprintCourtyard {
+            outline: Some(vec![rectangle_ring(start, end)]),
+            bbox: (start.0, start.1, end.0, end.1),
+            curved: false,
+            ..circle.clone()
+        };
+        assert_eq!(circle.overlap_area(&probe), None);
+    }
     use super::*;
     use crate::parser::parse_sexp;
 

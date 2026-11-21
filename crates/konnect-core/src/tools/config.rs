@@ -16,7 +16,7 @@ use crate::tool;
 use crate::tools::{invalid_arg, require_str, ToolContext, ToolDef};
 use konnect_sexp::writer::{write_atomic_if_unchanged, write_new_atomic};
 use konnect_sexp::SexpError;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -69,8 +69,8 @@ fn default_project_config() -> serde_json::Value {
         "fab_constraints": {},
         "naming_conventions": {},
         // Project-side sourcing overrides. NOTE: deep_merge REPLACES arrays,
-        // so a project-level "avl" supersedes the user list entirely rather
-        // than appending to it — the same semantics design_rules has.
+        // so a project-level "avl" supersedes the user list entirely.
+        // Design rules are combined by the effective view separately.
         "sourcing": {}
     })
 }
@@ -215,6 +215,27 @@ fn persist_config(path: &Path, expected: Option<&str>, content: &str) -> Result<
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    write_config(path, expected, content)
+}
+
+/// Create only the settings subdirectory. If the project vanished after
+/// validation, do not recreate it as a side effect of saving preferences.
+fn persist_project_config(
+    path: &Path,
+    expected: Option<&str>,
+    content: &str,
+) -> Result<(), SexpError> {
+    if let Some(parent) = path.parent() {
+        match std::fs::create_dir(parent) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    write_config(path, expected, content)
+}
+
+fn write_config(path: &Path, expected: Option<&str>, content: &str) -> Result<(), SexpError> {
     match expected {
         Some(expected) => write_atomic_if_unchanged(path, expected, content),
         None => write_new_atomic(path, content),
@@ -286,25 +307,126 @@ fn update_config(
     }
 }
 
-/// The `change` that sets one dot-path key; a path through a non-object is
-/// the caller's argument, not an internal failure.
+/// Resolve a requested setting against the keys and shapes Konnect defines.
+fn config_key_schema<'a>(defaults: &'a Value, key_path: &str) -> anyhow::Result<&'a Value> {
+    let mut entry = defaults;
+    for key in key_path.split('.') {
+        anyhow::ensure!(
+            !key.trim().is_empty(),
+            "Configuration path has an empty segment"
+        );
+        let object = entry
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("'{key_path}' traverses a non-object setting"))?;
+        entry = object.get(key).ok_or_else(|| {
+            let candidates = object
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::anyhow!("Unknown key '{key}' in '{key_path}'; expected one of {candidates}")
+        })?;
+    }
+    Ok(entry)
+}
+
+fn validate_config_value(key_path: &str, schema: &Value, value: &Value) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        json_type_name(schema) == json_type_name(value),
+        "'{key_path}' must be {}",
+        json_type_name(schema)
+    );
+    if let Some(object) = value.as_object() {
+        for (key, value) in object {
+            anyhow::ensure!(
+                !key.trim().is_empty() && !key.contains('.'),
+                "'{key_path}' contains a key that is not a single path segment"
+            );
+            let entry = config_key_schema(schema, key)?;
+            validate_config_value(&format!("{key_path}.{key}"), entry, value)?;
+        }
+    } else if let Some(items) = value.as_array() {
+        let mut rules = std::collections::BTreeSet::new();
+        for item in items {
+            let text = item
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("'{key_path}' must contain only strings"))?;
+            if key_path == "design_rules" {
+                let text = text.trim();
+                anyhow::ensure!(!text.is_empty(), "Design rules must not be blank");
+                anyhow::ensure!(
+                    rules.insert(text),
+                    "Design rules must be unique within a scope"
+                );
+            }
+        }
+    } else if key_path == "fab_constraints.layer_count" {
+        anyhow::ensure!(
+            value.as_u64().is_some_and(|layers| layers > 0),
+            "'{key_path}' must be a positive integer"
+        );
+    } else if value.is_number() {
+        let limit = if key_path.starts_with("sourcing.derating.") {
+            1.0
+        } else {
+            f64::MAX
+        };
+        anyhow::ensure!(
+            value
+                .as_f64()
+                .is_some_and(|number| (0.0..=limit).contains(&number)),
+            "'{key_path}' must be a nonnegative number within its supported range"
+        );
+    }
+    Ok(())
+}
+
+/// Validate the requested change while leaving unrelated existing settings alone.
 fn set_key(
     key_path: &str,
-    value: serde_json::Value,
-) -> impl FnOnce(&mut serde_json::Value) -> Result<(), CallToolResult> + '_ {
+    value: Value,
+) -> impl FnOnce(&mut Value) -> Result<(), CallToolResult> + '_ {
     move |config| {
+        if value.is_null() {
+            // Removal only needs a well-formed path to a saved key, so keys
+            // written by earlier versions outside the schema stay removable.
+            if key_path.split('.').any(|key| key.trim().is_empty()) {
+                return Err(invalid_arg(
+                    "key_path",
+                    "Configuration path has an empty segment",
+                ));
+            }
+        } else {
+            let defaults = default_user_config();
+            let schema = config_key_schema(&defaults, key_path)
+                .map_err(|error| invalid_arg("key_path", &error.to_string()))?;
+            validate_config_value(key_path, schema, &value)
+                .map_err(|error| invalid_arg("value", &error.to_string()))?;
+        }
         set_dot_path(config, key_path, value)
             .map_err(|error| invalid_arg("key_path", &error.to_string()))
     }
 }
 
 /// The `change` that appends one design rule.
-fn push_rule(rule: &str) -> impl FnOnce(&mut serde_json::Value) -> Result<(), CallToolResult> + '_ {
+fn push_rule(rule: &str) -> impl FnOnce(&mut Value) -> Result<(), CallToolResult> + '_ {
     move |config| {
-        match config["design_rules"].as_array_mut() {
-            Some(rules) => rules.push(json!(rule)),
-            None => config["design_rules"] = json!([rule]),
+        if config.get("design_rules").is_none() {
+            config["design_rules"] = json!([]);
         }
+        let rules = config["design_rules"].as_array_mut().ok_or_else(|| {
+            invalid_arg("rule", "the existing design_rules setting is not an array")
+        })?;
+        if rules
+            .iter()
+            .any(|stored| stored.as_str().is_some_and(|stored| stored.trim() == rule))
+        {
+            return Err(invalid_arg(
+                "rule",
+                "this design rule already exists in this scope",
+            ));
+        }
+        rules.push(json!(rule));
         Ok(())
     }
 }
@@ -337,48 +459,31 @@ fn deep_merge(base: &serde_json::Value, overlay: &serde_json::Value) -> serde_js
     }
 }
 
-/// Set a value at a dot-notation path, e.g. "fab_constraints.fab_house" = "JLCPCB".
-///
-/// Fails with an error (instead of panicking) if a segment of the path already
-/// holds a non-object value, since there is nowhere to insert the child key.
-fn set_dot_path(
-    config: &mut serde_json::Value,
-    key_path: &str,
-    value: serde_json::Value,
-) -> anyhow::Result<()> {
-    let parts: Vec<&str> = key_path.split('.').collect();
-    let mut current = config;
-    for (i, part) in parts.iter().enumerate() {
-        if i == parts.len() - 1 {
-            // Last part — set the value
-            return match current {
-                serde_json::Value::Object(map) => {
-                    map.insert(part.to_string(), value);
-                    Ok(())
-                }
-                other => anyhow::bail!(
-                    "Cannot set '{key_path}': '{}' is not an object (found {})",
-                    parts[..i].join("."),
-                    json_type_name(other)
-                ),
-            };
-        }
-        // Navigate into nested object, creating it if missing.
-        if !current.get(*part).map(|v| v.is_object()).unwrap_or(false) {
-            match current {
-                serde_json::Value::Object(map) => {
-                    map.insert(part.to_string(), json!({}));
-                }
-                other => anyhow::bail!(
-                    "Cannot set '{key_path}': '{}' is not an object (found {})",
-                    parts[..i].join("."),
-                    json_type_name(other)
-                ),
-            }
-        }
-        current = current
-            .get_mut(*part)
-            .expect("just verified or inserted as an object above");
+/// Set or delete a dot-notation key, creating missing objects only on set.
+fn set_dot_path(config: &mut Value, key_path: &str, value: Value) -> anyhow::Result<()> {
+    let parts: Vec<_> = key_path.split('.').collect();
+    let (last, parents) = parts
+        .split_last()
+        .expect("splitting a string yields at least one part");
+    let mut entry = config;
+    for key in parents {
+        let map = entry
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("'{key_path}' traverses a non-object setting"))?;
+        entry = if value.is_null() {
+            map.get_mut(*key)
+                .ok_or_else(|| anyhow::anyhow!("'{key_path}' is not set"))?
+        } else {
+            map.entry(*key).or_insert_with(|| json!({}))
+        };
+    }
+    let map = entry
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("'{key_path}' traverses a non-object setting"))?;
+    if value.is_null() {
+        anyhow::ensure!(map.remove(*last).is_some(), "'{key_path}' is not set");
+    } else {
+        map.insert((*last).to_string(), value);
     }
     Ok(())
 }
@@ -428,7 +533,9 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Dot-notation path to the config key, e.g. 'fab_constraints.fab_house' or 'default_passives.decoupling_cap'"
                     },
                     "value": {
-                        "description": "New value to set (string, number, array, or object)"
+                        "type": ["string", "number", "array", "object", "boolean", "null"],
+                        "additionalProperties": true,
+                        "description": "Value for the specified key, or null to delete an existing key"
                     }
                 },
                 "required": ["key_path", "value"]
@@ -463,7 +570,11 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory (optional, uses configured default)" },
                     "key_path": { "type": "string", "description": "Dot-notation config key" },
-                    "value": { "description": "New value to set" }
+                    "value": {
+                        "type": ["string", "number", "array", "object", "boolean", "null"],
+                        "additionalProperties": true,
+                        "description": "Value for the specified key, or null to delete an existing key"
+                    }
                 },
                 "required": ["key_path", "value"]
             }),
@@ -472,6 +583,7 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "get_effective_config",
             "Return the merged configuration (user defaults + project overrides). \
+             Design rules are ordered user first, then project, with scope in 'design_rule_sources'. \
              This is the config Claude should use for all design decisions. 'sources' says \
              where each half came from ('file', 'defaults', or 'not_configured' when there is no \
              project directory). Refuses with invalid_configuration, naming which file, rather \
@@ -496,6 +608,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "rule": { "type": "string", "description": "The design rule in plain English" },
                     "scope": {
                         "type": "string",
+                        "enum": ["user", "project"],
                         "description": "'user' (applies to all projects) or 'project' (this project only)",
                         "default": "project"
                     },
@@ -568,12 +681,10 @@ async fn handle_load_user_config(
     Ok(load_user_config_at(&path))
 }
 
-fn required_value(args: &serde_json::Value) -> Result<serde_json::Value, CallToolResult> {
-    let value = args["value"].clone();
-    if value.is_null() {
-        return Err(CallToolResult::error("Missing required argument: 'value'"));
-    }
-    Ok(value)
+fn required_value(args: &Value) -> Result<Value, CallToolResult> {
+    args.get("value")
+        .cloned()
+        .ok_or_else(|| invalid_arg("value", "required"))
 }
 
 async fn handle_save_user_config(
@@ -595,7 +706,11 @@ async fn handle_save_user_config(
         match update_config(
             &path,
             "user",
-            default_user_config(),
+            if value.is_null() {
+                json!({})
+            } else {
+                default_user_config()
+            },
             "save_user_config",
             set_key(&key_path, value.clone()),
             persist_config,
@@ -636,7 +751,10 @@ async fn handle_save_project_config(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let project_dir = resolve_project_dir(args, ctx)?;
+    let project_dir = match write_project_dir(args, ctx) {
+        Ok(dir) => dir,
+        Err(refusal) => return Ok(refusal),
+    };
     let key_path = match require_str(args, "key_path") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -651,10 +769,14 @@ async fn handle_save_project_config(
         match update_config(
             &path,
             "project",
-            default_project_config(),
+            if value.is_null() {
+                json!({})
+            } else {
+                default_project_config()
+            },
             "save_project_config",
             set_key(&key_path, value.clone()),
-            persist_config,
+            persist_project_config,
         ) {
             Ok(saved) => CallToolResult::json(&json!({
                 "updated": key_path,
@@ -691,8 +813,31 @@ fn effective_config_at(user_path: &Path, project_path: Option<&Path>) -> CallToo
         Ok(configs) => configs,
         Err(refusal) => return refusal,
     };
+    let scoped_rules: Vec<_> = design_rules(&user.value)
+        .into_iter()
+        .map(|rule| (rule, "user"))
+        .chain(
+            design_rules(&project.value)
+                .into_iter()
+                .map(|rule| (rule, "project")),
+        )
+        .collect();
+    let mut effective = if project.source == FROM_FILE {
+        deep_merge(&user.value, &project.value)
+    } else {
+        user.value
+    };
+    effective["design_rules"] = json!(scoped_rules
+        .iter()
+        .map(|(rule, _)| rule)
+        .collect::<Vec<_>>());
+    let design_rule_sources: Vec<_> = scoped_rules
+        .iter()
+        .map(|(rule, source)| json!({ "rule": rule, "source": source }))
+        .collect();
     CallToolResult::json(&json!({
-        "effective_config": deep_merge(&user.value, &project.value),
+        "effective_config": effective,
+        "design_rule_sources": design_rule_sources,
         "sources": { "user": user.source, "project": project.source },
         "note": "Merged user defaults + project overrides. Use these values for all design decisions."
     }))
@@ -716,29 +861,41 @@ async fn handle_add_design_rule(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let rule = match require_str(args, "rule") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
+        Ok(rule) if !rule.trim().is_empty() => rule.trim(),
+        Ok(_) => return Ok(invalid_arg("rule", "must not be blank")),
+        Err(refusal) => return Ok(refusal),
     };
-    let scope = args["scope"].as_str().unwrap_or("project");
+    let scope = match args.get("scope") {
+        None => "project",
+        Some(scope) => match scope.as_str() {
+            Some(scope @ ("user" | "project")) => scope,
+            _ => return Ok(invalid_arg("scope", "must be user or project")),
+        },
+    };
 
-    let (path, which, default) = if scope == "user" {
-        (user_config_path()?, "user", default_user_config())
+    let (path, default) = if scope == "user" {
+        (user_config_path()?, default_user_config())
     } else {
-        let project_dir = resolve_project_dir(args, ctx)?;
-        (
-            project_config_path(&project_dir),
-            "project",
-            default_project_config(),
-        )
+        let project_dir = match write_project_dir(args, ctx) {
+            Ok(dir) => dir,
+            Err(refusal) => return Ok(refusal),
+        };
+        (project_config_path(&project_dir), default_project_config())
     };
     Ok(
         match update_config(
             &path,
-            which,
+            scope,
             default,
             "add_design_rule",
-            push_rule(&rule),
-            persist_config,
+            push_rule(rule),
+            |path, expected, content| {
+                if scope == "user" {
+                    persist_config(path, expected, content)
+                } else {
+                    persist_project_config(path, expected, content)
+                }
+            },
         ) {
             Ok(saved) => CallToolResult::json(&json!({
                 "added_rule": rule,
@@ -780,6 +937,27 @@ async fn handle_list_design_rules(
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+fn write_project_dir(args: &Value, ctx: &ToolContext) -> Result<PathBuf, CallToolResult> {
+    if args
+        .get("project_dir")
+        .is_some_and(|value| value.as_str().is_none_or(|dir| dir.trim().is_empty()))
+    {
+        return Err(invalid_arg(
+            "project_dir",
+            "must name an existing directory",
+        ));
+    }
+    let dir = resolve_project_dir(args, ctx)
+        .map_err(|error| invalid_arg("project_dir", &error.to_string()))?;
+    if !dir.is_dir() {
+        return Err(invalid_arg(
+            "project_dir",
+            "must name an existing directory",
+        ));
+    }
+    Ok(dir)
+}
 
 fn resolve_project_dir(args: &serde_json::Value, ctx: &ToolContext) -> anyhow::Result<PathBuf> {
     if let Some(dir) = args["project_dir"].as_str() {
@@ -880,15 +1058,10 @@ mod dot_path_and_merge_tests {
     }
 
     #[test]
-    fn set_dot_path_replaces_scalar_intermediate_segment_with_object() {
-        // "fab_constraints" already holds a string, not an object. The parent
-        // (root) is still an object, so it's free to replace that key with a
-        // fresh nested object rather than erroring — this matches the
-        // function's pre-existing "create if needed" behavior.
+    fn set_dot_path_refuses_to_replace_a_scalar_intermediate_segment() {
         let mut config = json!({ "fab_constraints": "JLCPCB" });
-        set_dot_path(&mut config, "fab_constraints.fab_house", json!("PCBWay"))
-            .expect("should succeed by replacing the scalar with an object");
-        assert_eq!(config["fab_constraints"]["fab_house"], "PCBWay");
+        assert!(set_dot_path(&mut config, "fab_constraints.fab_house", json!("PCBWay")).is_err());
+        assert_eq!(config, json!({ "fab_constraints": "JLCPCB" }));
     }
 }
 
@@ -1034,7 +1207,7 @@ mod config_state_tests {
             "user",
             default_user_config(),
             "save_user_config",
-            set_key("ui.theme", json!("dark")),
+            set_key("fab_constraints.fab_house", json!("PCBWay")),
             persist_config,
         )
         .err()
@@ -1065,14 +1238,14 @@ mod config_state_tests {
             "user",
             default_user_config(),
             "save_user_config",
-            set_key("ui.theme", json!("dark")),
+            set_key("fab_constraints.fab_house", json!("PCBWay")),
             persist_config,
         )
         .expect("a usable file is updated");
         assert!(!saved.created);
         assert_eq!(saved.value["kicad_cli"], "D:/tools/kicad-cli.exe");
         assert_eq!(saved.value["ui"]["density"], "compact");
-        assert_eq!(saved.value["ui"]["theme"], "dark");
+        assert_eq!(saved.value["fab_constraints"]["fab_house"], "PCBWay");
         let ConfigRead::Loaded { value, .. } = read_config(&path) else {
             panic!("the saved file parses")
         };
@@ -1088,13 +1261,13 @@ mod config_state_tests {
             "user",
             default_user_config(),
             "save_user_config",
-            set_key("ui.theme", json!("dark")),
+            set_key("fab_constraints.fab_house", json!("PCBWay")),
             persist_config,
         )
         .expect("an absent file is created");
         assert!(saved.created);
         let mut expected = default_user_config();
-        expected["ui"] = json!({ "theme": "dark" });
+        expected["fab_constraints"]["fab_house"] = json!("PCBWay");
         assert_eq!(saved.value, expected);
     }
 
@@ -1114,7 +1287,7 @@ mod config_state_tests {
                 "user",
                 default_user_config(),
                 "save_user_config",
-                set_key("ui.theme", json!("dark")),
+                set_key("fab_constraints.fab_house", json!("PCBWay")),
                 |target, expected, content| {
                     if after_replacement {
                         persist_config(target, expected, content).unwrap();
@@ -1150,7 +1323,7 @@ mod config_state_tests {
             "user",
             default_user_config(),
             "save_user_config",
-            set_key("ui.theme", json!("dark")),
+            set_key("fab_constraints.fab_house", json!("PCBWay")),
             |_, expected, _| {
                 assert!(expected.is_none(), "no file was read, so none is expected");
                 Err(SexpError::Io(std::io::Error::new(
@@ -1175,7 +1348,7 @@ mod config_state_tests {
             "user",
             default_user_config(),
             "save_user_config",
-            set_key("b", json!(2)),
+            set_key("fab_constraints.layer_count", json!(2)),
             |target, _, _| {
                 std::fs::write(target, r#"{"someone": "else"}"#).unwrap();
                 Ok(())

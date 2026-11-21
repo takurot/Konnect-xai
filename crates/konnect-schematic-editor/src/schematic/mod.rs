@@ -128,6 +128,13 @@ pub struct Schematic {
     pub raw_other: Vec<SexpNode>,
 }
 
+#[test]
+fn non_schematic_root_refusal_contract() {
+    for wrong_type in ["(kicad_pcb)", "(\"kicad_sch\")", "kicad_sch"] {
+        assert!(Schematic::from_source("mislabeled.kicad_sch", wrong_type).is_err());
+    }
+}
+
 impl Schematic {
     // ---- I/O ----------------------------------------------------------------
 
@@ -421,6 +428,9 @@ impl Schematic {
     // ---- internal -----------------------------------------------------------
 
     fn from_sexp(root: SexpNode, filepath: PathBuf, original_source: String) -> Result<Self> {
+        if root.tag() != Some("kicad_sch") {
+            return Err(crate::error::Error::MissingField("kicad_sch"));
+        }
         let mut version = None;
         let mut generator = None;
         let mut generator_version = None;
