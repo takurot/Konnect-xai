@@ -387,10 +387,19 @@ fn set_key(
     value: Value,
 ) -> impl FnOnce(&mut Value) -> Result<(), CallToolResult> + '_ {
     move |config| {
-        let defaults = default_user_config();
-        let schema = config_key_schema(&defaults, key_path)
-            .map_err(|error| invalid_arg("key_path", &error.to_string()))?;
-        if !value.is_null() {
+        if value.is_null() {
+            // Removal only needs a well-formed path to a saved key, so keys
+            // written by earlier versions outside the schema stay removable.
+            if key_path.split('.').any(|key| key.trim().is_empty()) {
+                return Err(invalid_arg(
+                    "key_path",
+                    "Configuration path has an empty segment",
+                ));
+            }
+        } else {
+            let defaults = default_user_config();
+            let schema = config_key_schema(&defaults, key_path)
+                .map_err(|error| invalid_arg("key_path", &error.to_string()))?;
             validate_config_value(key_path, schema, &value)
                 .map_err(|error| invalid_arg("value", &error.to_string()))?;
         }

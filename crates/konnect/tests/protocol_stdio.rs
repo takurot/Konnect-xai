@@ -1024,7 +1024,8 @@ fn configuration_mutations_refuse_invalid_requests_without_writing_and_accept_ex
         ("sourcing.derating.capacitor", json!({"voltage":1.2})),
         ("design_rules", json!(["", "Valid"])),
         ("design_rules", json!(["Same", " Same "])),
-        ("legacy.keep", json!(null)),
+        ("legacy.absent", json!(null)),
+        ("a..b.", json!(null)),
     ];
     for (key_path, value) in invalid {
         for (tool, args) in [
@@ -1111,6 +1112,29 @@ fn configuration_mutations_refuse_invalid_requests_without_writing_and_accept_ex
         McpProcess::tool_body(&result)["effective_config"]["fab_constraints"]["fab_house"],
         "JLCPCB"
     );
+
+    // A key saved by an earlier version is outside the schema but can still be removed.
+    for (tool, args, path) in [
+        (
+            "save_project_config",
+            json!({"project_dir":project,"key_path":"legacy.keep","value":null}),
+            &project_config,
+        ),
+        (
+            "save_user_config",
+            json!({"key_path":"legacy.keep","value":null}),
+            &user_config,
+        ),
+    ] {
+        let result = p.call_tool(tool, args);
+        assert_ne!(result["isError"], json!(true), "{tool}: {result}");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(
+            !stored["legacy"].as_object().unwrap().contains_key("keep"),
+            "{tool}: {stored}"
+        );
+    }
 }
 
 /// The other half: with no preferences file the load says it answered with
