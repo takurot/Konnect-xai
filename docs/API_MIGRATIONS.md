@@ -2260,6 +2260,19 @@ footprints with matching symbol identity, footprint and value. When omitted,
 the estimator tries the same-stem root schematic. The saved PCB determines the
 assembly population.
 
+
+## Unreleased: fabrication packages omit DNP assembly rows
+
+`export_manufacturing_package` excludes DNP symbols from the BOM for every fab
+house. Non-JLCPCB position CSVs exclude DNP footprints and honor DNP annotations
+from the explicitly selected schematic. For a same-stem schematic next to the
+board, a unique reference and matching footprint can identify a DNP position
+when the footprint has no schematic link yet. An ambiguous or conflicting link
+leaves the package incomplete.
+
+`estimate_cost` lists the identified LCSC references using fallback average
+pricing when the local JLCPCB catalog file is absent.
+
 ## Unreleased: `flip_component` on an open board uses KiCad 10.0.6's native `FlipItems`
 
 `flip_component` previously refused unconditionally whenever KiCad was
