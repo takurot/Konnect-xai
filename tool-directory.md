@@ -441,11 +441,11 @@ the router or relying on the KiCad ActionPlugin workflow.
 | Tool | Description |
 |------|-------------|
 | `audit_decoupling` | Audit schematic connectivity between IC power nets and decoupling capacitors; does not measure PCB placement distance. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
-| `audit_connections` | Check for common connection mistakes: missing pull-ups on I2C/reset, missing series resistors on LEDs, floating inputs, shorted outputs. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
-| `audit_power_rails` | Check power rail integrity: missing bulk capacitance, no test points, missing regulator output caps. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
-| `audit_manufacturing` | DFM checks for the configured fab house: component spacing, silkscreen overlap, via-in-pad, acid traps, board-outline issues. |
-| `run_design_review` | Run all available audit checks across every reachable schematic sheet and produce a consolidated report with status, coverage, and diagnostics. Returns `INCOMPLETE` rather than approval when coverage is partial or failed. |
-| `check_bom_health` | Analyze the BOM for supply-chain risks: parts with no MPN, lifecycle warnings, low stock, unavailable from preferred distributors. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
+| `audit_connections` | Check pull-up resistors on named I2C and reset nets. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
+| `audit_power_rails` | Check named power rails for decoupling, bulk capacitance, and test points. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
+| `audit_manufacturing` | Check saved outline geometry, footprint sides and origin proximity, and the saved project minimum track width for the selected fab house. |
+| `run_design_review` | Review every reachable schematic sheet and run KiCad ERC. With a saved board, also run DFM and KiCad DRC. Missing required evidence yields `INCOMPLETE`. |
+| `check_bom_health` | Inspect saved values, footprints, and part identifiers. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
 
 ---
 
@@ -476,7 +476,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | Tool | Description |
 |------|-------------|
 | `export_manufacturing_package` | Generate Gerbers, drill, fab-house BOM, and pick-and-place. JLCPCB assembly requires the exact board open with IPC enabled: native pad-box midpoints and board exports share a stable live snapshot, then versioned CPL corrections apply. Geometry and correction evidence remain separate; Component Placements preview is required. |
-| `validate_for_manufacturing` | Board pre-flight before ordering: checks outline, design rules, footprints, routing evidence, and complete DRC results. |
+| `validate_for_manufacturing` | Check the saved board outline, project minimum track width, footprints, and native DRC before ordering. Unconnected items block readiness and schematic parity requires review. |
 | `estimate_cost` | Estimate fabrication and assembly. JLCPCB pricing uses local catalog unit prices for LCSC IDs from saved PCB fields or UUID-linked root schematic components, reports fallback references and counts known Extended feeder fees once per part number. The model compares the saved Edge.Cuts bounding box with 100 × 100 mm, reports unknown dimensions when it cannot read the outline bounds, and excludes quantity discounts, attrition and shipping. |
 
 ---

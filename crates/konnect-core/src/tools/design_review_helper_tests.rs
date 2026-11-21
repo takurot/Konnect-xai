@@ -71,24 +71,12 @@ fn a_capacitor_is_a_c_reference_but_not_a_cn_connector() {
     assert!(!is_capacitor(&instance("R1", "")));
 }
 
-#[test]
-fn design_rule_values_parse_or_report_none() {
-    let content = "(rules (min_trace_width 0.127) (min_x abc) (min_y 0.2";
-    assert_eq!(
-        find_design_rule_value(content, "min_trace_width"),
-        Some(0.127)
-    );
-    assert_eq!(find_design_rule_value(content, "min_x"), None);
-    assert_eq!(find_design_rule_value(content, "min_y"), None);
-    assert_eq!(find_design_rule_value(content, "absent"), None);
-}
-
 fn footprint(reference: &str, x: f64, y: f64) -> String {
     format!("(footprint \"F\" (at {x} {y}) (property \"Reference\" \"{reference}\"))")
 }
 
 #[test]
-fn silkscreen_overlap_flags_only_footprints_closer_than_one_millimetre() {
+fn origin_proximity_flags_only_footprints_closer_than_one_millimetre() {
     let board = format!(
         "(kicad_pcb {} {} {})",
         footprint("R1", 10.0, 10.0),
@@ -96,7 +84,7 @@ fn silkscreen_overlap_flags_only_footprints_closer_than_one_millimetre() {
         footprint("R3", 20.0, 10.0),
     );
     let tree = parse_sexp(&board).unwrap();
-    let findings = check_silkscreen_overlap(&board, &tree);
+    let findings = check_footprint_origin_proximity(&tree);
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].component.as_deref(), Some("R1, R2"));
     assert!(
@@ -107,11 +95,11 @@ fn silkscreen_overlap_flags_only_footprints_closer_than_one_millimetre() {
 }
 
 #[test]
-fn silkscreen_overlap_skips_footprints_without_a_reference_or_position() {
+fn origin_proximity_skips_footprints_without_a_reference_or_position() {
     let board =
         "(kicad_pcb (footprint \"F\" (at 1 1)) (footprint \"G\" (property \"Reference\" \"R1\")))";
     let tree = parse_sexp(board).unwrap();
-    assert!(check_silkscreen_overlap(board, &tree).is_empty());
+    assert!(check_footprint_origin_proximity(&tree).is_empty());
 }
 
 fn result_with(content: Vec<ToolContent>, is_error: bool) -> CallToolResult {
@@ -381,6 +369,8 @@ async fn connection_audit_warns_for_named_reset_inputs_but_not_outputs_or_unname
         ("RESET", true, 1),
         ("NRST", true, 1),
         ("RST", true, 1),
+        ("~{RST}", true, 1),
+        ("~{RST}", false, 0),
         ("RESET_OUT", true, 0),
         ("RESET", false, 0),
     ] {
@@ -441,31 +431,4 @@ async fn bom_tilde_values_are_missing_and_explicit_mpn_satisfies_ic_identity() {
     assert_eq!(result["missing_value"], 1);
     assert_eq!(result["missing_footprint"], 1);
     assert_eq!(result["missing_mpn"], 0);
-}
-
-#[tokio::test]
-async fn manufacturing_audit_reports_missing_outline_mixed_sides_and_fab_rule_limits() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("manufacturing.kicad_pcb");
-    for fab in ["jlcpcb", "pcbway", "oshpark", "generic"] {
-        std::fs::write(&path,r#"(kicad_pcb (setup (min_trace_width 0.05))
-            (footprint "A" (layer "F.Cu")) (footprint "B" (layer "B.Cu")) (footprint "MissingLayer"))"#).unwrap();
-        let result = audit_result_json(
-            handle_audit_manufacturing(&json!({"board":path,"fab_house":fab}), &test_ctx())
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(result["components"], json!({"front":1,"back":1}));
-        let findings = result["findings"].as_array().unwrap();
-        assert!(findings.iter().any(|finding| finding["issue"]
-            .as_str()
-            .unwrap()
-            .contains("No board outline")));
-        assert!(findings.iter().any(|finding| finding["issue"]
-            .as_str()
-            .unwrap()
-            .contains("Minimum trace width")));
-        assert!(findings.iter().any(|finding| finding["severity"] == "info"));
-    }
 }

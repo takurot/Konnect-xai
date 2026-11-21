@@ -1769,6 +1769,33 @@ Two visible consequences:
 or when the kicad-cli never reported the category at all. No tool, argument, or
 existing field was renamed or removed.
 
+## Unreleased: design review and manufacturing evidence
+
+`run_design_review` runs native KiCad ERC on the supplied schematic root and
+includes the report counts and coordinate status in `design_review.erc`.
+ERC findings contribute to the verdict regardless of the presentation
+`severity_filter`. An unavailable or unreadable ERC report leaves `erc` null
+and yields an `INCOMPLETE` verdict with an `erc_unavailable` diagnostic.
+
+Standalone schematic audits describe their implemented and unchecked tests
+in `coverage.checked` and `coverage.not_checked`. The connection
+audit checks pull-ups on named I2C and reset nets. Use ERC for undriven
+inputs and outputs connected together.
+
+`audit_manufacturing` checks actual Edge.Cuts geometry and uses
+`board.design_settings.rules.min_track_width` from the same-stem saved
+`.kicad_pro`. Missing rules yield a partial audit with a named diagnostic.
+Its `coverage.not_checked` also lists outline closure, component clearance,
+silkscreen overlap, via-in-pad and acid traps. The proximity finding compares
+footprint origins within 1 mm. Both manufacturing checks accept only
+`jlcpcb`, `pcbway` and `oshpark` for `fab_house`.
+
+`validate_for_manufacturing` uses KiCad's DRC categories directly. An
+unconnected item makes the board `NOT READY` regardless of the native
+finding's severity. Schematic parity findings require at least
+`NEEDS REVIEW`. The raw DRC category counts and the reported board net and
+track counts retain their existing meaning.
+
 ## Unreleased: `add_mounting_hole` uses KiCad's shipped footprint names (minor release)
 
 `add_mounting_hole` wrote `MountingHole:MountingHole_{drill:.1}mm`. KiCad 10
