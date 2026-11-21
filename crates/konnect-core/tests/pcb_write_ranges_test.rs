@@ -201,6 +201,37 @@ async fn rotate_component_reports_the_rotation_kicad_stores() {
     assert_eq!(body["rotation"], 5.0, "{body}");
     let saved = std::fs::read_to_string(&p.board).unwrap();
     assert!(saved.contains("(at 100 50 5)"), "{saved}");
+
+    let (is_error, body) = call(
+        &p.handler,
+        "rotate_component",
+        json!({"board": p.board, "reference": "R1", "rotation": 725.1}),
+    )
+    .await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["rotation"], 5.1, "{body}");
+    let saved = std::fs::read_to_string(&p.board).unwrap();
+    assert!(saved.contains("(at 100 50 5.1)"), "{saved}");
+}
+
+#[tokio::test]
+async fn move_component_repairs_an_anchor_already_outside_the_range() {
+    let p = project().await;
+    let corrupted =
+        std::fs::read_to_string(&p.board)
+            .unwrap()
+            .replacen("(at 100 50)", "(at 3000 50)", 1);
+    std::fs::write(&p.board, corrupted).unwrap();
+    let (is_error, body) = call(
+        &p.handler,
+        "move_component",
+        json!({"board": p.board, "reference": "R1", "x": 10.0, "y": 10.0}),
+    )
+    .await;
+    assert!(!is_error, "{body}");
+    let saved = std::fs::read_to_string(&p.board).unwrap();
+    assert!(saved.contains("(at 10 10)"), "{saved}");
+    assert!(!saved.contains("(at 3000 50)"), "{saved}");
 }
 
 #[tokio::test]

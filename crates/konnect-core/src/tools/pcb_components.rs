@@ -836,6 +836,12 @@ fn normalize_root_angle(degrees: f64) -> f64 {
     }
 }
 
+/// The root angle as written and reported: nanometre-rounded on both sides of
+/// normalising, so 180.0000004 stays 180 and 725.1 is exactly 5.1.
+fn stored_root_angle(degrees: f64) -> f64 {
+    round6(normalize_root_angle(round6(degrees)))
+}
+
 /// Render `(at x y angle)`, dropping a zero angle as KiCad's writer does and
 /// trimming trailing zeros from the decimals.
 fn format_at(x: f64, y: f64, angle: f64) -> String {
@@ -1307,7 +1313,13 @@ fn update_footprint_placement(
         .get_f64(2)
         .context("footprint root placement has an invalid Y position")?;
     let old_rotation = at.get_f64(3).unwrap_or(0.0);
-    validate_placement_values(old_x, old_y, old_rotation)?;
+    // The board may already hold an out-of-range anchor (written before #131);
+    // a move must still be able to repair it, so only the new values face the
+    // board range.
+    anyhow::ensure!(
+        old_x.is_finite() && old_y.is_finite() && old_rotation.is_finite(),
+        "footprint root placement is not finite"
+    );
     match update {
         FootprintPlacementUpdate::Move { x, y } => validate_placement_values(x, y, old_rotation)?,
         FootprintPlacementUpdate::Rotate { rotation } => {
@@ -1324,11 +1336,9 @@ fn update_footprint_placement(
     let (x, y, rotation) = match update {
         FootprintPlacementUpdate::Move { x, y } => (x, y, old_rotation),
         FootprintPlacementUpdate::Rotate { rotation } => {
-            (old_x, old_y, normalize_root_angle(round6(rotation)))
+            (old_x, old_y, stored_root_angle(rotation))
         }
-        FootprintPlacementUpdate::Set { x, y, rotation } => {
-            (x, y, normalize_root_angle(round6(rotation)))
-        }
+        FootprintPlacementUpdate::Set { x, y, rotation } => (x, y, stored_root_angle(rotation)),
     };
 
     // Replace the root `(at …)` FIRST, while `at_start`/`at_end` still index
@@ -2315,7 +2325,7 @@ async fn handle_place_component(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let rotation = normalize_root_angle(round6(args["rotation"].as_f64().unwrap_or(0.0)));
+    let rotation = stored_root_angle(args["rotation"].as_f64().unwrap_or(0.0));
     let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
     if let Some(rejection) = back_side_layer_error(&layer) {
         return Ok(rejection);
@@ -2523,7 +2533,7 @@ async fn handle_rotate_component(
         Err(e) => return Ok(e),
     };
     // KiCad keeps a footprint root angle in (-180, 180]; report that spelling.
-    let stored_rotation = normalize_root_angle(round6(rotation));
+    let stored_rotation = stored_root_angle(rotation);
 
     let ref_ipc = reference.clone();
     match attempt_ipc_write(ctx, &board, "rotation", move |c| {
