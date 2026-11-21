@@ -248,6 +248,14 @@ fn a_table_that_does_not_read_back_as_planned_is_refused() {
     assert!(layer_table_reads_back(KICAD10_BOARD, &planned).is_ok());
     assert!(layer_table_reads_back(&misplaced, &planned).is_err());
     assert!(layer_table_reads_back("(kicad_pcb (layers", &planned).is_err());
+    let four = board_with_inner(2);
+    let after_back = four.replace(
+        "\t\t(4 \"In1.Cu\" signal)\n\t\t(6 \"In2.Cu\" signal)\n\t\t(2 \"B.Cu\" signal)\n",
+        "\t\t(2 \"B.Cu\" signal)\n\t\t(4 \"In1.Cu\" signal)\n\t\t(6 \"In2.Cu\" signal)\n",
+    );
+    assert_ne!(after_back, four);
+    let planned_four = konnect_sexp::layers::layers(&parse_sexp(&four).unwrap());
+    assert!(layer_table_reads_back(&after_back, &planned_four).is_err());
 }
 
 #[tokio::test]
