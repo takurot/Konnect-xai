@@ -586,7 +586,9 @@ fn zone_outline(args: &serde_json::Value) -> Result<Vec<(f64, f64)>, CallToolRes
         .ok_or_else(|| {
             crate::tools::invalid_arg("points", "every vertex needs numeric 'x' and 'y'")
         })?;
-    // An outline closed by repeating its first vertex is the same polygon.
+    // Repeated vertices, including one that closes the outline by repeating
+    // the first, describe the same polygon.
+    points.dedup();
     if points.len() > 3 && points.first() == points.last() {
         points.pop();
     }
@@ -1442,8 +1444,10 @@ pub fn tools() -> Vec<ToolDef> {
              and that result carries a warning, because a file-only edit is invisible to an \
              open pcbnew and is lost on its next save. A file-mode zone is written unfilled \
              and reports filled: false with fill_instructions. Refuses a non-copper layer, \
-             a non-positive clearance or min_width, a self-intersecting outline, and (in \
-             file mode) a net no pad, track or via on the board carries.",
+             a non-positive clearance or min_width, a vertex without numeric x/y, a \
+             self-intersecting or zero-area outline, and, in file mode, a net the board \
+             does not have: on a KiCad 10 board one no pad, track or via carries, on a \
+             legacy board one missing from the net table.",
             zone_schema(),
             |args, ctx| async move { handle_add_zone(args, ctx).await }
         )
@@ -2839,7 +2843,9 @@ pub(crate) async fn add_zone_impl(
 
     let content = std::fs::read_to_string(&board_path)?;
     let tree = konnect_sexp::parse_sexp(&content)?;
+    // The empty name is KiCad's no-net pour, a legitimate isolated fill.
     if konnect_sexp::net::names_nets_in_place(&tree)
+        && !net_name.is_empty()
         && !nets_carried_by_board_items(&tree).contains(&net_name)
     {
         return Ok(CallToolResult::error(format!(
@@ -5482,6 +5488,15 @@ mod zone_net_format_tests {
         assert_eq!(after, with_zone);
     }
 
+    /// KiCad's no-net pour (empty name) is legitimate isolated copper.
+    #[tokio::test]
+    async fn an_unnetted_zone_is_still_accepted_on_a_kicad_10_board() {
+        let (result, after) = zone(KICAD_10, "").await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let z = &after[after.find("(zone").expect("zone written")..];
+        assert!(z.contains("(net \"\")"), "{z}");
+    }
+
     #[tokio::test]
     async fn a_non_copper_layer_is_refused() {
         assert_refused(json!({ "layer": "Edge.Cuts" }), "copper").await;
@@ -5499,11 +5514,24 @@ mod zone_net_format_tests {
 
     #[tokio::test]
     async fn a_self_intersecting_outline_is_refused() {
+        // Asymmetric, so its signed area is nonzero and only the crossing
+        // check can catch it.
         let bow_tie = json!([
             {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 10.0},
-            {"x": 10.0, "y": 0.0}, {"x": 0.0, "y": 10.0}
+            {"x": 10.0, "y": 0.0}, {"x": 0.0, "y": 20.0}
         ]);
         assert_refused(json!({ "points": bow_tie }), "self-intersect").await;
+        let vertex_on_edge = json!([
+            {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 10.0},
+            {"x": 5.0, "y": 0.0}, {"x": 0.0, "y": 10.0}
+        ]);
+        assert_refused(json!({ "points": vertex_on_edge }), "self-intersect").await;
+        let fold_back_spike = json!([
+            {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 10.0},
+            {"x": 5.0, "y": 10.0}, {"x": 5.0, "y": 15.0}, {"x": 5.0, "y": 12.0},
+            {"x": 0.0, "y": 10.0}
+        ]);
+        assert_refused(json!({ "points": fold_back_spike }), "self-intersect").await;
         let collinear =
             json!([ {"x": 0.0, "y": 0.0}, {"x": 5.0, "y": 0.0}, {"x": 10.0, "y": 0.0} ]);
         assert_refused(json!({ "points": collinear }), "self-intersect").await;
@@ -5532,7 +5560,11 @@ mod zone_net_format_tests {
             {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0},
             {"x": 10.0, "y": 10.0}, {"x": 0.0, "y": 10.0}, {"x": 0.0, "y": 0.0}
         ]);
-        for points in [square, l_shape, closed_square] {
+        let repeated_vertex = json!([
+            {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 0.0},
+            {"x": 10.0, "y": 10.0}, {"x": 0.0, "y": 10.0}
+        ]);
+        for points in [square, l_shape, closed_square, repeated_vertex] {
             let (result, _) = zone_with(KICAD_10, json!({ "points": points })).await;
             assert!(!result.is_error, "{}", text_of(&result));
         }
