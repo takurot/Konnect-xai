@@ -361,6 +361,15 @@ add_zone(board, net_name, layer, points, clearance?, min_width?,
   and carries a `warning` describing the process-local evidence and cold-start
   limitation. A board observed live earlier in this server session fails with
   `unsafe_file_fallback` instead of writing the file.
+- A file-mode zone is written unfilled and the result carries `filled: false`
+  with instructions for filling it. Gerbers from the saved file have no copper for it
+  until it is filled, in KiCad or with
+  `kicad-cli pcb drc --refill-zones --save-board <board>`.
+- Refused before anything is written: a non-copper `layer` (e.g. Edge.Cuts),
+  `clearance` or `min_width` that is not a number above 0, a point without
+  numeric `x`/`y`, and a self-intersecting or zero-area outline. In file mode
+  on a KiCad 10 board the net must already be carried by a pad, track or via;
+  a name only another zone uses is refused too.
 
 ### refill_zones
 

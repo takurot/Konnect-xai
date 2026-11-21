@@ -532,11 +532,12 @@ pub(crate) fn zone_schema() -> serde_json::Value {
             "layer":      { "type": "string", "description": "Copper layer (e.g. 'F.Cu')" },
             "points": {
                 "type": "array",
-                "description": "Polygon vertices as [{x, y}], in mm",
-                "items": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } } }
+                "description": "Vertices of a simple (non-self-intersecting) polygon as [{x, y}], in mm",
+                "minItems": 3,
+                "items": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } }, "required": ["x", "y"] }
             },
-            "clearance":  { "type": "number", "description": "Zone clearance in mm", "default": DEFAULT_ZONE_CLEARANCE_MM },
-            "min_width":  { "type": "number", "description": "Minimum fill width in mm", "default": DEFAULT_ZONE_MIN_WIDTH_MM },
+            "clearance":  { "type": "number", "description": "Zone clearance in mm", "default": DEFAULT_ZONE_CLEARANCE_MM, "exclusiveMinimum": 0 },
+            "min_width":  { "type": "number", "description": "Minimum fill width in mm", "default": DEFAULT_ZONE_MIN_WIDTH_MM, "exclusiveMinimum": 0 },
             "name":       { "type": "string", "description": "Optional zone name, as shown in pcbnew's zone properties" },
             "priority":   { "type": "integer", "description": "Higher priority wins where zones overlap", "default": 0, "minimum": 0 },
             "pad_connection": {
@@ -548,6 +549,125 @@ pub(crate) fn zone_schema() -> serde_json::Value {
         },
         "required": ["board", "net_name", "layer", "points"]
     })
+}
+
+/// A zone written to the file has no `filled_polygon`, so nothing plotted
+/// from the saved board shows the pour until something fills it (#128).
+const ZONE_FILL_INSTRUCTIONS: &str =
+    "The zone was written unfilled: Gerbers and other plots from the saved file contain no \
+     copper for it yet. Fill it by opening the board in KiCad and refilling zones (B), by \
+     calling refill_zones while KiCad holds the board, or with \
+     `kicad-cli pcb drc --refill-zones --save-board <board>`.";
+
+/// An optional length in mm that must be a finite number above zero.
+fn positive_mm(args: &serde_json::Value, key: &str, default: f64) -> Result<f64, CallToolResult> {
+    match args.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(value) => match value.as_f64() {
+            Some(mm) if mm.is_finite() && mm > 0.0 => Ok(mm),
+            _ => Err(crate::tools::invalid_arg(
+                key,
+                "must be a number greater than 0 (mm)",
+            )),
+        },
+    }
+}
+
+/// The zone outline, refused unless every vertex is numeric and the closed
+/// polygon is simple. KiCad fills a bow-tie outline unpredictably.
+fn zone_outline(args: &serde_json::Value) -> Result<Vec<(f64, f64)>, CallToolResult> {
+    let Some(raw) = args["points"].as_array() else {
+        return Err(CallToolResult::error("Missing 'points' array"));
+    };
+    let mut points = raw
+        .iter()
+        .map(|p| Some((p["x"].as_f64()?, p["y"].as_f64()?)))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            crate::tools::invalid_arg("points", "every vertex needs numeric 'x' and 'y'")
+        })?;
+    // Repeated vertices, including one that closes the outline by repeating
+    // the first, describe the same polygon.
+    points.dedup();
+    if points.len() > 3 && points.first() == points.last() {
+        points.pop();
+    }
+    if points.len() < 3 {
+        return Err(CallToolResult::error("Zone requires at least 3 points"));
+    }
+    if !is_simple_polygon(&points) {
+        return Err(crate::tools::invalid_arg(
+            "points",
+            "the outline must not self-intersect or collapse to zero area",
+        ));
+    }
+    Ok(points)
+}
+
+/// Whether the closed polygon has nonzero area and no two edges meet except
+/// adjacent edges at their shared vertex.
+fn is_simple_polygon(points: &[(f64, f64)]) -> bool {
+    type P = (f64, f64);
+    let cross = |o: P, a: P, b: P| (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0);
+    let on_segment = |p: P, a: P, b: P| {
+        p.0 >= a.0.min(b.0) && p.0 <= a.0.max(b.0) && p.1 >= a.1.min(b.1) && p.1 <= a.1.max(b.1)
+    };
+    let touches = |a: P, b: P, c: P, d: P| {
+        let (d1, d2) = (cross(c, d, a), cross(c, d, b));
+        let (d3, d4) = (cross(a, b, c), cross(a, b, d));
+        if d1 * d2 < 0.0 && d3 * d4 < 0.0 {
+            return true;
+        }
+        (d1 == 0.0 && on_segment(a, c, d))
+            || (d2 == 0.0 && on_segment(b, c, d))
+            || (d3 == 0.0 && on_segment(c, a, b))
+            || (d4 == 0.0 && on_segment(d, a, b))
+    };
+    let n = points.len();
+    let edge = |i: usize| (points[i], points[(i + 1) % n]);
+    let doubled_area: f64 = (0..n)
+        .map(|i| {
+            let (a, b) = edge(i);
+            a.0 * b.1 - b.0 * a.1
+        })
+        .sum();
+    if doubled_area == 0.0 {
+        return false;
+    }
+    for i in 0..n {
+        let (a, b) = edge(i);
+        if a == b {
+            return false;
+        }
+        for j in i + 1..n {
+            let (c, d) = edge(j);
+            let adjacent = j == i + 1 || (i == 0 && j == n - 1);
+            if adjacent {
+                let (shared, far, other) = if j == i + 1 { (b, a, d) } else { (a, b, c) };
+                // Adjacent edges share one vertex; they may not fold back
+                // over each other.
+                if cross(shared, far, other) == 0.0
+                    && (on_segment(other, shared, far) || on_segment(far, shared, other))
+                {
+                    return false;
+                }
+            } else if touches(a, b, c, d) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Nets some item other than a zone carries on a KiCad 10 board: pads,
+/// tracks, vias. A zone's own net proves nothing, it may be the same typo.
+fn nets_carried_by_board_items(tree: &SexpNode) -> std::collections::HashSet<String> {
+    tree.children()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|child| child.head() != Some("zone"))
+        .flat_map(konnect_sexp::net::collect_net_keys)
+        .collect()
 }
 
 // ─── Board graphics ───────────────────────────────────────────────────────────
@@ -1322,8 +1442,12 @@ pub fn tools() -> Vec<ToolDef> {
              refilled, so it shows up at once and is undoable there. Only when no live KiCAD \
              answers does it fall back to inserting the (zone …) S-expression into the file, \
              and that result carries a warning, because a file-only edit is invisible to an \
-             open pcbnew and is lost on its next save. Refuses a net the board does not \
-             declare rather than binding copper to net 0.",
+             open pcbnew and is lost on its next save. A file-mode zone is written unfilled \
+             and reports filled: false with fill_instructions. Refuses a non-copper layer, \
+             a non-positive clearance or min_width, a vertex without numeric x/y, a \
+             self-intersecting or zero-area outline, and, in file mode, a net the board \
+             does not have: on a KiCad 10 board one no pad, track or via carries, on a \
+             legacy board one missing from the net table.",
             zone_schema(),
             |args, ctx| async move { handle_add_zone(args, ctx).await }
         )
@@ -2644,36 +2768,35 @@ pub(crate) async fn add_zone_impl(
     };
     let layer = match require_str(args, "layer") {
         Ok(v) => match canonical_board_layer(v) {
-            Ok(layer) => layer,
+            Ok(layer) if konnect_sexp::layers::is_copper_name(&layer) => layer,
+            Ok(layer) => {
+                return Ok(crate::tools::invalid_arg(
+                    "layer",
+                    &format!("'{layer}' is not a copper layer; a zone needs one such as F.Cu"),
+                ))
+            }
             Err(error) => return Ok(error),
         },
         Err(e) => return Ok(e),
     };
-    let clearance = args["clearance"]
-        .as_f64()
-        .unwrap_or(DEFAULT_ZONE_CLEARANCE_MM);
-    let min_width = args["min_width"]
-        .as_f64()
-        .unwrap_or(DEFAULT_ZONE_MIN_WIDTH_MM);
+    let clearance = match positive_mm(args, "clearance", DEFAULT_ZONE_CLEARANCE_MM) {
+        Ok(v) => v,
+        Err(error) => return Ok(error),
+    };
+    let min_width = match positive_mm(args, "min_width", DEFAULT_ZONE_MIN_WIDTH_MM) {
+        Ok(v) => v,
+        Err(error) => return Ok(error),
+    };
     let zone_name = args["name"].as_str().unwrap_or("").to_string();
     let priority = args["priority"].as_u64().unwrap_or(0) as u32;
     let connection = match PadConnection::parse(args["pad_connection"].as_str()) {
         Ok(v) => v,
         Err(message) => return Ok(CallToolResult::error(message)),
     };
-    let pts_arr = match args["points"].as_array() {
-        Some(a) => a.clone(),
-        None => return Ok(CallToolResult::error("Missing 'points' array")),
+    let points = match zone_outline(args) {
+        Ok(points) => points,
+        Err(error) => return Ok(error),
     };
-
-    let points: Vec<(f64, f64)> = pts_arr
-        .iter()
-        .filter_map(|p| Some((p["x"].as_f64()?, p["y"].as_f64()?)))
-        .collect();
-
-    if points.len() < 3 {
-        return Ok(CallToolResult::error("Zone requires at least 3 points"));
-    }
 
     let describe = || {
         json!({
@@ -2720,6 +2843,19 @@ pub(crate) async fn add_zone_impl(
 
     let content = std::fs::read_to_string(&board_path)?;
     let tree = konnect_sexp::parse_sexp(&content)?;
+    // The empty name is KiCad's no-net pour, a legitimate isolated fill.
+    if konnect_sexp::net::names_nets_in_place(&tree)
+        && !net_name.is_empty()
+        && !nets_carried_by_board_items(&tree).contains(&net_name)
+    {
+        return Ok(CallToolResult::error(format!(
+            "Net '{net_name}' is not carried by any pad, track or via on {}. A zone on it \
+             would fill as dead copper. Check the name (case matters) with get_nets_list, \
+             or put the net on copper first (update the board from the schematic, assign \
+             a pad's net, route_trace or add_via).",
+            board_path.display()
+        )));
+    }
     let Some(net) = konnect_sexp::net::net_ref_for_write(&tree, &net_name) else {
         return Ok(CallToolResult::error(format!(
             "Net '{net_name}' is not declared in {}'s net table. On this legacy-format board \
@@ -2744,6 +2880,8 @@ pub(crate) async fn add_zone_impl(
     body["source"] = json!("file");
     body["fallback_reason"] = fallback_reason.evidence();
     body["warning"] = json!(fallback_reason.warning());
+    body["filled"] = json!(false);
+    body["fill_instructions"] = json!(ZONE_FILL_INSTRUCTIONS);
     Ok(CallToolResult::json(&body))
 }
 
@@ -5315,6 +5453,136 @@ mod zone_net_format_tests {
         assert!(result.is_error, "{}", text_of(&result));
         assert!(text_of(&result).contains("'solid', 'thermal' or 'none'"));
         assert_eq!(after, KICAD_10, "file must be untouched");
+    }
+
+    async fn assert_refused(extra: serde_json::Value, needle: &str) {
+        let (result, after) = zone_with(KICAD_10, extra.clone()).await;
+        assert!(result.is_error, "{extra}: {}", text_of(&result));
+        assert!(
+            text_of(&result).contains(needle),
+            "{extra}: {}",
+            text_of(&result)
+        );
+        assert_eq!(after, KICAD_10, "{extra}: file must be untouched");
+    }
+
+    /// #128: on a KiCad 10 board any name used to become `(net "TYPO_GDN")`,
+    /// a zone that fills to 0 mm² of dead copper with no DRC complaint.
+    #[tokio::test]
+    async fn a_net_no_board_item_carries_is_refused_on_a_kicad_10_board() {
+        assert_refused(json!({ "net_name": "TYPO_GDN" }), "TYPO_GDN").await;
+        assert_refused(json!({ "net_name": "gnd" }), "gnd").await;
+    }
+
+    /// Another zone on the same misspelled net is not evidence that the net
+    /// exists: it is the same dead copper twice.
+    #[tokio::test]
+    async fn a_net_carried_only_by_another_zone_is_refused() {
+        let with_zone = KICAD_10.replacen(
+            ")\n)\n",
+            ")\n\t(zone\n\t\t(net \"TYPO\")\n\t\t(layer \"F.Cu\")\n\t)\n)\n",
+            1,
+        );
+        let (result, after) = zone(&with_zone, "TYPO").await;
+        assert!(result.is_error, "{}", text_of(&result));
+        assert_eq!(after, with_zone);
+    }
+
+    /// KiCad's no-net pour (empty name) is legitimate isolated copper.
+    #[tokio::test]
+    async fn an_unnetted_zone_is_still_accepted_on_a_kicad_10_board() {
+        let (result, after) = zone(KICAD_10, "").await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let z = &after[after.find("(zone").expect("zone written")..];
+        assert!(z.contains("(net \"\")"), "{z}");
+    }
+
+    #[tokio::test]
+    async fn a_non_copper_layer_is_refused() {
+        assert_refused(json!({ "layer": "Edge.Cuts" }), "copper").await;
+        assert_refused(json!({ "layer": "F.SilkS" }), "copper").await;
+    }
+
+    #[tokio::test]
+    async fn non_positive_or_non_numeric_clearance_and_min_width_are_refused() {
+        assert_refused(json!({ "clearance": -1.0 }), "clearance").await;
+        assert_refused(json!({ "clearance": 0.0 }), "clearance").await;
+        assert_refused(json!({ "clearance": "0.3" }), "clearance").await;
+        assert_refused(json!({ "min_width": 0.0 }), "min_width").await;
+        assert_refused(json!({ "min_width": -0.1 }), "min_width").await;
+    }
+
+    #[tokio::test]
+    async fn a_self_intersecting_outline_is_refused() {
+        // Asymmetric, so its signed area is nonzero and only the crossing
+        // check can catch it.
+        let bow_tie = json!([
+            {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 10.0},
+            {"x": 10.0, "y": 0.0}, {"x": 0.0, "y": 20.0}
+        ]);
+        assert_refused(json!({ "points": bow_tie }), "self-intersect").await;
+        let vertex_on_edge = json!([
+            {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 10.0},
+            {"x": 5.0, "y": 0.0}, {"x": 0.0, "y": 10.0}
+        ]);
+        assert_refused(json!({ "points": vertex_on_edge }), "self-intersect").await;
+        let fold_back_spike = json!([
+            {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 10.0},
+            {"x": 5.0, "y": 10.0}, {"x": 5.0, "y": 15.0}, {"x": 5.0, "y": 12.0},
+            {"x": 0.0, "y": 10.0}
+        ]);
+        assert_refused(json!({ "points": fold_back_spike }), "self-intersect").await;
+        let collinear =
+            json!([ {"x": 0.0, "y": 0.0}, {"x": 5.0, "y": 0.0}, {"x": 10.0, "y": 0.0} ]);
+        assert_refused(json!({ "points": collinear }), "self-intersect").await;
+    }
+
+    #[tokio::test]
+    async fn a_point_without_numeric_coordinates_is_refused_not_dropped() {
+        let points = json!([
+            {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0},
+            {"x": 10.0, "y": 10.0}, {"x": "5", "y": 10.0}
+        ]);
+        assert_refused(json!({ "points": points }), "points").await;
+    }
+
+    #[tokio::test]
+    async fn a_convex_and_a_concave_outline_are_accepted() {
+        let square = json!([
+            {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0},
+            {"x": 10.0, "y": 10.0}, {"x": 0.0, "y": 10.0}
+        ]);
+        let l_shape = json!([
+            {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 5.0},
+            {"x": 5.0, "y": 5.0}, {"x": 5.0, "y": 10.0}, {"x": 0.0, "y": 10.0}
+        ]);
+        let closed_square = json!([
+            {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0},
+            {"x": 10.0, "y": 10.0}, {"x": 0.0, "y": 10.0}, {"x": 0.0, "y": 0.0}
+        ]);
+        let repeated_vertex = json!([
+            {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 0.0},
+            {"x": 10.0, "y": 10.0}, {"x": 0.0, "y": 10.0}
+        ]);
+        for points in [square, l_shape, closed_square, repeated_vertex] {
+            let (result, _) = zone_with(KICAD_10, json!({ "points": points })).await;
+            assert!(!result.is_error, "{}", text_of(&result));
+        }
+    }
+
+    /// #128: a file-mode zone is written without `filled_polygon`, so a
+    /// Gerber plotted from the saved file has no copper there. The response
+    /// must say so instead of implying a pour exists.
+    #[tokio::test]
+    async fn a_file_mode_zone_reports_that_it_is_not_filled() {
+        let (result, after) = zone_with(KICAD_10, json!({})).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        assert!(!after.contains("filled_polygon"));
+        let body = body_of(&result);
+        assert_eq!(body["filled"], json!(false));
+        let how = body["fill_instructions"].as_str().expect("instructions");
+        assert!(how.contains("--refill-zones --save-board"), "{how}");
+        assert!(how.contains("refill_zones"), "{how}");
     }
 
     /// A KiCad that answers — even to say no — may be holding this board, so
