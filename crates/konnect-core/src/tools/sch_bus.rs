@@ -27,11 +27,11 @@ use crate::tools::{get_path, opt_f64, opt_str, require_f64, ToolContext, ToolDef
 use konnect_sexp::geometry::round6;
 use konnect_sexp::{
     parser::parse_sexp,
+    schematic::write_schematic_if_unchanged,
     schematic::{
         extract_symbol_instances, format_bus, format_bus_entry, format_net_label, format_wire,
         BusEntryDirection,
     },
-    writer::write_atomic_if_unchanged,
 };
 use serde_json::json;
 
@@ -155,8 +155,8 @@ async fn handle_add_bus(
 
     let content = std::fs::read_to_string(&sch_path)?;
     let new_content =
-        crate::tools::sch_wiring::insert_before_close(&content, &format_bus(x1, y1, x2, y2));
-    write_atomic_if_unchanged(&sch_path, &content, &new_content)?;
+        crate::tools::sch_wiring::insert_before_close(&content, &format_bus(x1, y1, x2, y2))?;
+    write_schematic_if_unchanged(&sch_path, &content, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "added": "bus",
@@ -198,8 +198,8 @@ async fn handle_batch_add_bus(
     }
 
     let content = std::fs::read_to_string(&sch_path)?;
-    let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
-    write_atomic_if_unchanged(&sch_path, &content, &new_content)?;
+    let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts)?;
+    write_schematic_if_unchanged(&sch_path, &content, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "added_count": added.len(),
@@ -233,9 +233,11 @@ async fn handle_add_bus_entry(
     };
 
     let content = std::fs::read_to_string(&sch_path)?;
-    let new_content =
-        crate::tools::sch_wiring::insert_before_close(&content, &format_bus_entry(x, y, direction));
-    write_atomic_if_unchanged(&sch_path, &content, &new_content)?;
+    let new_content = crate::tools::sch_wiring::insert_before_close(
+        &content,
+        &format_bus_entry(x, y, direction),
+    )?;
+    write_schematic_if_unchanged(&sch_path, &content, &new_content)?;
 
     // Which end is the bus side is a fact about the sheet, not about the
     // request: the entry's `at` corner is wherever the caller put it. The
@@ -377,7 +379,7 @@ async fn handle_connect_pins_to_bus(
             (ex, py, dir * size, dir * size, px, py)
         };
 
-        let staged_source = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
+        let staged_source = crate::tools::sch_wiring::insert_before_close(&content, &inserts)?;
         let staged_tree = parse_sexp(&staged_source)?;
         if let Err(refusal) = check_route(
             &staged_tree,
@@ -409,8 +411,8 @@ async fn handle_connect_pins_to_bus(
         }));
     }
 
-    let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
-    write_atomic_if_unchanged(&sch_path, &content, &new_content)?;
+    let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts)?;
+    write_schematic_if_unchanged(&sch_path, &content, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "connected_count": added.len(),

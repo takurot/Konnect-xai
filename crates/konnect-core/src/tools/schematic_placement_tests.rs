@@ -403,6 +403,88 @@ fn body(result: &CallToolResult) -> Value {
 }
 
 #[tokio::test]
+async fn noncardinal_schematic_rotation_refuses_every_write() {
+    let (_directory, _root, path) = fixture(false);
+    let reference = Schematic::load(&path)
+        .unwrap()
+        .symbols
+        .iter()
+        .filter_map(|symbol| symbol.reference())
+        .find(|reference| !reference.starts_with('#'))
+        .unwrap()
+        .to_owned();
+    let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+        auto_load_toolsets: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let label = |net, x, rotation| json!({ "net": net, "x": x, "y": 80.0, "rotation": rotation });
+    let component = |reference, rotation| {
+        json!({
+            "lib_id": "complex_hierarchy:R", "reference": reference, "x": 100.0, "y": 100.0,
+            "rotation": rotation
+        })
+    };
+    let call = |name, mut arguments: Value| {
+        arguments["schematic"] = json!(path);
+        handler.handle_message(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }))
+    };
+    for (net, x) in [("A", 100.0), ("B", 110.0)] {
+        let setup = call("add_schematic_net_label", label(net, x, 0.0))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_ne!(setup["isError"], true, "{setup}");
+    }
+    let before = std::fs::read(&path).unwrap();
+    let cases = [
+        ("add_schematic_component", component("R999", 45.0)),
+        (
+            "rotate_schematic_component",
+            json!({"reference": reference, "rotation": 45.0}),
+        ),
+        (
+            "add_power_symbol",
+            json!({"power_net": "GND", "x": 100.0, "y": 100.0, "rotation": 45}),
+        ),
+        ("add_schematic_net_label", label("C", 120.0, 45.0)),
+        ("rotate_schematic_label", label("A", 100.0, 45.0)),
+        (
+            "batch_place_components",
+            json!({"components": [
+                component("R999", 90.0), component("R998", 45.0)
+            ]}),
+        ),
+        (
+            "batch_rotate_labels",
+            json!({"labels": [label("A", 100.0, 90.0), label("B", 110.0, 45.0)]}),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (name, args) in cases {
+        let result = call(name, args).await.unwrap().result.unwrap();
+        let body: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        let unchanged = std::fs::read(&path).unwrap() == before;
+        if result["isError"] != true || body["error"]["kind"] != "invalid_argument" || !unchanged {
+            failures.push(format!(
+                "{name}: isError={}, kind={}, unchanged={unchanged}",
+                result["isError"], body["error"]["kind"]
+            ));
+            // Keep every case independent even on the buggy baseline.
+            std::fs::write(&path, &before).unwrap();
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
 async fn native_placement_preserves_unique_and_reused_paths_with_committed_readback() {
     for reused in [false, true] {
         for name in PLACERS {

@@ -6,7 +6,7 @@
 //! # Verdict vs. score
 //!
 //! The numeric score is advisory; the verdict is not. **Hard failures** —
-//! same-side courtyard-bbox overlaps and parts outside the board outline —
+//! same-side courtyard overlaps and parts outside the board outline —
 //! decide the verdict no matter what the number says, because a board with
 //! two parts in the same physical space is unbuildable at any score. A board
 //! with no Edge.Cuts outline cannot be judged "inside", so it can never pass:
@@ -287,12 +287,13 @@ async fn handle_score_placement(
     let index = PcbConnectivityIndex::build(&tree);
     let values = footprint_values(&tree);
 
-    // ── Hard failure (a): same-side courtyard-bbox overlaps ─────────────────
+    // ── Hard failure (a): same-side courtyard overlaps ─────────────────
     // Opposite sides never collide (a Front part and a Back part share x/y but
     // not space), and AnchorOnly bboxes are position-only stand-ins with zero
     // area — a pair involving one is skipped, not scored as touching.
     let mut hard_failures: Vec<serde_json::Value> = Vec::new();
     let mut overlap_refs: BTreeSet<String> = BTreeSet::new();
+    let mut unproven_courtyard_refs = BTreeSet::new();
     let mut overlap_pairs = 0usize;
     for (i, a) in scan.items.iter().enumerate() {
         for b in &scan.items[i + 1..] {
@@ -302,19 +303,22 @@ async fn handle_score_placement(
             {
                 continue;
             }
-            let ix = a.bbox.2.min(b.bbox.2) - a.bbox.0.max(b.bbox.0);
-            let iy = a.bbox.3.min(b.bbox.3) - a.bbox.1.max(b.bbox.1);
-            if ix > 0.0 && iy > 0.0 {
+            let (ra, rb) = (courtyard_reference(a), courtyard_reference(b));
+            let Some(area) = a.overlap_area(b) else {
+                unproven_courtyard_refs.insert(ra);
+                unproven_courtyard_refs.insert(rb);
+                continue;
+            };
+            if area > 1e-9 {
                 overlap_pairs += 1;
-                let (ra, rb) = (courtyard_reference(a), courtyard_reference(b));
                 overlap_refs.insert(ra.to_string());
                 overlap_refs.insert(rb.to_string());
                 hard_failures.push(json!({
                     "kind": "courtyard_overlap",
                     "references": [ra, rb],
                     "detail": format!(
-                        "{ra} and {rb} courtyard bboxes overlap by {} mm² on the {} side",
-                        round3(ix * iy),
+                        "{ra} and {rb} courtyards overlap by {} mm² on the {} side",
+                        round3(area),
                         side_name(a.layer_side),
                     ),
                 }));
@@ -450,15 +454,16 @@ async fn handle_score_placement(
         }));
     }
 
-    // The verdict derives ONLY from hard failures and outline shape — the
-    // numeric score never decides it. Precedence: hard failures →
-    // outline_missing → outline_unproven → pass.
+    // The verdict derives from observed hard failures and proof of geometry.
+    // The numeric score never decides it.
     let verdict = if !hard_failures.is_empty() {
         "hard_fail"
     } else if matches!(outline_shape, OutlineShape::Missing) {
         "outline_missing"
     } else if matches!(outline_shape, OutlineShape::Unproven { .. }) {
         "outline_unproven"
+    } else if !unproven_courtyard_refs.is_empty() {
+        "courtyard_unproven"
     } else {
         "pass"
     };
@@ -474,6 +479,7 @@ async fn handle_score_placement(
             OutlineShape::Missing => "missing",
         },
         "hard_failures": hard_failures,
+        "unproven_courtyards": unproven_courtyard_refs,
         "deductions": deductions,
         "connector_edges": connector_edges,
         "uncoupled_caps": uncoupled_caps,
@@ -787,6 +793,7 @@ async fn handle_place_decoupling(
             "the plan does not improve the score ({before_num} \u{2192} {after_num})"
         ));
     }
+    guard_proven_courtyards(&score_after, &mut applicability);
     if score_after["verdict"] == "hard_fail" && score_before["verdict"] != "hard_fail" {
         applicability.block(format!(
             "the plan introduces a hard failure the board did not have \
@@ -1394,6 +1401,15 @@ fn force_directed_applicability(
     applicability
 }
 
+fn guard_proven_courtyards(score: &serde_json::Value, applicability: &mut PlanApplicability) {
+    if score["unproven_courtyards"]
+        .as_array()
+        .is_some_and(|references| !references.is_empty())
+    {
+        applicability.block("courtyard overlap could not be evaluated for the planned placement");
+    }
+}
+
 async fn handle_force_directed(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1681,7 +1697,7 @@ async fn handle_force_directed(
         score_before["score"].as_i64().unwrap_or(i64::MIN),
         score_after["score"].as_i64().unwrap_or(i64::MIN),
     );
-    let applicability = force_directed_applicability(
+    let mut applicability = force_directed_applicability(
         max_displacement_mm,
         converged,
         iterations_run,
@@ -1690,6 +1706,7 @@ async fn handle_force_directed(
         score_after["verdict"].as_str().unwrap_or("unavailable"),
         &move_safety,
     );
+    guard_proven_courtyards(&score_after, &mut applicability);
     let (plan_status, blocking_reasons) = applicability.to_json();
 
     if dry_run {
@@ -4741,6 +4758,63 @@ mod placement_boundary_contract_tests {
             );
             assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
         }
+    }
+
+    #[tokio::test]
+    async fn rotated_courtyards_distinguish_bbox_overlap_touch_and_intersection() {
+        let geometry = r#"(fp_rect (start -2 -0.25) (end 2 0.25)
+            (stroke (width 0.05) (type solid)) (fill none) (layer "F.CrtYd"))"#;
+        for (spacing, overlaps) in [(0.75, false), (0.5, false), (0.25, true), (0.0, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let board = dir.path().join("rotated.kicad_pcb");
+            let offset = spacing / std::f64::consts::SQRT_2;
+            let x = 15.0 + offset;
+            let first =
+                footprint("A1", 15.0, 15.0, "F", geometry).replace("(at 15 15)", "(at 15 15 45)");
+            let second = footprint("A2", x, x, "F", geometry)
+                .replace(&format!("(at {x} {x})"), &format!("(at {x} {x} 45)"));
+            std::fs::write(&board, outline(&(first + &second))).unwrap();
+            let result =
+                handle_score_placement(&json!({"board": board}), &ctx_talking_to(String::new()))
+                    .await
+                    .unwrap();
+            let value = body(&result);
+            assert_eq!(
+                value["hard_failures"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|failure| failure["kind"] == "courtyard_overlap"),
+                overlaps,
+                "{value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_courtyards_block_application_even_with_a_different_hard_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("ambiguous.kicad_pcb");
+        let rect = courtyard("F");
+        let content = outline(
+            &[
+                footprint("A1", 15.0, 15.0, "F", &format!("{rect}{rect}")),
+                footprint("A2", 15.5, 15.0, "F", &rect),
+                footprint("A3", 40.0, 40.0, "F", &rect),
+            ]
+            .concat(),
+        );
+        std::fs::write(&board, content).unwrap();
+        let response =
+            handle_score_placement(&json!({"board": board}), &ctx_talking_to(String::new()))
+                .await
+                .unwrap();
+        let score = body(&response);
+        assert_eq!(score["verdict"], "hard_fail", "{score}");
+        assert_eq!(score["unproven_courtyards"], json!(["A1", "A2"]));
+        let mut applicability = PlanApplicability::new();
+        guard_proven_courtyards(&score, &mut applicability);
+        assert!(applicability.is_blocked());
     }
 
     #[tokio::test]

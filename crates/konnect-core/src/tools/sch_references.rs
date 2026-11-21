@@ -8,8 +8,8 @@ use crate::mcp::{
     protocol::CallToolResult,
 };
 use konnect_sexp::{
-    parse_sexp, transaction::commit_file_transaction_with_dependencies,
-    writer::write_atomic_if_unchanged, FileTransition, SexpError,
+    parse_sexp, schematic::write_schematic_if_unchanged,
+    transaction::commit_file_transaction_with_dependencies, FileTransition, SexpError,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -210,7 +210,7 @@ impl ReferenceInventory {
             return Ok(());
         }
         if self.dependencies.is_empty() {
-            return write_atomic_if_unchanged(&self.path, before, candidate);
+            return write_schematic_if_unchanged(&self.path, before, candidate);
         }
         commit_file_transaction_with_dependencies(
             &self.directory,

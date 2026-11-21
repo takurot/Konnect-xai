@@ -70,7 +70,10 @@ impl Mcp {
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
         if let Some(home) = home {
-            command.env("HOME", home).env("APPDATA", home);
+            command
+                .env("HOME", home)
+                .env("APPDATA", home)
+                .env("KICAD_CONFIG_HOME", home.join("kicad-config"));
         }
         let mut child = command
             .arg("--config")
@@ -147,6 +150,256 @@ impl Drop for Mcp {
 fn body(result: &Value) -> Value {
     serde_json::from_str(result["content"][0]["text"].as_str().unwrap_or("{}"))
         .unwrap_or(Value::Null)
+}
+
+#[test]
+#[ignore = "requires kicad-cli and stock libraries; run via e2e workflow"]
+fn pcbway_package_excludes_schematic_dnp_from_bom_and_positions() {
+    let cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("project");
+    let schematic = project.join("assembly.kicad_sch");
+    let board = project.join("assembly.kicad_pcb");
+    let output = directory.path().join("package");
+    let footprint = "Resistor_SMD:R_0603_1608Metric";
+    let mut mcp = Mcp::spawn(&cli);
+    mcp.tool(
+        "create_project",
+        json!({"name": "assembly", "path": project}),
+    );
+    mcp.load("sch_components");
+    mcp.load("pcb_components");
+    mcp.load("manufacturing");
+    for (reference, x, dnp) in [("R1", 55.88, false), ("R2", 68.58, true)] {
+        mcp.tool(
+            "add_schematic_component",
+            json!({
+                "schematic": schematic, "lib_id": "Device:R", "reference": reference,
+                "footprint": footprint, "x": x, "y": 50.8, "dnp": dnp
+            }),
+        );
+        mcp.tool(
+            "place_component",
+            json!({
+                "board": board, "footprint": footprint, "reference": reference, "x": x, "y": 50.8
+            }),
+        );
+    }
+    let saved = std::fs::read(&board).unwrap();
+    let package = body(&mcp.tool(
+        "export_manufacturing_package",
+        json!({
+            "board": board, "schematic": schematic, "output_dir": output, "fab_house": "pcbway",
+            "bom_fields": "Reference,Value,Footprint,${QUANTITY}"
+        }),
+    ));
+    assert_eq!(package["complete"], true, "{package}");
+    for file in ["bom.csv", "positions.csv"] {
+        let contents = std::fs::read_to_string(output.join(file)).unwrap();
+        assert!(
+            contents
+                .lines()
+                .any(|line| line.starts_with("R1,") || line.starts_with("\"R1\",")),
+            "populated control R1 missing from {file}: {contents}"
+        );
+        assert!(
+            !contents.contains("R2"),
+            "unfitted R2 included in {file}: {contents}"
+        );
+    }
+    assert_eq!(std::fs::read(board).unwrap(), saved);
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
+fn schematic_calls_preserve_the_board_and_project_when_passed_the_wrong_file() {
+    let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("document_types");
+    let board = project.join("document_types.kicad_pcb");
+    let settings = project.join("document_types.kicad_pro");
+    let schematic = project.join("document_types.kicad_sch");
+
+    let mut mcp = Mcp::spawn(&kicad_cli);
+    mcp.tool(
+        "create_project",
+        json!({"name": "document_types", "path": project}),
+    );
+    mcp.load("sch_wiring");
+    mcp.load("sch_hierarchy");
+    mcp.load("sch_analysis");
+
+    for (tool, args, original) in [
+        (
+            "add_junction",
+            json!({"schematic": board, "x": 50.8, "y": 50.8}),
+            &board,
+        ),
+        (
+            "set_schematic_page",
+            json!({"schematic": board, "size": "A3"}),
+            &board,
+        ),
+        (
+            "list_schematic_nets",
+            json!({"schematic": settings}),
+            &settings,
+        ),
+    ] {
+        let before = std::fs::read(original).unwrap();
+        let response = mcp.request("tools/call", json!({"name": tool, "arguments": args}));
+        let result = &response["result"];
+        assert_eq!(result["isError"], true, "{response}");
+        let refusal = body(result);
+        assert_eq!(refusal["error"]["kind"], "invalid_argument", "{response}");
+        assert_eq!(refusal["error"]["field"], "schematic", "{response}");
+        assert_eq!(refusal["error"]["reason"], "not_a_schematic", "{response}");
+        assert_eq!(std::fs::read(original).unwrap(), before);
+    }
+
+    mcp.tool(
+        "set_schematic_page",
+        json!({"schematic": schematic, "size": "A3"}),
+    );
+    let saved = std::fs::read_to_string(&schematic).unwrap();
+    let document = konnect_sexp::parse_sexp(&saved).unwrap();
+    assert_eq!(document.find_str("paper"), Some("A3"));
+
+    for (domain, operation, input) in [("pcb", "drc", &board), ("sch", "erc", &schematic)] {
+        let report = dir.path().join(format!("{domain}-report.txt"));
+        let result = Command::new(&kicad_cli)
+            .args([domain, operation, "--output"])
+            .arg(&report)
+            .arg(input)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        assert!(report.is_file(), "{report:?}");
+    }
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
+fn native_library_loading_survives_rejected_symbol_and_footprint_edits() {
+    let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
+    let area = tempfile::tempdir().unwrap();
+    let symbols = area.path().join("Parts.kicad_sym");
+    let pads = area.path().join("Pads.pretty");
+    let footprint = pads.join("Fixture.kicad_mod");
+    let mut mcp = Mcp::spawn(&kicad_cli);
+    mcp.load("library");
+
+    mcp.tool(
+        "create_symbol",
+        json!({
+            "library_path": symbols, "name": "Parent", "reference_prefix": "U",
+            "pins": [{"number": "1", "name": "IN", "type": "input", "x": -5.08, "y": 0, "angle": 0}]
+        }),
+    );
+    let mut source = std::fs::read_to_string(&symbols).unwrap();
+    let close = source.rfind(')').unwrap();
+    source.insert_str(
+        close,
+        r#"(symbol "Dependent"
+            (extends "Parent")
+            (property "Value" "Dependent" (at 0 -2.54 0) (effects (font (size 1.27 1.27)))))
+        "#,
+    );
+    std::fs::write(&symbols, &source).unwrap();
+
+    let response = mcp.request(
+        "tools/call",
+        json!({
+            "name": "delete_symbol",
+            "arguments": {"library_path": symbols, "symbol_name": "Parent"}
+        }),
+    );
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    let error = body(&response["result"]);
+    assert!(
+        error["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Dependent"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&symbols).unwrap(), source);
+
+    mcp.tool(
+        "create_footprint",
+        json!({
+            "output": footprint, "name": "Fixture",
+            "pads": [{"number":"1","type":"smd","shape":"rect","x":0,"y":0,"width":2,"height":2}]
+        }),
+    );
+    let original = std::fs::read(&footprint).unwrap();
+    let response = mcp.request(
+        "tools/call",
+        json!({
+            "name": "edit_footprint_pad",
+            "arguments": {"footprint_path": footprint, "pad_number": "1", "width": -2}
+        }),
+    );
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    assert_eq!(
+        body(&response["result"])["error"]["kind"],
+        "invalid_argument"
+    );
+    assert_eq!(std::fs::read(&footprint).unwrap(), original);
+
+    let upgraded_symbols = area.path().join("Upgraded.kicad_sym");
+    let upgraded_pads = area.path().join("Upgraded.pretty");
+    for (mode, source, target) in [
+        ("sym", &symbols, &upgraded_symbols),
+        ("fp", &pads, &upgraded_pads),
+    ] {
+        let result = Command::new(&kicad_cli)
+            .args([mode, "upgrade", "--force", "--output"])
+            .arg(target)
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+    }
+    assert!(upgraded_symbols.is_file());
+    assert!(upgraded_pads.join("Fixture.kicad_mod").is_file());
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
+fn placement_courtyards_agree_with_real_kicad_on_rotated_demo_board() {
+    let cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
+    let dir = tempfile::tempdir().unwrap();
+    let board = dir.path().join("ecc83-pp.kicad_pcb");
+    let original = include_bytes!("../../konnect-sexp/tests/fixtures/ecc83-pp.kicad_pcb");
+    std::fs::write(&board, original).unwrap();
+    let report = dir.path().join("drc.json");
+    let native = Command::new(&cli)
+        .args(["pcb", "drc", "--format", "json", "-o"])
+        .arg(&report)
+        .arg(&board)
+        .output()
+        .unwrap();
+    assert!(native.status.success(), "{native:?}");
+    let drc: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+    assert!(drc["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|violation| violation["type"] != "courtyards_overlap"));
+
+    let mut mcp = Mcp::spawn(&cli);
+    mcp.load("placement");
+    let score = body(&mcp.tool("score_placement", json!({"board": board})));
+    assert!(
+        score["hard_failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|failure| failure["kind"] != "courtyard_overlap"),
+        "{score}"
+    );
+    assert_eq!(std::fs::read(&board).unwrap(), original);
 }
 
 #[test]
@@ -312,6 +565,7 @@ fn fabrication_and_document_exports_through_mcp() {
         ),
     ] {
         let output = dir.path().join(filename);
+        std::fs::write(&output, b"previous ordinary export").unwrap();
         let mut args = json!({"board":board,"output":output});
         if let Some(format) = format {
             args["format"] = json!(format);
@@ -330,14 +584,43 @@ fn fabrication_and_document_exports_through_mcp() {
         }
     }
 
+    let compressed_ipc = dir.path().join("packed-ipc.xml");
+    mcp.tool(
+        "export_ipc2581",
+        json!({"board":board,"output":compressed_ipc,"compress":true}),
+    );
+    assert!(std::fs::read(compressed_ipc)
+        .unwrap()
+        .starts_with(b"PK\x03\x04"));
+
+    let odb_dir = dir.path().join("odb-directory");
+    std::fs::create_dir(&odb_dir).unwrap();
+    mcp.tool(
+        "export_odb",
+        json!({"board":board,"output":odb_dir,"compression":"none"}),
+    );
+    assert!(odb_dir.join("steps/pcb/profile").is_file());
+
     let dxf_dir = dir.path().join("dxf");
+    std::fs::create_dir(&dxf_dir).unwrap();
+    let keep = dxf_dir.join("keep.txt");
+    std::fs::write(&keep, b"unrelated output directory contents").unwrap();
     let response = body(&mcp.tool(
         "export_dxf",
         json!({"board":board,"output_dir":dxf_dir,"layers":["Edge.Cuts"]}),
     ));
     let files = response["files"].as_array().expect("DXF file inventory");
-    assert_eq!(files.len(), 1);
-    let dxf = std::fs::read_to_string(dxf_dir.join(files[0].as_str().unwrap())).unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(
+        std::fs::read(&keep).unwrap(),
+        b"unrelated output directory contents"
+    );
+    let dxf_name = files
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|name| name.ends_with(".dxf"))
+        .expect("DXF layer file");
+    let dxf = std::fs::read_to_string(dxf_dir.join(dxf_name)).unwrap();
     assert!(dxf.lines().any(|line| line.trim() == "ENTITIES"));
     assert_eq!(dxf.lines().filter(|line| line.trim() == "LINE").count(), 4);
 
@@ -348,6 +631,79 @@ fn fabrication_and_document_exports_through_mcp() {
     ));
     assert_eq!(response["exported"], json!(pdf));
     assert!(std::fs::read(pdf).unwrap().starts_with(b"%PDF-"));
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
+fn schematic_audits_agree_with_native_bom_references_and_counts() {
+    let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
+    let dir = tempfile::tempdir().unwrap();
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../konnect-core/tests/fixtures");
+    for name in [
+        "complex_hierarchy.kicad_pro",
+        "complex_hierarchy.kicad_sch",
+        "ampli_ht.kicad_sch",
+    ] {
+        std::fs::copy(
+            fixtures.join("project_ownership").join(name),
+            dir.path().join(name),
+        )
+        .unwrap();
+    }
+    let ecc_dir = dir.path().join("ecc83");
+    std::fs::create_dir(&ecc_dir).unwrap();
+    let ecc = ecc_dir.join("ecc83-pp.kicad_sch");
+    std::fs::copy(fixtures.join("ecc83_multiunit.kicad_sch"), &ecc).unwrap();
+    let complex = dir.path().join("complex_hierarchy.kicad_sch");
+    let mut mcp = Mcp::spawn(&kicad_cli);
+    mcp.load("design_review");
+    for (schematic, scope, expected_count) in [(&complex, "hierarchy", 68), (&ecc, "file", 11)] {
+        let output = schematic.with_extension("csv");
+        let native = Command::new(&kicad_cli)
+            .args(["sch", "export", "bom", "--output"])
+            .arg(&output)
+            .args(["--fields", "Reference", "--labels", "Refs"])
+            .arg(schematic)
+            .output()
+            .unwrap();
+        assert!(
+            native.status.success(),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        let csv = std::fs::read_to_string(output).unwrap();
+        let references: Vec<_> = csv.lines().skip(1).collect();
+        assert_eq!(references.len(), expected_count, "{csv}");
+        let report = body(&mcp.tool(
+            "check_bom_health",
+            json!({"schematic": schematic, "schematic_scope": scope}),
+        ));
+        assert_eq!(report["total_components"], references.len(), "{report}");
+        if scope == "hierarchy" {
+            assert!(references
+                .iter()
+                .any(|entry| entry.trim_matches('"') == "U301"));
+            let decoupling = body(&mcp.tool(
+                "audit_decoupling",
+                json!({"schematic": schematic, "schematic_scope": scope}),
+            ));
+            assert!(
+                decoupling["findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|finding| {
+                        finding["component"] == "U301"
+                            && finding["sheet_instance_path"]
+                                .as_str()
+                                .unwrap()
+                                .ends_with("4b3a13a4/")
+                    }),
+                "{decoupling}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -735,6 +1091,66 @@ fn structural_scan_fixture_reloads_through_real_kicad() {
 }
 
 #[test]
+#[ignore = "requires kicad-cli and symbol libraries; run via e2e workflow"]
+fn normalized_schematic_rotations_load_in_real_kicad() {
+    use konnect_sexp::schematic::{extract_labels, extract_symbol_instances, read_schematic};
+
+    let kicad_cli = find_kicad_cli().expect("kicad-cli is required");
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("rotation");
+    let path = project.join("rotation.kicad_sch");
+    let mut mcp = Mcp::spawn(&kicad_cli);
+    mcp.tool(
+        "create_project",
+        json!({"name": "rotation", "path": project}),
+    );
+    mcp.load("sch_components");
+    mcp.load("sch_wiring");
+    mcp.tool(
+        "add_schematic_component",
+        json!({"schematic": path, "lib_id": "Device:R", "reference": "R1", "x": 50.8, "y": 50.8}),
+    );
+    for rotation in [-90, 270] {
+        let rotated = body(&mcp.tool(
+            "rotate_schematic_component",
+            json!({"schematic": path, "reference": "R1", "rotation": rotation}),
+        ));
+        assert_eq!(rotated["rotation"], 270.0, "{rotated}");
+    }
+    mcp.tool(
+        "add_power_symbol",
+        json!({"schematic": path, "power_net": "GND", "x": 55.88, "y": 55.88, "rotation": -90}),
+    );
+    mcp.tool(
+        "add_schematic_net_label",
+        json!({"schematic": path, "net": "SIGNAL", "label_type": "global_label",
+            "x": 76.2, "y": 76.2, "rotation": 630}),
+    );
+    let (_, tree) = read_schematic(&path).unwrap();
+    let symbols = extract_symbol_instances(&tree);
+    assert_eq!(symbols.len(), 2);
+    assert!(symbols.iter().all(|symbol| symbol.rotation == 270.0));
+    let labels = extract_labels(&tree);
+    assert_eq!(labels.len(), 1);
+    assert_eq!(labels[0].rotation, 270.0);
+
+    let report = tmp.path().join("erc.json");
+    let output = Command::new(&kicad_cli)
+        .args(["sch", "erc", "--format", "json", "--output"])
+        .arg(&report)
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "KiCad ERC rejected the schematic: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+    assert!(report["sheets"].is_array(), "{report}");
+}
+
+#[test]
 #[ignore = "requires kicad-cli + symbol libraries; run via e2e workflow"]
 fn full_design_loop_with_real_kicad() {
     let Some(kicad_cli) = find_kicad_cli() else {
@@ -929,8 +1345,8 @@ fn full_design_loop_with_real_kicad() {
         "R1 pin 1 is not a node of VIN — the label did not bind its pin:\n{vin}"
     );
 
-    // The review's runtime coverage uses Konnect's parser so the tool remains
-    // usable without kicad-cli. Cross-check that count here against KiCad's
+    // The review counts schematic placements using Konnect's parser.
+    // Cross-check that count here against KiCad's
     // own netlist so parser drift cannot turn incomplete extraction into a
     // clean verdict (#184).
     let netlist_tree = konnect_sexp::parse_sexp(&netlist).expect("KiCad netlist must parse");
@@ -1119,6 +1535,244 @@ fn a_written_default_netclass_still_plots_wires() {
     assert!(
         (after - radius).abs() < 1e-6,
         "a sparse named class changed the junction dot: {radius} -> {after}"
+    );
+}
+
+#[test]
+#[ignore = "requires KiCad and its stock library templates"]
+fn library_search_works_without_global_tables_and_includes_project_footprints() {
+    let cli = find_kicad_cli().expect("stock KiCad required for library search");
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("fixture.kicad_pro");
+    let footprint_table = workspace.path().join("fp-lib-table");
+    let library = workspace.path().join("Custom.pretty");
+    let footprint = library.join("MySOT.kicad_mod");
+    std::fs::write(&project, "{}").unwrap();
+    std::fs::create_dir(&library).unwrap();
+    std::fs::write(
+        &footprint,
+        r#"(footprint "MySOT" (version 20241229) (generator "pcbnew") (layer "F.Cu"))"#,
+    )
+    .unwrap();
+    let table = r#"(fp_lib_table (version 7) (lib (name "Custom") (type "KiCad") (uri "${KIPRJMOD}/Custom.pretty") (options "") (descr "")))"#;
+    std::fs::write(&footprint_table, table).unwrap();
+
+    let mut mcp = Mcp::spawn_with_home(&cli, Some(home.path()));
+    mcp.load("library");
+    for (tool, query, expected) in [
+        ("search_symbols", "LM358", "Amplifier_Operational:LM358"),
+        (
+            "search_footprints",
+            "R_0603_1608",
+            "Resistor_SMD:R_0603_1608Metric",
+        ),
+    ] {
+        let search = body(&mcp.tool(tool, json!({"query":query})));
+        assert_eq!(search["table_source"], "template", "{search}");
+        assert!(
+            search["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["id"] == expected),
+            "{tool} should find {expected}: {search}"
+        );
+    }
+    for tool in ["list_symbol_libraries", "list_footprint_libraries"] {
+        let found = body(&mcp.tool(tool, json!({"scope":"global"})));
+        assert_eq!(found["table_source"], "template", "{found}");
+        assert!(found["count"].as_u64().unwrap() > 0, "{found}");
+    }
+    let found = body(&mcp.tool(
+        "search_footprints",
+        json!({"query":"MySOT","project":project,"limit":1}),
+    ));
+    assert_eq!(found["results"][0]["id"], "Custom:MySOT", "{found}");
+    let info = body(&mcp.tool(
+        "get_footprint_info",
+        json!({"footprint_path":"Custom:MySOT","project":project}),
+    ));
+    assert_eq!(info["name"], "MySOT");
+    assert_eq!(std::fs::read_to_string(&footprint_table).unwrap(), table);
+}
+
+#[test]
+#[ignore = "requires KiCad 10 and its stock symbol and footprint libraries"]
+fn design_review_and_readiness_use_native_evidence() {
+    let cli = find_kicad_cli().expect("KiCad 10 required for design review");
+    let dir = tempfile::tempdir().unwrap();
+    let mut mcp = Mcp::spawn(&cli);
+    for toolset in [
+        "sch_components",
+        "sch_wiring",
+        "design_review",
+        "verification",
+        "pcb_board",
+        "pcb_components",
+        "manufacturing",
+    ] {
+        mcp.load(toolset);
+    }
+    let gates = dir.path().join("gates");
+    mcp.tool("create_project", json!({"name": "gates", "path": gates}));
+    let schematic = gates.join("gates.kicad_sch");
+    let board = gates.join("gates.kicad_pcb");
+    for (reference, x, y) in [("U1", 50.8, 50.8), ("U2", 76.2, 76.2)] {
+        mcp.tool(
+            "add_schematic_component",
+            json!({
+                "schematic": schematic, "lib_id": "74xGxx:74LVC1G04", "reference": reference,
+                "footprint": "Package_TO_SOT_SMD:SOT-23-5", "x": x, "y": y
+            }),
+        );
+        mcp.tool(
+            "edit_schematic_component",
+            json!({
+                "schematic": schematic, "reference": reference, "fields": {"MPN": "SN74LVC1G04DBV"}
+            }),
+        );
+    }
+    mcp.tool(
+        "connect_pins",
+        json!({
+            "schematic": schematic, "ref1": "U1", "pin1": "4", "ref2": "U2", "pin2": "4"
+        }),
+    );
+    for (cap, gate, x, y) in [("C1", "U1", 45.72, 31.75), ("C2", "U2", 71.12, 57.15)] {
+        mcp.tool(
+            "add_schematic_component",
+            json!({
+                "schematic": schematic, "lib_id": "Device:C", "reference": cap,
+                "footprint": "Capacitor_SMD:C_0603_1608Metric", "value": "100n", "x": x, "y": y
+            }),
+        );
+        mcp.tool(
+            "connect_pins",
+            json!({
+                "schematic": schematic, "ref1": cap, "pin1": "2", "ref2": gate, "pin2": "5"
+            }),
+        );
+    }
+    mcp.tool(
+        "add_schematic_net_label",
+        json!({
+            "schematic": schematic, "net": "OUTPUTS", "x": 63.5, "y": 50.8
+        }),
+    );
+    let standalone = body(&mcp.tool("audit_connections", json!({"schematic": schematic})));
+    assert!(standalone["coverage"]["not_checked"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("shorted_outputs")));
+    let unified = body(&mcp.tool("run_design_review", json!({"schematic": schematic})));
+    let review = &unified["design_review"];
+    assert_eq!(review["status"], "complete", "{review}");
+    assert!(
+        review["verdict"].as_str().unwrap().starts_with("NOT READY"),
+        "{review}"
+    );
+    assert!(
+        review["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["audit"] == "erc"
+                && finding["rule"] == "pin_to_pin"
+                && finding["severity"] == "error"),
+        "{review}"
+    );
+
+    let dfm = body(&mcp.tool("audit_manufacturing", json!({"board": board})));
+    assert!(
+        dfm["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["issue"]
+                .as_str()
+                .unwrap()
+                .contains("No board outline")),
+        "{dfm}"
+    );
+    mcp.tool(
+        "set_design_rules",
+        json!({"board": board, "min_trace_width": 0.08}),
+    );
+    let dfm = body(&mcp.tool("audit_manufacturing", json!({"board": board})));
+    assert!(
+        dfm["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["issue"]
+                .as_str()
+                .unwrap()
+                .contains("Minimum trace width (0.080mm)")),
+        "{dfm}"
+    );
+
+    let pairs = dir.path().join("pairs");
+    mcp.tool("create_project", json!({"name": "pairs", "path": pairs}));
+    let schematic = pairs.join("pairs.kicad_sch");
+    let board = pairs.join("pairs.kicad_pcb");
+    let footprint = "Resistor_SMD:R_0603_1608Metric";
+    for (reference, x) in [("R1", 50.8), ("R2", 76.2)] {
+        mcp.tool(
+            "add_schematic_component",
+            json!({
+                "schematic": schematic, "lib_id": "Device:R", "reference": reference,
+                "footprint": footprint, "x": x, "y": 50.8
+            }),
+        );
+    }
+    for (pin, net, y) in [("1", "SUPPLY", 46.99), ("2", "RETURN", 54.61)] {
+        mcp.tool(
+            "connect_pins",
+            json!({
+                "schematic": schematic, "ref1": "R1", "pin1": pin, "ref2": "R2", "pin2": pin
+            }),
+        );
+        mcp.tool(
+            "add_schematic_net_label",
+            json!({"schematic": schematic, "net": net, "x": 50.8, "y": y}),
+        );
+    }
+    mcp.tool(
+        "add_board_outline",
+        json!({"board": board, "x1": 20.0, "y1": 20.0, "x2": 70.0, "y2": 70.0}),
+    );
+    for (reference, x) in [("R1", 30.0), ("R2", 50.0)] {
+        mcp.tool(
+            "place_component",
+            json!({
+                "board": board, "footprint": footprint, "reference": reference, "x": x, "y": 35.0
+            }),
+        );
+    }
+    mcp.tool(
+        "set_design_rules",
+        json!({"board": board, "min_trace_width": 0.20}),
+    );
+    let readiness = body(&mcp.tool("validate_for_manufacturing", json!({"board": board})));
+    assert_eq!(readiness["board_info"]["net_count"], 0, "{readiness}");
+    assert!(
+        readiness["drc"]["schematic_parity"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "{readiness}"
+    );
+    assert_ne!(readiness["verdict"], "READY", "{readiness}");
+    assert!(
+        readiness["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["issue"]
+                .as_str()
+                .unwrap()
+                .starts_with("DRC schematic parity")),
+        "{readiness}"
     );
 }
 

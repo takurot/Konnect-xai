@@ -932,6 +932,29 @@ pub(crate) fn invalid_arg(field: &str, reason: &str) -> CallToolResult {
     )
 }
 
+/// Parse an optional schema enum consistently even when invoked without MCP
+/// validation. An explicit non-string value does not select the default.
+pub(crate) fn optional_enum<T: serde::de::DeserializeOwned + serde::Serialize + PartialEq>(
+    args: &Value,
+    field: &str,
+    choices: &[T],
+    default: T,
+) -> Result<T, CallToolResult> {
+    let Some(value) = args.get(field) else {
+        return Ok(default);
+    };
+    value
+        .as_str()
+        .and_then(|_| serde_json::from_value::<T>(value.clone()).ok())
+        .filter(|value| choices.contains(value))
+        .ok_or_else(|| {
+            invalid_arg(
+                field,
+                &format!("must be one of {}", serde_json::json!(choices)),
+            )
+        })
+}
+
 /// Report that a write completed but its immediate readback could not prove
 /// the requested state. Callers must not turn this into a stale-target refusal:
 /// the file may already contain the mutation or an external follow-up edit.
@@ -1006,6 +1029,29 @@ pub fn require_f64(args: &Value, key: &str) -> Result<f64, CallToolResult> {
     args[key]
         .as_f64()
         .ok_or_else(|| invalid_arg(key, "missing or not a number"))
+}
+
+/// Cardinal angles are the rotations written for schematic symbols and labels.
+pub(crate) fn normalize_schematic_rotation(angle: f64) -> Option<f64> {
+    match angle.rem_euclid(360.0) {
+        0.0 => Some(0.0),
+        angle @ (90.0 | 180.0 | 270.0) => Some(angle),
+        _ => None,
+    }
+}
+
+pub(crate) fn schematic_rotation_arg(
+    value: Option<&Value>,
+    field: &str,
+    default: Option<f64>,
+) -> Result<f64, CallToolResult> {
+    let angle = match value {
+        Some(value) => value.as_f64(),
+        None => default,
+    }
+    .ok_or_else(|| invalid_arg(field, "missing or not a number"))?;
+    normalize_schematic_rotation(angle)
+        .ok_or_else(|| invalid_arg(field, "expected a multiple of 90 degrees"))
 }
 
 /// Validate a millimetre value before a coordinate is written or reported.
