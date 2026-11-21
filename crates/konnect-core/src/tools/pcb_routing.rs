@@ -1438,7 +1438,7 @@ async fn handle_create_netclass(
                     if value <= MAX_NETCLASS_MM
                         && (value > 0.0 || zero_allowed && value == 0.0) =>
                 {
-                    Some(value)
+                    Some(if value == 0.0 { 0.0 } else { value })
                 }
                 Ok(_) if zero_allowed => {
                     return Ok(invalid_arg(
@@ -2096,7 +2096,13 @@ async fn handle_route_diff_pair(
         None => 0.1,
         Some(_) => {
             match require_f64(args, "gap").and_then(|gap| super::checked_board_mm(gap, "gap")) {
-                Ok(gap) if gap >= 0.0 => gap,
+                Ok(gap) if gap >= 0.0 => {
+                    if gap == 0.0 {
+                        0.0
+                    } else {
+                        gap
+                    }
+                }
                 Ok(_) => return Ok(invalid_arg("gap", "must not be negative")),
                 Err(error) => return Ok(error),
             }

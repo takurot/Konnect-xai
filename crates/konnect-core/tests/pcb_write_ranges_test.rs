@@ -149,6 +149,25 @@ async fn board_coordinates_outside_kicad_range_are_refused() {
                    "x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 0.0, "width": 1e-7}),
             "width",
         ),
+        (
+            "route_differential_pair",
+            json!({"board": b, "net_pos": "P", "net_neg": "N",
+                   "x1": 0.0, "y1": 2147.4, "x2": 10.0, "y2": 2147.4, "gap": 1.0}),
+            "y1",
+        ),
+        (
+            "place_component",
+            json!({"board": b, "footprint": "Resistor_SMD:R_0402", "reference": "R9",
+                   "x": 3000.0, "y": 0.0}),
+            "x",
+        ),
+        (
+            "modify_trace",
+            json!({"board": b, "uuid": "00000000-0000-0000-0000-000000000000",
+                   "net_name": "GND", "layer": "F.Cu",
+                   "x1": 0.0, "y1": 0.0, "x2": 2148.0, "y2": 0.0}),
+            "x2",
+        ),
     ];
     for (name, args, field) in cases {
         assert_refused_unchanged(&p, &p.board, name, args, field).await;

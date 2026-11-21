@@ -1324,9 +1324,11 @@ fn update_footprint_placement(
     let (x, y, rotation) = match update {
         FootprintPlacementUpdate::Move { x, y } => (x, y, old_rotation),
         FootprintPlacementUpdate::Rotate { rotation } => {
-            (old_x, old_y, normalize_root_angle(rotation))
+            (old_x, old_y, normalize_root_angle(round6(rotation)))
         }
-        FootprintPlacementUpdate::Set { x, y, rotation } => (x, y, normalize_root_angle(rotation)),
+        FootprintPlacementUpdate::Set { x, y, rotation } => {
+            (x, y, normalize_root_angle(round6(rotation)))
+        }
     };
 
     // Replace the root `(at …)` FIRST, while `at_start`/`at_end` still index
@@ -2313,7 +2315,7 @@ async fn handle_place_component(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let rotation = args["rotation"].as_f64().unwrap_or(0.0);
+    let rotation = normalize_root_angle(round6(args["rotation"].as_f64().unwrap_or(0.0)));
     let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
     if let Some(rejection) = back_side_layer_error(&layer) {
         return Ok(rejection);
@@ -2391,7 +2393,7 @@ async fn handle_place_component(
             Ok(CallToolResult::json(&json!({
                 "placed": reference,
                 "footprint": footprint,
-                "x": round6(x), "y": round6(y), "rotation": normalize_root_angle(round6(rotation)), "layer": layer,
+                "x": round6(x), "y": round6(y), "rotation": rotation, "layer": layer,
                 "source": "file",
                 "fallback_reason": reason.evidence(),
                 "warning": reason.warning()
