@@ -774,6 +774,69 @@ async fn handle_run_erc(
 
 const MAX_SNAP_TOLERANCE_MM: f64 = 1.27;
 
+/// The refusal for a set of fixes that, taken together, would put two label
+/// or power names on one net. Each fix joins the net its wire is on to the net
+/// at its destination; fixes are unioned so that two snaps on one unnamed wire
+/// cannot join two named nets between them. Only label and power names count:
+/// unlabelled nets carry no name a caller chose.
+fn named_net_join(
+    tree: &SexpNode,
+    wires: &[konnect_sexp::schematic::Wire],
+    fixes: &[PlannedWireFix],
+) -> Option<CallToolResult> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let labels = konnect_sexp::schematic::extract_all_net_labels(tree);
+    let mut nets = super::sch_connectivity::net_graph_for(tree, wires, &labels);
+    let mut parent: BTreeMap<(i64, i64), (i64, i64)> = BTreeMap::new();
+    fn find(parent: &mut BTreeMap<(i64, i64), (i64, i64)>, root: (i64, i64)) -> (i64, i64) {
+        let next = *parent.entry(root).or_insert(root);
+        if next == root {
+            return root;
+        }
+        let top = find(parent, next);
+        parent.insert(root, top);
+        top
+    }
+    let roots: Vec<_> = fixes
+        .iter()
+        .map(|fix| {
+            (
+                nets.root_at(fix.from.0, fix.from.1),
+                nets.root_at(fix.to.0, fix.to.1),
+            )
+        })
+        .collect();
+    for &(from, to) in &roots {
+        let (a, b) = (find(&mut parent, from), find(&mut parent, to));
+        parent.insert(a, b);
+    }
+    let mut names: BTreeMap<(i64, i64), BTreeSet<String>> = BTreeMap::new();
+    let mut points: BTreeMap<(i64, i64), Vec<[f64; 2]>> = BTreeMap::new();
+    for (fix, &(from, to)) in fixes.iter().zip(&roots) {
+        let group = find(&mut parent, from);
+        let entry = names.entry(group).or_default();
+        entry.extend(nets.name_of_root(from));
+        entry.extend(nets.name_of_root(to));
+        points.entry(group).or_default().push([fix.to.0, fix.to.1]);
+    }
+    let (group, joined) = names.into_iter().find(|(_, joined)| joined.len() > 1)?;
+    let joined: Vec<String> = joined.into_iter().collect();
+    Some(CallToolResult::error_kind(
+        ToolErrorKind::WouldJoinNets {
+            nets: joined.clone(),
+            at: points.remove(&group).unwrap_or_default(),
+        },
+        format!(
+            "snapping would join the named nets {}; connect them explicitly if that is intended",
+            joined
+                .iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    ))
+}
+
 async fn handle_fix_connectivity(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -947,30 +1010,8 @@ async fn handle_fix_connectivity(
 
     // A snap may finish a connection, but never join two differently named
     // nets: that is a rewiring decision, not a near-miss repair.
-    let labels_for_nets = analysis_net_labels(&tree);
-    let mut nets = analysis_net_graph(&tree, &wires, &labels_for_nets);
-    for fix in &fixes {
-        let (Some(from), Some(to)) = (
-            nets.net_at(fix.from.0, fix.from.1),
-            nets.net_at(fix.to.0, fix.to.1),
-        ) else {
-            continue;
-        };
-        if from != to {
-            return Ok(CallToolResult::error_kind(
-                ToolErrorKind::WouldJoinNets {
-                    nets: vec![from.clone(), to.clone()],
-                    at: vec![[fix.to.0, fix.to.1]],
-                },
-                format!(
-                    "snapping wire {} {} endpoint onto {} would join net '{from}' to net '{to}'; \
-                     connect them explicitly if that is intended",
-                    fix.uuid,
-                    fix.endpoint.name(),
-                    format_point(fix.to)
-                ),
-            ));
-        }
+    if let Some(refusal) = named_net_join(&tree, &wires, &fixes) {
+        return Ok(refusal);
     }
 
     // Resolve every target structurally before constructing a replacement. A

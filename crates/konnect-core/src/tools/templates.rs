@@ -601,8 +601,10 @@ async fn handle_apply_template(
                 base_y + (placed.len() as f64) * spacing_y,
                 1.27,
             );
-            if let Err(error) = crate::tools::sch_values::check_schematic_coord(y, "position_y") {
-                return Ok(error);
+            for (value, field) in [(x, "position_x"), (y, "position_y")] {
+                if let Err(error) = crate::tools::sch_values::check_schematic_coord(value, field) {
+                    return Ok(error);
+                }
             }
             let placement = match crate::tools::sch_components::place_one_component(
                 &mut sch,
@@ -637,6 +639,13 @@ async fn handle_apply_template(
     }
 
     let candidate = sch.to_source();
+    for placement in &placed {
+        let reference = placement["reference"].as_str().unwrap_or_default();
+        if let Err(error) = crate::tools::sch_values::check_pins_within_limit(&candidate, reference)
+        {
+            return Ok(error);
+        }
+    }
     let paper = crate::tools::sch_values::paper_size_mm(&candidate);
     let warnings: Vec<String> = placed
         .iter()

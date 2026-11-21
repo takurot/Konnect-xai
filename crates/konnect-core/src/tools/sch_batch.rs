@@ -1156,6 +1156,7 @@ async fn handle_bulk_move(
         }
 
         let mut placements: Vec<serde_json::Value> = Vec::new();
+        let errors_before = errors.len();
         for (sym_start, sym_end) in blocks {
             // Find first (at X Y [ROT]) inside this symbol block
             let sym_block = &content[sym_start..sym_end];
@@ -1242,7 +1243,9 @@ async fn handle_bulk_move(
         }
 
         if placements.is_empty() {
-            unchanged.push(reference.to_string());
+            if errors.len() == errors_before {
+                unchanged.push(reference.to_string());
+            }
         } else {
             moved.push(json!({
                 "reference": reference,

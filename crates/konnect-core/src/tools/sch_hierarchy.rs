@@ -667,18 +667,16 @@ fn ensure_resize_keeps_pins_on_edges(
     Ok(())
 }
 
-/// Which size argument moved the pin off: the edge's own coordinate comes
-/// from width (left/right edges sit at x, x + width) or height (top/bottom),
-/// and running past a corner comes from the other one.
+/// Which size argument moved the pin off. The right and bottom edges sit at
+/// x + width and y + height, so a pin no longer on that line is the width's or
+/// height's doing; a pin still on its line has run past a corner along it.
+/// The left and top edges do not move with size, so only the run applies.
 fn resize_field(side: &str, after: SheetBox, x: f64, y: f64) -> &'static str {
-    let within = |value: f64, start: f64, length: f64| {
-        value >= start - SHEET_PIN_EDGE_TOLERANCE_MM
-            && value <= start + length + SHEET_PIN_EDGE_TOLERANCE_MM
-    };
+    let off = |actual: f64, expected: f64| (actual - expected).abs() > SHEET_PIN_EDGE_TOLERANCE_MM;
     match side {
-        "right" if within(y, after.y, after.height) => "width",
+        "right" if off(x, after.x + after.width) => "width",
+        "bottom" if off(y, after.y + after.height) => "height",
         "left" | "right" => "height",
-        "bottom" if within(x, after.x, after.width) => "height",
         _ => "width",
     }
 }

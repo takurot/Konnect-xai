@@ -168,7 +168,7 @@ async fn edit_sheet_refuses_a_resize_that_leaves_a_pin_off_its_edge() {
         &path,
         json!({ "sheet_name": "A", "width": 12.7, "height": 5.08 }),
         "invalid_argument",
-        None,
+        Some("width"),
     )
     .await;
     // Only the width shrinks: TOP at x = 120.65 is past the new right corner.
@@ -180,6 +180,11 @@ async fn edit_sheet_refuses_a_resize_that_leaves_a_pin_off_its_edge() {
         Some("width"),
     )
     .await;
+    let flagged = call("add_no_connect", &path, json!({ "x": 130.0, "y": 60.96 })).await;
+    assert!(
+        !flagged.is_error,
+        "an unused sheet pin takes a flag: {flagged:?}"
+    );
     let taller = call(
         "edit_sheet",
         &path,
@@ -250,6 +255,14 @@ async fn add_junction_needs_a_wire_and_is_idempotent() {
         json!({ "x": 200.66, "y": 200.66 }),
         "invalid_argument",
         Some("x"),
+    )
+    .await;
+    assert_refused(
+        "add_junction",
+        &path,
+        json!({ "x": 114.3 }),
+        "invalid_argument",
+        Some("y"),
     )
     .await;
     let first = call("add_junction", &path, json!({ "x": 114.3, "y": 127.0 })).await;
@@ -390,6 +403,20 @@ async fn fix_connectivity_bounds_its_tolerance_and_refuses_net_changes() {
 
     let (_dir, path) = fixture(&near_miss_source(
         "\t(label \"N1\" (at 40 80 0) (uuid \"l1\"))\n",
+    ));
+    assert_refused(
+        "fix_connectivity",
+        &path,
+        json!({ "snap_tolerance": 1.0 }),
+        "would_join_nets",
+        None,
+    )
+    .await;
+
+    // An unnamed wire between two labels: neither snap alone names two nets,
+    // both together join N1 to N2.
+    let (_dir, path) = fixture(&near_miss_source(
+        "\t(label \"N1\" (at 39.5 80 0) (uuid \"l1\"))\n",
     ));
     assert_refused(
         "fix_connectivity",

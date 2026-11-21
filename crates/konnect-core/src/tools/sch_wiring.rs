@@ -2415,13 +2415,18 @@ impl MarkerSite {
     }
 }
 
-fn marker_point(value: &serde_json::Value) -> Result<(f64, f64), String> {
-    let coordinate = |axis: &str| {
+/// The point a marker goes on, or the axis at fault and why.
+fn marker_point(value: &serde_json::Value) -> Result<(f64, f64), (&'static str, String)> {
+    let coordinate = |axis: &'static str| {
         let number = value[axis]
             .as_f64()
-            .ok_or_else(|| format!("needs a numeric {axis}"))?;
-        super::sch_values::check_schematic_coord(number, axis)
-            .map_err(|_| format!("{axis} = {number} is outside the schematic coordinate range"))
+            .ok_or_else(|| (axis, format!("needs a numeric {axis}")))?;
+        super::sch_values::check_schematic_coord(number, axis).map_err(|_| {
+            (
+                axis,
+                format!("{axis} = {number} is outside the schematic coordinate range"),
+            )
+        })
     };
     Ok((coordinate("x")?, coordinate("y")?))
 }
@@ -2436,21 +2441,24 @@ fn no_connect_placement(
         return Ok(MarkerPlacement::AlreadyPresent);
     }
     let pins = index.point_detail(x, y).pins;
+    let attached = index.on_wire(x, y)
+        || index.on_bus(x, y)
+        || index.has_label(x, y)
+        || index.has_junction(x, y);
     let Some(first) = pins.first() else {
+        // An unused hierarchical sheet pin takes a flag the way a part's pin does.
+        if index.has_sheet_pin(x, y) && !attached {
+            return Ok(MarkerPlacement::Add);
+        }
         return Err(format!(
-            "no component pin at ({x}, {y}); a no-connect flag marks an unused pin"
+            "no unconnected component or sheet pin at ({x}, {y}); a no-connect flag marks an \
+             unused pin"
         ));
     };
     // Stacked pins of one part are one connection point; another part's pin is
     // a connection.
     let other_part = pins.iter().any(|pin| pin.reference != first.reference);
-    if other_part
-        || index.on_wire(x, y)
-        || index.on_bus(x, y)
-        || index.has_label(x, y)
-        || index.has_sheet_pin(x, y)
-        || index.has_junction(x, y)
-    {
+    if other_part || attached || index.has_sheet_pin(x, y) {
         return Err(format!(
             "pin {}.{} at ({x}, {y}) is already connected; a no-connect flag there is an \
                  ERC error",
@@ -2498,7 +2506,7 @@ fn add_markers(
     positions: &[serde_json::Value],
     placement: fn(&ConnectivityIndex<'_>, (f64, f64)) -> Result<MarkerPlacement, String>,
     format_marker: fn(f64, f64) -> String,
-    field_of: fn(usize) -> String,
+    field_of: fn(usize, &'static str) -> String,
     refusals: Refusals,
 ) -> anyhow::Result<Result<MarkerOutcome, CallToolResult>> {
     let site = MarkerSite::load(path)?;
@@ -2509,14 +2517,17 @@ fn add_markers(
             errors: Vec::new(),
         };
         for (i, value) in positions.iter().enumerate() {
-            let checked = marker_point(value)
-                .and_then(|point| placement(index, point).map(|placed| (point, placed)));
+            let checked = marker_point(value).and_then(|point| {
+                placement(index, point)
+                    .map(|placed| (point, placed))
+                    .map_err(|reason| ("x", reason))
+            });
             let (point, placed) = match checked {
                 Ok(checked) => checked,
-                Err(reason) if refusals == Refusals::Atomic => {
-                    return Err(invalid_arg(&field_of(i), &reason))
+                Err((axis, reason)) if refusals == Refusals::Atomic => {
+                    return Err(invalid_arg(&field_of(i, axis), &reason))
                 }
-                Err(reason) => {
+                Err((_, reason)) => {
                     outcome.errors.push(format!("Position {i}: {reason}"));
                     continue;
                 }
@@ -2562,14 +2573,14 @@ async fn handle_add_no_connect(
     let sch_path = get_path(args, "schematic")?;
     let point = match marker_point(args) {
         Ok(point) => point,
-        Err(reason) => return Ok(invalid_arg("x", &reason)),
+        Err((axis, reason)) => return Ok(invalid_arg(axis, &reason)),
     };
     let added = match add_markers(
         &sch_path,
         &[json!({ "x": point.0, "y": point.1 })],
         no_connect_placement,
         konnect_sexp::schematic::format_no_connect,
-        |_| "x".to_string(),
+        |_, axis| axis.to_string(),
         Refusals::Atomic,
     )? {
         Ok(outcome) => outcome.added,
@@ -2597,7 +2608,7 @@ async fn handle_batch_add_no_connect(
         &positions,
         no_connect_placement,
         konnect_sexp::schematic::format_no_connect,
-        |i| format!("positions[{i}]"),
+        |i, _| format!("positions[{i}]"),
         Refusals::PerPosition,
     )? {
         Ok(outcome) => outcome,
@@ -2727,14 +2738,14 @@ async fn handle_add_junction(
     let sch_path = get_path(args, "schematic")?;
     let point = match marker_point(args) {
         Ok(point) => point,
-        Err(reason) => return Ok(invalid_arg("x", &reason)),
+        Err((axis, reason)) => return Ok(invalid_arg(axis, &reason)),
     };
     let added = match add_markers(
         &sch_path,
         &[json!({ "x": point.0, "y": point.1 })],
         junction_placement,
         format_junction,
-        |_| "x".to_string(),
+        |_, axis| axis.to_string(),
         Refusals::Atomic,
     )? {
         Ok(outcome) => outcome.added,
@@ -2760,7 +2771,7 @@ async fn handle_batch_add_junction(
         &positions,
         junction_placement,
         format_junction,
-        |i| format!("positions[{i}]"),
+        |i, _| format!("positions[{i}]"),
         Refusals::Atomic,
     )? {
         Ok(outcome) => outcome,
