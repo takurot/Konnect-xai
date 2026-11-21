@@ -187,12 +187,7 @@ fn handshake_baseline_and_full_registry_loads() {
 
     // list_toolboxes reports the registry; every toolset must load.
     let boxes = McpProcess::tool_body(&p.call_tool("list_toolboxes", json!({})));
-    let toolsets: Vec<String> = boxes["toolsets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["name"].as_str().unwrap().to_string())
-        .collect();
+    let toolsets = boxes["toolsets"].as_array().unwrap();
     assert!(
         toolsets.len() >= 17,
         "expected 17+ toolsets, got {}",
@@ -202,18 +197,32 @@ fn handshake_baseline_and_full_registry_loads() {
     assert!(boxes.get("license_tier").is_none());
     assert!(boxes["toolsets"][0].get("tier").is_none());
 
-    let mut total = 0u64;
-    for name in &toolsets {
-        let loaded = McpProcess::tool_body(&p.call_tool("load_toolset", json!({"name": name})));
-        let added = loaded["tools_added"].as_u64().unwrap_or(0);
-        assert!(added > 0, "toolset '{name}' loaded no tools");
-        total += added;
+    let mut initially_loaded = 0;
+    let mut newly_loaded = 0;
+    for toolset in toolsets {
+        let name = toolset["name"].as_str().unwrap();
+        let count = toolset["tool_count"].as_u64().unwrap();
+        let expected = if toolset["loaded"].as_bool().unwrap() {
+            initially_loaded += count;
+            0
+        } else {
+            count
+        };
+        let result = p.call_tool("load_toolset", json!({"name": name}));
+        assert_eq!(result["isError"], false, "{name}: {result}");
+        let response = McpProcess::tool_body(&result);
+        let added = response["tools_added"].as_u64().unwrap();
+        assert_eq!(added, expected, "{name}: {response}");
+        newly_loaded += added;
     }
     assert_eq!(
-        total,
+        initially_loaded + newly_loaded,
         boxes["total_tools"].as_u64().unwrap(),
         "sum of loaded tools disagrees with list_toolboxes total"
     );
+    let list = p.request("tools/list", json!({}));
+    let full = list["result"]["tools"].as_array().unwrap().len();
+    assert_eq!(full as u64, baseline as u64 + newly_loaded);
 }
 
 #[test]
@@ -561,6 +570,132 @@ fn load_toolset_batch_form_loads_all_and_notifies_once() {
         errors[0].as_str().unwrap().contains("list_toolboxes"),
         "{errors:#?}"
     );
+}
+
+#[test]
+fn toolset_notifications_only_report_actual_catalogue_changes() {
+    let mut p = McpProcess::spawn();
+    for (tool, name, want_error, notifications, tools_added) in [
+        ("load_toolset", json!("unknown_toolset"), true, 0, None),
+        ("load_toolset", json!(""), true, 0, None),
+        ("load_toolset", json!([]), true, 0, None),
+        ("unload_toolset", json!("unknown_toolset"), true, 0, None),
+        ("load_toolset", json!("project"), false, 0, Some(0)),
+        ("unload_toolset", json!("pcb_routing"), false, 0, None),
+        (
+            "load_toolset",
+            json!([
+                "sch_components",
+                "project",
+                "unknown_toolset",
+                "sch_components"
+            ]),
+            false,
+            1,
+            Some(18),
+        ),
+        (
+            "load_toolset",
+            json!(["sch_components", "unknown_toolset"]),
+            false,
+            0,
+            Some(0),
+        ),
+        ("unload_toolset", json!("sch_components"), false, 1, None),
+        ("unload_toolset", json!("sch_components"), false, 0, None),
+    ] {
+        let lines = p.call_tool_then_fence(tool, json!({"name":name}));
+        let result = &lines[0]["result"];
+        let actual = lines
+            .iter()
+            .filter(|line| line["method"] == "notifications/tools/list_changed")
+            .count();
+        assert_eq!(actual, notifications, "{tool} {name}: {lines:?}");
+        assert_eq!(result["isError"], want_error, "{tool} {name}: {result}");
+        if let Some(added) = tools_added {
+            let body = McpProcess::tool_body(result);
+            assert_eq!(body["tools_added"], added, "{body}");
+            assert_eq!(
+                body["tools"].as_array().unwrap().len(),
+                added as usize,
+                "{body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn served_errors_match_counters_and_error_kinds_in_memory_and_jsonl() {
+    let mut p = McpProcess::spawn();
+    let mut cases = vec![
+        (
+            "load_toolset",
+            json!({"name": "unknown_toolset"}),
+            "invalid_argument",
+        ),
+        (
+            "unload_toolset",
+            json!({"name":"unknown_toolset"}),
+            "invalid_argument",
+        ),
+        ("route_trace", json!({}), "toolset_not_loaded"),
+        ("definitely_no_such_tool", json!({}), "unknown_tool"),
+        ("get_recent_calls", json!({"limit":0}), "invalid_argument"),
+        ("get_recent_calls", json!({"limit":-1}), "invalid_argument"),
+        ("get_recent_calls", json!({"limit":101}), "invalid_argument"),
+    ];
+    if cfg!(unix) {
+        cases.push((
+            "reload_server",
+            json!({"confirm":false}),
+            "invalid_argument",
+        ));
+    }
+    let mut errors = Vec::new();
+    for (tool, args, kind) in cases {
+        let result = p.call_tool(tool, args);
+        let body = McpProcess::tool_body(&result);
+        assert_eq!(result["isError"], true, "{tool}: {result}");
+        assert_eq!(body["error"]["kind"], kind, "{tool}: {body}");
+        errors.push((tool, kind));
+    }
+    let stats = McpProcess::tool_body(&p.call_tool("server_stats", json!({})));
+    assert_eq!(stats["error_calls"], errors.len(), "{stats}");
+    assert_eq!(stats["per_tool"]["route_trace"]["errors"], 1, "{stats}");
+    assert_eq!(
+        stats["per_tool"]["route_trace"]["last_status"], "not_found",
+        "{stats}"
+    );
+    assert_eq!(
+        stats["per_tool"]["definitely_no_such_tool"]["errors"], 1,
+        "{stats}"
+    );
+    for limit in [1, 100] {
+        let response = p.call_tool("get_recent_calls", json!({"limit":limit}));
+        assert_eq!(response["isError"], false, "{response}");
+        let recent = McpProcess::tool_body(&response);
+        assert_eq!(recent["limit_applied"], limit, "{recent}");
+        if limit == 100 {
+            let recent_errors: Vec<_> = recent["calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .filter_map(|call| Some((call["tool"].as_str()?, call["error_kind"].as_str()?)))
+                .collect();
+            assert_eq!(recent_errors, errors, "{recent}");
+        }
+    }
+    let log = std::fs::read_to_string(stats["log_path"].as_str().unwrap()).unwrap();
+    let rows: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let logged_errors: Vec<_> = rows
+        .iter()
+        .filter_map(|call| Some((call["tool"].as_str()?, call["error_kind"].as_str()?)))
+        .collect();
+    assert_eq!(logged_errors, errors, "{rows:?}");
 }
 
 /// All names in one `load_toolset` call unknown -> a typed `invalid_argument`

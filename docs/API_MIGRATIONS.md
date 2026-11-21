@@ -3,6 +3,22 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: toolset changes and observed tool errors
+
+`load_toolset` reports only newly added tools in `tools_added` and `tools`.
+Its `loaded` field still uses a name for a single request and an array for a
+batch. An active toolset is a successful no-op, and a mixed batch retains its
+per-name `errors` entries. An unknown or empty request returns
+`invalid_argument`. Unloading a known inactive toolset reports that it is
+already unloaded. Konnect sends `notifications/tools/list_changed` only when
+the advertised catalogue changes.
+
+`server_stats` counts every served `isError: true` result, including unknown
+or unloaded tools. Recent calls and the JSONL log record their structured
+error kind, with `handler_error` when a legacy reply contains only text.
+`get_recent_calls.limit` accepts integers from 1 to 100 and defaults to 20.
+Use 100 to request the full bounded buffer.
+
 ## Unreleased – Server configuration and terminal startup
 
 Automatic server configuration discovery now uses the recognized PCM plugin

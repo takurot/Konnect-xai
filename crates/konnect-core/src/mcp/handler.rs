@@ -317,7 +317,8 @@ impl McpHandler {
             "tool_call_start"
         );
 
-        let (result, status, error_kind) = self.dispatch_tool(&params.name, &args).await;
+        let (result, status, _) = self.dispatch_tool(&params.name, &args).await;
+        let error_kind = extract_error_kind(&result);
 
         let dur_ms = started.elapsed().as_millis() as u64;
         let result_bytes = result_content_bytes(&result);
@@ -331,17 +332,20 @@ impl McpHandler {
         );
 
         self.observer
-            .record(CallRecord {
-                call_id,
-                ts,
-                tool: params.name.clone(),
-                toolset,
-                dur_ms,
-                status,
-                error_kind,
-                args_bytes,
-                result_bytes,
-            })
+            .record_result(
+                CallRecord {
+                    call_id,
+                    ts,
+                    tool: params.name.clone(),
+                    toolset,
+                    dur_ms,
+                    status,
+                    error_kind,
+                    args_bytes,
+                    result_bytes,
+                },
+                result.is_error,
+            )
             .await;
 
         result
@@ -360,14 +364,15 @@ impl McpHandler {
                 return schema_argument_error(&error);
             }
         }
-        if let Some(result) =
-            meta_tools::handle_meta_tool_with_reload(name, args, &self.ctx, &self.reload).await
+        if let Some((result, catalogue_changed)) =
+            meta_tools::dispatch_meta_tool(name, args, &self.ctx, &self.reload).await
         {
-            if name == "load_toolset" || name == "unload_toolset" {
+            if catalogue_changed {
                 self.notify_tools_list_changed().await;
             }
             let status = call_status(&result);
-            return (result, status, None);
+            let error_kind = extract_error_kind(&result);
+            return (result, status, error_kind);
         }
 
         // Loaded domain tool? If not and auto-load is enabled (opt-in, off by
@@ -376,8 +381,15 @@ impl McpHandler {
         let mut tool_def = self.ctx.router.get_tool(name).await;
         if tool_def.is_none() && self.ctx.config.auto_load_toolsets {
             if let Some(toolset) = self.ctx.router.find_toolset_for_tool(name) {
-                self.ctx.router.load(toolset).await;
-                self.notify_tools_list_changed().await;
+                if self
+                    .ctx
+                    .router
+                    .load(toolset)
+                    .await
+                    .is_some_and(|added| !added.is_empty())
+                {
+                    self.notify_tools_list_changed().await;
+                }
                 tool_def = self.ctx.router.get_tool(name).await;
             }
         }
