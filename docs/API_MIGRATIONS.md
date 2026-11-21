@@ -96,6 +96,17 @@ accept an instance UUID; `connect_pins` additionally accepts `uuid1`/`uuid2`
 instead of `ref1`/`ref2`, and `connect_to_net` accepts `uuid` instead of
 `reference`. Parse failures refuse instead of bypassing junction analysis.
 
+## Unreleased: placement scores actual courtyard intersections
+
+`score_placement` uses bounding boxes to select possible overlap pairs, then
+measures the area of the authored courtyard contours after the footprint
+rotation. A boundary touch has zero overlap area. Circles and arcs use
+inscribed chords with at most 0.001 mm deviation. A potentially overlapping
+pair whose courtyard cannot be assembled or whose clearance falls within the
+curve approximation tolerance is reported in `unproven_courtyards`
+and can produce a `courtyard_unproven` verdict, which blocks automatic placement.
+The existing same-side policy and pad-only fallback still apply.
+
 ## Unreleased: omitted rectangular symbol pin coordinates are distributed (patch release)
 
 `create_symbol` no longer places every coordinate-less rectangular-unit pin at
@@ -1274,6 +1285,14 @@ A refusal leaves the file byte-identical. The remedy depends on which one it is:
   `lib_symbols` entry) and retry.
 - For `stale_target` naming a marker with no UUID, delete and re-add that
   marker so KiCad's writer gives it one.
+
+## Unreleased – KiCad design paths are reserved export destinations
+
+Choose a separate destination for manufacturing exports, plots, netlists, BOMs,
+renders, and ERC or DRC reports. Export tools refuse a destination whose name
+or existing symlink target identifies a KiCad design or library before invoking
+KiCad or writing the result. Directory-valued exports also reserve terminal
+names such as `.pretty`, which can name a KiCad footprint library.
 
 ## Unreleased: explicit live-board synchronization for CLI DRC
 
@@ -2482,6 +2501,24 @@ target.
 
 Diagnostics present ordinary Windows canonical drive and UNC paths in their
 usual spelling. The transaction journal keeps its existing relative-path format.
+
+## Unreleased - library search and listing on a fresh KiCad installation
+
+`search_symbols`, `search_footprints`, `list_symbol_libraries`, and
+`list_footprint_libraries` read the selected KiCad user table when it exists.
+When it is absent, these tools can read the matching installation's shipped
+template and include `table_source: "template"` in the response. They do not
+install or modify the user table.
+
+When neither a requested project table, a user table nor a shipped template is
+available, a search or global listing returns `library_table_unavailable`.
+An existing empty table or a search with no matches still returns an empty
+result. Unreadable and malformed tables return a diagnostic.
+
+`search_footprints` accepts an optional `project` path to a `.kicad_pro` file
+or a project directory. It defaults to the server's configured
+`project_dir`. Project footprint libraries are searched first. When a project
+and global table use the same nickname, the project entry is used for search.
 
 ## Unreleased `connect_to_net` checks the endpoint's saved net
 

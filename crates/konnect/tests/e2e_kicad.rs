@@ -70,7 +70,10 @@ impl Mcp {
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
         if let Some(home) = home {
-            command.env("HOME", home).env("APPDATA", home);
+            command
+                .env("HOME", home)
+                .env("APPDATA", home)
+                .env("KICAD_CONFIG_HOME", home.join("kicad-config"));
         }
         let mut child = command
             .arg("--config")
@@ -364,6 +367,43 @@ fn native_library_loading_survives_rejected_symbol_and_footprint_edits() {
 
 #[test]
 #[ignore = "requires kicad-cli; run via e2e workflow"]
+fn placement_courtyards_agree_with_real_kicad_on_rotated_demo_board() {
+    let cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
+    let dir = tempfile::tempdir().unwrap();
+    let board = dir.path().join("ecc83-pp.kicad_pcb");
+    let original = include_bytes!("../../konnect-sexp/tests/fixtures/ecc83-pp.kicad_pcb");
+    std::fs::write(&board, original).unwrap();
+    let report = dir.path().join("drc.json");
+    let native = Command::new(&cli)
+        .args(["pcb", "drc", "--format", "json", "-o"])
+        .arg(&report)
+        .arg(&board)
+        .output()
+        .unwrap();
+    assert!(native.status.success(), "{native:?}");
+    let drc: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+    assert!(drc["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|violation| violation["type"] != "courtyards_overlap"));
+
+    let mut mcp = Mcp::spawn(&cli);
+    mcp.load("placement");
+    let score = body(&mcp.tool("score_placement", json!({"board": board})));
+    assert!(
+        score["hard_failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|failure| failure["kind"] != "courtyard_overlap"),
+        "{score}"
+    );
+    assert_eq!(std::fs::read(&board).unwrap(), original);
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
 fn fabrication_and_document_exports_through_mcp() {
     let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
     let dir = tempfile::tempdir().unwrap();
@@ -431,6 +471,7 @@ fn fabrication_and_document_exports_through_mcp() {
         ),
     ] {
         let output = dir.path().join(filename);
+        std::fs::write(&output, b"previous ordinary export").unwrap();
         let mut args = json!({"board":board,"output":output});
         if let Some(format) = format {
             args["format"] = json!(format);
@@ -449,14 +490,43 @@ fn fabrication_and_document_exports_through_mcp() {
         }
     }
 
+    let compressed_ipc = dir.path().join("packed-ipc.xml");
+    mcp.tool(
+        "export_ipc2581",
+        json!({"board":board,"output":compressed_ipc,"compress":true}),
+    );
+    assert!(std::fs::read(compressed_ipc)
+        .unwrap()
+        .starts_with(b"PK\x03\x04"));
+
+    let odb_dir = dir.path().join("odb-directory");
+    std::fs::create_dir(&odb_dir).unwrap();
+    mcp.tool(
+        "export_odb",
+        json!({"board":board,"output":odb_dir,"compression":"none"}),
+    );
+    assert!(odb_dir.join("steps/pcb/profile").is_file());
+
     let dxf_dir = dir.path().join("dxf");
+    std::fs::create_dir(&dxf_dir).unwrap();
+    let keep = dxf_dir.join("keep.txt");
+    std::fs::write(&keep, b"unrelated output directory contents").unwrap();
     let response = body(&mcp.tool(
         "export_dxf",
         json!({"board":board,"output_dir":dxf_dir,"layers":["Edge.Cuts"]}),
     ));
     let files = response["files"].as_array().expect("DXF file inventory");
-    assert_eq!(files.len(), 1);
-    let dxf = std::fs::read_to_string(dxf_dir.join(files[0].as_str().unwrap())).unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(
+        std::fs::read(&keep).unwrap(),
+        b"unrelated output directory contents"
+    );
+    let dxf_name = files
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|name| name.ends_with(".dxf"))
+        .expect("DXF layer file");
+    let dxf = std::fs::read_to_string(dxf_dir.join(dxf_name)).unwrap();
     assert!(dxf.lines().any(|line| line.trim() == "ENTITIES"));
     assert_eq!(dxf.lines().filter(|line| line.trim() == "LINE").count(), 4);
 
@@ -1299,6 +1369,65 @@ fn a_written_default_netclass_still_plots_wires() {
         (after - radius).abs() < 1e-6,
         "a sparse named class changed the junction dot: {radius} -> {after}"
     );
+}
+
+#[test]
+#[ignore = "requires KiCad and its stock library templates"]
+fn library_search_works_without_global_tables_and_includes_project_footprints() {
+    let cli = find_kicad_cli().expect("stock KiCad required for library search");
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("fixture.kicad_pro");
+    let footprint_table = workspace.path().join("fp-lib-table");
+    let library = workspace.path().join("Custom.pretty");
+    let footprint = library.join("MySOT.kicad_mod");
+    std::fs::write(&project, "{}").unwrap();
+    std::fs::create_dir(&library).unwrap();
+    std::fs::write(
+        &footprint,
+        r#"(footprint "MySOT" (version 20241229) (generator "pcbnew") (layer "F.Cu"))"#,
+    )
+    .unwrap();
+    let table = r#"(fp_lib_table (version 7) (lib (name "Custom") (type "KiCad") (uri "${KIPRJMOD}/Custom.pretty") (options "") (descr "")))"#;
+    std::fs::write(&footprint_table, table).unwrap();
+
+    let mut mcp = Mcp::spawn_with_home(&cli, Some(home.path()));
+    mcp.load("library");
+    for (tool, query, expected) in [
+        ("search_symbols", "LM358", "Amplifier_Operational:LM358"),
+        (
+            "search_footprints",
+            "R_0603_1608",
+            "Resistor_SMD:R_0603_1608Metric",
+        ),
+    ] {
+        let search = body(&mcp.tool(tool, json!({"query":query})));
+        assert_eq!(search["table_source"], "template", "{search}");
+        assert!(
+            search["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["id"] == expected),
+            "{tool} should find {expected}: {search}"
+        );
+    }
+    for tool in ["list_symbol_libraries", "list_footprint_libraries"] {
+        let found = body(&mcp.tool(tool, json!({"scope":"global"})));
+        assert_eq!(found["table_source"], "template", "{found}");
+        assert!(found["count"].as_u64().unwrap() > 0, "{found}");
+    }
+    let found = body(&mcp.tool(
+        "search_footprints",
+        json!({"query":"MySOT","project":project,"limit":1}),
+    ));
+    assert_eq!(found["results"][0]["id"], "Custom:MySOT", "{found}");
+    let info = body(&mcp.tool(
+        "get_footprint_info",
+        json!({"footprint_path":"Custom:MySOT","project":project}),
+    ));
+    assert_eq!(info["name"], "MySOT");
+    assert_eq!(std::fs::read_to_string(&footprint_table).unwrap(), table);
 }
 
 #[test]
