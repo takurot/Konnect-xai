@@ -1,0 +1,12 @@
+# KiCad 10.0.8: sch export netlist --format kicadxml ecc83-pp.kicad_sch
+# Exact saved demo: ecc83_multiunit.kicad_sch (sha256 8a2d0359a0f3e647378034d84ab72b09dd7aa42f8b1f5e7fa0ff28ae369beee9)
+# Native unconnected-* pin records are intentionally omitted from this oracle.
+GND	C1.2 P1.1 P2.2 P3.2 R2.2 R3.2 R4.2
+Net-(P1-PM)	P1.2 R4.1 U1.2
+Net-(P2-P1)	C2.1 P2.1 R3.1
+Net-(P3-P1)	C1.1 P3.1 U1.6
+Net-(P4-P1)	P4.1 U1.9
+Net-(P4-PM)	P4.2 U1.4 U1.5
+Net-(U1A-G)	R1.1 U1.1 U1.7
+Net-(U1A-K)	C2.2 R1.2 U1.8
+Net-(U1B-K)	R2.1 U1.3

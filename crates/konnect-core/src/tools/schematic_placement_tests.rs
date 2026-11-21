@@ -111,9 +111,9 @@ fn fixture(reused: bool) -> (tempfile::TempDir, PathBuf, PathBuf) {
     (directory, root, child)
 }
 
-async fn place(name: &str, child: &Path) -> CallToolResult {
+async fn place(name: &str, child: &Path, reused: bool) -> CallToolResult {
     let component = json!({
-        "lib_id": "complex_hierarchy:LM358N", "reference": "U999",
+        "lib_id": "complex_hierarchy:LM358N", "reference": if reused { "U?" } else { "U999" },
         "value": "placement readback", "x": 100.1, "y": 80.2,
         "rotation": 90.0, "unit": 2
     });
@@ -121,7 +121,7 @@ async fn place(name: &str, child: &Path) -> CallToolResult {
         "add_schematic_component" => component,
         "batch_place_components" => json!({"components": [
             component,
-            {"lib_id": "complex_hierarchy:R", "reference": "R999", "x": 110.1, "y": 80.2}
+            {"lib_id": "complex_hierarchy:R", "reference": if reused { "R?" } else { "R999" }, "x": 110.1, "y": 80.2}
         ]}),
         "add_power_symbol" => json!({"power_net": "GND", "x": 100.1, "y": 80.2, "rotation": 90.0}),
         _ => unreachable!(),
@@ -146,18 +146,253 @@ async fn place(name: &str, child: &Path) -> CallToolResult {
     (tool.handler)(&args, context).await.unwrap()
 }
 
-async fn add_native_component(child: &Path, component: Value) -> CallToolResult {
-    let mut args = component;
-    args["schematic"] = json!(child.display().to_string());
+async fn call_schematic_tool(name: &str, path: &Path, mut args: Value) -> CallToolResult {
+    args["schematic"] = json!(path.display().to_string());
     let context = Arc::new(ToolContext::new(
         ServerConfig::default(),
         Arc::new(ToolRouter::new()),
     ));
-    let tool = sch_components::tools()
-        .into_iter()
-        .find(|tool| tool.name == "add_schematic_component")
-        .unwrap();
+    let mut tools = sch_components::tools();
+    tools.extend(sch_batch::tools());
+    tools.extend(templates::tools());
+    let tool = tools.into_iter().find(|tool| tool.name == name).unwrap();
     (tool.handler)(&args, context).await.unwrap()
+}
+
+async fn add_native_component(child: &Path, component: Value) -> CallToolResult {
+    call_schematic_tool("add_schematic_component", child, component).await
+}
+
+fn resistor(reference: &str, x: f64) -> Value {
+    json!({"lib_id": "complex_hierarchy:R", "reference": reference, "x": x, "y": 100.0})
+}
+
+#[tokio::test]
+async fn occupied_number_across_sheets_refuses_add_and_rename_without_writing() {
+    let (_directory, root, child) = fixture(false);
+    let mut root_candidate = resistor("R901", 100.0);
+    root_candidate["lib_id"] = json!("complex_hierarchy:CP");
+    let root_ref = add_native_component(&root, root_candidate).await;
+    assert!(!root_ref.is_error, "{root_ref:?}");
+    let child_ref = add_native_component(&child, resistor("R902", 110.0)).await;
+    assert!(!child_ref.is_error, "{child_ref:?}");
+    let before = std::fs::read(&child).unwrap();
+
+    let rejected = add_native_component(&child, resistor("R0901", 120.0)).await;
+    assert!(rejected.is_error, "{rejected:?}");
+    assert_eq!(body(&rejected)["error"]["kind"], "reference_conflict");
+    assert_eq!(std::fs::read(&child).unwrap(), before);
+
+    let rejected = call_schematic_tool(
+        "edit_schematic_component",
+        &child,
+        json!({"reference": "R902", "new_reference": "R901", "value": "22k"}),
+    )
+    .await;
+    assert!(rejected.is_error, "{rejected:?}");
+    assert_eq!(body(&rejected)["error"]["kind"], "reference_conflict");
+    assert_eq!(std::fs::read(&child).unwrap(), before);
+
+    let accepted = call_schematic_tool(
+        "edit_schematic_component",
+        &child,
+        json!({"reference": "R902", "new_reference": "R903", "value": "22k"}),
+    )
+    .await;
+    assert!(!accepted.is_error, "{accepted:?}");
+    let accepted = body(&accepted);
+    assert_eq!(accepted["unit_count"], 1);
+    assert!(accepted["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|change| {
+            change
+                .as_str()
+                .is_some_and(|message| message == "Value → 22k (1 unit(s))")
+        }));
+}
+
+#[tokio::test]
+async fn numbered_legacy_property_on_a_sibling_remains_reserved() {
+    let (_directory, root, child) = fixture(false);
+    let mut root_candidate = resistor("R901", 100.0);
+    root_candidate["lib_id"] = json!("complex_hierarchy:CP");
+    let root_ref = add_native_component(&root, root_candidate).await;
+    assert!(!root_ref.is_error, "{root_ref:?}");
+    let mut saved = Schematic::load(&root).unwrap();
+    let symbol = saved
+        .symbols
+        .iter_mut()
+        .find(|symbol| symbol.reference() == Some("R901"))
+        .unwrap();
+    symbol
+        .raw_sub_nodes
+        .retain(|node| node.tag() != Some("instances"));
+    saved.overwrite().unwrap();
+
+    let before = std::fs::read(&child).unwrap();
+    let rejected = add_native_component(&child, resistor("R901", 110.0)).await;
+    assert!(rejected.is_error, "{rejected:?}");
+    assert_eq!(body(&rejected)["error"]["kind"], "reference_conflict");
+    assert_eq!(std::fs::read(&child).unwrap(), before);
+}
+
+#[tokio::test]
+async fn batch_keeps_first_number_and_rejects_duplicate_item() {
+    let (_directory, _root, child) = fixture(false);
+    let result = call_schematic_tool(
+        "batch_place_components",
+        &child,
+        json!({"components": [resistor("R901", 100.0), resistor("R901", 110.0)]}),
+    )
+    .await;
+    let response = body(&result);
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(response["placed_count"], 1);
+    assert_eq!(response["failures"][0]["kind"], "reference_conflict");
+    assert_eq!(
+        Schematic::load(&child)
+            .unwrap()
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.reference() == Some("R901"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn repeated_physical_symbol_cannot_use_one_number_in_two_logical_instances() {
+    let (_directory, _root, child) = fixture(true);
+    let before = std::fs::read(&child).unwrap();
+
+    let rejected = add_native_component(&child, resistor("R901", 100.0)).await;
+    assert!(rejected.is_error, "{rejected:?}");
+    assert_eq!(body(&rejected)["error"]["kind"], "reference_conflict");
+    assert_eq!(std::fs::read(&child).unwrap(), before);
+
+    let accepted = add_native_component(&child, resistor("R?", 100.0)).await;
+    assert!(!accepted.is_error, "{accepted:?}");
+    assert_eq!(body(&accepted)["instance_paths"], json!([PATH_A, PATH_B]));
+}
+
+#[tokio::test]
+async fn distinct_package_units_can_share_a_reference_across_sheets() {
+    let (_directory, root, child) = fixture(false);
+    std::fs::write(
+        root.parent().unwrap().join("sym-lib-table"),
+        r#"(sym_lib_table (lib (name "complex_hierarchy") (type "KiCad") (uri "${KIPRJMOD}/sheets/deep/fixture.kicad_sym") (options "") (descr "KiCad demo definitions")))"#,
+    ).unwrap();
+    for (path, unit) in [(&root, 1), (&child, 2)] {
+        let placed = add_native_component(
+            path,
+            json!({
+                "lib_id": "complex_hierarchy:LM358N", "reference": "U991",
+                "value": "same package", "x": 100.0, "y": 100.0, "unit": unit
+            }),
+        )
+        .await;
+        assert!(!placed.is_error, "{placed:?}");
+    }
+
+    let before = std::fs::read(&child).unwrap();
+    let split = call_schematic_tool(
+        "edit_schematic_component",
+        &child,
+        json!({"reference": "U991", "new_reference": "U992"}),
+    )
+    .await;
+    assert!(split.is_error, "{split:?}");
+    assert_eq!(body(&split)["error"]["kind"], "reference_conflict");
+    let replace = call_schematic_tool(
+        "replace_component",
+        &child,
+        json!({"reference": "U991", "new_lib_id": "complex_hierarchy:R", "unit": 1}),
+    )
+    .await;
+    assert!(replace.is_error, "{replace:?}");
+    assert_eq!(body(&replace)["error"]["kind"], "reference_conflict");
+    assert_eq!(std::fs::read(&child).unwrap(), before);
+}
+
+#[tokio::test]
+async fn references_are_reserved_across_saved_top_level_sheets() {
+    let (_directory, root, child) = fixture(false);
+    let sibling = root.with_file_name("second.kicad_sch");
+    let mut other = Schematic::load(&root).unwrap();
+    let other_uuid = "cdebdb5d-a7f9-445d-93b9-c6ecdcdebef8";
+    other.uuid = Some(other_uuid.to_owned());
+    other.sheets = konnect_schematic_editor::SheetCollection::new(Vec::new());
+    other.symbols.retain(|_| false);
+    other.save(&sibling).unwrap();
+
+    let project_path = root.with_extension("kicad_pro");
+    let mut project: Value =
+        serde_json::from_slice(&std::fs::read(&project_path).unwrap()).unwrap();
+    project["schematic"]["top_level_sheets"] = json!([
+        {"filename": "complex_hierarchy.kicad_sch"},
+        {"filename": "second.kicad_sch", "uuid": other_uuid}
+    ]);
+    std::fs::write(project_path, serde_json::to_vec(&project).unwrap()).unwrap();
+    let mut capacitor = resistor("R901", 100.0);
+    capacitor["lib_id"] = json!("complex_hierarchy:CP");
+    let placed = add_native_component(&sibling, capacitor).await;
+    assert!(!placed.is_error, "{placed:?}");
+
+    let before = std::fs::read(&child).unwrap();
+    let refused = add_native_component(&child, resistor("R901", 110.0)).await;
+    assert!(refused.is_error, "{refused:?}");
+    assert_eq!(body(&refused)["error"]["kind"], "reference_conflict");
+    assert_eq!(std::fs::read(&child).unwrap(), before);
+}
+
+#[test]
+fn numbered_reference_commit_refuses_a_sibling_revision_race() {
+    let (_directory, root, child) = fixture(false);
+    let before = std::fs::read_to_string(&child).unwrap();
+    let inventory =
+        sch_references::ReferenceInventory::load(&child, &before, &before, None).unwrap();
+    let mut other_revision = std::fs::read_to_string(&root).unwrap();
+    other_revision.push('\n');
+    std::fs::write(&root, &other_revision).unwrap();
+    let candidate = format!("{before}\n");
+    let error = inventory.commit(&before, &candidate).unwrap_err();
+    assert!(
+        matches!(error, konnect_sexp::SexpError::Conflict { .. }),
+        "{error:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&child).unwrap(), before);
+    assert_eq!(std::fs::read_to_string(&root).unwrap(), other_revision);
+}
+
+#[test]
+fn nested_reference_commit_recovers_pending_project_journal() {
+    let (_directory, root, child) = fixture(false);
+    let before = std::fs::read_to_string(&child).unwrap();
+    let inventory =
+        sch_references::ReferenceInventory::load(&child, &before, &before, None).unwrap();
+    let root_before = std::fs::read_to_string(&root).unwrap();
+    let root_after = format!("{root_before}\n");
+    let journal_path = root.with_file_name(".konnect-transaction-reference-test.json");
+    let journal = json!({
+        "version": 1, "id": "reference-test",
+        "entries": [{
+            "path": root.file_name().unwrap().to_str().unwrap(),
+            "expected": root_before, "replacement": root_after
+        }]
+    });
+    std::fs::write(&journal_path, journal.to_string()).unwrap();
+
+    let candidate = format!("{before}\n");
+    let error = inventory.commit(&before, &candidate).unwrap_err();
+    assert!(
+        matches!(error, konnect_sexp::SexpError::Conflict { .. }),
+        "{error:?}"
+    );
+    assert!(!journal_path.exists());
+    assert_eq!(std::fs::read_to_string(&child).unwrap(), before);
+    assert_eq!(std::fs::read_to_string(&root).unwrap(), root_after);
 }
 
 fn body(result: &CallToolResult) -> Value {
@@ -168,6 +403,88 @@ fn body(result: &CallToolResult) -> Value {
 }
 
 #[tokio::test]
+async fn noncardinal_schematic_rotation_refuses_every_write() {
+    let (_directory, _root, path) = fixture(false);
+    let reference = Schematic::load(&path)
+        .unwrap()
+        .symbols
+        .iter()
+        .filter_map(|symbol| symbol.reference())
+        .find(|reference| !reference.starts_with('#'))
+        .unwrap()
+        .to_owned();
+    let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+        auto_load_toolsets: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let label = |net, x, rotation| json!({ "net": net, "x": x, "y": 80.0, "rotation": rotation });
+    let component = |reference, rotation| {
+        json!({
+            "lib_id": "complex_hierarchy:R", "reference": reference, "x": 100.0, "y": 100.0,
+            "rotation": rotation
+        })
+    };
+    let call = |name, mut arguments: Value| {
+        arguments["schematic"] = json!(path);
+        handler.handle_message(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }))
+    };
+    for (net, x) in [("A", 100.0), ("B", 110.0)] {
+        let setup = call("add_schematic_net_label", label(net, x, 0.0))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_ne!(setup["isError"], true, "{setup}");
+    }
+    let before = std::fs::read(&path).unwrap();
+    let cases = [
+        ("add_schematic_component", component("R999", 45.0)),
+        (
+            "rotate_schematic_component",
+            json!({"reference": reference, "rotation": 45.0}),
+        ),
+        (
+            "add_power_symbol",
+            json!({"power_net": "GND", "x": 100.0, "y": 100.0, "rotation": 45}),
+        ),
+        ("add_schematic_net_label", label("C", 120.0, 45.0)),
+        ("rotate_schematic_label", label("A", 100.0, 45.0)),
+        (
+            "batch_place_components",
+            json!({"components": [
+                component("R999", 90.0), component("R998", 45.0)
+            ]}),
+        ),
+        (
+            "batch_rotate_labels",
+            json!({"labels": [label("A", 100.0, 90.0), label("B", 110.0, 45.0)]}),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (name, args) in cases {
+        let result = call(name, args).await.unwrap().result.unwrap();
+        let body: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        let unchanged = std::fs::read(&path).unwrap() == before;
+        if result["isError"] != true || body["error"]["kind"] != "invalid_argument" || !unchanged {
+            failures.push(format!(
+                "{name}: isError={}, kind={}, unchanged={unchanged}",
+                result["isError"], body["error"]["kind"]
+            ));
+            // Keep every case independent even on the buggy baseline.
+            std::fs::write(&path, &before).unwrap();
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
 async fn native_placement_preserves_unique_and_reused_paths_with_committed_readback() {
     for reused in [false, true] {
         for name in PLACERS {
@@ -175,7 +492,7 @@ async fn native_placement_preserves_unique_and_reused_paths_with_committed_readb
             let root_before = std::fs::read(&root).unwrap();
             let project_before = std::fs::read(root.with_extension("kicad_pro")).unwrap();
             let existing = Schematic::load(&child).unwrap().symbols.into_vec();
-            let result = place(name, &child).await;
+            let result = place(name, &child, reused).await;
             assert!(!result.is_error, "{name}, reused={reused}: {result:?}");
             let response = body(&result);
             let placed = if name == "batch_place_components" {
@@ -221,7 +538,7 @@ async fn native_placement_preserves_unique_and_reused_paths_with_committed_readb
                 assert_eq!(entry["y"].as_f64(), Some(symbol.at.y));
                 assert_eq!(entry["rotation"].as_f64(), symbol.at.rotation);
                 assert_eq!(entry["unit"], symbol.unit);
-                if symbol.reference() == Some("U999") {
+                if matches!(symbol.reference(), Some("U999" | "U?")) {
                     assert_eq!(symbol.unit, 2);
                 }
                 // Every placer is handed an off-grid point (x = 100.1 or 110.1,
@@ -402,7 +719,7 @@ async fn native_placement_refuses_stale_instance_metadata_without_writing() {
             schematic.overwrite().unwrap();
             let before = std::fs::read(&child).unwrap();
             let root_before = std::fs::read(&root).unwrap();
-            let result = place(name, &child).await;
+            let result = place(name, &child, true).await;
             assert!(result.is_error, "{name}/{corruption}: {result:?}");
             assert_eq!(
                 body(&result)["error"]["kind"],
@@ -1089,7 +1406,7 @@ async fn native_placement_refuses_ambiguous_ownership_without_writing() {
         .unwrap();
         let before = std::fs::read(&child).unwrap();
         let root_before = std::fs::read(&root).unwrap();
-        let result = place(name, &child).await;
+        let result = place(name, &child, true).await;
         assert!(result.is_error, "{name}: {result:?}");
         assert_eq!(body(&result)["error"]["kind"], "conflict");
         assert_eq!(std::fs::read(&child).unwrap(), before);
@@ -1305,12 +1622,19 @@ async fn native_component_writes_accept_children_under_both_configured_roots() {
         let expected = format!("/{root_id}{sheet_suffix}");
         std::fs::write(path, child_source.replace(PATH_A, &expected)).unwrap();
     }
-    for (path, root_id) in children {
+    for ((path, root_id), reference) in children.into_iter().zip(["U999", "U1000"]) {
         let expected = format!("/{root_id}{sheet_suffix}");
-        let result = place("add_schematic_component", path).await;
+        let result = add_native_component(
+            path,
+            json!({
+                "lib_id": "complex_hierarchy:LM358N", "reference": reference,
+                "x": 100.1, "y": 80.2, "unit": 2
+            }),
+        )
+        .await;
         assert!(!result.is_error, "{result:?}");
         let doc = Schematic::load(path).unwrap();
-        let symbol = doc.symbols.by_reference("U999").unwrap();
+        let symbol = doc.symbols.by_reference(reference).unwrap();
         assert_eq!(
             symbol.instance_paths(),
             [("complex_hierarchy".to_owned(), expected)]

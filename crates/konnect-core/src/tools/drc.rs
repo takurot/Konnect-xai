@@ -15,6 +15,7 @@ pub(crate) async fn write_report(output: &str, contents: &str) -> anyhow::Result
     let path = std::path::PathBuf::from(output);
     let contents = contents.to_string();
     crate::tools::blocking_work::spawn_tracked_blocking(move || {
+        cli::ensure_export_destination_is_not_design_file(&path)?;
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("could not create report directory {}", parent.display())
@@ -125,6 +126,9 @@ pub(crate) async fn run(
     // permission changes or filesystem races still need applied-state recovery.
     if let Some(output) = args["output"].as_str() {
         let output_path = Path::new(output);
+        if let Err(error) = cli::ensure_export_destination_is_not_design_file(output_path) {
+            return Ok(Err(super::invalid_arg("output", &error.to_string())));
+        }
         let same_board = match (output_path.canonicalize(), board.canonicalize()) {
             (Ok(output), Ok(board)) => output == board,
             _ => output_path == board,

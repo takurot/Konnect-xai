@@ -16,8 +16,9 @@ use crate::tools::{
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::geometry::round6;
+use konnect_sexp::schematic::write_schematic_if_unchanged;
 use konnect_sexp::schematic::{format_hierarchical_sheet, HierarchicalSheetSpec};
-use konnect_sexp::writer::{write_atomic_if_unchanged, write_new_atomic};
+use konnect_sexp::writer::write_new_atomic;
 use konnect_sexp::{
     commit_command, commit_file_transaction, parse_sexp, prepare_command, read_consistent,
     FileTransition, ItemAnchor, ItemId, SchematicCommand,
@@ -28,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 mod instance_contract_tests;
-mod instances;
+pub(crate) mod instances;
 mod page_history;
 use instances::HierarchySnapshot;
 
@@ -321,6 +322,9 @@ pub(crate) async fn handle_create_schematic(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let path = get_path(args, "path")?;
+    if !konnect_sexp::schematic::has_schematic_extension(&path) {
+        return Ok(crate::tools::invalid_arg("path", "not_a_schematic"));
+    }
     let size = opt_str(args, "size").unwrap_or("A4").to_string();
     let portrait = args["portrait"].as_bool().unwrap_or(false);
     let (w, h) = match paper_dimensions(&size) {
@@ -431,7 +435,7 @@ async fn handle_set_page(
             content.insert_str(anchor, &format!("\n  {node}"));
         }
     }
-    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+    write_schematic_if_unchanged(&sch_path, &expected, &content)?;
 
     Ok(CallToolResult::json(&json!({
         "size": size,

@@ -4,8 +4,9 @@
 
 use crate::geometry::{fmt_mm, transform_pin, PinTransform};
 use crate::parser::{parse_sexp, SexpNode};
-use crate::writer::read_consistent;
+use crate::writer::{read_consistent, write_atomic_if_unchanged};
 use crate::SexpError;
+use std::io::{self, BufRead};
 use std::path::Path;
 
 // ─── Schematic file I/O ───────────────────────────────────────────────────────
@@ -27,10 +28,63 @@ pub fn format_blank_schematic_with_paper(size: &str, portrait: bool) -> String {
     )
 }
 
+/// Check the extension used for a KiCad schematic.
+#[must_use]
+pub fn has_schematic_extension(path: &Path) -> bool {
+    crate::paths::has_document_extension(path, "kicad_sch")
+}
+
+/// Recognize the bare root token without loading or parsing the file body.
+pub fn has_schematic_root(source: impl BufRead) -> io::Result<bool> {
+    crate::parser::has_bare_list_root(source, "kicad_sch")
+}
+
+/// Replace text only when both revisions are schematic sources and the
+/// observed bytes still match the on-disk revision.
+pub fn write_schematic_if_unchanged(
+    path: &Path,
+    expected: &str,
+    replacement: &str,
+) -> Result<(), SexpError> {
+    if !has_schematic_root(expected.as_bytes())? || !has_schematic_root(replacement.as_bytes())? {
+        return Err(SexpError::MissingNode("kicad_sch".into()));
+    }
+    write_atomic_if_unchanged(path, expected, replacement)
+}
+
 pub fn read_schematic(path: &Path) -> Result<(String, SexpNode), SexpError> {
     let content = read_consistent(path)?;
     let tree = parse_sexp(&content)?;
+    if !matches!(tree.get(0), Some(SexpNode::Atom(name)) if name == "kicad_sch") {
+        return Err(SexpError::MissingNode("kicad_sch".into()));
+    }
     Ok((content, tree))
+}
+
+#[test]
+fn read_schematic_refuses_an_unrecognized_root_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mislabeled.kicad_sch");
+    for wrong_type in ["(kicad_pcb)", "(\"kicad_sch\")", "kicad_sch"] {
+        std::fs::write(&path, wrong_type).unwrap();
+        assert!(read_schematic(&path).is_err());
+    }
+}
+
+#[test]
+fn schematic_write_verifies_the_exact_before_and_replacement_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mislabeled.kicad_sch");
+    let board = "(kicad_pcb)";
+    let schematic = "(kicad_sch)";
+
+    std::fs::write(&path, board).unwrap();
+    assert!(write_schematic_if_unchanged(&path, board, schematic).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), board);
+
+    std::fs::write(&path, schematic).unwrap();
+    assert!(write_schematic_if_unchanged(&path, schematic, board).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), schematic);
 }
 
 // ─── Coordinate helpers ───────────────────────────────────────────────────────
@@ -818,13 +872,25 @@ pub fn extract_all_net_labels(tree: &SexpNode) -> Vec<Label> {
 /// it flags. Symbols whose definition is not embedded in `lib_symbols` are
 /// skipped: without it there is no pin to place the label on.
 pub fn extract_power_symbol_labels(tree: &SexpNode) -> Vec<Label> {
+    power_symbol_labels(tree, false)
+}
+
+/// Explicit power labels on the active saved presentation of each symbol.
+pub fn extract_active_power_symbol_labels(tree: &SexpNode) -> Vec<Label> {
+    power_symbol_labels(tree, true)
+}
+
+fn power_symbol_labels(tree: &SexpNode, active_body_only: bool) -> Vec<Label> {
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
 
     let mut labels = Vec::new();
-    for inst in extract_symbol_instances(tree) {
+    for placement in tree.find_all("symbol") {
+        let Some(inst) = extract_symbol_instance(placement) else {
+            continue;
+        };
         if inst.value.is_empty() {
             continue;
         }
@@ -837,7 +903,12 @@ pub fn extract_power_symbol_labels(tree: &SexpNode) -> Vec<Label> {
             continue;
         }
         let t = inst.pin_transform();
-        for pin in extract_lib_pins_for_unit(sym, inst.unit) {
+        let pins = if active_body_only {
+            extract_lib_pins_for_placement(sym, placement, inst.unit)
+        } else {
+            extract_lib_pins_for_unit(sym, inst.unit)
+        };
+        for pin in pins {
             if pin.electrical_type != "power_in" {
                 continue;
             }
@@ -851,6 +922,58 @@ pub fn extract_power_symbol_labels(tree: &SexpNode) -> Vec<Label> {
                 uuid: inst.uuid.clone(),
             });
         }
+    }
+    labels
+}
+
+/// Legacy invisible power inputs on ordinary symbols connect globally by pin
+/// name. Saved electrical analysis includes these alongside explicit power
+/// symbols.
+pub fn extract_legacy_power_pin_labels(tree: &SexpNode) -> Vec<Label> {
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
+    let mut labels = Vec::new();
+    for placement in tree.find_all("symbol") {
+        let Some(instance) = extract_symbol_instance(placement) else {
+            continue;
+        };
+        let Some(symbol) = find_lib_symbol(&lib_syms, &instance) else {
+            continue;
+        };
+        if symbol.find("power").is_some() {
+            continue;
+        }
+        let style = symbol_body_style(placement);
+        visit_unit_pin_nodes(symbol, instance.unit, Some(style), &mut |node| {
+            let hidden = node.find_str("hide").map_or_else(
+                || {
+                    node.children().is_some_and(|fields| {
+                        fields
+                            .iter()
+                            .skip(3)
+                            .any(|field| field.as_str() == Some("hide"))
+                    })
+                },
+                |value| value == "yes",
+            );
+            if !hidden || node.get(1).and_then(SexpNode::as_str) != Some("power_in") {
+                return;
+            }
+            let Some(pin) = parse_lib_pin(node).filter(|pin| !pin.name.is_empty()) else {
+                return;
+            };
+            let (x, y) = pin_endpoint(&pin, instance.pin_transform());
+            labels.push(Label {
+                kind: LabelKind::PowerSymbol,
+                net: pin.name,
+                x,
+                y,
+                rotation: instance.rotation,
+                uuid: instance.uuid.clone(),
+            });
+        });
     }
     labels
 }
@@ -879,7 +1002,7 @@ pub struct LibPin {
 /// `connect_pins` ("Pin '2' not found on 'R1'").
 pub fn extract_lib_pins(sym_node: &SexpNode) -> Vec<LibPin> {
     let mut out = Vec::new();
-    collect_pins_recursive(sym_node, &mut out);
+    visit_pin_nodes(sym_node, &mut |node| out.extend(parse_lib_pin(node)));
     out
 }
 
@@ -894,45 +1017,79 @@ pub fn extract_lib_pins(sym_node: &SexpNode) -> Vec<LibPin> {
 /// suffix, are always kept).
 pub fn extract_lib_pins_for_unit(sym_node: &SexpNode, unit: u32) -> Vec<LibPin> {
     let mut out = Vec::new();
+    visit_unit_pin_nodes(sym_node, unit, None, &mut |node| {
+        out.extend(parse_lib_pin(node))
+    });
+    out
+}
+
+/// Pins belonging to the active unit and body style of a saved placement.
+pub fn extract_lib_pins_for_placement(
+    definition: &SexpNode,
+    placement: &SexpNode,
+    unit: u32,
+) -> Vec<LibPin> {
+    let mut out = Vec::new();
+    let style = symbol_body_style(placement);
+    visit_unit_pin_nodes(definition, unit, Some(style), &mut |node| {
+        out.extend(parse_lib_pin(node));
+    });
+    out
+}
+
+fn symbol_body_style(placement: &SexpNode) -> u32 {
+    placement
+        .find_str("body_style")
+        .or_else(|| placement.find_str("convert"))
+        .and_then(|style| style.parse().ok())
+        .unwrap_or(1)
+}
+
+fn visit_unit_pin_nodes(
+    sym_node: &SexpNode,
+    unit: u32,
+    body_style: Option<u32>,
+    visit: &mut impl FnMut(&SexpNode),
+) {
     for pin in sym_node.find_all("pin") {
-        if let Some(lib_pin) = parse_lib_pin(pin) {
-            out.push(lib_pin);
-        }
+        visit(pin);
     }
     for sub in sym_node.find_all("symbol") {
-        let sub_unit = sub
+        let variant = sub
             .get(1)
-            .and_then(|n| n.as_str())
-            .and_then(parse_subsymbol_unit);
-        match sub_unit {
-            Some(n) if n != 0 && n != unit => {} // another unit's pins: skip
-            // n == 0 (common), n == unit, or an un-suffixed name: keep all.
-            _ => collect_pins_recursive(sub, &mut out),
+            .and_then(SexpNode::as_str)
+            .and_then(parse_subsymbol_variant);
+        if variant.is_none_or(|(sub_unit, sub_style)| {
+            (sub_unit == 0 || sub_unit == unit)
+                && body_style.is_none_or(|active| sub_style == 0 || sub_style == active)
+        }) {
+            visit_pin_nodes(sub, visit);
         }
     }
-    out
 }
 
 /// Parse the unit number `N` out of a `Name_N_M` sub-symbol name. Returns
 /// `None` when the name doesn't end in two `_`-separated integers (base names
 /// may themselves contain underscores and digits, e.g. `R_Small_1_1` → 1).
 pub fn parse_subsymbol_unit(name: &str) -> Option<u32> {
-    let mut it = name.rsplitn(3, '_');
-    let _style: u32 = it.next()?.parse().ok()?;
-    let unit: u32 = it.next()?.parse().ok()?;
-    it.next()?; // a base name must exist before the suffix
-    Some(unit)
+    parse_subsymbol_variant(name).map(|(unit, _)| unit)
 }
 
-fn collect_pins_recursive(node: &SexpNode, out: &mut Vec<LibPin>) {
+fn parse_subsymbol_variant(name: &str) -> Option<(u32, u32)> {
+    let mut fields = name.rsplitn(3, '_');
+    let style = fields.next()?.parse().ok()?;
+    let unit = fields.next()?.parse().ok()?;
+    fields.next()?; // a base name must exist before the suffix
+    Some((unit, style))
+}
+
+fn visit_pin_nodes(node: &SexpNode, visit: &mut impl FnMut(&SexpNode)) {
     for pin in node.find_all("pin") {
-        if let Some(lib_pin) = parse_lib_pin(pin) {
-            out.push(lib_pin);
-        }
+        visit(pin);
     }
     // Recurse into unit/body-style sub-symbols ("R_1_1", "R_1_0", …).
     for sub in node.find_all("symbol") {
-        collect_pins_recursive(sub, out);
+        visit_pin_nodes(sub, visit);
     }
 }
 

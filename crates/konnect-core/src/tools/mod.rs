@@ -46,6 +46,8 @@ pub(crate) mod sch_connectivity;
 pub mod sch_export;
 pub mod sch_hierarchy;
 mod sch_overlap;
+mod sch_project_netlist;
+mod sch_references;
 pub(crate) mod sch_route_safety;
 pub mod sch_wiring;
 pub mod schematic_builder;
@@ -931,6 +933,29 @@ pub(crate) fn invalid_arg(field: &str, reason: &str) -> CallToolResult {
     )
 }
 
+/// Parse an optional schema enum consistently even when invoked without MCP
+/// validation. An explicit non-string value does not select the default.
+pub(crate) fn optional_enum<T: serde::de::DeserializeOwned + serde::Serialize + PartialEq>(
+    args: &Value,
+    field: &str,
+    choices: &[T],
+    default: T,
+) -> Result<T, CallToolResult> {
+    let Some(value) = args.get(field) else {
+        return Ok(default);
+    };
+    value
+        .as_str()
+        .and_then(|_| serde_json::from_value::<T>(value.clone()).ok())
+        .filter(|value| choices.contains(value))
+        .ok_or_else(|| {
+            invalid_arg(
+                field,
+                &format!("must be one of {}", serde_json::json!(choices)),
+            )
+        })
+}
+
 /// Report that a write completed but its immediate readback could not prove
 /// the requested state. Callers must not turn this into a stale-target refusal:
 /// the file may already contain the mutation or an external follow-up edit.
@@ -1005,6 +1030,29 @@ pub fn require_f64(args: &Value, key: &str) -> Result<f64, CallToolResult> {
     args[key]
         .as_f64()
         .ok_or_else(|| invalid_arg(key, "missing or not a number"))
+}
+
+/// Cardinal angles are the rotations written for schematic symbols and labels.
+pub(crate) fn normalize_schematic_rotation(angle: f64) -> Option<f64> {
+    match angle.rem_euclid(360.0) {
+        0.0 => Some(0.0),
+        angle @ (90.0 | 180.0 | 270.0) => Some(angle),
+        _ => None,
+    }
+}
+
+pub(crate) fn schematic_rotation_arg(
+    value: Option<&Value>,
+    field: &str,
+    default: Option<f64>,
+) -> Result<f64, CallToolResult> {
+    let angle = match value {
+        Some(value) => value.as_f64(),
+        None => default,
+    }
+    .ok_or_else(|| invalid_arg(field, "missing or not a number"))?;
+    normalize_schematic_rotation(angle)
+        .ok_or_else(|| invalid_arg(field, "expected a multiple of 90 degrees"))
 }
 
 /// Validate a millimetre value before a coordinate is written or reported.
@@ -1222,15 +1270,37 @@ pub(crate) type PlacedPinsByReference = Vec<(
 /// reference alone collapses on a pre-annotation sheet where every part is
 /// `R?`.
 pub(crate) fn placed_pins_by_reference(tree: &konnect_sexp::SexpNode) -> PlacedPinsByReference {
-    use konnect_sexp::schematic::{
-        extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol,
-    };
+    placed_pins_with(tree, |definition, _, unit| {
+        konnect_sexp::schematic::extract_lib_pins_for_unit(definition, unit)
+    })
+}
+
+/// Saved analysis uses the presentation selected on each placement.
+fn analysis_placed_pins_by_reference(tree: &konnect_sexp::SexpNode) -> PlacedPinsByReference {
+    placed_pins_with(
+        tree,
+        konnect_sexp::schematic::extract_lib_pins_for_placement,
+    )
+}
+
+fn placed_pins_with(
+    tree: &konnect_sexp::SexpNode,
+    select: impl Fn(
+        &konnect_sexp::SexpNode,
+        &konnect_sexp::SexpNode,
+        u32,
+    ) -> Vec<konnect_sexp::schematic::LibPin>,
+) -> PlacedPinsByReference {
+    use konnect_sexp::schematic::{extract_symbol_instance, find_lib_symbol};
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
     let mut by_reference = Vec::new();
-    for inst in extract_symbol_instances(tree) {
+    for placement in tree.find_all("symbol") {
+        let Some(inst) = extract_symbol_instance(placement) else {
+            continue;
+        };
         // find_lib_symbol, not a lib_id match: an instance carrying a
         // (lib_name …) is a sheet-local derived symbol whose pins can sit
         // elsewhere than the base definition's (#143).
@@ -1238,7 +1308,7 @@ pub(crate) fn placed_pins_by_reference(tree: &konnect_sexp::SexpNode) -> PlacedP
             continue;
         };
         let t = inst.pin_transform();
-        let pins = extract_lib_pins_for_unit(sym, inst.unit)
+        let pins = select(sym, placement, inst.unit)
             .into_iter()
             .map(|p| (p, t))
             .collect();

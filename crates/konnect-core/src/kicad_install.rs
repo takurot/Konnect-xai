@@ -296,6 +296,40 @@ pub fn share_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// Pick templates from the same installation as the selected executable.
+pub(crate) fn library_template_candidates(configured: &str, table: &str) -> Vec<PathBuf> {
+    let configured = configured.trim();
+    let cli = if configured.is_empty() {
+        find_cli("kicad-cli")
+    } else {
+        Some(crate::tools::cli::resolve_cli_executable(configured))
+    };
+    if let Some(cli) = cli {
+        // Follow package-manager symlinks to the owning installation.
+        let share = |binary: &Path| {
+            let parent = binary.parent()?;
+            if parent.file_name() == Some(OsStr::new("MacOS")) {
+                Some(parent.parent()?.join("SharedSupport"))
+            } else {
+                installation_root_from_binary(binary).map(|root| root.join("share/kicad"))
+            }
+        };
+        let root = cli
+            .canonicalize()
+            .ok()
+            .and_then(|binary| share(&binary))
+            .or_else(|| share(&cli));
+        return root
+            .into_iter()
+            .map(|root| root.join("template").join(table))
+            .collect();
+    }
+    share_roots()
+        .into_iter()
+        .map(|root| root.join("template").join(table))
+        .collect()
+}
+
 #[cfg(target_os = "windows")]
 fn installation_roots() -> Vec<PathBuf> {
     static ROOTS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
