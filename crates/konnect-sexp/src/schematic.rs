@@ -4,8 +4,9 @@
 
 use crate::geometry::{fmt_mm, transform_pin, PinTransform};
 use crate::parser::{parse_sexp, SexpNode};
-use crate::writer::read_consistent;
+use crate::writer::{read_consistent, write_atomic_if_unchanged};
 use crate::SexpError;
+use std::io::{self, BufRead};
 use std::path::Path;
 
 // ─── Schematic file I/O ───────────────────────────────────────────────────────
@@ -27,10 +28,63 @@ pub fn format_blank_schematic_with_paper(size: &str, portrait: bool) -> String {
     )
 }
 
+/// Check the extension used for a KiCad schematic.
+#[must_use]
+pub fn has_schematic_extension(path: &Path) -> bool {
+    crate::paths::has_document_extension(path, "kicad_sch")
+}
+
+/// Recognize the bare root token without loading or parsing the file body.
+pub fn has_schematic_root(source: impl BufRead) -> io::Result<bool> {
+    crate::parser::has_bare_list_root(source, "kicad_sch")
+}
+
+/// Replace text only when both revisions are schematic sources and the
+/// observed bytes still match the on-disk revision.
+pub fn write_schematic_if_unchanged(
+    path: &Path,
+    expected: &str,
+    replacement: &str,
+) -> Result<(), SexpError> {
+    if !has_schematic_root(expected.as_bytes())? || !has_schematic_root(replacement.as_bytes())? {
+        return Err(SexpError::MissingNode("kicad_sch".into()));
+    }
+    write_atomic_if_unchanged(path, expected, replacement)
+}
+
 pub fn read_schematic(path: &Path) -> Result<(String, SexpNode), SexpError> {
     let content = read_consistent(path)?;
     let tree = parse_sexp(&content)?;
+    if !matches!(tree.get(0), Some(SexpNode::Atom(name)) if name == "kicad_sch") {
+        return Err(SexpError::MissingNode("kicad_sch".into()));
+    }
     Ok((content, tree))
+}
+
+#[test]
+fn read_schematic_refuses_an_unrecognized_root_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mislabeled.kicad_sch");
+    for wrong_type in ["(kicad_pcb)", "(\"kicad_sch\")", "kicad_sch"] {
+        std::fs::write(&path, wrong_type).unwrap();
+        assert!(read_schematic(&path).is_err());
+    }
+}
+
+#[test]
+fn schematic_write_verifies_the_exact_before_and_replacement_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mislabeled.kicad_sch");
+    let board = "(kicad_pcb)";
+    let schematic = "(kicad_sch)";
+
+    std::fs::write(&path, board).unwrap();
+    assert!(write_schematic_if_unchanged(&path, board, schematic).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), board);
+
+    std::fs::write(&path, schematic).unwrap();
+    assert!(write_schematic_if_unchanged(&path, schematic, board).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), schematic);
 }
 
 // ─── Coordinate helpers ───────────────────────────────────────────────────────

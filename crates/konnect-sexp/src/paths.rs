@@ -3,6 +3,13 @@
 use std::borrow::Cow;
 use std::path::Path;
 
+/// Compare a document extension using the spelling accepted on all platforms.
+#[must_use]
+pub fn has_document_extension(path: &Path, expected: &str) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+}
+
 /// Display ordinary Windows paths in the spelling users and KiCad use.
 /// Retain extended-only names where removing the prefix would change their meaning.
 pub fn display_path(path: &Path) -> Cow<'_, str> {

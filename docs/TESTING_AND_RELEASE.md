@@ -289,8 +289,14 @@ after filenames have changed, it returns `mutation_outcome_uncertain` with
 `renamed_pairs`, completed `content_rewrites`, `failing_target`, and any
 `rollback_failures`. Inspect that inventory and preserve external changes before
 reconciling filenames and project references. Never blindly retry the rename or
-roll back already rewritten contents. Project names are escaped independently
-for JSON metadata and S-expression annotation keys.
+roll back already rewritten contents.
+
+Dry-run and apply validate the new filename stem and parse the project settings
+before any move. The JSON rewrite updates matching metadata filenames, entries
+for the moved root sheet, and local settings references to moved files. Other
+settings values, including board rules and net classes, are retained. The
+schematic rewrite updates project annotation keys, and the PCB rewrite updates
+footprint `sheetfile` references to the moved root schematic.
 
 `rename_project` uses the shared native exclusive rename primitive for forward
 moves, rollback, backup directories and optional project-directory moves. A

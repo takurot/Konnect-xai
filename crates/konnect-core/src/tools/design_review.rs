@@ -3,7 +3,7 @@
 //! Analyzes schematic and PCB files for common design issues. Returns structured
 //! findings that Claude can explain, prioritize, and suggest fixes for.
 //!
-//! These tools work on the S-expression files directly — no KiCAD running required.
+//! Standalone audits read saved design files. The consolidated review also runs KiCad CLI.
 
 use super::cli;
 use crate::mcp::protocol::CallToolResult;
@@ -55,8 +55,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "audit_connections",
-            "Check for common connection mistakes: missing pull-ups on I2C/reset, \
-             missing series resistors on LEDs, floating inputs, outputs shorted together. \
+            "Check for missing pull-up resistors on named I2C and reset nets. \
              Defaults to one file; set schematic_scope to 'hierarchy' to audit every \
              reachable sheet instance.",
             json!({
@@ -76,9 +75,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "audit_power_rails",
-            "Check power rail integrity: missing bulk capacitance, no test points on power rails, \
-             voltage regulator output caps missing. Defaults to one file; set schematic_scope \
-             to 'hierarchy' to audit every reachable sheet instance.",
+            "Check named power rails for decoupling, bulk capacitance and test points. \
+             Defaults to one file; set schematic_scope to 'hierarchy' to audit every \
+             reachable sheet instance.",
             json!({
                 "type": "object",
                 "properties": {
@@ -96,15 +95,16 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "audit_manufacturing",
-            "DFM checks for the configured fab house: component spacing, silkscreen overlap, \
-             via-in-pad, acid traps, board outline issues.",
+            "Check saved Edge.Cuts geometry, footprint-side counts and origin proximity, \
+             and the saved project minimum track width for the selected fab house.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "fab_house": {
                         "type": "string",
-                        "description": "Target manufacturer: 'jlcpcb' (default), 'pcbway', 'oshpark'",
+                        "enum": ["jlcpcb", "pcbway", "oshpark"],
+                        "description": "Target manufacturer",
                         "default": "jlcpcb"
                     }
                 },
@@ -114,13 +114,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "run_design_review",
-            "Run all available audit checks and produce a consolidated design review report. \
-             Audits every reachable schematic sheet, and when a board is supplied also runs \
-             KiCAD's DRC, folding its errors, unconnected items and schematic-parity findings \
-             into the verdict. Reports status, coverage, and diagnostics. Returns an INCOMPLETE \
-             verdict instead of approval when coverage is partial, when an audit failed, or \
-             when DRC could not run. This is the tool to call when the user asks 'is my board \
-             ready?' or 'review my design'.",
+            "Review every reachable saved schematic sheet and run KiCad ERC. With a saved \
+             board, also run DFM checks and KiCad DRC, including routing and schematic parity. \
+             Reports findings, coverage and diagnostics. Missing required evidence yields INCOMPLETE.",
             json!({
                 "type": "object",
                 "properties": {
@@ -138,10 +134,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_bom_health",
-            "Check saved BOM components for missing values, footprints, and MPN or LCSC fields. \
-             Defaults to one file; set schematic_scope to 'hierarchy' to audit every reachable \
-             sheet instance. Set check_passive_mpn to false to exempt standard Device resistors, \
-             capacitors, inductors and diodes from the MPN check.",
+            "Inspect saved schematic packages for missing values, footprints and MPN or LCSC \
+             fields. Defaults to one file; set schematic_scope to 'hierarchy' to audit every \
+             reachable sheet instance. Set check_passive_mpn to false to exempt standard Device \
+             resistors, capacitors, inductors and diodes from the MPN check.",
             json!({
                 "type": "object",
                 "properties": {
@@ -192,6 +188,35 @@ impl StandaloneSchematicAudit {
             Self::PowerRails => "power_rails",
             Self::BomHealth => "bom_health",
         }
+    }
+
+    fn add_check_coverage(self, coverage: &mut Value) {
+        let (checked, not_checked): (&[&str], &[&str]) = match self {
+            Self::Decoupling => (&["power_pin_net_decoupling"], &["pcb_placement_distance"]),
+            Self::Connections => (
+                &["named_i2c_pullups", "named_reset_pullups"],
+                &[
+                    "led_series_resistors",
+                    "floating_inputs",
+                    "shorted_outputs",
+                    "unnamed_reset_nets",
+                ],
+            ),
+            Self::PowerRails => (
+                &[
+                    "named_rail_decoupling",
+                    "named_rail_bulk_capacitance",
+                    "named_rail_test_points",
+                ],
+                &["regulator_output_requirements", "rail_drivers"],
+            ),
+            Self::BomHealth => (
+                &["saved_values", "saved_footprints", "saved_part_identifiers"],
+                &["part_lifecycle", "stock", "distributor_availability"],
+            ),
+        };
+        coverage["checked"] = json!(checked);
+        coverage["not_checked"] = json!(not_checked);
     }
 
     async fn run_file(self, args: &Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
@@ -409,7 +434,12 @@ fn audit_connections_tree(tree: &SexpNode) -> anyhow::Result<CallToolResult> {
 
         // Check for reset pins without pull-up
         for (pin, transform) in pins {
-            let name_upper = pin.name.to_uppercase();
+            let name = pin
+                .name
+                .strip_prefix("~{")
+                .and_then(|name| name.strip_suffix('}'))
+                .unwrap_or(&pin.name);
+            let name_upper = name.to_uppercase();
             if (name_upper.contains("RESET") || name_upper.contains("NRST") || name_upper == "RST")
                 && !name_upper.contains("OUT")
             {
@@ -441,7 +471,7 @@ fn audit_connections_tree(tree: &SexpNode) -> anyhow::Result<CallToolResult> {
         serde_json::to_string(&json!({
             "audit": "connections",
             "findings": findings,
-            "summary": format!("{} connection issues found.", findings.len())
+            "summary": format!("{} findings from named pull-up checks.", findings.len())
         }))
         .unwrap(),
     ))
@@ -536,37 +566,65 @@ fn audit_power_rails_tree(tree: &SexpNode) -> anyhow::Result<CallToolResult> {
 
 // ─── Manufacturing audit ─────────────────────────────────────────────────────
 
+pub(super) fn fab_track_width(args: &Value) -> Result<(&str, f64), CallToolResult> {
+    match args.get("fab_house").map(Value::as_str) {
+        None | Some(Some("jlcpcb")) => Ok(("jlcpcb", 0.127)),
+        Some(Some("pcbway")) => Ok(("pcbway", 0.1)),
+        Some(Some("oshpark")) => Ok(("oshpark", 0.152)),
+        _ => Err(invalid_arg(
+            "fab_house",
+            "expected jlcpcb, pcbway, or oshpark",
+        )),
+    }
+}
+
+pub(super) async fn saved_project_min_track_width(board: &Path) -> anyhow::Result<f64> {
+    use anyhow::Context as _;
+
+    let project = board.with_extension("kicad_pro");
+    let content = tokio::fs::read(&project)
+        .await
+        .with_context(|| format!("cannot read saved project {}", project.display()))?;
+    let settings: Value = serde_json::from_slice(&content)
+        .with_context(|| format!("cannot parse saved project {}", project.display()))?;
+    settings
+        .pointer("/board/design_settings/rules/min_track_width")
+        .and_then(Value::as_f64)
+        .filter(|width| width.is_finite() && *width >= 0.0)
+        .with_context(|| format!("no valid minimum track width in {}", project.display()))
+}
+
 async fn handle_audit_manufacturing(
-    args: &serde_json::Value,
+    args: &Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
-    let fab_house = args["fab_house"].as_str().unwrap_or("jlcpcb");
-    info!(board = %board_path.display(), fab_house = %fab_house, "[BETA] Running DFM audit");
+    let board = get_path(args, "board")?;
+    let (fab_house, min_trace) = match fab_track_width(args) {
+        Ok(fab) => fab,
+        Err(error) => return Ok(error),
+    };
+    let report = audit_manufacturing(&board, fab_house, min_trace).await?;
+    Ok(CallToolResult::text(serde_json::to_string(&report)?))
+}
 
-    let content = tokio::fs::read_to_string(&board_path).await?;
+async fn audit_manufacturing(
+    board: &Path,
+    fab_house: &str,
+    min_trace: f64,
+) -> anyhow::Result<Value> {
+    info!(board = %board.display(), fab_house, "[BETA] Running DFM audit");
+
+    let content = tokio::fs::read_to_string(board).await?;
     let tree = parse_sexp(&content)?;
-
     let mut findings = Vec::new();
 
-    // Get fab constraints for the target fab house
-    let (min_trace, _min_space, _min_drill, _min_annular) = match fab_house {
-        "jlcpcb" => (0.127, 0.127, 0.3, 0.13), // JLCPCB standard capability
-        "pcbway" => (0.1, 0.1, 0.2, 0.1),
-        "oshpark" => (0.152, 0.152, 0.254, 0.127), // 6mil/6mil
-        _ => (0.15, 0.15, 0.3, 0.13),
-    };
-
-    // Check board outline exists
-    let has_edge_cuts = content.contains("Edge.Cuts");
-    if !has_edge_cuts {
+    if konnect_sexp::board::board_outline_bbox(&tree).is_none() {
         findings.push(AuditFinding {
             severity: "error",
             category: "dfm",
             component: None,
-            issue: "No board outline found (Edge.Cuts layer is empty)".to_string(),
-            recommendation: "Add a board outline on the Edge.Cuts layer using add_board_outline"
-                .to_string(),
+            issue: "No board outline geometry found on Edge.Cuts".to_string(),
+            recommendation: "Add or repair the board outline on the Edge.Cuts layer".to_string(),
         });
     }
 
@@ -601,43 +659,56 @@ async fn handle_audit_manufacturing(
         });
     }
 
-    // Check for silkscreen overlapping pads
-    let silkscreen_issues = check_silkscreen_overlap(&content, &tree);
-    findings.extend(silkscreen_issues);
+    findings.extend(check_footprint_origin_proximity(&tree));
 
-    // Check design rules in setup section
-    let _setup = tree.find("setup");
-    if let Some(_setup) = _setup {
-        // Check trace width
-        if let Some(trace_min) = find_design_rule_value(&content, "min_trace_width") {
+    let mut checked = vec![
+        "outline_geometry",
+        "footprint_sides",
+        "footprint_origin_proximity",
+    ];
+    let mut not_checked = vec![
+        "outline_closure",
+        "component_clearance",
+        "silkscreen_overlap",
+        "via_in_pad",
+        "acid_traps",
+    ];
+    let mut diagnostics = Vec::new();
+    match saved_project_min_track_width(board).await {
+        Ok(trace_min) => {
+            checked.push("project_minimum_track_width");
             if trace_min < min_trace {
                 findings.push(AuditFinding {
                     severity: "error",
                     category: "dfm",
                     component: None,
                     issue: format!(
-                        "Minimum trace width ({:.3}mm) is below {} capability ({:.3}mm)",
-                        trace_min, fab_house, min_trace
+                        "Minimum trace width ({trace_min:.3}mm) is below {fab_house} capability ({min_trace:.3}mm)"
                     ),
-                    recommendation: format!(
-                        "Increase minimum trace width to at least {:.3}mm",
-                        min_trace
-                    ),
+                    recommendation: format!("Increase minimum trace width to at least {min_trace:.3}mm"),
                 });
             }
         }
+        Err(error) => {
+            not_checked.push("project_minimum_track_width");
+            diagnostics.push(json!({
+                "code": "project_minimum_track_width_unavailable",
+                "source": board,
+                "message": format!("{error:#}"),
+            }));
+        }
     }
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "audit": "manufacturing",
-            "fab_house": fab_house,
-            "components": { "front": front_count, "back": back_count },
-            "findings": findings,
-            "summary": format!("{} DFM issues found for {}.", findings.len(), fab_house)
-        }))
-        .unwrap(),
-    ))
+    Ok(json!({
+        "audit": "manufacturing",
+        "status": if diagnostics.is_empty() { "complete" } else { "partial" },
+        "fab_house": fab_house,
+        "components": { "front": front_count, "back": back_count },
+        "coverage": { "checked": checked, "not_checked": not_checked },
+        "diagnostics": diagnostics,
+        "findings": findings,
+        "summary": format!("{} DFM findings for {}.", findings.len(), fab_house)
+    }))
 }
 
 // ─── Unified design review ───────────────────────────────────────────────────
@@ -1061,6 +1132,7 @@ async fn handle_scoped_schematic_audit(
         let result = audit.run_file(args, ctx).await?;
         let mut body = audit_result_json(result)?;
         decorate_file_audit_result(&mut body, schematic_symbol_count(&root_path)?);
+        audit.add_check_coverage(&mut body["coverage"]);
         return Ok(CallToolResult::text(serde_json::to_string(&body)?));
     }
 
@@ -1177,6 +1249,8 @@ async fn handle_scoped_schematic_audit(
         )
     });
 
+    audit.add_check_coverage(&mut body["coverage"]);
+
     match audit {
         StandaloneSchematicAudit::Decoupling => {
             // Preserve the pre-existing field that distinguishes connectivity
@@ -1273,6 +1347,53 @@ async fn handle_run_design_review(
         }));
     }
 
+    let mut erc = AuditAggregate::new("erc");
+    erc.requested = 1;
+    let erc_summary = match cli::run_erc(&ctx.config.kicad_cli, &root_path).await {
+        Ok(report) => {
+            erc.completed = 1;
+            let errors = report
+                .violations
+                .iter()
+                .filter(|v| v.severity == "error")
+                .count();
+            let warnings = report
+                .violations
+                .iter()
+                .filter(|v| v.severity == "warning")
+                .count();
+            erc.findings
+                .extend(report.violations.iter().map(|violation| {
+                    json!({
+                        "audit": "erc",
+                        "category": "erc",
+                        "source": root_path,
+                        "severity": violation.severity,
+                        "rule": violation.rule,
+                        "message": violation.description,
+                        "sheet": violation.sheet,
+                        "items": violation.items
+                    })
+                }));
+            Some(json!({
+                "errors": errors,
+                "warnings": warnings,
+                "violations": report.violations.len(),
+                "coordinates": report.coordinates,
+            }))
+        }
+        Err(error) => {
+            erc.failed = 1;
+            diagnostics.push(json!({
+                "code": "erc_unavailable",
+                "source": root_path,
+                "message": format!("ERC could not run or its report could not be read: {error:#}"),
+            }));
+            None
+        }
+    };
+    audits.push(erc);
+
     let mut board_coverage = None;
     let mut drc_summary = None;
     if let Some(board) = args["board"].as_str() {
@@ -1312,7 +1433,17 @@ async fn handle_run_design_review(
         }
 
         let mut manufacturing = AuditAggregate::new("manufacturing");
-        let result = handle_audit_manufacturing(args, ctx).await;
+        let result = match fab_track_width(args) {
+            Ok((fab_house, min_trace)) => audit_manufacturing(&board_path, fab_house, min_trace)
+                .await
+                .map(|report| {
+                    if let Some(entries) = report["diagnostics"].as_array() {
+                        diagnostics.extend(entries.iter().cloned());
+                    }
+                    CallToolResult::text(report.to_string())
+                }),
+            Err(error) => Ok(error),
+        };
         manufacturing.record(&board_path, result, &mut diagnostics);
         audits.push(manufacturing);
 
@@ -1497,6 +1628,7 @@ async fn handle_run_design_review(
                     // — in the latter case `diagnostics` says so and the verdict
                     // is INCOMPLETE. Never zero: this review must not be able to
                     // imply a clean board it did not check.
+                    "erc": erc_summary,
                     "drc": drc_summary,
                     "diagnostics": diagnostics
                 }
@@ -1884,12 +2016,7 @@ fn is_power_net_name(name: &str) -> bool {
         || upper.starts_with("V+")
 }
 
-fn check_silkscreen_overlap(
-    _content: &str,
-    tree: &konnect_sexp::parser::SexpNode,
-) -> Vec<AuditFinding> {
-    // Simplified check: look for footprints that are very close together
-    // A full implementation would check bounding boxes of silkscreen elements
+fn check_footprint_origin_proximity(tree: &konnect_sexp::parser::SexpNode) -> Vec<AuditFinding> {
     let fps = tree.find_all("footprint");
     let mut findings = Vec::new();
 
@@ -1922,23 +2049,17 @@ fn check_silkscreen_overlap(
                     category: "dfm",
                     component: Some(format!("{}, {}", ref_a, ref_b)),
                     issue: format!(
-                        "{} and {} are only {:.2}mm apart — possible silkscreen overlap or assembly issue",
+                        "Footprint origins of {} and {} are {:.2}mm apart",
                         ref_a, ref_b, dist
                     ),
-                    recommendation: "Increase spacing between components to at least 1mm for reliable assembly".to_string(),
+                    recommendation:
+                        "Inspect component spacing and silkscreen clearances in the PCB editor"
+                            .to_string(),
                 });
             }
         }
     }
     findings
-}
-
-fn find_design_rule_value(content: &str, rule_name: &str) -> Option<f64> {
-    let pat = format!("({} ", rule_name);
-    let pos = content.find(&pat)?;
-    let after = &content[pos + pat.len()..];
-    let end = after.find(')')?;
-    after[..end].trim().parse().ok()
 }
 
 fn extract_findings(result: &CallToolResult) -> Result<Vec<Value>, String> {
@@ -1963,15 +2084,35 @@ fn extract_findings(result: &CallToolResult) -> Result<Vec<Value>, String> {
     Ok(findings.clone())
 }
 
-/// A context with no `kicad_cli`, no board and no project — every field of
-/// `ServerConfig` at its default. Both test modules below run tools that only
-/// read a schematic off disk.
 #[cfg(test)]
 fn test_ctx() -> ToolContext {
     ToolContext::new(
         crate::tools::ServerConfig::default(),
         std::sync::Arc::new(crate::router::ToolRouter::new()),
     )
+}
+
+#[cfg(test)]
+fn test_erc_context(violations: Value) -> (tempfile::TempDir, ToolContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let script = cli::test_support::write_script(
+        dir.path(),
+        "erc",
+        "#!/bin/sh\n[ \"$1 $2\" = 'sch erc' ] || exit 1\ncp \"$0.report\" \"$4\"\n",
+        "@echo off\r\nif not \"%~1 %~2\"==\"sch erc\" exit /b 1\r\ncopy /y \"%~f0.report\" \"%~4\" >nul\r\n",
+    );
+    std::fs::write(
+        dir.path().join(format!(
+            "{}.report",
+            script.file_name().unwrap().to_str().unwrap()
+        )),
+        json!({"kicad_version": "10.0.8", "sheets": [{"path": "/", "violations": violations}]})
+            .to_string(),
+    )
+    .unwrap();
+    let mut ctx = test_ctx();
+    ctx.config.kicad_cli = script.to_str().unwrap().to_string();
+    (dir, ctx)
 }
 
 #[cfg(test)]
@@ -2027,21 +2168,24 @@ mod review_completion_tests {
     async fn manufacturing_audit_reports_outline_sides_and_fab_trace_limits() {
         let tmp = TempDir::new().unwrap();
         let board = tmp.path().join("dfm.kicad_pcb");
+        let source = r#"(kicad_pcb
+            (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))
+            (footprint "front" (layer "F.Cu"))
+            (footprint "back" (layer "B.Cu"))
+            (footprint "layerless"))"#;
+        std::fs::write(&board, source).unwrap();
         for (fab, width, below_limit) in [
             ("jlcpcb", 0.126, true),
             ("jlcpcb", 0.127, false),
             ("pcbway", 0.1, false),
             ("oshpark", 0.151, true),
-            ("other", 0.15, false),
         ] {
-            let source = format!(
-                r#"(kicad_pcb
-                (setup (min_trace_width {width}))
-                (footprint "front" (layer "F.Cu"))
-                (footprint "back" (layer "B.Cu"))
-                (footprint "layerless"))"#
-            );
-            std::fs::write(&board, &source).unwrap();
+            std::fs::write(
+                board.with_extension("kicad_pro"),
+                json!({"board": {"design_settings": {"rules": {"min_track_width": width}}}})
+                    .to_string(),
+            )
+            .unwrap();
             let report = tool_json(
                 handle_audit_manufacturing(&json!({"board": board, "fab_house": fab}), &test_ctx())
                     .await
@@ -2068,6 +2212,46 @@ mod review_completion_tests {
             );
             assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
         }
+    }
+
+    #[tokio::test]
+    async fn dfm_names_missing_saved_rules_and_unchecked_geometry() {
+        let tmp = TempDir::new().unwrap();
+        let board = tmp.path().join("outline.kicad_pcb");
+        std::fs::write(
+            &board,
+            r#"(kicad_pcb (gr_rect (start 1 1) (end 10 10) (layer "Edge.Cuts")))"#,
+        )
+        .unwrap();
+        let args = json!({"board": board});
+        let missing = tool_json(
+            handle_audit_manufacturing(&args, &test_ctx())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(missing["status"], "partial");
+        let unchecked = missing["coverage"]["not_checked"].as_array().unwrap();
+        assert!(unchecked.contains(&json!("outline_closure")));
+        assert!(unchecked.contains(&json!("project_minimum_track_width")));
+        assert!(unchecked.contains(&json!("via_in_pad")));
+        assert_eq!(
+            missing["diagnostics"][0]["code"],
+            "project_minimum_track_width_unavailable"
+        );
+
+        std::fs::write(board.with_extension("kicad_pro"), "{bad").unwrap();
+        let malformed = tool_json(
+            handle_audit_manufacturing(&args, &test_ctx())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(malformed["status"], "partial");
+
+        let unsupported =
+            handle_audit_manufacturing(&json!({"board": board, "fab_house": "other"}), &test_ctx())
+                .await
+                .unwrap();
+        assert!(unsupported.is_error);
     }
 
     fn single_unit_schematic(footprint: &str) -> String {
@@ -2227,12 +2411,55 @@ mod review_completion_tests {
         serde_json::from_str(text).expect("review result must be valid JSON")
     }
 
+    #[tokio::test]
+    async fn review_requires_native_erc_and_reports_native_errors() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("pins.kicad_sch");
+        std::fs::write(
+            &root,
+            single_unit_schematic("Resistor_SMD:R_0603_1608Metric"),
+        )
+        .unwrap();
+        let args = json!({"schematic": root, "severity_filter": "error"});
+        let unavailable = review_json(handle_run_design_review(&args, &test_ctx()).await.unwrap());
+        assert_eq!(unavailable["design_review"]["status"], "partial");
+        assert_eq!(unavailable["design_review"]["audits"]["erc"]["failed"], 1);
+        assert!(unavailable["design_review"]["erc"].is_null());
+
+        let (_malformed_cli, malformed_ctx) = test_erc_context(Value::Null);
+        let malformed = review_json(
+            handle_run_design_review(&args, &malformed_ctx)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(malformed["design_review"]["status"], "partial");
+        assert_eq!(
+            malformed["design_review"]["diagnostics"][0]["code"],
+            "erc_unavailable"
+        );
+
+        let (_cli, ctx) = test_erc_context(json!([
+            {"type": "pin_to_pin", "severity": "error", "description": "Outputs connected", "items": []},
+            {"type": "pin_not_driven", "severity": "warning", "description": "Input not driven", "items": []}
+        ]));
+        let result = review_json(handle_run_design_review(&args, &ctx).await.unwrap());
+        let report = &result["design_review"];
+        assert_eq!(report["status"], "complete");
+        assert_eq!(report["erc"]["errors"], 1);
+        assert_eq!(report["erc"]["warnings"], 1);
+        assert_eq!(report["warnings"], 1);
+        assert!(report["verdict"].as_str().unwrap().starts_with("NOT READY"));
+        assert_eq!(report["findings"][0]["rule"], "pin_to_pin");
+        assert_eq!(report["findings"].as_array().unwrap().len(), 1);
+    }
+
     async fn review(schematic: &Path, board: Option<&Path>) -> Value {
         let mut args = json!({"schematic": schematic.display().to_string()});
         if let Some(board) = board {
             args["board"] = json!(board.display().to_string());
         }
-        review_json(handle_run_design_review(&args, &test_ctx()).await.unwrap())
+        let (_cli, ctx) = test_erc_context(json!([]));
+        review_json(handle_run_design_review(&args, &ctx).await.unwrap())
     }
 
     #[test]
@@ -3097,10 +3324,11 @@ mod net_resolution_tests {
     #[tokio::test]
     async fn a_correctly_drawn_sheet_is_not_reported_as_not_ready() {
         let file = sheet(WIRED_SHEET);
+        let (_cli, ctx) = test_erc_context(json!([]));
         let body = audit_json(
             handle_run_design_review(
                 &json!({ "schematic": file.path().to_str().unwrap(), "severity_filter": "info" }),
-                &test_ctx(),
+                &ctx,
             )
             .await
             .unwrap(),
@@ -3344,13 +3572,11 @@ mod net_resolution_tests {
     #[tokio::test]
     async fn a_multi_unit_part_no_longer_holds_the_review_open() {
         let file = sheet(MULTI_UNIT_POWER_SHEET);
+        let (_cli, ctx) = test_erc_context(json!([]));
         let body = audit_json(
-            handle_run_design_review(
-                &json!({ "schematic": file.path().to_str().unwrap() }),
-                &test_ctx(),
-            )
-            .await
-            .unwrap(),
+            handle_run_design_review(&json!({ "schematic": file.path().to_str().unwrap() }), &ctx)
+                .await
+                .unwrap(),
         );
         let review = &body["design_review"];
 

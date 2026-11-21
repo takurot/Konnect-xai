@@ -411,7 +411,7 @@ async fn handle_get_pin_connections(
     };
     let mut g = net_graph_for(&tree, &wires, &labels);
     Ok(CallToolResult::json(
-        &json!({ "reference": reference, "pin": pin_number, "pin_x": px, "pin_y": py, "net": g.net_at(px, py) }),
+        &json!({ "reference": reference, "pin": pin_number, "pin_x": round6(px), "pin_y": round6(py), "net": g.net_at(px, py) }),
     ))
 }
 

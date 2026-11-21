@@ -187,12 +187,7 @@ fn handshake_baseline_and_full_registry_loads() {
 
     // list_toolboxes reports the registry; every toolset must load.
     let boxes = McpProcess::tool_body(&p.call_tool("list_toolboxes", json!({})));
-    let toolsets: Vec<String> = boxes["toolsets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["name"].as_str().unwrap().to_string())
-        .collect();
+    let toolsets = boxes["toolsets"].as_array().unwrap();
     assert!(
         toolsets.len() >= 17,
         "expected 17+ toolsets, got {}",
@@ -202,18 +197,32 @@ fn handshake_baseline_and_full_registry_loads() {
     assert!(boxes.get("license_tier").is_none());
     assert!(boxes["toolsets"][0].get("tier").is_none());
 
-    let mut total = 0u64;
-    for name in &toolsets {
-        let loaded = McpProcess::tool_body(&p.call_tool("load_toolset", json!({"name": name})));
-        let added = loaded["tools_added"].as_u64().unwrap_or(0);
-        assert!(added > 0, "toolset '{name}' loaded no tools");
-        total += added;
+    let mut initially_loaded = 0;
+    let mut newly_loaded = 0;
+    for toolset in toolsets {
+        let name = toolset["name"].as_str().unwrap();
+        let count = toolset["tool_count"].as_u64().unwrap();
+        let expected = if toolset["loaded"].as_bool().unwrap() {
+            initially_loaded += count;
+            0
+        } else {
+            count
+        };
+        let result = p.call_tool("load_toolset", json!({"name": name}));
+        assert_eq!(result["isError"], false, "{name}: {result}");
+        let response = McpProcess::tool_body(&result);
+        let added = response["tools_added"].as_u64().unwrap();
+        assert_eq!(added, expected, "{name}: {response}");
+        newly_loaded += added;
     }
     assert_eq!(
-        total,
+        initially_loaded + newly_loaded,
         boxes["total_tools"].as_u64().unwrap(),
         "sum of loaded tools disagrees with list_toolboxes total"
     );
+    let list = p.request("tools/list", json!({}));
+    let full = list["result"]["tools"].as_array().unwrap().len();
+    assert_eq!(full as u64, baseline as u64 + newly_loaded);
 }
 
 #[test]
@@ -561,6 +570,132 @@ fn load_toolset_batch_form_loads_all_and_notifies_once() {
         errors[0].as_str().unwrap().contains("list_toolboxes"),
         "{errors:#?}"
     );
+}
+
+#[test]
+fn toolset_notifications_only_report_actual_catalogue_changes() {
+    let mut p = McpProcess::spawn();
+    for (tool, name, want_error, notifications, tools_added) in [
+        ("load_toolset", json!("unknown_toolset"), true, 0, None),
+        ("load_toolset", json!(""), true, 0, None),
+        ("load_toolset", json!([]), true, 0, None),
+        ("unload_toolset", json!("unknown_toolset"), true, 0, None),
+        ("load_toolset", json!("project"), false, 0, Some(0)),
+        ("unload_toolset", json!("pcb_routing"), false, 0, None),
+        (
+            "load_toolset",
+            json!([
+                "sch_components",
+                "project",
+                "unknown_toolset",
+                "sch_components"
+            ]),
+            false,
+            1,
+            Some(18),
+        ),
+        (
+            "load_toolset",
+            json!(["sch_components", "unknown_toolset"]),
+            false,
+            0,
+            Some(0),
+        ),
+        ("unload_toolset", json!("sch_components"), false, 1, None),
+        ("unload_toolset", json!("sch_components"), false, 0, None),
+    ] {
+        let lines = p.call_tool_then_fence(tool, json!({"name":name}));
+        let result = &lines[0]["result"];
+        let actual = lines
+            .iter()
+            .filter(|line| line["method"] == "notifications/tools/list_changed")
+            .count();
+        assert_eq!(actual, notifications, "{tool} {name}: {lines:?}");
+        assert_eq!(result["isError"], want_error, "{tool} {name}: {result}");
+        if let Some(added) = tools_added {
+            let body = McpProcess::tool_body(result);
+            assert_eq!(body["tools_added"], added, "{body}");
+            assert_eq!(
+                body["tools"].as_array().unwrap().len(),
+                added as usize,
+                "{body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn served_errors_match_counters_and_error_kinds_in_memory_and_jsonl() {
+    let mut p = McpProcess::spawn();
+    let mut cases = vec![
+        (
+            "load_toolset",
+            json!({"name": "unknown_toolset"}),
+            "invalid_argument",
+        ),
+        (
+            "unload_toolset",
+            json!({"name":"unknown_toolset"}),
+            "invalid_argument",
+        ),
+        ("route_trace", json!({}), "toolset_not_loaded"),
+        ("definitely_no_such_tool", json!({}), "unknown_tool"),
+        ("get_recent_calls", json!({"limit":0}), "invalid_argument"),
+        ("get_recent_calls", json!({"limit":-1}), "invalid_argument"),
+        ("get_recent_calls", json!({"limit":101}), "invalid_argument"),
+    ];
+    if cfg!(unix) {
+        cases.push((
+            "reload_server",
+            json!({"confirm":false}),
+            "invalid_argument",
+        ));
+    }
+    let mut errors = Vec::new();
+    for (tool, args, kind) in cases {
+        let result = p.call_tool(tool, args);
+        let body = McpProcess::tool_body(&result);
+        assert_eq!(result["isError"], true, "{tool}: {result}");
+        assert_eq!(body["error"]["kind"], kind, "{tool}: {body}");
+        errors.push((tool, kind));
+    }
+    let stats = McpProcess::tool_body(&p.call_tool("server_stats", json!({})));
+    assert_eq!(stats["error_calls"], errors.len(), "{stats}");
+    assert_eq!(stats["per_tool"]["route_trace"]["errors"], 1, "{stats}");
+    assert_eq!(
+        stats["per_tool"]["route_trace"]["last_status"], "not_found",
+        "{stats}"
+    );
+    assert_eq!(
+        stats["per_tool"]["definitely_no_such_tool"]["errors"], 1,
+        "{stats}"
+    );
+    for limit in [1, 100] {
+        let response = p.call_tool("get_recent_calls", json!({"limit":limit}));
+        assert_eq!(response["isError"], false, "{response}");
+        let recent = McpProcess::tool_body(&response);
+        assert_eq!(recent["limit_applied"], limit, "{recent}");
+        if limit == 100 {
+            let recent_errors: Vec<_> = recent["calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .filter_map(|call| Some((call["tool"].as_str()?, call["error_kind"].as_str()?)))
+                .collect();
+            assert_eq!(recent_errors, errors, "{recent}");
+        }
+    }
+    let log = std::fs::read_to_string(stats["log_path"].as_str().unwrap()).unwrap();
+    let rows: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let logged_errors: Vec<_> = rows
+        .iter()
+        .filter_map(|call| Some((call["tool"].as_str()?, call["error_kind"].as_str()?)))
+        .collect();
+    assert_eq!(logged_errors, errors, "{rows:?}");
 }
 
 /// All names in one `load_toolset` call unknown -> a typed `invalid_argument`
@@ -920,6 +1055,219 @@ fn a_malformed_user_configuration_is_refused_and_never_overwritten_over_stdio() 
             std::fs::read_to_string(&config).unwrap(),
             original,
             "{tool} left the preferences file exactly as it was"
+        );
+    }
+}
+
+#[test]
+fn effective_configuration_combines_rules_with_scope_and_keeps_override_precedence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let mut p = McpProcess::spawn_with_env(Some(tmp.path()), true, &[]);
+
+    let result = p.call_tool(
+        "add_design_rule",
+        json!({"rule": "User rule", "scope": "user"}),
+    );
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let result = p.call_tool(
+        "save_user_config",
+        json!({"key_path": "sourcing.avl", "value": ["TDK"]}),
+    );
+    assert_ne!(result["isError"], json!(true), "{result}");
+
+    for (args, source) in [
+        (json!({}), "not_configured"),
+        (json!({"project_dir": project}), "defaults"),
+    ] {
+        let result = p.call_tool("get_effective_config", args);
+        let body = McpProcess::tool_body(&result);
+        assert_eq!(body["sources"]["project"], source, "{body}");
+        assert_eq!(
+            body["effective_config"]["design_rules"],
+            json!(["User rule"]),
+            "{body}"
+        );
+        assert_eq!(
+            body["design_rule_sources"],
+            json!([{"rule":"User rule","source":"user"}])
+        );
+    }
+    assert!(!project.join(".konnect").exists());
+
+    let result = p.call_tool(
+        "add_design_rule",
+        json!({"project_dir": project, "rule": "Project rule"}),
+    );
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let result = p.call_tool(
+        "save_project_config",
+        json!({"project_dir": project, "key_path": "sourcing.avl", "value": ["Murata"]}),
+    );
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let result = p.call_tool("get_effective_config", json!({"project_dir": project}));
+    let body = McpProcess::tool_body(&result);
+    assert_eq!(body["sources"]["project"], "file");
+    assert_eq!(
+        body["effective_config"]["design_rules"],
+        json!(["User rule", "Project rule"])
+    );
+    assert_eq!(
+        body["design_rule_sources"],
+        json!([{"rule":"User rule","source":"user"},{"rule":"Project rule","source":"project"}])
+    );
+    assert_eq!(
+        body["effective_config"]["sourcing"]["avl"],
+        json!(["Murata"])
+    );
+    let result = p.call_tool(
+        "save_project_config",
+        json!({"project_dir":project,"key_path":"fab_constraints","value":{"fab_house":"PCBWay"}}),
+    );
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let result = p.call_tool("get_effective_config", json!({"project_dir":project}));
+    assert_eq!(
+        McpProcess::tool_body(&result)["effective_config"]["fab_constraints"]["fab_house"],
+        "PCBWay"
+    );
+}
+
+#[test]
+fn configuration_mutations_refuse_invalid_requests_without_writing_and_accept_explicit_unset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    let project_config = project.join(".konnect/project.json");
+    let user_config = user_config_under(tmp.path());
+    let absent = tmp.path().join("absent");
+    std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+    let original = r#"{"legacy":{"keep":1},"fab_constraints":{"min_clearance_mm":0.15,"fab_house":"JLCPCB"},"design_rules":["Already stored"]}"#;
+    std::fs::write(&project_config, original).unwrap();
+    std::fs::write(&user_config, original).unwrap();
+    let mut p = McpProcess::spawn_with_env(Some(tmp.path()), true, &[]);
+
+    let invalid = [
+        ("fab_constraints.min_trace_width_mm", json!("abc")),
+        ("fab_constraints.layer_count", json!(-3)),
+        ("fab_constraints.layer_count", json!(2.5)),
+        ("fab_constraints.fab_hosue", json!("JLCPCB")),
+        ("", json!(1)),
+        ("a..b.", json!(1)),
+        ("fab_constraints.min_clearance_mm.value", json!(0.2)),
+        ("sourcing.avl", json!(["Murata", 1])),
+        ("sourcing.derating.capacitor", json!({"voltage":1.2})),
+        ("design_rules", json!(["", "Valid"])),
+        ("design_rules", json!(["Same", " Same "])),
+        ("legacy.absent", json!(null)),
+        ("a..b.", json!(null)),
+    ];
+    for (key_path, value) in invalid {
+        for (tool, args) in [
+            (
+                "save_user_config",
+                json!({"key_path":key_path,"value":value}),
+            ),
+            (
+                "save_project_config",
+                json!({"project_dir":project,"key_path":key_path,"value":value}),
+            ),
+        ] {
+            let result = p.call_tool(tool, args);
+            assert_eq!(
+                result["isError"],
+                json!(true),
+                "{tool}: {key_path}: {result}"
+            );
+            let body = McpProcess::tool_body(&result);
+            assert_eq!(
+                body["error"]["kind"], "invalid_argument",
+                "{tool}: {key_path}: {body}"
+            );
+            if key_path == "fab_constraints.fab_hosue" {
+                let reason = body["error"]["reason"].as_str().unwrap();
+                assert!(reason.contains("fab_house"), "{reason}");
+            }
+            assert_eq!(std::fs::read_to_string(&project_config).unwrap(), original);
+            assert_eq!(std::fs::read_to_string(&user_config).unwrap(), original);
+        }
+    }
+
+    for args in [
+        json!({"project_dir":project,"scope":"global","rule":"Unknown scope"}),
+        json!({"project_dir":project,"rule":" "}),
+        json!({"project_dir":project,"rule":" Already stored "}),
+        json!({"scope":"user","rule":"Already stored"}),
+    ] {
+        let result = p.call_tool("add_design_rule", args);
+        assert_eq!(result["isError"], json!(true), "{result}");
+        assert_eq!(
+            McpProcess::tool_body(&result)["error"]["kind"],
+            "invalid_argument"
+        );
+        assert_eq!(std::fs::read_to_string(&project_config).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&user_config).unwrap(), original);
+    }
+
+    for (tool, args) in [
+        (
+            "save_project_config",
+            json!({"project_dir":absent,"key_path":"fab_constraints.fab_house","value":"JLCPCB"}),
+        ),
+        (
+            "add_design_rule",
+            json!({"project_dir":absent,"rule":"Missing directory"}),
+        ),
+        (
+            "save_project_config",
+            json!({"project_dir":project,"key_path":"fab_constraints.layer_count","value":null}),
+        ),
+    ] {
+        let result = p.call_tool(tool, args);
+        assert_eq!(result["isError"], json!(true), "{result}");
+        assert!(!absent.exists());
+        assert_eq!(std::fs::read_to_string(&project_config).unwrap(), original);
+    }
+
+    let result = p.call_tool(
+        "save_project_config",
+        json!({"project_dir":project,"key_path":"fab_constraints.fab_house","value":null}),
+    );
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&project_config).unwrap()).unwrap();
+    assert_eq!(stored["legacy"]["keep"], 1);
+    assert_eq!(stored["fab_constraints"]["min_clearance_mm"], 0.15);
+    assert!(!stored["fab_constraints"]
+        .as_object()
+        .unwrap()
+        .contains_key("fab_house"));
+    let result = p.call_tool("get_effective_config", json!({"project_dir": project}));
+    assert_eq!(
+        McpProcess::tool_body(&result)["effective_config"]["fab_constraints"]["fab_house"],
+        "JLCPCB"
+    );
+
+    // A key saved by an earlier version is outside the schema but can still be removed.
+    for (tool, args, path) in [
+        (
+            "save_project_config",
+            json!({"project_dir":project,"key_path":"legacy.keep","value":null}),
+            &project_config,
+        ),
+        (
+            "save_user_config",
+            json!({"key_path":"legacy.keep","value":null}),
+            &user_config,
+        ),
+    ] {
+        let result = p.call_tool(tool, args);
+        assert_ne!(result["isError"], json!(true), "{tool}: {result}");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(
+            !stored["legacy"].as_object().unwrap().contains_key("keep"),
+            "{tool}: {stored}"
         );
     }
 }
@@ -1351,4 +1699,134 @@ mod child_stdio {
         drop(release);
         wait_for_file(&finished).await;
     }
+}
+
+fn assert_reported_mm(value: &Value, expected: f64) {
+    assert_eq!(value, &json!(expected), "unexpected millimetre value");
+    let rendered = value.to_string();
+    if let Some((_, decimals)) = rendered.split_once('.') {
+        assert!(
+            decimals.len() <= 6,
+            "excess millimetre precision: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn schematic_pin_lookup_aliases_report_nanometre_precision() {
+    let directory = tempfile::tempdir().unwrap();
+    let schematic = directory.path().join("ecc83.kicad_sch");
+    std::fs::write(
+        &schematic,
+        include_str!("../../konnect-core/tests/fixtures/ecc83_multiunit.kicad_sch"),
+    )
+    .unwrap();
+    let mut server = McpProcess::spawn_configured(Some(directory.path()), true);
+    let loaded = server.call_tool("load_toolset", json!({"name":"sch_analysis"}));
+    assert_eq!(loaded["isError"], false, "{loaded}");
+
+    for name in ["get_pin_connections", "get_pin_net_name"] {
+        let result = server.call_tool(
+            name,
+            json!({"schematic":schematic,"reference":"U1","pin_number":"8"}),
+        );
+        assert_eq!(result["isError"], false, "{result}");
+        let body = McpProcess::tool_body(&result);
+        assert_eq!(body["reference"], "U1");
+        assert_eq!(body["pin"], "8");
+        assert_reported_mm(&body["pin_x"], 157.48);
+        assert_reported_mm(&body["pin_y"], 74.93);
+    }
+}
+
+#[test]
+fn schematic_overlap_depth_and_bounds_report_nanometre_precision() {
+    let directory = tempfile::tempdir().unwrap();
+    let schematic = directory.path().join("overlap.kicad_sch");
+    std::fs::write(
+        &schematic,
+        r#"(kicad_sch (version 20260206)
+          (lib_symbols (symbol "Test:Block" (symbol "Block_1_1"
+            (rectangle (start -1.016 -1.016) (end 1.016 1.016)
+              (stroke (width 0)) (fill (type none))))))
+          (symbol (lib_id "Test:Block") (at 100 50 0) (unit 1) (property "Reference" "R1"))
+          (symbol (lib_id "Test:Block") (at 101 50 0) (unit 1) (property "Reference" "R2")))"#,
+    )
+    .unwrap();
+    let mut server = McpProcess::spawn_configured(Some(directory.path()), true);
+    let loaded = server.call_tool("load_toolset", json!({"name":"sch_analysis"}));
+    assert_eq!(loaded["isError"], false, "{loaded}");
+    let result = server.call_tool("check_schematic_overlaps", json!({"schematic":schematic}));
+    assert_eq!(result["isError"], false, "{result}");
+    let body = McpProcess::tool_body(&result);
+    assert_eq!(body["overlap_count"], 1);
+    let overlap = &body["overlaps"][0];
+    assert_eq!(overlap["a"], "R1");
+    assert_eq!(overlap["b"], "R2");
+    assert_reported_mm(&overlap["overlap_x_mm"], 1.032);
+    assert_reported_mm(&overlap["overlap_y_mm"], 2.032);
+    for (bounds, x_min, x_max) in [("bounds_a", 98.984, 101.016), ("bounds_b", 99.984, 102.016)] {
+        assert_reported_mm(&overlap[bounds]["x_min"], x_min);
+        assert_reported_mm(&overlap[bounds]["x_max"], x_max);
+        assert_reported_mm(&overlap[bounds]["y_min"], 48.984);
+        assert_reported_mm(&overlap[bounds]["y_max"], 51.016);
+    }
+}
+
+#[test]
+fn connectivity_refusal_formats_endpoint_and_candidate_millimetres() {
+    let directory = tempfile::tempdir().unwrap();
+    let schematic = directory.path().join("connectivity.kicad_sch");
+    let source = r#"(kicad_sch (version 20260206)
+      (wire (pts (xy 0 0) (xy 97.78999999999999 10)) (uuid "fixture-wire"))
+      (label "A" (at 97.76 10 0))
+      (label "B" (at 97.83000000000001 10 0)))"#;
+    std::fs::write(&schematic, source).unwrap();
+    let mut server = McpProcess::spawn_configured(Some(directory.path()), true);
+    let loaded = server.call_tool("load_toolset", json!({"name":"sch_export"}));
+    assert_eq!(loaded["isError"], false, "{loaded}");
+    let result = server.call_tool("fix_connectivity", json!({"schematic":schematic}));
+    assert_eq!(result["isError"], true, "{result}");
+    let body = McpProcess::tool_body(&result);
+    assert_eq!(body["error"]["kind"], "stale_target");
+    assert_eq!(
+        body["error"]["target"],
+        "wire fixture-wire end endpoint at (97.79, 10)"
+    );
+    assert_eq!(
+        body["error"]["reason"],
+        "more than one snap destination was observed: (97.76, 10), (97.83, 10)"
+    );
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("(97.79, 10)") && message.contains("(97.83, 10)"));
+    assert_eq!(std::fs::read_to_string(schematic).unwrap(), source);
+}
+
+#[test]
+fn estimate_cost_rounds_reported_board_dimensions() {
+    let directory = tempfile::tempdir().unwrap();
+    let board = directory.path().join("precision.kicad_pcb");
+    std::fs::write(
+        &board,
+        r#"(kicad_pcb (version 20260206)
+          (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+          (gr_rect (start 0.1 0.1) (end 0.3 0.3)
+            (stroke (width 0) (type solid)) (layer "Edge.Cuts")))"#,
+    )
+    .unwrap();
+    let mut server = McpProcess::spawn_configured(Some(directory.path()), true);
+    let loaded = server.call_tool("load_toolset", json!({"name":"manufacturing"}));
+    assert_eq!(loaded["isError"], false, "{loaded}");
+    let result = server.call_tool(
+        "estimate_cost",
+        json!({"board":board,"fab_house":"pcbway","quantity":7}),
+    );
+    assert_eq!(result["isError"], false, "{result}");
+    let body = McpProcess::tool_body(&result);
+    assert_reported_mm(&body["board"]["width_mm"], 0.2);
+    assert_reported_mm(&body["board"]["height_mm"], 0.2);
+    assert_eq!(body["board"]["copper_layers"], 2);
+    assert_eq!(body["quantity"], 7);
+    assert_eq!(body["cost_estimate"]["total_estimate"], "$6.00");
+    assert_eq!(body["cost_estimate"]["per_board"], "$0.86");
 }

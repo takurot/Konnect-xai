@@ -587,6 +587,7 @@ impl Drop for ExportStaging {
 }
 
 fn export_staging_dir(destination: &Path) -> Result<Arc<ExportStaging>> {
+    ensure_export_destination_is_not_design_file(destination)?;
     let parent = destination
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -599,7 +600,18 @@ fn export_staging_dir(destination: &Path) -> Result<Arc<ExportStaging>> {
         .context("failed to create an export staging directory")
 }
 
-fn ensure_export_destination_is_not_design_file(destination: &Path) -> Result<()> {
+/// Give native single-file exporters an isolated sibling path with the exact
+/// caller-selected filename, since KiCad chooses some formats by extension.
+fn stage_export_file(destination: &Path) -> Result<(Arc<ExportStaging>, PathBuf)> {
+    let staging = export_staging_dir(destination)?;
+    let filename = destination
+        .file_name()
+        .context("export output has no filename")?;
+    let staged = staging.path().join(filename);
+    Ok((staging, staged))
+}
+
+pub(crate) fn ensure_export_destination_is_not_design_file(destination: &Path) -> Result<()> {
     let canonical = destination.canonicalize().ok();
     let reserved = [Some(destination), canonical.as_deref()]
         .into_iter()
@@ -704,6 +716,7 @@ fn publish_verified_file_blocking(
     staging: &ExportStaging,
     before_install: impl FnOnce(),
 ) -> Result<u64> {
+    ensure_export_destination_is_not_design_file(destination)?;
     let metadata = std::fs::metadata(staged).with_context(|| {
         format!(
             "{artifact} export reported success but did not create {}",
@@ -779,10 +792,7 @@ pub(crate) async fn publish_verified_bytes(
     bytes: &[u8],
     artifact: &str,
 ) -> Result<()> {
-    let staging = export_staging_dir(output)?;
-    let staged = staging
-        .path()
-        .join(output.file_name().context("output has no file name")?);
+    let (staging, staged) = stage_export_file(output)?;
     tokio::fs::write(&staged, bytes).await?;
     publish_verified_file(&staged, output, artifact, &staging).await?;
     Ok(())
@@ -978,6 +988,33 @@ const ERC_JSON_SCALE_FIXED_IN: (u64, u64, u64) = (10, 0, 7);
 /// 10.99 nightly may sit on either side of it. Every other development branch
 /// is wholly before or wholly after, and its version orders like any other.
 const KICAD_DEVELOPMENT_MINOR: u64 = 99;
+
+/// Minimum severity requested for a saved KiCad rules report.
+#[derive(Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ReportSeverity {
+    Error,
+    Warning,
+    Info,
+}
+
+impl ReportSeverity {
+    pub(crate) const OPTIONS: [Self; 3] = [Self::Error, Self::Warning, Self::Info];
+
+    pub(crate) fn from_args(
+        args: &serde_json::Value,
+    ) -> Result<Self, crate::mcp::protocol::CallToolResult> {
+        super::optional_enum(args, "severity", &Self::OPTIONS, Self::Warning)
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+            Self::Info => "info",
+        }
+    }
+}
 
 /// Run ERC on a schematic and return parsed violations.
 /// KiCAD 10: `sch erc --output <path> --format json <input>`
@@ -1517,6 +1554,7 @@ pub(crate) async fn export_named_schematic_svg(
     output: &Path,
     options: &SchematicSvgOptions<'_>,
 ) -> Result<Vec<PathBuf>> {
+    ensure_export_destination_is_not_design_file(output)?;
     anyhow::ensure!(
         output
             .extension()
@@ -1526,7 +1564,6 @@ pub(crate) async fn export_named_schematic_svg(
     let root_name = output
         .file_name()
         .context("root SVG output has no file name")?;
-    ensure_export_destination_is_not_design_file(output)?;
     let root_exists = match tokio::fs::symlink_metadata(output).await {
         Ok(metadata) => {
             anyhow::ensure!(
@@ -1778,6 +1815,7 @@ pub async fn export_netlist(
     output: &Path,
     format: &str,
 ) -> Result<()> {
+    let (staging, staged) = stage_export_file(output)?;
     // Map friendly names to v10 format values
     let lower = format.to_lowercase();
     let v10_format = match lower.as_str() {
@@ -1795,12 +1833,13 @@ pub async fn export_netlist(
         "export",
         "netlist",
         "--output",
-        output.to_str().unwrap(),
+        staged.to_str().unwrap(),
         "--format",
         v10_format,
         schematic.to_str().unwrap(),
     ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;
+    publish_verified_file(&staged, output, "schematic netlist", &staging).await?;
     Ok(())
 }
 
@@ -2068,13 +2107,15 @@ pub async fn export_3d(
     format: &str,
     include_unspecified: bool,
 ) -> Result<()> {
+    let (staging, staged) = stage_export_file(output)?;
     let args = export_3d_args(
         pcb.to_str().unwrap(),
-        output.to_str().unwrap(),
+        staged.to_str().unwrap(),
         format,
         include_unspecified,
     )?;
     run_cli(cli, &args, LONG_TIMEOUT).await?;
+    publish_verified_file(&staged, output, "3D model", &staging).await?;
     Ok(())
 }
 
@@ -2170,33 +2211,26 @@ pub(crate) async fn export_native_netlist(
     output: &Path,
     schematic: bool,
 ) -> Result<()> {
-    ensure_export_destination_is_not_design_file(output)?;
-    let staging = export_staging_dir(output)?;
-    let staged = staging.path().join(
-        output
-            .file_name()
-            .context("netlist output has no file name")?,
-    );
     if schematic {
-        export_netlist(cli, source, &staged, "kicad").await?;
+        export_netlist(cli, source, output, "kicad").await
     } else {
-        export_ipcd356(cli, source, &staged).await?;
+        export_ipcd356(cli, source, output).await
     }
-    publish_verified_file(&staged, output, "netlist", &staging).await?;
-    Ok(())
 }
 
 /// KiCAD 10: `pcb export ipcd356 --output <path> <input>`
 pub async fn export_ipcd356(cli: &str, pcb: &Path, output: &Path) -> Result<()> {
+    let (staging, staged) = stage_export_file(output)?;
     let args = [
         "pcb",
         "export",
         "ipcd356",
         "--output",
-        output.to_str().unwrap(),
+        staged.to_str().unwrap(),
         pcb.to_str().unwrap(),
     ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;
+    publish_verified_file(&staged, output, "IPC-D-356 netlist", &staging).await?;
     Ok(())
 }
 
@@ -2207,7 +2241,8 @@ pub async fn export_ipcd356(cli: &str, pcb: &Path, output: &Path) -> Result<()> 
 /// KiCAD 10 rejects — #250). DXF differs in output shape only: one file per
 /// requested layer is written into `output_dir` (verified against KiCAD 10.0).
 pub async fn export_dxf(cli: &str, pcb: &Path, output_dir: &Path, layers: &[&str]) -> Result<()> {
-    let output_str = output_dir.to_str().unwrap();
+    let staging = export_staging_dir(output_dir)?;
+    let output_str = staging.path().to_str().unwrap();
     let pcb_str = pcb.to_str().unwrap();
     let layers_csv = layers.join(",");
 
@@ -2220,20 +2255,35 @@ pub async fn export_dxf(cli: &str, pcb: &Path, output_dir: &Path, layers: &[&str
     args.push(pcb_str);
 
     run_cli(cli, &args, LONG_TIMEOUT).await?;
+    let mut entries = tokio::fs::read_dir(staging.path()).await?;
+    let mut files = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("dxf"))
+        {
+            files.push(path);
+        }
+    }
+    anyhow::ensure!(!files.is_empty(), "DXF export did not create a layer file");
+    publish_verified_files(&files, output_dir, "DXF", &staging).await?;
     Ok(())
 }
 
 /// KiCAD 10: `pcb export gencad --output <path> <input>`
 pub async fn export_gencad(cli: &str, pcb: &Path, output: &Path) -> Result<()> {
+    let (staging, staged) = stage_export_file(output)?;
     let args = [
         "pcb",
         "export",
         "gencad",
         "--output",
-        output.to_str().unwrap(),
+        staged.to_str().unwrap(),
         pcb.to_str().unwrap(),
     ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;
+    publish_verified_file(&staged, output, "GenCAD", &staging).await?;
     Ok(())
 }
 
@@ -2245,7 +2295,8 @@ pub async fn export_ipc2581(
     units: &str,
     compress: bool,
 ) -> Result<()> {
-    let output_str = output.to_str().unwrap();
+    let (staging, staged) = stage_export_file(output)?;
+    let output_str = staged.to_str().unwrap();
     let pcb_str = pcb.to_str().unwrap();
 
     let mut args: Vec<&str> = vec![
@@ -2257,6 +2308,7 @@ pub async fn export_ipc2581(
     args.push(pcb_str);
 
     run_cli(cli, &args, LONG_TIMEOUT).await?;
+    publish_verified_file(&staged, output, "IPC-2581", &staging).await?;
     Ok(())
 }
 
@@ -2269,12 +2321,25 @@ pub async fn export_odb(
     units: &str,
     compression: &str,
 ) -> Result<()> {
+    // KiCad writes a directory tree in this mode, rather than an archive.
+    let staged = if compression == "none" {
+        ensure_export_destination_is_not_design_file(output)?;
+        match tokio::fs::metadata(output).await {
+            Ok(metadata) => anyhow::ensure!(metadata.is_dir(), "ODB++ output must be a directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("could not inspect ODB++ output directory"),
+        }
+        None
+    } else {
+        Some(stage_export_file(output)?)
+    };
+    let cli_output = staged.as_ref().map_or(output, |(_, path)| path.as_path());
     let args = [
         "pcb",
         "export",
         "odb",
         "--output",
-        output.to_str().unwrap(),
+        cli_output.to_str().unwrap(),
         "--units",
         units,
         "--compression",
@@ -2282,6 +2347,9 @@ pub async fn export_odb(
         pcb.to_str().unwrap(),
     ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;
+    if let Some((staging, staged)) = staged {
+        publish_verified_file(&staged, output, "ODB++ archive", &staging).await?;
+    }
     Ok(())
 }
 
@@ -2308,13 +2376,14 @@ pub async fn render_pcb_png(
     width: u32,
     height: u32,
 ) -> Result<()> {
+    let (staging, staged) = stage_export_file(output)?;
     let width_str = width.to_string();
     let height_str = height.to_string();
     let args = vec![
         "pcb",
         "render",
         "--output",
-        output.to_str().unwrap(),
+        staged.to_str().unwrap(),
         "--width",
         &width_str,
         "--height",
@@ -2322,6 +2391,7 @@ pub async fn render_pcb_png(
         pcb.to_str().unwrap(),
     ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;
+    publish_verified_file(&staged, output, "PCB PNG", &staging).await?;
     Ok(())
 }
 

@@ -52,5 +52,8 @@ installation. On a stock KiCad 10.0.8 fixture, a supported custom clearance
 constraint changed the reported violations, while an unrecognized constraint
 produced the same ordinary DRC report and exit status as running with no
 custom rule. That CLI command cannot validate general rule input. The existing
-`set_layer_constraints` tool still handles its fixed clearance and trace-width
-forms.
+`set_layer_constraints` tool handles its fixed clearance and trace-width
+forms. For a change, pass the exact case-sensitive layer name from the saved
+PCB's enabled layer table. Board display aliases and disabled inner layers
+are refused before the rules file is opened for writing. An existing rule in
+the file is not revalidated by that operation.
