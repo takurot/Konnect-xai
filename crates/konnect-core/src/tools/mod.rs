@@ -1062,6 +1062,28 @@ pub(crate) fn checked_mm(value: f64, key: &str) -> Result<f64, CallToolResult> {
         .map_err(|error| invalid_arg(key, &error.to_string()))
 }
 
+/// KiCad stores board lengths as signed 32-bit nanometres. Past this the
+/// value wraps when KiCad loads the board.
+pub(crate) const KICAD_BOARD_MAX_MM: f64 = i32::MAX as f64 / 1_000_000.0;
+
+/// Validate a board coordinate against KiCad's representable range, unlike
+/// [`checked_mm`], which only guards the 64-bit conversion.
+pub(crate) fn checked_board_mm(value: f64, key: &str) -> Result<f64, CallToolResult> {
+    if value.is_finite() && value.abs() <= KICAD_BOARD_MAX_MM {
+        Ok(konnect_sexp::geometry::round6(value))
+    } else {
+        Err(invalid_arg(
+            key,
+            &format!("must be within ±{KICAD_BOARD_MAX_MM} mm, KiCad's board coordinate range"),
+        ))
+    }
+}
+
+/// Extract a required board coordinate within KiCad's range.
+pub(crate) fn require_board_mm(args: &Value, key: &str) -> Result<f64, CallToolResult> {
+    checked_board_mm(require_f64(args, key)?, key)
+}
+
 /// Extract an optional f64.
 pub fn opt_f64(args: &Value, key: &str) -> Option<f64> {
     args[key].as_f64()

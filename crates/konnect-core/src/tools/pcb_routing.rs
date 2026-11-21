@@ -8,7 +8,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::board_source::{self, BoardSource};
 use crate::tools::{
-    get_path, invalid_arg, opt_f64, require_f64, require_str, with_board_ipc_classified,
+    get_path, invalid_arg, require_f64, require_str, with_board_ipc_classified,
     with_bound_board_ipc_classified, BoardBinding, ToolContext, ToolDef,
 };
 use anyhow::Context;
@@ -458,19 +458,19 @@ async fn handle_route_trace(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let x1 = match require_f64(args, "x1") {
+    let x1 = match super::require_board_mm(args, "x1") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y1 = match require_f64(args, "y1") {
+    let y1 = match super::require_board_mm(args, "y1") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let x2 = match require_f64(args, "x2") {
+    let x2 = match super::require_board_mm(args, "x2") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y2 = match require_f64(args, "y2") {
+    let y2 = match super::require_board_mm(args, "y2") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -580,11 +580,11 @@ async fn handle_add_via(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let x = match require_f64(args, "x") {
+    let x = match super::require_board_mm(args, "x") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y = match require_f64(args, "y") {
+    let y = match super::require_board_mm(args, "y") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -1278,19 +1278,19 @@ async fn handle_modify_trace(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let x1 = match require_f64(args, "x1") {
+    let x1 = match super::require_board_mm(args, "x1") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y1 = match require_f64(args, "y1") {
+    let y1 = match super::require_board_mm(args, "y1") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let x2 = match require_f64(args, "x2") {
+    let x2 = match super::require_board_mm(args, "x2") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y2 = match require_f64(args, "y2") {
+    let y2 = match super::require_board_mm(args, "y2") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -1425,23 +1425,35 @@ async fn handle_create_netclass(
     if let Some(refusal) = refuse_while_kicad_holds_the_board(ctx, &board_path).await? {
         return Ok(refusal);
     }
-    // The differential fields are scaled into signed 32-bit nanometres by KiCad.
-    // Reject out-of-domain values before touching the project.
+    // KiCad scales every field into signed 32-bit nanometres. Widths and via
+    // sizes must be physical; clearances and gaps may be zero. Reject
+    // out-of-domain values before touching the project.
     let mut requested = Vec::new();
     for (key, arg, default) in NETCLASS_FIELDS {
-        let value = if default.is_none() && args.get(arg).is_some() {
-            match require_f64(args, arg) {
-                Ok(value) if (0.0..=MAX_NETCLASS_MM).contains(&value) => Some(round6(value)),
-                Ok(_) => {
+        let zero_allowed = matches!(key, "clearance" | "diff_pair_gap" | "diff_pair_via_gap");
+        let value = match args.get(arg) {
+            None => None,
+            Some(_) => match require_f64(args, arg) {
+                Ok(value)
+                    if value <= MAX_NETCLASS_MM
+                        && (value > 0.0 || zero_allowed && value == 0.0) =>
+                {
+                    Some(round6(value))
+                }
+                Ok(_) if zero_allowed => {
                     return Ok(invalid_arg(
                         arg,
                         &format!("must be within 0..={MAX_NETCLASS_MM} mm"),
                     ))
                 }
+                Ok(_) => {
+                    return Ok(invalid_arg(
+                        arg,
+                        &format!("must be greater than 0 and at most {MAX_NETCLASS_MM} mm"),
+                    ))
+                }
                 Err(error) => return Ok(error),
-            }
-        } else {
-            opt_f64(args, arg)
+            },
         };
         requested.push((key, value, default));
     }
@@ -1690,7 +1702,7 @@ fn wildcard_matches(pattern: &str, name: &str) -> bool {
     p == pat.len()
 }
 
-const MAX_NETCLASS_MM: f64 = i32::MAX as f64 / 1_000_000.0;
+const MAX_NETCLASS_MM: f64 = super::KICAD_BOARD_MAX_MM;
 
 /// KiCad key, tool argument, and creation default for a named class.
 /// Differential fields are absent unless explicitly set. KiCad inherits width
@@ -2057,19 +2069,19 @@ async fn handle_route_diff_pair(
         Err(e) => return Ok(e),
     };
     let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
-    let x1 = match require_f64(args, "x1") {
+    let x1 = match super::require_board_mm(args, "x1") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y1 = match require_f64(args, "y1") {
+    let y1 = match super::require_board_mm(args, "y1") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let x2 = match require_f64(args, "x2") {
+    let x2 = match super::require_board_mm(args, "x2") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y2 = match require_f64(args, "y2") {
+    let y2 = match super::require_board_mm(args, "y2") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
