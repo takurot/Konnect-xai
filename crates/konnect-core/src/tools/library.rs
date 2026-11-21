@@ -2780,8 +2780,12 @@ async fn register_in_lib_table_with_policy(
 /// `${KIPRJMOD}`, a symlinked prefix such as macOS `/var`), and calling that a
 /// conflict would ask the caller to replace an entry that is already right.
 fn same_library_uri(table_uri: &str, requested_uri: &str, table_dir: Option<&Path>) -> bool {
+    // A bare relative URI would canonicalise against the server's working
+    // directory, which says nothing about where KiCad looks.
     let resolve = |uri: &str| {
-        expand_catalogue_uri(uri, table_dir, None).and_then(|path| std::fs::canonicalize(path).ok())
+        expand_catalogue_uri(uri, table_dir, None)
+            .filter(|path| path.is_absolute())
+            .and_then(|path| std::fs::canonicalize(path).ok())
     };
     matches!(
         (resolve(table_uri), resolve(requested_uri)),
@@ -6821,6 +6825,53 @@ mod tests {
         let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
         assert_eq!(output["state"], "unchanged", "{output}");
         assert_eq!(std::fs::read_to_string(&table).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn replace_existing_rewrites_an_equivalent_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("parts.kicad_sym");
+        std::fs::write(&library, "(kicad_symbol_lib)\n").unwrap();
+        let table = tmp.path().join("sym-lib-table");
+        let absolute = library.to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            &table,
+            format!(
+                "(sym_lib_table\n  (version 7)\n  (lib (name \"Parts\") (type \"KiCad\") (uri \"{absolute}\") (options \"\") (descr \"\"))\n)\n"
+            ),
+        )
+        .unwrap();
+
+        let result = handle_register_symbol_library(
+            &json!({
+                "library_path": library,
+                "nickname": "Parts",
+                "project": tmp.path(),
+                "replace_existing": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["state"], "updated", "{output}");
+        assert_eq!(output["uri"], "${KIPRJMOD}/parts.kicad_sym", "{output}");
+        assert!(std::fs::read_to_string(&table)
+            .unwrap()
+            .contains("(uri \"${KIPRJMOD}/parts.kicad_sym\")"));
+    }
+
+    #[test]
+    fn a_bare_relative_table_uri_is_never_equivalent() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("parts.kicad_sym"), "").unwrap();
+        assert!(!same_library_uri(
+            "parts.kicad_sym",
+            "${KIPRJMOD}/parts.kicad_sym",
+            Some(tmp.path())
+        ));
     }
 
     #[cfg(unix)]
