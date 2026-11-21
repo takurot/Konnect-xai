@@ -1138,6 +1138,7 @@ async fn handle_bulk_move(
     let expected = content.clone();
     let mut edits: Vec<SexpEdit> = Vec::new();
     let mut moved: Vec<serde_json::Value> = Vec::new();
+    let mut unchanged: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
     for ref_val in &refs {
@@ -1204,6 +1205,16 @@ async fn handle_bulk_move(
             if !rot.is_finite() {
                 return Ok(super::invalid_arg("rotation", "must be finite"));
             }
+            for (field, value) in [("x", new_x), ("y", new_y)] {
+                if let Err(error) = super::sch_values::check_schematic_coord(value, field) {
+                    return Ok(error);
+                }
+            }
+            // Snapping can absorb a small delta entirely; that placement did
+            // not move and must not be reported as moved.
+            if new_x == x && new_y == y {
+                continue;
+            }
             edits.push(SexpEdit::replace(
                 at_abs,
                 at_end,
@@ -1230,7 +1241,9 @@ async fn handle_bulk_move(
             }));
         }
 
-        if !placements.is_empty() {
+        if placements.is_empty() {
+            unchanged.push(reference.to_string());
+        } else {
             moved.push(json!({
                 "reference": reference,
                 "units": placements.len(),
@@ -1294,6 +1307,7 @@ async fn handle_bulk_move(
     Ok(CallToolResult::json(&json!({
         "moved_count": moved.len(),
         "moved": moved,
+        "unchanged": unchanged,
         "dx": round6(dx), "dy": round6(dy),
         "junctions_added_count": junctions_added,
         "junctions_pruned_count": junctions_pruned,
@@ -1697,15 +1711,15 @@ async fn handle_connect_passthrough(
         Ok(value) => value,
         Err(error) => return Ok(error),
     };
-    let net_name = match require_str(args, "net_name") {
+    let net_name = match super::sch_values::net_name(args, "net_name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let x = match require_f64(args, "x") {
+    let x = match super::sch_values::schematic_coord(args, "x") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y = match require_f64(args, "y") {
+    let y = match super::sch_values::schematic_coord(args, "y") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -1871,6 +1885,13 @@ fn schematic_text_justify(value: &str) -> Result<String, String> {
             "right" => claim(&mut horizontal, "right", token)?,
             "top" => claim(&mut vertical, "top", token)?,
             "bottom" => claim(&mut vertical, "bottom", token)?,
+            "center" => {
+                return Err(format!(
+                    "justify '{trimmed}' combines 'center' with another token - 'center' stands \
+                     alone; to centre one axis, omit that axis's token (e.g. 'bottom' alone is \
+                     horizontally centred)"
+                ))
+            }
             _ => {
                 return Err(format!(
                     "unknown justify token '{token}' - use left, right, top, bottom, or center"
@@ -1907,7 +1928,10 @@ async fn handle_add_schematic_text(
         (Ok(x), Ok(y)) => (x, y),
         (Err(error), _) | (_, Err(error)) => return Ok(error),
     };
-    let size = args["size"].as_f64().unwrap_or(1.27);
+    let size = match super::opt_positive_f64(args, "size") {
+        Ok(size) => size.unwrap_or(1.27),
+        Err(error) => return Ok(error),
+    };
     let size = match super::checked_mm(size, "size") {
         Ok(value) => value,
         Err(error) => return Ok(error),

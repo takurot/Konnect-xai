@@ -594,11 +594,11 @@ async fn handle_add_schematic_component(
         Ok(s) => s.to_string(),
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
-    let x = match require_f64(args, "x") {
+    let x = match super::sch_values::schematic_coord(args, "x") {
         Ok(v) => v,
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
-    let y = match require_f64(args, "y") {
+    let y = match super::sch_values::schematic_coord(args, "y") {
         Ok(v) => v,
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
@@ -688,6 +688,9 @@ async fn handle_add_schematic_component(
         unit,
     );
     let candidate = sch.to_source();
+    if let Err(error) = super::sch_values::check_pins_within_limit(&candidate, &placed.reference) {
+        return Ok(failed_component_placement(error, &sch_path));
+    }
     let persisted = if is_numbered(&placed.reference) {
         let inventory =
             match ReferenceInventory::load(&sch_path, &before, &candidate, Some(&context)) {
@@ -3568,11 +3571,11 @@ async fn handle_move_schematic_component(
         Ok(r) => r.to_string(),
         Err(e) => return Ok(e),
     };
-    let new_x = match require_f64(args, "x") {
+    let new_x = match super::sch_values::schematic_coord(args, "x") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let new_y = match require_f64(args, "y") {
+    let new_y = match super::sch_values::schematic_coord(args, "y") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -3612,6 +3615,9 @@ async fn handle_move_schematic_component(
         Err(error) => return Ok(error),
     };
     let candidate = sch.to_source();
+    if let Err(error) = super::sch_values::check_pins_within_limit(&candidate, &reference) {
+        return Ok(error);
+    }
     let (candidate, added, pruned) = reconcile_junctions_for_placement(&before_source, candidate);
     write_schematic_if_unchanged(&sch_path, &before_source, &candidate)?;
     let moved_markers =

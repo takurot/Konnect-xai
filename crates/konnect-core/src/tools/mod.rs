@@ -49,12 +49,13 @@ mod sch_overlap;
 mod sch_project_netlist;
 mod sch_references;
 pub(crate) mod sch_route_safety;
+pub(crate) mod sch_values;
 pub mod sch_wiring;
+#[cfg(test)]
+mod sch_write_validation_tests;
 pub mod schematic_builder;
 #[cfg(test)]
 mod schematic_placement_tests;
-#[cfg(test)]
-mod sch_write_validation_tests;
 pub mod svg_import;
 pub mod templates;
 pub mod verification;

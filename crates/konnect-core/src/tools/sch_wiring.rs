@@ -3,6 +3,7 @@
 //! Key rule: Every wire add operation must auto-detect T-junctions and insert
 //! junction dots. This uses `konnect_sexp::schematic::find_t_junctions`.
 
+use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
 use super::sch_route_safety::{
     allow_join, check_coordinate_route, check_named_stub_route, check_route, local_junctions,
     route_segments, NamedStubRoute,
@@ -10,18 +11,19 @@ use super::sch_route_safety::{
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    get_path, invalid_arg, opt_f64, opt_str, require_array, require_f64, require_str,
-    schematic_rotation_arg, ToolContext, ToolDef,
+    get_path, invalid_arg, opt_f64, opt_positive_f64, opt_str, require_array, require_f64,
+    require_str, schematic_rotation_arg, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::schematic::write_schematic_if_unchanged;
 use konnect_sexp::{
-    geometry::{round6, snap_point},
+    geometry::{points_coincident, round6, snap_point},
     parser::parse_sexp,
     schematic::{
-        extract_symbol_instances, extract_wires, find_lib_symbol, format_junction, format_wire,
-        parse_at, pin_endpoint, pin_outward_direction, read_schematic, LabelKind, Wire,
+        extract_all_net_labels, extract_buses, extract_symbol_instances, extract_wires,
+        find_lib_symbol, format_junction, format_wire, parse_at, pin_endpoint,
+        pin_outward_direction, read_schematic, LabelKind, Wire,
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
@@ -374,7 +376,7 @@ pub fn tools() -> Vec<ToolDef> {
                         "enum": ["auto", "right", "left", "up", "down"],
                         "default": "auto"
                     },
-                    "stub_length": { "type": "number", "default": 2.54,
+                    "stub_length": { "type": "number", "default": 2.54, "exclusiveMinimum": 0,
                         "description": "Length of the wire stub in mm" },
                     "label_type": {
                         "type": "string",
@@ -1684,15 +1686,15 @@ async fn handle_add_net_label(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let net = match require_str(args, "net") {
+    let net = match super::sch_values::net_name(args, "net") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let x = match require_f64(args, "x") {
+    let x = match super::sch_values::schematic_coord(args, "x") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y = match require_f64(args, "y") {
+    let y = match super::sch_values::schematic_coord(args, "y") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -2380,26 +2382,203 @@ async fn handle_add_power_symbol(
     Ok(CallToolResult::json(&observed))
 }
 
+/// Whether a marker would add anything at a point, given what is already there.
+#[derive(Clone, Copy, PartialEq)]
+enum MarkerPlacement {
+    Add,
+    AlreadyPresent,
+}
+
+/// The sheet's connection items, read once for marker placement checks.
+struct MarkerSite {
+    content: String,
+    tree: konnect_sexp::SexpNode,
+}
+
+impl MarkerSite {
+    fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+        let (content, tree) = read_schematic(path)?;
+        Ok(Self { content, tree })
+    }
+
+    fn with_index<T>(&self, check: impl FnOnce(&ConnectivityIndex<'_>) -> T) -> T {
+        let wires = extract_wires(&self.tree);
+        let buses = extract_buses(&self.tree);
+        let labels = extract_all_net_labels(&self.tree);
+        check(&ConnectivityIndex::build(
+            &self.tree,
+            &wires,
+            &buses,
+            &labels,
+            COINCIDENT_TOLERANCE,
+        ))
+    }
+}
+
+fn marker_point(value: &serde_json::Value) -> Result<(f64, f64), String> {
+    let coordinate = |axis: &str| {
+        let number = value[axis]
+            .as_f64()
+            .ok_or_else(|| format!("needs a numeric {axis}"))?;
+        super::sch_values::check_schematic_coord(number, axis)
+            .map_err(|_| format!("{axis} = {number} is outside the schematic coordinate range"))
+    };
+    Ok((coordinate("x")?, coordinate("y")?))
+}
+
+/// A no-connect flag belongs on a component pin that nothing else reaches.
+/// Anywhere else KiCad's ERC reports it as dangling or as connected.
+fn no_connect_placement(
+    index: &ConnectivityIndex<'_>,
+    (x, y): (f64, f64),
+) -> Result<MarkerPlacement, String> {
+    if index.has_no_connect(x, y) {
+        return Ok(MarkerPlacement::AlreadyPresent);
+    }
+    let pins = index.point_detail(x, y).pins;
+    let Some(first) = pins.first() else {
+        return Err(format!(
+            "no component pin at ({x}, {y}); a no-connect flag marks an unused pin"
+        ));
+    };
+    // Stacked pins of one part are one connection point; another part's pin is
+    // a connection.
+    let other_part = pins.iter().any(|pin| pin.reference != first.reference);
+    if other_part
+        || index.on_wire(x, y)
+        || index.on_bus(x, y)
+        || index.has_label(x, y)
+        || index.has_sheet_pin(x, y)
+        || index.has_junction(x, y)
+    {
+        return Err(format!(
+            "pin {}.{} at ({x}, {y}) is already connected; a no-connect flag there is an \
+                 ERC error",
+            first.reference, first.pin.number
+        ));
+    }
+    Ok(MarkerPlacement::Add)
+}
+
+/// A junction dot joins wires or buses, so it needs one under it.
+fn junction_placement(
+    index: &ConnectivityIndex<'_>,
+    (x, y): (f64, f64),
+) -> Result<MarkerPlacement, String> {
+    if index.has_junction(x, y) {
+        return Ok(MarkerPlacement::AlreadyPresent);
+    }
+    if !(index.on_wire(x, y) || index.on_bus(x, y)) {
+        return Err(format!(
+            "no wire or bus passes through ({x}, {y}); a junction there joins nothing"
+        ));
+    }
+    Ok(MarkerPlacement::Add)
+}
+
+/// How a batch treats a position it cannot mark.
+#[derive(Clone, Copy, PartialEq)]
+enum Refusals {
+    /// Refuse the whole call and write nothing.
+    Atomic,
+    /// Report the position in `errors` and still write the others.
+    PerPosition,
+}
+
+struct MarkerOutcome {
+    added: Vec<(f64, f64)>,
+    already_present: usize,
+    errors: Vec<String>,
+}
+
+/// Check every position before writing, collapse repeats, and add the rest in
+/// one write.
+fn add_markers(
+    path: &std::path::Path,
+    positions: &[serde_json::Value],
+    placement: fn(&ConnectivityIndex<'_>, (f64, f64)) -> Result<MarkerPlacement, String>,
+    format_marker: fn(f64, f64) -> String,
+    field_of: fn(usize) -> String,
+    refusals: Refusals,
+) -> anyhow::Result<Result<MarkerOutcome, CallToolResult>> {
+    let site = MarkerSite::load(path)?;
+    let planned = site.with_index(|index| {
+        let mut outcome = MarkerOutcome {
+            added: Vec::new(),
+            already_present: 0,
+            errors: Vec::new(),
+        };
+        for (i, value) in positions.iter().enumerate() {
+            let checked = marker_point(value)
+                .and_then(|point| placement(index, point).map(|placed| (point, placed)));
+            let (point, placed) = match checked {
+                Ok(checked) => checked,
+                Err(reason) if refusals == Refusals::Atomic => {
+                    return Err(invalid_arg(&field_of(i), &reason))
+                }
+                Err(reason) => {
+                    outcome.errors.push(format!("Position {i}: {reason}"));
+                    continue;
+                }
+            };
+            let repeated = outcome
+                .added
+                .iter()
+                .any(|&(ax, ay)| points_coincident(ax, ay, point.0, point.1, COINCIDENT_TOLERANCE));
+            match placed {
+                MarkerPlacement::Add if !repeated => outcome.added.push(point),
+                _ => outcome.already_present += 1,
+            }
+        }
+        Ok(outcome)
+    });
+    let outcome = match planned {
+        Ok(outcome) => outcome,
+        Err(error) => return Ok(Err(error)),
+    };
+    if !outcome.added.is_empty() {
+        let markers: String = outcome
+            .added
+            .iter()
+            .map(|&(x, y)| format_marker(x, y))
+            .collect();
+        let new_content = insert_before_close(&site.content, &markers)?;
+        write_schematic_if_unchanged(path, &site.content, &new_content)?;
+    }
+    Ok(Ok(outcome))
+}
+
+fn points_json(points: &[(f64, f64)]) -> Vec<serde_json::Value> {
+    points
+        .iter()
+        .map(|&(x, y)| json!({ "x": round6(x), "y": round6(y) }))
+        .collect()
+}
+
 async fn handle_add_no_connect(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let x = match require_f64(args, "x") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
+    let point = match marker_point(args) {
+        Ok(point) => point,
+        Err(reason) => return Ok(invalid_arg("x", &reason)),
     };
-    let y = match require_f64(args, "y") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
+    let added = match add_markers(
+        &sch_path,
+        &[json!({ "x": point.0, "y": point.1 })],
+        no_connect_placement,
+        konnect_sexp::schematic::format_no_connect,
+        |_| "x".to_string(),
+        Refusals::Atomic,
+    )? {
+        Ok(outcome) => outcome.added,
+        Err(error) => return Ok(error),
     };
-
-    let mut sch = cse::Schematic::load(&sch_path)?;
-    sch.add_no_connect(x, y);
-    sch.overwrite()?;
-    Ok(CallToolResult::json(
-        &json!({ "added_no_connect": { "x": round6(x), "y": round6(y) } }),
-    ))
+    Ok(CallToolResult::json(&json!({
+        "added_no_connect": { "x": round6(point.0), "y": round6(point.1) },
+        "already_present": added.is_empty()
+    })))
 }
 
 async fn handle_batch_add_no_connect(
@@ -2407,30 +2586,28 @@ async fn handle_batch_add_no_connect(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let positions = match args["positions"].as_array() {
-        Some(a) => a.clone(),
-        None => return Ok(CallToolResult::error("Missing 'positions' array")),
+    let positions = match require_array(args, "positions") {
+        Ok(a) => a.clone(),
+        Err(e) => return Ok(e),
     };
-
-    let mut sch = cse::Schematic::load(&sch_path)?;
-    let mut added: Vec<serde_json::Value> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-
-    for (i, p) in positions.iter().enumerate() {
-        match (p["x"].as_f64(), p["y"].as_f64()) {
-            (Some(x), Some(y)) => {
-                sch.add_no_connect(x, y);
-                added.push(json!({ "x": round6(x), "y": round6(y) }));
-            }
-            _ => errors.push(format!("Position {i}: needs numeric x and y")),
-        }
-    }
-    sch.overwrite()?;
-
+    // Flagging twenty pins and having one refused should land the other
+    // nineteen and name the one, so this batch reports per position.
+    let outcome = match add_markers(
+        &sch_path,
+        &positions,
+        no_connect_placement,
+        konnect_sexp::schematic::format_no_connect,
+        |i| format!("positions[{i}]"),
+        Refusals::PerPosition,
+    )? {
+        Ok(outcome) => outcome,
+        Err(error) => return Ok(error),
+    };
     Ok(CallToolResult::json(&json!({
-        "added_count": added.len(),
-        "added": added,
-        "errors": errors
+        "added_count": outcome.added.len(),
+        "added": points_json(&outcome.added),
+        "already_present_count": outcome.already_present,
+        "errors": outcome.errors
     })))
 }
 
@@ -2548,21 +2725,25 @@ async fn handle_add_junction(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let x = match require_f64(args, "x") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
+    let point = match marker_point(args) {
+        Ok(point) => point,
+        Err(reason) => return Ok(invalid_arg("x", &reason)),
     };
-    let y = match require_f64(args, "y") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
+    let added = match add_markers(
+        &sch_path,
+        &[json!({ "x": point.0, "y": point.1 })],
+        junction_placement,
+        format_junction,
+        |_| "x".to_string(),
+        Refusals::Atomic,
+    )? {
+        Ok(outcome) => outcome.added,
+        Err(error) => return Ok(error),
     };
-
-    let mut sch = cse::Schematic::load(&sch_path)?;
-    sch.add_junction(x, y);
-    sch.overwrite()?;
-    Ok(CallToolResult::json(
-        &json!({ "added_junction": { "x": round6(x), "y": round6(y) } }),
-    ))
+    Ok(CallToolResult::json(&json!({
+        "added_junction": { "x": round6(point.0), "y": round6(point.1) },
+        "already_present": added.is_empty()
+    })))
 }
 
 async fn handle_batch_add_junction(
@@ -2574,14 +2755,22 @@ async fn handle_batch_add_junction(
         Ok(a) => a.clone(),
         Err(e) => return Ok(e),
     };
-    let mut sch = cse::Schematic::load(&sch_path)?;
-    for pos in &positions {
-        let x = pos["x"].as_f64().unwrap_or(0.0);
-        let y = pos["y"].as_f64().unwrap_or(0.0);
-        sch.add_junction(x, y);
-    }
-    sch.overwrite()?;
-    Ok(CallToolResult::json(&json!({ "added": positions.len() })))
+    let outcome = match add_markers(
+        &sch_path,
+        &positions,
+        junction_placement,
+        format_junction,
+        |i| format!("positions[{i}]"),
+        Refusals::Atomic,
+    )? {
+        Ok(outcome) => outcome,
+        Err(error) => return Ok(error),
+    };
+    Ok(CallToolResult::json(&json!({
+        "added": outcome.added.len(),
+        "already_present": outcome.already_present,
+        "positions": points_json(&outcome.added)
+    })))
 }
 
 async fn handle_connect_to_net(
@@ -2594,7 +2783,10 @@ async fn handle_connect_to_net(
         Err(e) => return Ok(e),
     };
     let direction = opt_str(args, "direction").unwrap_or("auto");
-    let stub_length = opt_f64(args, "stub_length").unwrap_or(2.54);
+    let stub_length = match opt_positive_f64(args, "stub_length") {
+        Ok(length) => length.unwrap_or(2.54),
+        Err(error) => return Ok(error),
+    };
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
 
     let (content, tree) = read_schematic(&sch_path)?;
@@ -4992,7 +5184,8 @@ mod batch_no_connect_tests {
     use std::io::Write;
     use std::sync::Arc;
 
-    const SCH: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"eeschema\")\n  (uuid \"root\")\n  (paper \"A4\")\n  (lib_symbols)\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
+    /// R1's two pins are free at (10, 16.19) and (10, 23.81).
+    const SCH: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"eeschema\")\n  (uuid \"root\")\n  (paper \"A4\")\n  (lib_symbols (symbol \"Device:R\" (symbol \"R_1_1\"\n    (pin passive line (at 0 3.81 270) (length 1.27) (name \"~\") (number \"1\"))\n    (pin passive line (at 0 -3.81 90) (length 1.27) (name \"~\") (number \"2\")))))\n  (symbol (lib_id \"Device:R\") (at 10 20 0) (unit 1) (uuid \"u1\")\n    (property \"Reference\" \"R1\" (at 10 20 0)))\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
 
     async fn run(positions: serde_json::Value) -> (String, serde_json::Value) {
         let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
@@ -5026,7 +5219,7 @@ mod batch_no_connect_tests {
 
     #[tokio::test]
     async fn writes_every_flag_in_one_pass() {
-        let (out, body) = run(json!([{"x": 10.0, "y": 20.0}, {"x": 30.0, "y": 40.0}])).await;
+        let (out, body) = run(json!([{"x": 10.0, "y": 16.19}, {"x": 10.0, "y": 23.81}])).await;
         assert_eq!(body["added_count"], 2);
         assert_eq!(out.matches("(no_connect").count(), 2);
     }
@@ -5036,9 +5229,9 @@ mod batch_no_connect_tests {
     #[tokio::test]
     async fn a_bad_entry_is_reported_without_losing_the_others() {
         let (out, body) =
-            run(json!([{"x": 10.0, "y": 20.0}, {"x": "nope"}, {"x": 1.0, "y": 2.0}])).await;
+            run(json!([{"x": 10.0, "y": 16.19}, {"x": "nope"}, {"x": 1.0, "y": 2.0}, {"x": 10.0, "y": 23.81}])).await;
         assert_eq!(body["added_count"], 2);
-        assert_eq!(body["errors"].as_array().unwrap().len(), 1);
+        assert_eq!(body["errors"].as_array().unwrap().len(), 2, "{body}");
         assert_eq!(out.matches("(no_connect").count(), 2);
     }
 

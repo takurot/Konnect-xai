@@ -481,8 +481,14 @@ async fn handle_apply_template(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let base_x = args["position_x"].as_f64().unwrap_or(100.0);
-    let base_y = args["position_y"].as_f64().unwrap_or(100.0);
+    let position = |key: &str| match &args[key] {
+        serde_json::Value::Null => Ok(100.0),
+        _ => crate::tools::sch_values::schematic_coord(args, key),
+    };
+    let (base_x, base_y) = match (position("position_x"), position("position_y")) {
+        (Ok(x), Ok(y)) => (x, y),
+        (Err(error), _) | (_, Err(error)) => return Ok(error),
+    };
     let net_mappings: std::collections::HashMap<String, String> = args["net_mappings"]
         .as_object()
         .map(|m| {
@@ -590,8 +596,14 @@ async fn handle_apply_template(
                 placed_by_template_ref.insert(template_ref, reference.clone());
             }
 
-            let x = base_x;
-            let y = base_y + (placed.len() as f64) * spacing_y;
+            let (x, y) = konnect_sexp::geometry::snap_point(
+                base_x,
+                base_y + (placed.len() as f64) * spacing_y,
+                1.27,
+            );
+            if let Err(error) = crate::tools::sch_values::check_schematic_coord(y, "position_y") {
+                return Ok(error);
+            }
             let placement = match crate::tools::sch_components::place_one_component(
                 &mut sch,
                 &context.instance_paths,
@@ -625,6 +637,21 @@ async fn handle_apply_template(
     }
 
     let candidate = sch.to_source();
+    let paper = crate::tools::sch_values::paper_size_mm(&candidate);
+    let warnings: Vec<String> = placed
+        .iter()
+        .filter_map(|placement| {
+            let (width, height) = paper?;
+            let (x, y) = (placement["x"].as_f64()?, placement["y"].as_f64()?);
+            let on_page = (0.0..=width).contains(&x) && (0.0..=height).contains(&y);
+            (!on_page).then(|| {
+                format!(
+                    "{} at ({x}, {y}) is outside the {width} x {height} mm page",
+                    placement["reference"].as_str().unwrap_or("component")
+                )
+            })
+        })
+        .collect();
     if let Err(error) = references.validate(&candidate) {
         return Ok(error);
     }
@@ -708,6 +735,7 @@ async fn handle_apply_template(
         serde_json::to_string(&json!({
             "template": template_id,
             "components_placed": placed,
+            "warnings": warnings,
             "wired": false,
             "connections_to_wire": mapped_connections,
             "design_notes": tmpl["design_notes"],

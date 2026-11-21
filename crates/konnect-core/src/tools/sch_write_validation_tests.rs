@@ -144,7 +144,10 @@ async fn sheet_with_right_and_top_pins() -> (tempfile::TempDir, PathBuf) {
     )
     .await;
     assert!(!added.is_error, "{added:?}");
-    for (name, x, y, side) in [("RIGHT", 130.0, 60.96, "right"), ("TOP", 120.65, 50.0, "top")] {
+    for (name, x, y, side) in [
+        ("RIGHT", 130.0, 60.96, "right"),
+        ("TOP", 120.65, 50.0, "top"),
+    ] {
         let pin = call(
             "add_sheet_pin",
             &path,
@@ -213,26 +216,28 @@ async fn add_no_connect_only_marks_a_free_pin_and_is_idempotent() {
 }
 
 #[tokio::test]
-async fn batch_add_no_connect_refuses_the_whole_batch_and_collapses_duplicates() {
+async fn batch_add_no_connect_reports_refused_positions_and_collapses_duplicates() {
     let (_dir, path) = fixture(&sheet_source());
-    assert_refused(
-        "batch_add_no_connect",
-        &path,
-        json!({ "positions": [{ "x": 101.6, "y": 97.79 }, { "x": 127.0, "y": 97.79 }] }),
-        "invalid_argument",
-        Some("positions[1]"),
-    )
-    .await;
     let result = call(
         "batch_add_no_connect",
         &path,
-        json!({ "positions": [{ "x": 101.6, "y": 97.79 }, { "x": 101.6, "y": 97.79 },
-                              { "x": 101.6, "y": 105.41 }] }),
+        json!({ "positions": [{ "x": 101.6, "y": 97.79 }, { "x": 127.0, "y": 97.79 },
+                              { "x": 101.6, "y": 97.79 }, { "x": 101.6, "y": 105.41 }] }),
     )
     .await;
     assert!(!result.is_error, "{result:?}");
-    assert_eq!(body(&result)["added_count"], 2);
-    assert_eq!(body(&result)["already_present_count"], 1);
+    let body = body(&result);
+    assert_eq!(body["added_count"], 2, "{body}");
+    assert_eq!(body["already_present_count"], 1, "{body}");
+    let errors = body["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{body}");
+    assert!(
+        errors[0]
+            .as_str()
+            .unwrap()
+            .starts_with("Position 1: pin R2.1"),
+        "{body}"
+    );
     assert_eq!(count(&path, "no_connect"), 2);
 }
 
@@ -261,7 +266,10 @@ async fn add_junction_needs_a_wire_and_is_idempotent() {
 async fn batch_add_junction_collapses_duplicates_and_refuses_bad_points_atomically() {
     let (_dir, path) = fixture(&sheet_source());
     for (positions, field) in [
-        (json!([{ "x": 114.3, "y": 127.0 }, { "x": 200.66, "y": 200.66 }]), "positions[1]"),
+        (
+            json!([{ "x": 114.3, "y": 127.0 }, { "x": 200.66, "y": 200.66 }]),
+            "positions[1]",
+        ),
         (json!([{ "x": 114.3 }]), "positions[0]"),
     ] {
         assert_refused(
@@ -404,7 +412,14 @@ async fn apply_template_refuses_an_unloadable_position() {
     for field in ["position_x", "position_y"] {
         let mut args = json!({ "template_id": "ldo_3v3" });
         args[field] = json!(1e9);
-        assert_refused("apply_template", &path, args, "invalid_argument", Some(field)).await;
+        assert_refused(
+            "apply_template",
+            &path,
+            args,
+            "invalid_argument",
+            Some(field),
+        )
+        .await;
     }
 }
 

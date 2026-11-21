@@ -600,16 +600,16 @@ async fn batch_delete_no_connect_refuses_when_nothing_matches_and_allows_an_empt
 
 #[tokio::test]
 async fn junctions_are_added_singly_and_in_batches_and_need_both_coordinates() {
-    let (_d, path) = sheet("");
+    let (_d, path) = sheet(WIRE_A);
     let r = handle_add_junction(
-        &json!({"schematic": p(&path), "x": 10.0, "y": 20.0}),
+        &json!({"schematic": p(&path), "x": 105.41, "y": 101.6}),
         &ctx(),
     )
     .await
     .unwrap();
     assert!(!r.is_error, "{}", text(&r));
     let r = handle_batch_add_junction(
-        &json!({"schematic": p(&path), "positions": [{"x": 1.0, "y": 2.0}, {"x": 3.0, "y": 4.0}]}),
+        &json!({"schematic": p(&path), "positions": [{"x": 106.68, "y": 101.6}, {"x": 107.95, "y": 101.6}]}),
         &ctx(),
     )
     .await

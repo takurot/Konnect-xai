@@ -179,7 +179,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic":       { "type": "string", "description": "Path to .kicad_sch file" },
-                    "snap_tolerance":  { "type": "number", "description": "Snap distance in mm", "default": 0.05 },
+                    "snap_tolerance":  { "type": "number", "description": "Snap distance in mm, at most 1.27 (one schematic grid step)", "default": 0.05, "exclusiveMinimum": 0, "maximum": 1.27 },
                     "dry_run":         { "type": "boolean", "description": "Report fixes without applying them", "default": false }
                 },
                 "required": ["schematic"]
@@ -772,12 +772,25 @@ async fn handle_run_erc(
     Ok(CallToolResult::json(&response))
 }
 
+const MAX_SNAP_TOLERANCE_MM: f64 = 1.27;
+
 async fn handle_fix_connectivity(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let snap_tol = args["snap_tolerance"].as_f64().unwrap_or(0.05);
+    let snap_tol = match crate::tools::opt_positive_f64(args, "snap_tolerance") {
+        Ok(tolerance) => tolerance.unwrap_or(0.05),
+        Err(error) => return Ok(error),
+    };
+    // Beyond one grid step a "near miss" is a different connection point, and
+    // snapping onto it rewires the sheet rather than repairing it.
+    if snap_tol > MAX_SNAP_TOLERANCE_MM {
+        return Ok(crate::tools::invalid_arg(
+            "snap_tolerance",
+            &format!("must be at most {MAX_SNAP_TOLERANCE_MM} mm (one schematic grid step)"),
+        ));
+    }
     let dry_run = args["dry_run"].as_bool().unwrap_or(false);
     let exact_tol = 0.01_f64;
     let format_point = |(x, y)| format!("({}, {})", fmt_mm(x), fmt_mm(y));
@@ -863,9 +876,15 @@ async fn handle_fix_connectivity(
                     .map(format_point)
                     .collect::<Vec<_>>()
                     .join(", ");
-                return Ok(stale_connectivity_target(
-                    target,
-                    format!("more than one snap destination was observed: {candidates}"),
+                return Ok(CallToolResult::error_kind(
+                    ToolErrorKind::AmbiguousTarget {
+                        target: target.clone(),
+                        candidates: near.iter().copied().map(format_point).collect(),
+                    },
+                    format!(
+                        "cannot snap {target}: more than one snap destination is in range \
+                         ({candidates}); lower snap_tolerance or connect it explicitly"
+                    ),
                 ));
             }
 
@@ -925,6 +944,34 @@ async fn handle_fix_connectivity(
         .zip(keep)
         .filter_map(|(fix, keep)| keep.then_some(fix))
         .collect();
+
+    // A snap may finish a connection, but never join two differently named
+    // nets: that is a rewiring decision, not a near-miss repair.
+    let labels_for_nets = analysis_net_labels(&tree);
+    let mut nets = analysis_net_graph(&tree, &wires, &labels_for_nets);
+    for fix in &fixes {
+        let (Some(from), Some(to)) = (
+            nets.net_at(fix.from.0, fix.from.1),
+            nets.net_at(fix.to.0, fix.to.1),
+        ) else {
+            continue;
+        };
+        if from != to {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::WouldJoinNets {
+                    nets: vec![from.clone(), to.clone()],
+                    at: vec![[fix.to.0, fix.to.1]],
+                },
+                format!(
+                    "snapping wire {} {} endpoint onto {} would join net '{from}' to net '{to}'; \
+                     connect them explicitly if that is intended",
+                    fix.uuid,
+                    fix.endpoint.name(),
+                    format_point(fix.to)
+                ),
+            ));
+        }
+    }
 
     // Resolve every target structurally before constructing a replacement. A
     // failure refuses the whole operation and leaves the document unchanged.
@@ -1656,7 +1703,10 @@ mod connectivity_edit_tests {
         let original = fixture(Some("wire-1"), "", &labels);
         let (result, file) = run_fix(&original).await;
 
-        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("ambiguous_target")
+        );
         assert_eq!(std::fs::read_to_string(file.path()).unwrap(), original);
     }
 

@@ -183,7 +183,9 @@ async fn handle_batch_add_bus(
         let (x1, y1, x2, y2) = match read_xy_pair(item) {
             Ok(v) => v,
             Err(_) => {
-                errors.push(format!("Segment {i}: needs x1, y1, x2, y2"));
+                errors.push(format!(
+                    "Segment {i}: needs in-range x1, y1, x2, y2 and a non-zero length"
+                ));
                 continue;
             }
         };
@@ -448,12 +450,21 @@ fn snap_coordinate(value: f64) -> f64 {
 }
 
 fn read_xy_pair(v: &serde_json::Value) -> Result<(f64, f64, f64, f64), CallToolResult> {
-    Ok((
-        snap_coordinate(require_f64(v, "x1")?),
-        snap_coordinate(require_f64(v, "y1")?),
-        snap_coordinate(require_f64(v, "x2")?),
-        snap_coordinate(require_f64(v, "y2")?),
-    ))
+    let coordinate =
+        |key: &str| crate::tools::sch_values::schematic_coord(v, key).map(snap_coordinate);
+    let (x1, y1, x2, y2) = (
+        coordinate("x1")?,
+        coordinate("y1")?,
+        coordinate("x2")?,
+        coordinate("y2")?,
+    );
+    if x1 == x2 && y1 == y2 {
+        return Err(crate::tools::invalid_arg(
+            "x2",
+            "the bus segment has zero length after snapping to the 1.27 mm grid",
+        ));
+    }
+    Ok((x1, y1, x2, y2))
 }
 
 #[cfg(test)]

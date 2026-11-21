@@ -1788,14 +1788,14 @@ fn connectivity_refusal_formats_endpoint_and_candidate_millimetres() {
     let result = server.call_tool("fix_connectivity", json!({"schematic":schematic}));
     assert_eq!(result["isError"], true, "{result}");
     let body = McpProcess::tool_body(&result);
-    assert_eq!(body["error"]["kind"], "stale_target");
+    assert_eq!(body["error"]["kind"], "ambiguous_target");
     assert_eq!(
         body["error"]["target"],
         "wire fixture-wire end endpoint at (97.79, 10)"
     );
     assert_eq!(
-        body["error"]["reason"],
-        "more than one snap destination was observed: (97.76, 10), (97.83, 10)"
+        body["error"]["candidates"],
+        json!(["(97.76, 10)", "(97.83, 10)"])
     );
     let message = body["message"].as_str().unwrap();
     assert!(message.contains("(97.79, 10)") && message.contains("(97.83, 10)"));
