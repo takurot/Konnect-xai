@@ -3,6 +3,38 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: schematic write validation (#132)
+
+Schematic write tools refuse values KiCad would clamp, move or flag, with
+`invalid_argument` and no file change:
+
+- Coordinates outside KiCad's +-151848.5687 mm range, for a symbol's origin
+  or any of its pins (`add_schematic_component`, `move_schematic_component`,
+  `apply_template`, net labels, `connect_passthrough`, markers, buses).
+- Blank net names, or names containing control characters
+  (`add_schematic_net_label`, `connect_passthrough`).
+- `connect_to_net.stub_length` and `add_schematic_text.size` of zero or less,
+  and zero-length bus segments.
+- `edit_sheet` resizes that leave a sheet pin off its edge.
+
+`add_no_connect` and `add_junction` are idempotent. A repeat returns
+`already_present: true` and writes nothing. A no-connect goes only on an
+unconnected component or sheet pin, and a junction only where a wire or bus
+passes. `batch_add_junction` refuses the whole batch on a bad point, and
+reports `added` (junctions written), `already_present` and `positions`.
+`batch_add_no_connect` keeps per-position `errors` and adds
+`already_present_count`.
+
+`fix_connectivity.snap_tolerance` must be in (0, 1.27] mm. More than one snap
+destination is reported as `ambiguous_target` with `candidates`, no longer
+`stale_target` with `reason`. Snaps that would join two label or power names
+are refused with `would_join_nets`.
+
+`bulk_move_schematic_components` lists references whose snapped position did
+not change under `unchanged` instead of `moved`. `apply_template` reports the
+grid-snapped coordinates it placed and adds `warnings` for placements off the
+page.
+
 ## Unreleased: toolset changes and observed tool errors
 
 `load_toolset` reports only newly added tools in `tools_added` and `tools`.

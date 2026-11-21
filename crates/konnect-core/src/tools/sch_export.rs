@@ -179,7 +179,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic":       { "type": "string", "description": "Path to .kicad_sch file" },
-                    "snap_tolerance":  { "type": "number", "description": "Snap distance in mm", "default": 0.05 },
+                    "snap_tolerance":  { "type": "number", "description": "Snap distance in mm, at most 1.27 (one schematic grid step)", "default": 0.05, "exclusiveMinimum": 0, "maximum": 1.27 },
                     "dry_run":         { "type": "boolean", "description": "Report fixes without applying them", "default": false }
                 },
                 "required": ["schematic"]
@@ -772,12 +772,93 @@ async fn handle_run_erc(
     Ok(CallToolResult::json(&response))
 }
 
+const MAX_SNAP_TOLERANCE_MM: f64 = 1.27;
+
+/// The refusal for a set of fixes that, taken together, would put two label
+/// or power names on one net. Each fix joins the net its wire is on to the net
+/// at its destination; fixes are unioned so that two snaps on one unnamed wire
+/// cannot join two named nets between them. Only label and power names count:
+/// unlabelled nets carry no name a caller chose, so joining them is a repair.
+fn named_net_join(
+    tree: &SexpNode,
+    wires: &[konnect_sexp::schematic::Wire],
+    fixes: &[PlannedWireFix],
+) -> Option<CallToolResult> {
+    use std::collections::{BTreeMap, BTreeSet};
+    // The analysis graph sees what KiCad's netlister sees (legacy hidden power
+    // pins, active power bodies, `{slash}`), but it also names unlabelled nets;
+    // keep only names some label or power symbol actually carries.
+    let labels = analysis_net_labels(tree);
+    let mut nets = analysis_net_graph(tree, wires, &labels);
+    let label_names: BTreeSet<String> = labels.iter().map(|label| label.net.clone()).collect();
+    let named = |name: Option<String>| name.filter(|name| label_names.contains(name));
+    let mut parent: BTreeMap<(i64, i64), (i64, i64)> = BTreeMap::new();
+    fn find(parent: &mut BTreeMap<(i64, i64), (i64, i64)>, root: (i64, i64)) -> (i64, i64) {
+        let next = *parent.entry(root).or_insert(root);
+        if next == root {
+            return root;
+        }
+        let top = find(parent, next);
+        parent.insert(root, top);
+        top
+    }
+    let roots: Vec<_> = fixes
+        .iter()
+        .map(|fix| {
+            (
+                nets.root_at(fix.from.0, fix.from.1),
+                nets.root_at(fix.to.0, fix.to.1),
+            )
+        })
+        .collect();
+    for &(from, to) in &roots {
+        let (a, b) = (find(&mut parent, from), find(&mut parent, to));
+        parent.insert(a, b);
+    }
+    let mut names: BTreeMap<(i64, i64), BTreeSet<String>> = BTreeMap::new();
+    let mut points: BTreeMap<(i64, i64), Vec<[f64; 2]>> = BTreeMap::new();
+    for (fix, &(from, to)) in fixes.iter().zip(&roots) {
+        let group = find(&mut parent, from);
+        let entry = names.entry(group).or_default();
+        entry.extend(named(nets.name_of_root(from)));
+        entry.extend(named(nets.name_of_root(to)));
+        points.entry(group).or_default().push([fix.to.0, fix.to.1]);
+    }
+    let (group, joined) = names.into_iter().find(|(_, joined)| joined.len() > 1)?;
+    let joined: Vec<String> = joined.into_iter().collect();
+    Some(CallToolResult::error_kind(
+        ToolErrorKind::WouldJoinNets {
+            nets: joined.clone(),
+            at: points.remove(&group).unwrap_or_default(),
+        },
+        format!(
+            "snapping would join the named nets {}; connect them explicitly if that is intended",
+            joined
+                .iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    ))
+}
+
 async fn handle_fix_connectivity(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let snap_tol = args["snap_tolerance"].as_f64().unwrap_or(0.05);
+    let snap_tol = match crate::tools::opt_positive_f64(args, "snap_tolerance") {
+        Ok(tolerance) => tolerance.unwrap_or(0.05),
+        Err(error) => return Ok(error),
+    };
+    // Beyond one grid step a "near miss" is a different connection point, and
+    // snapping onto it rewires the sheet rather than repairing it.
+    if snap_tol > MAX_SNAP_TOLERANCE_MM {
+        return Ok(crate::tools::invalid_arg(
+            "snap_tolerance",
+            &format!("must be at most {MAX_SNAP_TOLERANCE_MM} mm (one schematic grid step)"),
+        ));
+    }
     let dry_run = args["dry_run"].as_bool().unwrap_or(false);
     let exact_tol = 0.01_f64;
     let format_point = |(x, y)| format!("({}, {})", fmt_mm(x), fmt_mm(y));
@@ -863,9 +944,15 @@ async fn handle_fix_connectivity(
                     .map(format_point)
                     .collect::<Vec<_>>()
                     .join(", ");
-                return Ok(stale_connectivity_target(
-                    target,
-                    format!("more than one snap destination was observed: {candidates}"),
+                return Ok(CallToolResult::error_kind(
+                    ToolErrorKind::AmbiguousTarget {
+                        target: target.clone(),
+                        candidates: near.iter().copied().map(format_point).collect(),
+                    },
+                    format!(
+                        "cannot snap {target}: more than one snap destination is in range \
+                         ({candidates}); lower snap_tolerance or connect it explicitly"
+                    ),
                 ));
             }
 
@@ -925,6 +1012,12 @@ async fn handle_fix_connectivity(
         .zip(keep)
         .filter_map(|(fix, keep)| keep.then_some(fix))
         .collect();
+
+    // A snap may finish a connection, but never join two differently named
+    // nets: that is a rewiring decision, not a near-miss repair.
+    if let Some(refusal) = named_net_join(&tree, &wires, &fixes) {
+        return Ok(refusal);
+    }
 
     // Resolve every target structurally before constructing a replacement. A
     // failure refuses the whole operation and leaves the document unchanged.
@@ -1656,7 +1749,10 @@ mod connectivity_edit_tests {
         let original = fixture(Some("wire-1"), "", &labels);
         let (result, file) = run_fix(&original).await;
 
-        assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("ambiguous_target")
+        );
         assert_eq!(std::fs::read_to_string(file.path()).unwrap(), original);
     }
 

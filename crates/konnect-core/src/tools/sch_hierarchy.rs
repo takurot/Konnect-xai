@@ -371,7 +371,7 @@ const PAPER_SIZES: &[(&str, f64, f64)] = &[
 
 /// Landscape width and height of a named paper size, or the `invalid_argument`
 /// refusal naming every size that would have worked.
-fn paper_dimensions(size: &str) -> Result<(f64, f64), CallToolResult> {
+pub(super) fn paper_dimensions(size: &str) -> Result<(f64, f64), CallToolResult> {
     match PAPER_SIZES.iter().find(|(n, _, _)| *n == size) {
         Some(&(_, w, h)) => Ok((w, h)),
         None => {
@@ -634,6 +634,51 @@ fn ensure_pin_is_on_sheet_edge(
         ));
     }
     Ok(())
+}
+
+/// Refuse a resize that takes a sheet pin off the edge it was on. KiCad would
+/// move such a pin on load, which detaches whatever was wired to it.
+fn ensure_resize_keeps_pins_on_edges(
+    sheet: &cse::Sheet,
+    before: SheetBox,
+) -> Result<(), CallToolResult> {
+    let after = SheetBox::of(sheet);
+    for pin in &sheet.pins {
+        let Some(side) = sheet_pin_side_for_rotation(pin.at.rotation) else {
+            continue;
+        };
+        let (x, y) = pin.position();
+        if ensure_pin_is_on_sheet_edge(before, sheet.name(), side, x, y).is_err() {
+            continue;
+        }
+        if ensure_pin_is_on_sheet_edge(after, sheet.name(), side, x, y).is_err() {
+            return Err(invalid_arg(
+                resize_field(side, after, x, y),
+                &format!(
+                    "the new size leaves sheet pin '{}' at ({x}, {y}) off the '{side}' edge of \
+                     sheet '{}'; KiCad would move it and detach its wiring. Move the pin with \
+                     edit_sheet_pin first, or choose a size that keeps it on the edge",
+                    pin.name,
+                    sheet.name()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Which size argument moved the pin off. The right and bottom edges sit at
+/// x + width and y + height, so a pin no longer on that line is the width's or
+/// height's doing; a pin still on its line has run past a corner along it.
+/// The left and top edges do not move with size, so only the run applies.
+fn resize_field(side: &str, after: SheetBox, x: f64, y: f64) -> &'static str {
+    let off = |actual: f64, expected: f64| (actual - expected).abs() > SHEET_PIN_EDGE_TOLERANCE_MM;
+    match side {
+        "right" if off(x, after.x + after.width) => "width",
+        "bottom" if off(y, after.y + after.height) => "height",
+        "left" | "right" => "height",
+        _ => "width",
+    }
 }
 
 /// Refuse a whole import that would run an edge past its corner.
@@ -1339,7 +1384,11 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
     if let (Some(w), Some(h)) = (requested_width, requested_height) {
         requested.push("size");
         if sheet.width != w || sheet.height != h {
+            let before_box = SheetBox::of(sheet);
             sheet.set_size(w, h);
+            if let Err(error) = ensure_resize_keeps_pins_on_edges(sheet, before_box) {
+                return Ok(error);
+            }
             changed.push("size");
         }
     }
@@ -3551,6 +3600,18 @@ mod tests {
         root
     }
 
+    /// Shrink sheet A the way an external editor can, leaving its pins where
+    /// they were. `edit_sheet` refuses this, but such files exist.
+    fn resize_sheet_leaving_pins(root: &Path, width: f64, height: f64) {
+        let mut schematic = cse::Schematic::load(root).unwrap();
+        schematic
+            .sheets
+            .by_name_mut("A")
+            .unwrap()
+            .set_size(width, height);
+        schematic.overwrite().unwrap();
+    }
+
     fn pin_rotation(root: &Path, pin_name: &str) -> Option<f64> {
         cse::Schematic::load(root)
             .unwrap()
@@ -4509,8 +4570,8 @@ mod tests {
 
     #[tokio::test]
     async fn import_sheet_pins_ignores_a_pin_the_sheet_shrank_away_from() {
-        // `edit_sheet` resizes a sheet without moving its pins, so shrinking one
-        // strands them past the new corner. Such a pin names the edge but is not
+        // A sheet resized outside Konnect (edit_sheet now refuses this) keeps its
+        // pins where they were, so shrinking one strands them past the new corner. Such a pin names the edge but is not
         // on it, and measuring it would report the edge filled through a slot it
         // no longer has — refusing an import onto an edge that holds no valid pin
         // at all. Its coordinate still blocks a slot, and so does the corner
@@ -4528,13 +4589,7 @@ mod tests {
         .await
         .unwrap();
         // The 50 mm left edge becomes a 20 mm one; DEEP is now off the box.
-        handle_edit_sheet(
-            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
-                     "width": 80.0, "height": 20.0 }),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        resize_sheet_leaving_pins(&root, 80.0, 20.0);
 
         let child_path = tmp.path().join("a.kicad_sch");
         add_label(&child_path, "VIN", "input", 5.0, 5.0);
@@ -4754,13 +4809,7 @@ mod tests {
         )
         .await
         .unwrap();
-        handle_edit_sheet(
-            &json!({ "schematic": root.display().to_string(), "sheet_name": "A",
-                     "width": 80.0, "height": 5.08 }),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        resize_sheet_leaving_pins(&root, 80.0, 5.08);
 
         let child_path = tmp.path().join("a.kicad_sch");
         add_label(&child_path, "ONE", "input", 5.0, 5.0);
