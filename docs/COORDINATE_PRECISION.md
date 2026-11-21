@@ -27,7 +27,11 @@ Rotation checks the computed nanometre values before converting them to integers
 Generated schematic primitives, board graphics, library geometry, and the
 schematic editor share `fmt_mm`. JSON writers round named coordinate expressions,
 and typed IPC coordinate fields use `serialize_mm`. Neither path walks arbitrary
-JSON numbers or edits quoted user text.
+JSON numbers or edits quoted user text. Pin lookup, schematic overlap depths,
+and manufacturing estimates round their reported millimetre values.
+Connectivity repair diagnostics format endpoint and destination coordinates
+with `fmt_mm`. Graph solving, collision checks, repair decisions, and pricing
+use the original measurements.
 
 The regression suite covers positive and negative decimal grids, half-nanometre
 ties, negative zero, invalid values, generated schematic primitives, label

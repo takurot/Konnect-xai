@@ -14,12 +14,13 @@ use crate::tools::{
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{points_coincident, round6, snap_point},
+    schematic::write_schematic_if_unchanged,
     schematic::{
         extract_all_net_labels, extract_buses, extract_labels, extract_symbol_instances,
         extract_wires, find_lib_symbol, format_net_label, format_wire, pin_endpoint,
         pin_outward_direction, read_schematic, symbol_bounds_for_instance, SymbolBounds,
     },
-    writer::{apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit},
+    writer::{apply_edits, new_uuid, read_consistent, SexpEdit},
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -532,7 +533,7 @@ async fn handle_batch_connect_to_net(
         let rotation = dir.label_rotation;
         let staged_source = match &sch {
             Some(schematic) => schematic.to_source(),
-            None => crate::tools::sch_wiring::insert_before_close(&content, &inserts),
+            None => crate::tools::sch_wiring::insert_before_close(&content, &inserts)?,
         };
         let staged_tree = konnect_sexp::parse_sexp(&staged_source)?;
         if let Err(refusal) = check_route(
@@ -600,8 +601,9 @@ async fn handle_batch_connect_to_net(
                 // Labels are element class 2; symbol instances MUST come last, so a
                 // splice at the file's final `)` puts them after the instances and
                 // KiCad refuses the whole file (#156, same bug as add_schematic_text).
-                let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts);
-                write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+                let new_content =
+                    crate::tools::sch_wiring::insert_before_close(&content, &inserts)?;
+                write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
             }
         }
     }
@@ -792,7 +794,7 @@ async fn handle_batch_place_components(
             super::sch_wiring::reconcile_junctions_for_placement(&before_source, candidate);
         junctions_added = added;
         junctions_pruned = pruned;
-        if let Err(error) = write_atomic_if_unchanged(&sch_path, &before_source, &candidate) {
+        if let Err(error) = write_schematic_if_unchanged(&sch_path, &before_source, &candidate) {
             let result = super::mutation_outcome_uncertain(
                 &sch_path,
                 "batch_place_components",
@@ -969,7 +971,7 @@ async fn handle_batch_connect_pins(
     }
 
     if !resolved.is_empty() {
-        write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+        write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
     }
 
     let mut result = CallToolResult::json(&json!({
@@ -1239,7 +1241,7 @@ async fn handle_bulk_move(
     let (new_content, junctions_added, junctions_pruned) =
         crate::tools::sch_wiring::reconcile_junctions_for_placement(&expected, new_content);
 
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     let moved_markers = match crate::tools::sch_wiring::observed_no_connect_moves(
         &sch_path,
@@ -1441,7 +1443,7 @@ async fn handle_batch_edit(
         )));
     }
     let attributes_observed = if attribute_patches.is_empty() {
-        write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+        write_schematic_if_unchanged(&sch_path, &expected, &content)?;
         Vec::new()
     } else {
         match super::sch_components::commit_attribute_batch(
@@ -1694,8 +1696,8 @@ async fn handle_connect_passthrough(
     let new_content = crate::tools::sch_wiring::insert_before_close(
         &content,
         &format!("{wire_sexp}{label_sexp}"),
-    );
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    )?;
+    write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "net": net_name,
@@ -1916,8 +1918,8 @@ async fn handle_add_schematic_text(
     // Before the first symbol instance, not at the end of the file: KiCad 10
     // requires symbol instances to come last and refuses to load a schematic
     // with a `(text …)` after them.
-    let new_content = crate::tools::sch_wiring::insert_before_close(&content, &text_sexp);
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    let new_content = crate::tools::sch_wiring::insert_before_close(&content, &text_sexp)?;
+    write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "added": text,
@@ -3671,7 +3673,8 @@ mod multi_unit_handler_tests {
 
         let external = format!("{expected}\n; external edit\n");
         std::fs::write(schematic.path(), &external).unwrap();
-        let error = write_atomic_if_unchanged(schematic.path(), &expected, &candidate).unwrap_err();
+        let error =
+            write_schematic_if_unchanged(schematic.path(), &expected, &candidate).unwrap_err();
         assert!(matches!(error, konnect_sexp::SexpError::Conflict { .. }));
         assert_eq!(std::fs::read_to_string(schematic.path()).unwrap(), external);
     }
@@ -3982,8 +3985,26 @@ mod insert_order_tests {
     const SCH: &str = "(kicad_sch\n\t(lib_symbols\n\t\t(symbol \"Device:R\")\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(uuid \"u1\")\n\t)\n\t(sheet_instances\n\t\t(path \"/\" (page \"1\"))\n\t)\n)\n";
 
     #[test]
+    fn only_one_balanced_schematic_root_can_receive_items() {
+        for source in [
+            "(kicad_pcb)",
+            r#"(kicad_sch (text "broken""#,
+            "(kicad_sch) (kicad_pcb)",
+        ] {
+            assert!(
+                insert_before_close(source, "(junction)").is_err(),
+                "{source}"
+            );
+        }
+
+        let source = "  \r\n (  kicad_sch ( symbol (lib_id \"Device:R\")))";
+        let result = insert_before_close(source, "(junction)").unwrap();
+        assert!(result.find("(junction)").unwrap() < result.find("( symbol").unwrap());
+    }
+
+    #[test]
     fn labels_land_before_the_symbol_instances() {
-        let out = insert_before_close(SCH, "\n  (label \"NET\" (at 10 10 0))");
+        let out = insert_before_close(SCH, "\n  (label \"NET\" (at 10 10 0))").unwrap();
         let label = out.find("(label \"NET\"").expect("label written");
         let inst = out.find("(symbol\n\t\t(lib_id").expect("instance present");
         assert!(

@@ -979,6 +979,33 @@ const ERC_JSON_SCALE_FIXED_IN: (u64, u64, u64) = (10, 0, 7);
 /// is wholly before or wholly after, and its version orders like any other.
 const KICAD_DEVELOPMENT_MINOR: u64 = 99;
 
+/// Minimum severity requested for a saved KiCad rules report.
+#[derive(Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ReportSeverity {
+    Error,
+    Warning,
+    Info,
+}
+
+impl ReportSeverity {
+    pub(crate) const OPTIONS: [Self; 3] = [Self::Error, Self::Warning, Self::Info];
+
+    pub(crate) fn from_args(
+        args: &serde_json::Value,
+    ) -> Result<Self, crate::mcp::protocol::CallToolResult> {
+        super::optional_enum(args, "severity", &Self::OPTIONS, Self::Warning)
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+            Self::Info => "info",
+        }
+    }
+}
+
 /// Run ERC on a schematic and return parsed violations.
 /// KiCAD 10: `sch erc --output <path> --format json <input>`
 pub async fn run_erc(cli: &str, schematic: &Path) -> Result<ErcReport> {
