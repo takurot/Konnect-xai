@@ -399,7 +399,13 @@ register_symbol_library(nickname, library_path, scope?, project?, replace_existi
 register_footprint_library(nickname, library_path, scope?, project?, replace_existing?)
 ```
 
-- Registration is idempotent by default: an existing nickname is left unchanged.
+- `library_path` must be an absolute path to an existing `.kicad_sym` file
+  (symbols) or `.pretty` directory (footprints); anything else is refused.
+- `project` may be the `.kicad_pro` file or the project directory; both select
+  the same table here and in `list_*_libraries` and `get_footprint_info`.
+- Re-registering a nickname with the same URI reports `unchanged`. A nickname
+  already bound to a different URI returns an error with `state: "conflict"`,
+  the table's current `uri`, and the requested URI; the table is not changed.
 - Set `replace_existing=true` to update a stale URI for that nickname in place.
 - Project-local and same-repository sibling libraries are written as portable
   `${KIPRJMOD}` URIs; existing options, descriptions, and unrelated entries are preserved.

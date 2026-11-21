@@ -81,37 +81,31 @@ fn repository_relative_uri_reaches_a_sibling_library_inside_the_same_repository(
     let library = repo.path().join("libs/shared.pretty");
     std::fs::create_dir_all(&table_dir).unwrap();
     std::fs::create_dir_all(&library).unwrap();
-    let pro = table_dir.join("proj.kicad_pro");
-    std::fs::write(&pro, "{}").unwrap();
     assert_eq!(
-        repository_relative_uri(&library, &table_dir, &pro).as_deref(),
+        repository_relative_uri(&library, &table_dir).as_deref(),
         Some("${KIPRJMOD}/../../libs/shared.pretty")
     );
 }
 
 #[test]
-fn repository_relative_uri_refuses_without_a_project_file_or_repository() {
+fn repository_relative_uri_refuses_without_a_repository_or_existing_paths() {
     let repo = tempfile::tempdir().unwrap();
     let table_dir = repo.path().join("proj");
     let library = repo.path().join("lib.pretty");
-    std::fs::create_dir_all(&table_dir).unwrap();
     std::fs::create_dir_all(&library).unwrap();
-    let pro = table_dir.join("proj.kicad_pro");
+    std::fs::create_dir(repo.path().join(".git")).unwrap();
     assert!(
-        repository_relative_uri(&library, &table_dir, &pro).is_none(),
-        "no project file on disk"
+        repository_relative_uri(&library, &table_dir).is_none(),
+        "the table directory does not exist yet"
     );
-    std::fs::write(&pro, "{}").unwrap();
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let missing_lib = repo.path().join("absent.pretty");
+    assert!(repository_relative_uri(&missing_lib, &table_dir).is_none());
+    std::fs::remove_dir(repo.path().join(".git")).unwrap();
     assert!(
-        repository_relative_uri(&library, &table_dir, &pro).is_none(),
+        repository_relative_uri(&library, &table_dir).is_none(),
         "no .git above the table"
     );
-    let not_pro = table_dir.join("notes.txt");
-    std::fs::write(&not_pro, "").unwrap();
-    assert!(repository_relative_uri(&library, &table_dir, &not_pro).is_none());
-    std::fs::create_dir(repo.path().join(".git")).unwrap();
-    let missing_lib = repo.path().join("absent.pretty");
-    assert!(repository_relative_uri(&missing_lib, &table_dir, &pro).is_none());
 }
 
 #[test]
@@ -121,11 +115,9 @@ fn repository_relative_uri_refuses_a_library_outside_the_repository() {
     std::fs::create_dir(repo.path().join(".git")).unwrap();
     let table_dir = repo.path().join("proj");
     std::fs::create_dir_all(&table_dir).unwrap();
-    let pro = table_dir.join("proj.kicad_pro");
-    std::fs::write(&pro, "{}").unwrap();
     let library = other.path().join("lib.pretty");
     std::fs::create_dir_all(&library).unwrap();
-    assert!(repository_relative_uri(&library, &table_dir, &pro).is_none());
+    assert!(repository_relative_uri(&library, &table_dir).is_none());
 }
 
 #[test]
