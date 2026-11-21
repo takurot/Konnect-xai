@@ -46,6 +46,7 @@ pub(crate) mod sch_connectivity;
 pub mod sch_export;
 pub mod sch_hierarchy;
 mod sch_overlap;
+mod sch_project_netlist;
 mod sch_references;
 pub(crate) mod sch_route_safety;
 pub mod sch_wiring;
@@ -1269,15 +1270,37 @@ pub(crate) type PlacedPinsByReference = Vec<(
 /// reference alone collapses on a pre-annotation sheet where every part is
 /// `R?`.
 pub(crate) fn placed_pins_by_reference(tree: &konnect_sexp::SexpNode) -> PlacedPinsByReference {
-    use konnect_sexp::schematic::{
-        extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol,
-    };
+    placed_pins_with(tree, |definition, _, unit| {
+        konnect_sexp::schematic::extract_lib_pins_for_unit(definition, unit)
+    })
+}
+
+/// Saved analysis uses the presentation selected on each placement.
+fn analysis_placed_pins_by_reference(tree: &konnect_sexp::SexpNode) -> PlacedPinsByReference {
+    placed_pins_with(
+        tree,
+        konnect_sexp::schematic::extract_lib_pins_for_placement,
+    )
+}
+
+fn placed_pins_with(
+    tree: &konnect_sexp::SexpNode,
+    select: impl Fn(
+        &konnect_sexp::SexpNode,
+        &konnect_sexp::SexpNode,
+        u32,
+    ) -> Vec<konnect_sexp::schematic::LibPin>,
+) -> PlacedPinsByReference {
+    use konnect_sexp::schematic::{extract_symbol_instance, find_lib_symbol};
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
     let mut by_reference = Vec::new();
-    for inst in extract_symbol_instances(tree) {
+    for placement in tree.find_all("symbol") {
+        let Some(inst) = extract_symbol_instance(placement) else {
+            continue;
+        };
         // find_lib_symbol, not a lib_id match: an instance carrying a
         // (lib_name …) is a sheet-local derived symbol whose pins can sit
         // elsewhere than the base definition's (#143).
@@ -1285,7 +1308,7 @@ pub(crate) fn placed_pins_by_reference(tree: &konnect_sexp::SexpNode) -> PlacedP
             continue;
         };
         let t = inst.pin_transform();
-        let pins = extract_lib_pins_for_unit(sym, inst.unit)
+        let pins = select(sym, placement, inst.unit)
             .into_iter()
             .map(|p| (p, t))
             .collect();

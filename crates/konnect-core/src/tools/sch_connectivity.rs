@@ -34,8 +34,9 @@
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_bus_entries, extract_junctions, extract_no_connects, extract_sheet_pins,
-        pin_endpoint, Label, LabelKind, LibPin, Wire,
+        extract_active_power_symbol_labels, extract_bus_entries, extract_junctions, extract_labels,
+        extract_legacy_power_pin_labels, extract_no_connects, extract_sheet_pins, pin_endpoint,
+        Label, LabelKind, LibPin, Wire,
     },
     SexpNode,
 };
@@ -51,6 +52,73 @@ fn bucket(value: f64, tolerance: f64) -> i64 {
     (value / tolerance).floor() as i64
 }
 
+// KiCad 10's schematic internal unit is 0.0001 mm (base_units.h).
+fn schematic_unit(value: f64) -> i64 {
+    (value * 10_000.0).round() as i64
+}
+
+pub(crate) fn schematic_point(x: f64, y: f64) -> (i64, i64) {
+    (schematic_unit(x), schematic_unit(y))
+}
+
+#[derive(Clone, Copy)]
+enum Precision {
+    Proximity(f64),
+    Electrical,
+}
+
+impl Precision {
+    fn cell(self, value: f64) -> i64 {
+        match self {
+            Self::Proximity(tolerance) => bucket(value, tolerance),
+            Self::Electrical => schematic_unit(value),
+        }
+    }
+
+    fn radius(self) -> i64 {
+        match self {
+            Self::Proximity(_) => 1,
+            Self::Electrical => 0,
+        }
+    }
+
+    fn same_point(self, x1: f64, y1: f64, x2: f64, y2: f64) -> bool {
+        match self {
+            Self::Proximity(tolerance) => points_coincident(x1, y1, x2, y2, tolerance),
+            Self::Electrical => schematic_point(x1, y1) == schematic_point(x2, y2),
+        }
+    }
+
+    fn same_axis(self, from: f64, to: f64) -> bool {
+        match self {
+            Self::Proximity(tolerance) => (from - to).abs() < tolerance,
+            Self::Electrical => schematic_unit(from) == schematic_unit(to),
+        }
+    }
+
+    fn wire_covers(self, x: f64, y: f64, wire: &Wire) -> bool {
+        match self {
+            Self::Proximity(tolerance) => {
+                point_on_segment(x, y, wire.x1, wire.y1, wire.x2, wire.y2, tolerance)
+            }
+            Self::Electrical => {
+                let (x, y) = schematic_point(x, y);
+                let (x1, y1) = schematic_point(wire.x1, wire.y1);
+                let (x2, y2) = schematic_point(wire.x2, wire.y2);
+                (x == x1 && x1 == x2 && (y1.min(y2)..=y1.max(y2)).contains(&y))
+                    || (y == y1 && y1 == y2 && (x1.min(x2)..=x1.max(x2)).contains(&x))
+            }
+        }
+    }
+
+    fn net_point(self, x: f64, y: f64) -> (i64, i64) {
+        match self {
+            Self::Proximity(_) => pt_key(x, y),
+            Self::Electrical => schematic_point(x, y),
+        }
+    }
+}
+
 /// Points bucketed at the coincidence tolerance, so a lookup probes nine cells
 /// instead of scanning every point. `points_coincident` compares an L∞ box of
 /// side `tol`, which the 3×3 neighbourhood covers exactly.
@@ -59,7 +127,7 @@ fn bucket(value: f64, tolerance: f64) -> i64 {
 /// the index was built from can recover the item itself and not only its
 /// coordinates — see [`ConnectivityIndex::point_detail`].
 struct PointIndex {
-    tol: f64,
+    precision: Precision,
     buckets: HashMap<(i64, i64), Vec<IndexedPoint>>,
 }
 
@@ -67,9 +135,9 @@ struct PointIndex {
 type IndexedPoint = (f64, f64, usize);
 
 impl PointIndex {
-    fn build(points: impl IntoIterator<Item = (f64, f64)>, tol: f64) -> Self {
+    fn build(points: impl IntoIterator<Item = (f64, f64)>, precision: Precision) -> Self {
         let mut index = PointIndex {
-            tol,
+            precision,
             buckets: HashMap::new(),
         };
         for (ordinal, (x, y)) in points.into_iter().enumerate() {
@@ -80,7 +148,7 @@ impl PointIndex {
     }
 
     fn cell(&self, x: f64, y: f64) -> (i64, i64) {
-        ((x / self.tol).floor() as i64, (y / self.tol).floor() as i64)
+        (self.precision.cell(x), self.precision.cell(y))
     }
 
     /// Every indexed point coinciding with `(x, y)`, as `(x, y, build ordinal)`.
@@ -89,12 +157,15 @@ impl PointIndex {
     /// the ordinal rather than inherit whichever cell was probed first.
     fn hits_at(&self, x: f64, y: f64) -> impl Iterator<Item = IndexedPoint> + '_ {
         let (cx, cy) = self.cell(x, y);
-        (-1..=1)
-            .flat_map(move |dx| (-1..=1).map(move |dy| (cx + dx, cy + dy)))
+        let radius = self.precision.radius();
+        (-radius..=radius)
+            .flat_map(move |dx| {
+                (-radius..=radius).map(move |dy| (cx.saturating_add(dx), cy.saturating_add(dy)))
+            })
             .filter_map(move |key| self.buckets.get(&key))
             .flatten()
             .copied()
-            .filter(move |(px, py, _)| points_coincident(x, y, *px, *py, self.tol))
+            .filter(move |(px, py, _)| self.precision.same_point(x, y, *px, *py))
     }
 
     /// How many indexed points coincide with `(x, y)`.
@@ -111,33 +182,33 @@ impl PointIndex {
 /// only be met in its own row, a vertical one in its own column. Mirrors
 /// `point_on_segment`, which answers `false` for anything diagonal.
 struct WireIndex<'a> {
-    tol: f64,
+    precision: Precision,
     rows: HashMap<i64, Vec<&'a Wire>>,
     columns: HashMap<i64, Vec<&'a Wire>>,
 }
 
 impl<'a> WireIndex<'a> {
-    fn tolerance(&self) -> f64 {
-        self.tol
+    fn build(wires: &'a [Wire], tol: f64) -> Self {
+        Self::build_with_precision(wires, Precision::Proximity(tol))
     }
 
-    fn build(wires: &'a [Wire], tol: f64) -> Self {
+    fn build_with_precision(wires: &'a [Wire], precision: Precision) -> Self {
         let mut index = WireIndex {
-            tol,
+            precision,
             rows: HashMap::new(),
             columns: HashMap::new(),
         };
         for wire in wires {
-            if (wire.x1 - wire.x2).abs() < tol {
+            if precision.same_axis(wire.x1, wire.x2) {
                 index
                     .columns
-                    .entry(bucket(wire.x1, tol))
+                    .entry(precision.cell(wire.x1))
                     .or_default()
                     .push(wire);
-            } else if (wire.y1 - wire.y2).abs() < tol {
+            } else if precision.same_axis(wire.y1, wire.y2) {
                 index
                     .rows
-                    .entry(bucket(wire.y1, tol))
+                    .entry(precision.cell(wire.y1))
                     .or_default()
                     .push(wire);
             }
@@ -147,20 +218,28 @@ impl<'a> WireIndex<'a> {
 
     /// Every wire that could pass through `(x, y)`.
     fn candidates(&self, x: f64, y: f64) -> impl Iterator<Item = &&'a Wire> {
-        let cell_x = bucket(x, self.tol);
-        let cell_y = bucket(y, self.tol);
-        (-1..=1).flat_map(move |delta| {
-            let column = self.columns.get(&(cell_x + delta)).into_iter().flatten();
-            let row = self.rows.get(&(cell_y + delta)).into_iter().flatten();
+        let cell_x = self.precision.cell(x);
+        let cell_y = self.precision.cell(y);
+        let radius = self.precision.radius();
+        (-radius..=radius).flat_map(move |delta| {
+            let column = self
+                .columns
+                .get(&cell_x.saturating_add(delta))
+                .into_iter()
+                .flatten();
+            let row = self
+                .rows
+                .get(&cell_y.saturating_add(delta))
+                .into_iter()
+                .flatten();
             column.chain(row)
         })
     }
 
     /// Every wire that actually passes through `(x, y)`.
     fn hits(&self, x: f64, y: f64) -> impl Iterator<Item = &&'a Wire> {
-        self.candidates(x, y).filter(move |wire| {
-            point_on_segment(x, y, wire.x1, wire.y1, wire.x2, wire.y2, self.tol)
-        })
+        self.candidates(x, y)
+            .filter(move |wire| self.precision.wire_covers(x, y, wire))
     }
 
     /// Lies anywhere on a wire, endpoints included.
@@ -172,10 +251,20 @@ impl<'a> WireIndex<'a> {
     /// without splitting the crossed wire.
     fn covers_interior(&self, x: f64, y: f64) -> bool {
         self.hits(x, y).any(|wire| {
-            !points_coincident(x, y, wire.x1, wire.y1, self.tol)
-                && !points_coincident(x, y, wire.x2, wire.y2, self.tol)
+            !self.precision.same_point(x, y, wire.x1, wire.y1)
+                && !self.precision.same_point(x, y, wire.x2, wire.y2)
         })
     }
+}
+
+pub(crate) fn electrical_t_junctions(wires: &[Wire]) -> Vec<(f64, f64)> {
+    let index = WireIndex::build_with_precision(wires, Precision::Electrical);
+    let mut seen = HashSet::new();
+    wires
+        .iter()
+        .flat_map(|wire| [(wire.x1, wire.y1), (wire.x2, wire.y2)])
+        .filter(|&(x, y)| seen.insert(schematic_point(x, y)) && index.covers_interior(x, y))
+        .collect()
 }
 
 // ─── Union-find net graph ─────────────────────────────────────────────────────
@@ -241,6 +330,7 @@ pub(crate) type NetRoot = (i64, i64);
 /// questions they actually ask — [`root_at`](Self::root_at) for a net's
 /// identity, [`name_of_root`](Self::name_of_root) for what it is called.
 pub(crate) struct NetGraph {
+    precision: Precision,
     /// Every name at a point, not just the winning one. A rail label written
     /// over the power symbol that names it puts two names on one coordinate,
     /// and dropping the loser would keep it out of
@@ -256,9 +346,21 @@ pub(crate) struct NetGraph {
     root_aliases: HashMap<NetRoot, BTreeSet<String>>,
 }
 
+/// Default KiCad alphabetic sub-reference: A through Z, then AA, AB, ….
+fn default_unit_suffix(mut unit: u32) -> String {
+    let mut reversed = Vec::new();
+    while unit > 0 {
+        let digit = (unit - 1) % 26;
+        reversed.push(char::from(b'A' + digit as u8));
+        unit = (unit - 1) / 26;
+    }
+    reversed.into_iter().rev().collect()
+}
+
 impl NetGraph {
-    fn new() -> Self {
+    fn new(precision: Precision) -> Self {
         NetGraph {
+            precision,
             point_nets: HashMap::new(),
             parent: HashMap::new(),
             root_names: HashMap::new(),
@@ -290,15 +392,15 @@ impl NetGraph {
     }
 
     fn add_wire(&mut self, w: &Wire) {
-        let a = pt_key(w.x1, w.y1);
-        let b = pt_key(w.x2, w.y2);
+        let a = self.precision.net_point(w.x1, w.y1);
+        let b = self.precision.net_point(w.x2, w.y2);
         self.ensure(a);
         self.ensure(b);
         self.union(a, b);
     }
 
     fn add_label(&mut self, x: f64, y: f64, net: &str, kind: LabelKind) {
-        let k = pt_key(x, y);
+        let k = self.precision.net_point(x, y);
         self.ensure(k);
         let held = self.point_nets.entry(k).or_default();
         // Kept whole, and ranked only when a name has to be *chosen*: every
@@ -321,7 +423,7 @@ impl NetGraph {
     /// compare net *names*: a net carrying two names has one root and would
     /// fail a name comparison against itself.
     pub(crate) fn root_at(&mut self, x: f64, y: f64) -> NetRoot {
-        self.find(pt_key(x, y))
+        self.find(self.precision.net_point(x, y))
     }
 
     /// What the net at `root` is called, or `None` when no label names it.
@@ -418,15 +520,98 @@ impl NetGraph {
     }
 
     pub(crate) fn points_on_net(&mut self, net: &str) -> Vec<(i64, i64)> {
-        // Collect keys first to avoid simultaneous borrow of point_nets and self.find()
-        let net_keys: Vec<(i64, i64)> = self
-            .point_nets
+        let net_roots = self
+            .root_aliases
             .iter()
-            .filter(|(_, names)| names.iter().any(|name| name.name == net))
-            .map(|(k, _)| *k)
+            .filter(|(_, aliases)| aliases.contains(net))
+            .map(|(&root, _)| root)
             .collect();
-        let net_roots: HashSet<NetRoot> = net_keys.iter().map(|k| self.find(*k)).collect();
         self.points_on_roots(&net_roots)
+    }
+
+    pub(crate) fn names(&self) -> BTreeSet<String> {
+        self.root_aliases.values().flatten().cloned().collect()
+    }
+
+    fn name_unlabelled_nets(&mut self, tree: &SexpNode) {
+        let unit_counts = super::sch_annotate::lib_symbol_units(tree);
+        let no_connect: HashSet<_> = extract_no_connects(tree)
+            .into_iter()
+            .map(|(x, y)| schematic_point(x, y))
+            .collect();
+        let mut candidates: HashMap<NetRoot, HashMap<(String, String), String>> = HashMap::new();
+        for (symbol, pins) in crate::tools::analysis_placed_pins_by_reference(tree) {
+            if symbol.reference.is_empty()
+                || symbol.reference.ends_with('?')
+                || symbol.reference.starts_with('#')
+            {
+                continue;
+            }
+            let named_reference = if unit_counts
+                .get(symbol.lib_symbol_name())
+                .is_some_and(|&count| count > 1)
+            {
+                format!("{}{}", symbol.reference, default_unit_suffix(symbol.unit))
+            } else {
+                symbol.reference.clone()
+            };
+            for (pin, transform) in &pins {
+                let (x, y) = pin_endpoint(pin, *transform);
+                if pin.electrical_type == "no_connect"
+                    || no_connect.contains(&schematic_point(x, y))
+                {
+                    continue;
+                }
+                let root = self.root_at(x, y);
+                if self.root_names.contains_key(&root) {
+                    continue;
+                }
+                let name = if pin.name.is_empty() || pin.name == "~" || pin.name == pin.number {
+                    format!("Net-({}-Pad{})", symbol.reference, pin.number)
+                } else if pins.iter().any(|(other, _)| {
+                    other.name == pin.name
+                        && other.number != pin.number
+                        && other.electrical_type != "no_connect"
+                }) {
+                    format!("Net-({named_reference}-{}-Pad{})", pin.name, pin.number)
+                } else {
+                    format!("Net-({named_reference}-{})", pin.name)
+                };
+                candidates
+                    .entry(root)
+                    .or_default()
+                    .insert((symbol.reference.clone(), pin.number.clone()), name);
+            }
+        }
+        let mut generated: Vec<_> = candidates
+            .into_iter()
+            .filter(|(_, pins)| pins.len() >= 2)
+            .filter_map(|(root, pins)| {
+                let name = pins.into_values().min_by(|a, b| {
+                    a.contains("-Pad")
+                        .cmp(&b.contains("-Pad"))
+                        .then_with(|| a.cmp(b))
+                })?;
+                Some((analysis_net_name(&name), root))
+            })
+            .collect();
+        generated.sort_unstable();
+
+        // Real aliases keep their established saved-sheet spelling. Give an
+        // occupied generated name a unique query key to keep roots separate.
+        let mut occupied = self.names();
+        for (base, root) in generated {
+            let name = if occupied.insert(base.clone()) {
+                base
+            } else {
+                (2u64..)
+                    .map(|index| format!("{base}#{index}"))
+                    .find(|name| occupied.insert(name.clone()))
+                    .expect("finitely many names are occupied")
+            };
+            self.root_names.insert(root, name.clone());
+            self.root_aliases.entry(root).or_default().insert(name);
+        }
     }
 
     /// Every point on any of `roots` — the same walk [`points_on_net`] does,
@@ -478,13 +663,17 @@ fn seed_physically_connected_graph(
     sheet_pins: &[(f64, f64)],
     on_wire: &WireIndex,
 ) -> NetGraph {
-    let mut graph = NetGraph::new();
+    let precision = on_wire.precision;
+    let mut graph = NetGraph::new(precision);
     for wire in wires {
         graph.add_wire(wire);
     }
     let attach = |graph: &mut NetGraph, x: f64, y: f64| {
         for wire in on_wire.hits(x, y) {
-            graph.union(pt_key(x, y), pt_key(wire.x1, wire.y1));
+            graph.union(
+                precision.net_point(x, y),
+                precision.net_point(wire.x1, wire.y1),
+            );
         }
     };
     for label in labels {
@@ -492,11 +681,11 @@ fn seed_physically_connected_graph(
         attach(&mut graph, label.x, label.y);
     }
     for &(x, y) in junctions {
-        graph.ensure(pt_key(x, y));
+        graph.ensure(precision.net_point(x, y));
         attach(&mut graph, x, y);
     }
     for &(x, y) in sheet_pins {
-        graph.ensure(pt_key(x, y));
+        graph.ensure(precision.net_point(x, y));
     }
     graph
 }
@@ -535,6 +724,48 @@ pub(crate) fn net_graph_for(tree: &SexpNode, wires: &[Wire], labels: &[Label]) -
         &extract_sheet_pins(tree),
         &WireIndex::build(wires, COINCIDENT_TOLERANCE),
     )
+}
+
+/// Expose a literal slash in saved KiCad net-name text; keep unrelated
+/// markup intact. The same conversion applies to caller-provided names.
+pub(crate) fn analysis_net_name(name: &str) -> String {
+    let mut result = String::new();
+    let mut remaining = name;
+    while let Some((prefix, suffix)) = remaining.split_once("{slash}") {
+        result.push_str(prefix);
+        if result.ends_with(['$', '~', '^', '_']) {
+            result.push_str("{slash}");
+        } else {
+            result.push('/');
+        }
+        remaining = suffix;
+    }
+    result.push_str(remaining);
+    result
+}
+
+pub(crate) fn analysis_net_labels(tree: &SexpNode) -> Vec<Label> {
+    extract_labels(tree)
+        .into_iter()
+        .chain(extract_active_power_symbol_labels(tree))
+        .chain(extract_legacy_power_pin_labels(tree))
+        .map(|mut label| {
+            label.net = analysis_net_name(&label.net);
+            label
+        })
+        .collect()
+}
+
+pub(crate) fn analysis_net_graph(tree: &SexpNode, wires: &[Wire], labels: &[Label]) -> NetGraph {
+    let mut graph = seed_net_graph(
+        wires,
+        labels,
+        &extract_junctions(tree),
+        &extract_sheet_pins(tree),
+        &WireIndex::build_with_precision(wires, Precision::Electrical),
+    );
+    graph.name_unlabelled_nets(tree);
+    graph
 }
 
 /// The same physical attachments as the net graph, without merging remote
@@ -610,7 +841,58 @@ impl<'a> ConnectivityIndex<'a> {
         labels: &'a [Label],
         tolerance: f64,
     ) -> Self {
-        let placed_pins: Vec<PlacedPin> = crate::tools::placed_pins_by_reference(tree)
+        Self::build_with_precision(
+            tree,
+            wires,
+            buses,
+            labels,
+            Precision::Proximity(tolerance),
+            crate::tools::placed_pins_by_reference(tree),
+        )
+    }
+
+    pub(crate) fn for_electrical_analysis(
+        tree: &SexpNode,
+        wires: &'a [Wire],
+        buses: &'a [Wire],
+        labels: &'a [Label],
+    ) -> Self {
+        Self::build_with_precision(
+            tree,
+            wires,
+            buses,
+            labels,
+            Precision::Electrical,
+            crate::tools::analysis_placed_pins_by_reference(tree),
+        )
+    }
+
+    pub(crate) fn for_analysis_proximity(
+        tree: &SexpNode,
+        wires: &'a [Wire],
+        buses: &'a [Wire],
+        labels: &'a [Label],
+        tolerance: f64,
+    ) -> Self {
+        Self::build_with_precision(
+            tree,
+            wires,
+            buses,
+            labels,
+            Precision::Proximity(tolerance),
+            crate::tools::analysis_placed_pins_by_reference(tree),
+        )
+    }
+
+    fn build_with_precision(
+        tree: &SexpNode,
+        wires: &'a [Wire],
+        buses: &'a [Wire],
+        labels: &'a [Label],
+        precision: Precision,
+        placed_pins: super::PlacedPinsByReference,
+    ) -> Self {
+        let placed_pins: Vec<PlacedPin> = placed_pins
             .into_iter()
             .flat_map(|(inst, pins)| {
                 pins.into_iter().map(move |(pin, transform)| PlacedPin {
@@ -623,7 +905,7 @@ impl<'a> ConnectivityIndex<'a> {
             .collect();
         let junctions = extract_junctions(tree);
         let sheet_pins = extract_sheet_pins(tree);
-        let on_bus = WireIndex::build(buses, tolerance);
+        let on_bus = WireIndex::build_with_precision(buses, precision);
         // An entry terminates a wire only when saved geometry proves exactly
         // one corner lies on a bus. Zero matches are detached; two matches are
         // ambiguous between buses. Neither case licenses a guessed wire side.
@@ -642,14 +924,14 @@ impl<'a> ConnectivityIndex<'a> {
         ConnectivityIndex {
             wires,
             labels,
-            on_wire: WireIndex::build(wires, tolerance),
+            on_wire: WireIndex::build_with_precision(wires, precision),
             on_bus,
-            bus_entry_wire_points: PointIndex::build(bus_entry_wire_points, tolerance),
+            bus_entry_wire_points: PointIndex::build(bus_entry_wire_points, precision),
             wire_ends: PointIndex::build(
                 wires
                     .iter()
                     .flat_map(|wire| [(wire.x1, wire.y1), (wire.x2, wire.y2)]),
-                tolerance,
+                precision,
             ),
             // Power symbols excluded on purpose. `extract_power_symbol_labels`
             // places a pseudo-label *on the symbol's own pin*, so indexing it
@@ -662,15 +944,15 @@ impl<'a> ConnectivityIndex<'a> {
                     .iter()
                     .filter(|label| label.kind != LabelKind::PowerSymbol)
                     .map(|label| (label.x, label.y)),
-                tolerance,
+                precision,
             ),
             // Built from `placed_pins` in order, so a hit's ordinal indexes
             // straight back into that slice — which is what lets
             // `point_detail` report the pin and not just its coordinates.
-            pin_points: PointIndex::build(placed_pins.iter().map(|p| p.at), tolerance),
-            sheet_pin_points: PointIndex::build(sheet_pins, tolerance),
-            junction_points: PointIndex::build(junctions, tolerance),
-            no_connect_points: PointIndex::build(extract_no_connects(tree), tolerance),
+            pin_points: PointIndex::build(placed_pins.iter().map(|p| p.at), precision),
+            sheet_pin_points: PointIndex::build(sheet_pins, precision),
+            junction_points: PointIndex::build(junctions, precision),
+            no_connect_points: PointIndex::build(extract_no_connects(tree), precision),
             placed_pins,
         }
     }
@@ -723,7 +1005,7 @@ impl<'a> ConnectivityIndex<'a> {
     pub(crate) fn wires_at(&self, x: f64, y: f64) -> usize {
         self.wires
             .iter()
-            .filter(|w| point_on_segment(x, y, w.x1, w.y1, w.x2, w.y2, self.on_wire.tolerance()))
+            .filter(|w| self.on_wire.precision.wire_covers(x, y, w))
             .count()
     }
 

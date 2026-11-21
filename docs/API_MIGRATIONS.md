@@ -2492,13 +2492,35 @@ Power symbols and power flags are omitted from the component pin list.
 
 Both net queries return `uuid` on each label, including the symbol UUID for a
 power label. `get_net_connectivity` also returns each wire's `uuid`. The field
-is `null` if the file has no identifier for that item. Labels are still
-filtered by the exact queried name.
+is `null` if the file has no identifier for that item. Labels are filtered by the queried alias after decoding KiCad's
+`{slash}` net-name escape.
 
 Both tools now report a missing name as an MCP tool error with
 `error: {kind: "not_found", net, suggestions}`. Suggestions are the sorted
 known names that match case-insensitively, or an empty array. A named net
 without component pins still returns a successful result.
+
+## Unreleased saved-sheet net analysis
+
+Saved-sheet net queries and `export_netlist_summary` now include generated
+names for unlabeled connections that join distinct annotated component pins,
+such as `Net-(R1-Pad2)`. If an existing alias uses the same text, the
+generated query name receives a numbered suffix. For named pins on multi-unit
+symbols, saved-file analysis uses KiCad's default alphabetic unit suffix. An
+isolated unnamed pin still returns `null` in the pin query or `"~"` in the summary. The inventory continues to expose named
+aliases. Both `A/B` and `A{slash}B` look up the same alias; the label inventory
+continues to show the literal saved text. Invisible power-input pins on legacy
+symbols contribute their saved pin name as a global alias. Pin analysis uses
+the active saved unit and body style.
+
+The analysis compares coordinates in KiCad's schematic internal units
+(0.0001 mm). `find_orphan_items` includes dangling wire ends, floating labels,
+and unconnected pins in `orphans`. The optional `tolerance` controls which of
+them also appear in `near_misses`. The default analysis scope is the requested schematic file. Set
+`export_netlist_summary.scope` to `project` on a top-level schematic to include
+saved child instances, sheet-pin links and global aliases. This mode reports
+`sheet_instance_path` on component placements. The native exporter remains the
+source for bus expansion and other KiCad-specific netlist features.
 
 ## Unreleased KiCad platform integration
 

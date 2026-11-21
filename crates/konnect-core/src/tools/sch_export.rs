@@ -6,14 +6,15 @@
 
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
-use crate::tools::{get_path, placed_pins, placed_pins_by_reference, ToolContext, ToolDef};
+use crate::tools::{
+    analysis_placed_pins_by_reference, get_path, placed_pins, ToolContext, ToolDef,
+};
 use konnect_sexp::{
     geometry::{fmt_mm, point_on_segment, points_coincident, round6},
     parser::{parse_sexp, SexpNode},
     schematic::write_schematic_if_unchanged,
     schematic::{
-        extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
-        pin_endpoint, read_schematic,
+        extract_labels, extract_symbol_instances, extract_wires, pin_endpoint, read_schematic,
     },
     writer::{apply_edits, find_direct_child_blocks, SexpEdit},
     SexpError,
@@ -22,7 +23,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 
 use super::cli;
-use super::sch_connectivity::net_graph_for;
+use super::sch_connectivity::{analysis_net_graph, analysis_net_labels};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -132,12 +133,13 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "export_netlist_summary",
             "Return a human-readable JSON summary of the schematic netlist: all \
-             components, their nets, pin counts. Nets come from labels and from \
-             power symbols. Does not require kicad-cli.",
+             components, their nets, pin counts. Includes generated names for unlabeled \
+             connections. Use project scope on the root schematic to include its saved child instances. Does not require kicad-cli.",
             json!({
                 "type": "object",
                 "properties": {
-                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" }
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "scope": { "type": "string", "enum": ["sheet", "project"], "default": "sheet" }
                 },
                 "required": ["schematic"]
             }),
@@ -536,19 +538,24 @@ async fn handle_export_netlist_summary(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    match args.get("scope") {
+        None => {}
+        Some(scope) if scope.as_str() == Some("sheet") => {}
+        Some(scope) if scope.as_str() == Some("project") => {
+            let summary = super::sch_project_netlist::project_netlist_summary(&sch_path)?;
+            return Ok(CallToolResult::json(&summary));
+        }
+        Some(_) => return Ok(super::invalid_arg("scope", "expected sheet or project")),
+    }
     let (_, tree) = read_schematic(&sch_path)?;
 
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
-    let placed = placed_pins_by_reference(&tree);
+    let labels = analysis_net_labels(&tree);
+    let placed = analysis_placed_pins_by_reference(&tree);
 
-    let mut g = net_graph_for(&tree, &wires, &labels);
-
-    // Collect distinct net names
-    let mut net_names: Vec<String> = labels.iter().map(|l| l.net.clone()).collect();
-    net_names.sort();
-    net_names.dedup();
+    let mut g = analysis_net_graph(&tree, &wires, &labels);
+    let net_names = g.names();
 
     // Build per-component net map
     let components: Vec<serde_json::Value> = instances
@@ -1273,6 +1280,113 @@ mod netlist_summary_tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_connection_uses_its_kicad_net_name_in_the_summary() {
+        // The frozen native netlist documented in two_name_nets.README.md
+        // identifies the two pins on this generated name.
+        let source = include_str!("../../tests/fixtures/two_name_nets.kicad_sch");
+        let s = summary(source).await;
+        assert_eq!(net_of(&s, "TP8", "1"), "Net-(TP8-Pad1)");
+        assert_eq!(net_of(&s, "TP9", "1"), "Net-(TP8-Pad1)");
+        assert!(s["nets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|net| net == "Net-(TP8-Pad1)"));
+    }
+
+    fn assert_native_membership(result: serde_json::Value, oracle: &str) {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let expected: BTreeMap<_, BTreeSet<_>> = oracle
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|row| {
+                let (name, pins) = row.split_once('\t').unwrap();
+                (
+                    name.to_owned(),
+                    pins.split_whitespace().map(str::to_owned).collect(),
+                )
+            })
+            .collect();
+        let mut actual: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for component in result["components"].as_array().unwrap() {
+            let reference = component["reference"].as_str().unwrap();
+            if reference.starts_with('#') {
+                continue;
+            }
+            for pin in component["pins"].as_array().unwrap() {
+                let net = pin["net"].as_str().unwrap();
+                if net != "~" {
+                    actual
+                        .entry(net.to_owned())
+                        .or_default()
+                        .insert(format!("{reference}.{}", pin["number"].as_str().unwrap()));
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn ecc83_offline_summary_matches_its_frozen_native_netlist() {
+        assert_native_membership(
+            summary(ECC83).await,
+            include_str!("../../tests/fixtures/ecc83_multiunit.native-nets.tsv"),
+        );
+    }
+
+    #[tokio::test]
+    async fn project_summary_matches_both_frozen_hierarchy_netlists_offline() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            auto_load_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        for (fixture, root, child, oracle) in [
+            (
+                "netlist_pic_programmer",
+                "pic_programmer.kicad_sch",
+                "pic_sockets.kicad_sch",
+                include_str!("../../tests/fixtures/netlist_pic_programmer/native-nets.tsv"),
+            ),
+            (
+                "project_ownership",
+                "complex_hierarchy.kicad_sch",
+                "ampli_ht.kicad_sch",
+                include_str!("../../tests/fixtures/project_ownership/native-nets.tsv"),
+            ),
+        ] {
+            // Each saved demo owns its own directory. The fixture tree also
+            // contains other projects used by independent tests.
+            let isolated = tempfile::tempdir().unwrap();
+            let fixture = fixtures.join(fixture);
+            let project = Path::new(root).with_extension("kicad_pro");
+            for name in [Path::new(root), Path::new(child), &project] {
+                std::fs::copy(fixture.join(name), isolated.path().join(name)).unwrap();
+            }
+            let path = isolated.path().join(root);
+            let result = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "export_netlist_summary", "arguments": {
+                        "schematic": path, "scope": "project"
+                    }}
+                }))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            assert_eq!(result["isError"], false, "{}: {result}", path.display());
+            let text = result["content"][0]["text"].as_str().unwrap();
+            let body: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["scope"], "project");
+            assert_native_membership(body, oracle);
+        }
     }
 
     /// The regression: nets came from labels alone, so a pin reached only
