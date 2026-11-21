@@ -188,11 +188,13 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "register_footprint_library",
-            "Register a local footprint library directory in the KiCAD global or project library table.",
+            "Register a local footprint library directory in the KiCAD global or project library table. \
+             A nickname already bound to a different library fails with state 'conflict' and the \
+             table's uri unless replace_existing is set.",
             json!({
                 "type": "object",
                 "properties": {
-                    "library_path": { "type": "string", "description": "Path to .pretty directory" },
+                    "library_path": { "type": "string", "description": "Absolute path to an existing .pretty directory" },
                     "nickname": { "type": "string", "description": "Library nickname" },
                     "scope": {
                         "type": "string",
@@ -202,7 +204,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "project": { "type": "string", "description": "Path to the .kicad_pro file, or to the project directory that holds it (required for project scope)" },
                     "replace_existing": {
                         "type": "boolean",
-                        "description": "Replace the URI of an existing nickname instead of leaving it unchanged",
+                        "description": "Point an existing nickname at this library instead of failing with state 'conflict'",
                         "default": false
                     }
                 },
@@ -321,12 +323,13 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "register_symbol_library",
             "Register a .kicad_sym library file in the KiCAD global or project symbol table. \
-             Reports whether the entry was inserted, left unchanged, or updated — an existing \
-             nickname is kept as-is unless replace_existing is set.",
+             Reports whether the entry was inserted, left unchanged, or updated. A nickname \
+             already bound to a different library fails with state 'conflict' and the table's \
+             uri unless replace_existing is set.",
             json!({
                 "type": "object",
                 "properties": {
-                    "library_path": { "type": "string", "description": "Path to .kicad_sym file" },
+                    "library_path": { "type": "string", "description": "Absolute path to an existing .kicad_sym file" },
                     "nickname": { "type": "string", "description": "Library nickname" },
                     "scope": {
                         "type": "string",
@@ -336,7 +339,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "project": { "type": "string", "description": "Path to the .kicad_pro file, or to the project directory that holds it (required for project scope)" },
                     "replace_existing": {
                         "type": "boolean",
-                        "description": "Replace the URI of an existing nickname instead of leaving it unchanged",
+                        "description": "Point an existing nickname at this library instead of failing with state 'conflict'",
                         "default": false
                     }
                 },
@@ -371,7 +374,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "query": { "type": "string", "description": "Search string (partial name or keyword match)" },
                     "limit": { "type": "integer", "description": "Maximum number of results to return", "default": 50 },
-                    "project_dir": { "type": "string", "description": "Project directory whose sym-lib-table is also searched. Defaults to the configured project_dir." }
+                    "project_dir": { "type": "string", "description": "Project directory, or its .kicad_pro file, whose sym-lib-table is also searched. Defaults to the configured project_dir." }
                 },
                 "required": ["query"]
             }),
@@ -430,7 +433,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "lib_id": { "type": "string", "description": "Library:Symbol identifier (e.g. 'Device:R')" },
-                    "project_dir": { "type": "string", "description": "Project directory to resolve project-scoped libraries. Defaults to the configured project_dir." }
+                    "project_dir": { "type": "string", "description": "Project directory, or its .kicad_pro file, to resolve project-scoped libraries. Defaults to the configured project_dir." }
                 },
                 "required": ["lib_id"]
             }),
@@ -2441,7 +2444,7 @@ fn validate_library_path(path: &Path, kind: LibraryKind) -> Result<(), CallToolR
     let has_extension = path
         .extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case(extension));
+        .is_some_and(|ext| ext == extension);
     if !path.is_absolute() {
         return Err(invalid_library_argument(
             "library_path",
@@ -2740,6 +2743,7 @@ async fn register_in_lib_table_with_policy(
     };
     let prepared = match prepare_lib_table_registration(
         &source,
+        table_path.parent(),
         root,
         nickname,
         uri,
@@ -2749,15 +2753,14 @@ async fn register_in_lib_table_with_policy(
         Ok(prepared) => prepared,
         Err(error) => return Ok(Err(error)),
     };
-    if prepared.registration.repaired_root {
-        tracing::warn!(
-            "Repaired the root element of {} — it declared the wrong table kind, so KiCad was skipping the whole table",
-            table_path.display()
-        );
-    }
-
     let conflict = prepared.registration.state == LibTableRegistrationState::Conflict;
     if !conflict && prepared.content != source {
+        if prepared.registration.repaired_root {
+            tracing::warn!(
+                "Repaired the root element of {} — it declared the wrong table kind, so KiCad was skipping the whole table",
+                table_path.display()
+            );
+        }
         if let Some(parent) = table_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -2770,8 +2773,25 @@ async fn register_in_lib_table_with_policy(
     Ok(Ok(prepared.registration))
 }
 
+/// Whether two lib-table URIs name the same library on disk.
+///
+/// A table written by KiCad, a user, or an older build can spell an existing
+/// library differently from the URI Konnect would write today (absolute vs
+/// `${KIPRJMOD}`, a symlinked prefix such as macOS `/var`), and calling that a
+/// conflict would ask the caller to replace an entry that is already right.
+fn same_library_uri(table_uri: &str, requested_uri: &str, table_dir: Option<&Path>) -> bool {
+    let resolve = |uri: &str| {
+        expand_catalogue_uri(uri, table_dir, None).and_then(|path| std::fs::canonicalize(path).ok())
+    };
+    matches!(
+        (resolve(table_uri), resolve(requested_uri)),
+        (Some(table), Some(requested)) if table == requested
+    )
+}
+
 fn prepare_lib_table_registration(
     source: &str,
+    table_dir: Option<&Path>,
     expected_root: &str,
     nickname: &str,
     uri: &str,
@@ -2820,7 +2840,12 @@ fn prepare_lib_table_registration(
         if current_uri == uri {
             (content, LibTableRegistrationState::Unchanged, current_uri)
         } else if !replace_existing {
-            (content, LibTableRegistrationState::Conflict, current_uri)
+            let state = if same_library_uri(&current_uri, uri, table_dir) {
+                LibTableRegistrationState::Unchanged
+            } else {
+                LibTableRegistrationState::Conflict
+            };
+            (content, state, current_uri)
         } else {
             let uri_range = find_direct_child_blocks(block, "lib")
                 .into_iter()
@@ -5177,10 +5202,14 @@ async fn handle_search_symbols(
     };
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
-    let project_dir = args["project_dir"]
+    let project_dir = match args["project_dir"]
         .as_str()
-        .map(PathBuf::from)
-        .or_else(|| ctx.config.project_dir.clone());
+        .map(project_table_dir)
+        .transpose()
+    {
+        Ok(project_dir) => project_dir.or_else(|| ctx.config.project_dir.clone()),
+        Err(error) => return Ok(error),
+    };
 
     let catalogue = match LibraryCatalogue::load(
         &ctx.config.kicad_cli,
@@ -5472,10 +5501,14 @@ async fn handle_get_symbol_info(
     let (lib_nick, sym_name) = (parts[0], parts[1]);
 
     // Project dir is optional: an explicit arg wins, else the server default.
-    let project_dir = args["project_dir"]
+    let project_dir = match args["project_dir"]
         .as_str()
-        .map(PathBuf::from)
-        .or_else(|| ctx.config.project_dir.clone());
+        .map(project_table_dir)
+        .transpose()
+    {
+        Ok(project_dir) => project_dir.or_else(|| ctx.config.project_dir.clone()),
+        Err(error) => return Ok(error),
+    };
 
     let lib_path = match resolve_symbol_lib_path(lib_nick, sym_name, project_dir.as_deref()) {
         Some(p) => p,
@@ -6620,6 +6653,10 @@ mod tests {
         std::fs::write(&file_named_pretty, "").unwrap();
         let dir_named_sym = tmp.path().join("dir.kicad_sym");
         std::fs::create_dir_all(&dir_named_sym).unwrap();
+        let plain_dir = tmp.path().join("footprints");
+        std::fs::create_dir_all(&plain_dir).unwrap();
+        let upper_pretty = tmp.path().join("Upper.PRETTY");
+        std::fs::create_dir_all(&upper_pretty).unwrap();
 
         for library in [
             tmp.path().join("missing.kicad_sym"),
@@ -6640,6 +6677,8 @@ mod tests {
             tmp.path().join("missing.pretty"),
             symbols,
             file_named_pretty,
+            plain_dir,
+            upper_pretty,
         ] {
             let result = handle_register_footprint_library(
                 &json!({"library_path": library, "nickname": "X", "project": tmp.path()}),
@@ -6674,6 +6713,13 @@ mod tests {
         assert_eq!(
             crate::mcp::error::extract_error_kind(&result).as_deref(),
             Some("conflict")
+        );
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["state"], "conflict", "{output}");
+        assert_eq!(output["uri"], "/abs/old.kicad_sym", "{output}");
+        assert_eq!(
+            output["requested_uri"], "${KIPRJMOD}/new.kicad_sym",
+            "{output}"
         );
         assert_eq!(std::fs::read_to_string(&table).unwrap(), BROKEN_SYM_TABLE);
     }
@@ -6748,6 +6794,72 @@ mod tests {
             "{}",
             result_text(&result)
         );
+    }
+
+    /// A table entry that spells an existing library differently from the URI
+    /// Konnect would write today is the same registration, not a conflict.
+    #[tokio::test]
+    async fn an_equivalent_spelling_of_the_registered_library_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("parts.kicad_sym");
+        std::fs::write(&library, "(kicad_symbol_lib)\n").unwrap();
+        let table = tmp.path().join("sym-lib-table");
+        let original = format!(
+            "(sym_lib_table\n  (version 7)\n  (lib (name \"Parts\") (type \"KiCad\") (uri \"{}\") (options \"\") (descr \"\"))\n)\n",
+            library.to_string_lossy().replace('\\', "/")
+        );
+        std::fs::write(&table, &original).unwrap();
+
+        let result = handle_register_symbol_library(
+            &json!({"library_path": library, "nickname": "Parts", "project": tmp.path()}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["state"], "unchanged", "{output}");
+        assert_eq!(std::fs::read_to_string(&table).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registration_follows_a_symlinked_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real.pretty");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link.pretty");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let result = handle_register_footprint_library(
+            &json!({"library_path": link, "nickname": "Linked", "project": tmp.path()}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["state"], "inserted", "{output}");
+    }
+
+    #[tokio::test]
+    async fn get_symbol_info_resolves_a_project_kicad_pro_like_its_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body =
+            "(kicad_symbol_lib\n  (symbol \"T1\"\n    (property \"Reference\" \"Q\")\n  )\n)\n";
+        let project_dir = write_project_sym_lib(&tmp, "testlib", body);
+
+        for project in [project_dir.clone(), project_dir.join("board.kicad_pro")] {
+            let result = handle_get_symbol_info(
+                &json!({"lib_id": "testlib:T1", "project_dir": project}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{project:?}: {:?}", result.content);
+        }
     }
 
     #[tokio::test]
