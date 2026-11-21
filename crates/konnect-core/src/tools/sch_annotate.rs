@@ -21,12 +21,11 @@
 
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::outcome::{self, OutcomeStatus};
+use konnect_sexp::schematic::write_schematic_if_unchanged;
 use konnect_sexp::{
     parse_sexp,
     schematic::parse_subsymbol_unit,
-    writer::{
-        apply_edits, find_enclosing_block, read_consistent, write_atomic_if_unchanged, SexpEdit,
-    },
+    writer::{apply_edits, find_enclosing_block, read_consistent, SexpEdit},
     SexpError, SexpNode,
 };
 use serde::Serialize;
@@ -1054,7 +1053,7 @@ fn body(
 
 /// Annotate the schematic at `path` and report exactly what happened.
 pub(crate) fn annotate_file(path: &Path, options: AnnotateOptions) -> CallToolResult {
-    annotate_file_with_persistence(path, options, write_atomic_if_unchanged)
+    annotate_file_with_persistence(path, options, write_schematic_if_unchanged)
 }
 
 /// Keep persistence injectable so tests can exercise failures after an actual
@@ -1316,7 +1315,7 @@ mod tests {
                     if after_replacement {
                         // Execute the real conditional atomic replacement, then
                         // simulate the writer's post-write readback conflict.
-                        write_atomic_if_unchanged(target, expected, prospective).unwrap();
+                        write_schematic_if_unchanged(target, expected, prospective).unwrap();
                     }
                     Err(SexpError::Conflict {
                         path: target.to_path_buf(),

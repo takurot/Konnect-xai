@@ -28,6 +28,14 @@ if you want that process to use them. `KONNECT_BRIDGE_DIR` must also be an
 absolute path when set. Server configuration can disable disk call logging
 with `call_log = false`.
 
+## Unreleased: schematic arguments require a KiCad schematic
+
+Pass a `.kicad_sch` file to a tool's `schematic` argument. A board, project
+settings file, or other document returns `invalid_argument` with
+`reason: "not_a_schematic"` before a tool edits or analyzes it. Renaming a
+different kind of file to `.kicad_sch` does not make it a schematic.
+`create_schematic` also requires a `.kicad_sch` output path.
+
 ## v0.14.0: conditional-write failures distinguish committed uncertainty
 
 A stale source revision returns `conflict`. If the replacement has committed
