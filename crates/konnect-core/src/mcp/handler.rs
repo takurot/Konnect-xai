@@ -1245,8 +1245,16 @@ mod schematic_document_boundary_tests {
                 let fallback = dir.path().join("unused");
                 let mut args = schema_example(schema, &fallback);
                 args["schematic"] = json!(path);
-                for alternatives in schema["allOf"].as_array().into_iter().flatten() {
-                    for field in alternatives["anyOf"][0]["required"].as_array().unwrap() {
+                // Satisfy each `anyOf` choice, whether top-level or nested in `allOf`,
+                // with the fields its first alternative requires.
+                let choices = schema["allOf"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(std::iter::once(schema))
+                    .filter_map(|choice| choice["anyOf"].get(0));
+                for alternative in choices {
+                    for field in alternative["required"].as_array().unwrap() {
                         let field = field.as_str().unwrap();
                         args[field] = schema_example(&schema["properties"][field], &fallback);
                     }
