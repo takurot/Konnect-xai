@@ -778,15 +778,20 @@ const MAX_SNAP_TOLERANCE_MM: f64 = 1.27;
 /// or power names on one net. Each fix joins the net its wire is on to the net
 /// at its destination; fixes are unioned so that two snaps on one unnamed wire
 /// cannot join two named nets between them. Only label and power names count:
-/// unlabelled nets carry no name a caller chose.
+/// unlabelled nets carry no name a caller chose, so joining them is a repair.
 fn named_net_join(
     tree: &SexpNode,
     wires: &[konnect_sexp::schematic::Wire],
     fixes: &[PlannedWireFix],
 ) -> Option<CallToolResult> {
     use std::collections::{BTreeMap, BTreeSet};
-    let labels = konnect_sexp::schematic::extract_all_net_labels(tree);
-    let mut nets = super::sch_connectivity::net_graph_for(tree, wires, &labels);
+    // The analysis graph sees what KiCad's netlister sees (legacy hidden power
+    // pins, active power bodies, `{slash}`), but it also names unlabelled nets;
+    // keep only names some label or power symbol actually carries.
+    let labels = analysis_net_labels(tree);
+    let mut nets = analysis_net_graph(tree, wires, &labels);
+    let label_names: BTreeSet<String> = labels.iter().map(|label| label.net.clone()).collect();
+    let named = |name: Option<String>| name.filter(|name| label_names.contains(name));
     let mut parent: BTreeMap<(i64, i64), (i64, i64)> = BTreeMap::new();
     fn find(parent: &mut BTreeMap<(i64, i64), (i64, i64)>, root: (i64, i64)) -> (i64, i64) {
         let next = *parent.entry(root).or_insert(root);
@@ -815,8 +820,8 @@ fn named_net_join(
     for (fix, &(from, to)) in fixes.iter().zip(&roots) {
         let group = find(&mut parent, from);
         let entry = names.entry(group).or_default();
-        entry.extend(nets.name_of_root(from));
-        entry.extend(nets.name_of_root(to));
+        entry.extend(named(nets.name_of_root(from)));
+        entry.extend(named(nets.name_of_root(to)));
         points.entry(group).or_default().push([fix.to.0, fix.to.1]);
     }
     let (group, joined) = names.into_iter().find(|(_, joined)| joined.len() > 1)?;
