@@ -317,7 +317,8 @@ impl McpHandler {
             "tool_call_start"
         );
 
-        let (result, status, error_kind) = self.dispatch_tool(&params.name, &args).await;
+        let (result, status, _) = self.dispatch_tool(&params.name, &args).await;
+        let error_kind = extract_error_kind(&result);
 
         let dur_ms = started.elapsed().as_millis() as u64;
         let result_bytes = result_content_bytes(&result);
@@ -331,17 +332,20 @@ impl McpHandler {
         );
 
         self.observer
-            .record(CallRecord {
-                call_id,
-                ts,
-                tool: params.name.clone(),
-                toolset,
-                dur_ms,
-                status,
-                error_kind,
-                args_bytes,
-                result_bytes,
-            })
+            .record_result(
+                CallRecord {
+                    call_id,
+                    ts,
+                    tool: params.name.clone(),
+                    toolset,
+                    dur_ms,
+                    status,
+                    error_kind,
+                    args_bytes,
+                    result_bytes,
+                },
+                result.is_error,
+            )
             .await;
 
         result
@@ -360,14 +364,15 @@ impl McpHandler {
                 return schema_argument_error(&error);
             }
         }
-        if let Some(result) =
-            meta_tools::handle_meta_tool_with_reload(name, args, &self.ctx, &self.reload).await
+        if let Some((result, catalogue_changed)) =
+            meta_tools::dispatch_meta_tool(name, args, &self.ctx, &self.reload).await
         {
-            if name == "load_toolset" || name == "unload_toolset" {
+            if catalogue_changed {
                 self.notify_tools_list_changed().await;
             }
             let status = call_status(&result);
-            return (result, status, None);
+            let error_kind = extract_error_kind(&result);
+            return (result, status, error_kind);
         }
 
         // Loaded domain tool? If not and auto-load is enabled (opt-in, off by
@@ -376,8 +381,15 @@ impl McpHandler {
         let mut tool_def = self.ctx.router.get_tool(name).await;
         if tool_def.is_none() && self.ctx.config.auto_load_toolsets {
             if let Some(toolset) = self.ctx.router.find_toolset_for_tool(name) {
-                self.ctx.router.load(toolset).await;
-                self.notify_tools_list_changed().await;
+                if self
+                    .ctx
+                    .router
+                    .load(toolset)
+                    .await
+                    .is_some_and(|added| !added.is_empty())
+                {
+                    self.notify_tools_list_changed().await;
+                }
                 tool_def = self.ctx.router.get_tool(name).await;
             }
         }
@@ -712,7 +724,17 @@ fn first_missing_required(schema: &Value, args: &Value) -> Option<String> {
         .as_array()?
         .iter()
         .filter_map(|v| v.as_str())
-        .find(|key| args.get(*key).map(Value::is_null).unwrap_or(true))
+        .find(|key| match args.get(*key) {
+            None => true,
+            Some(value) if value.is_null() => {
+                let property_type = &schema["properties"][*key]["type"];
+                property_type.as_str() != Some("null")
+                    && !property_type
+                        .as_array()
+                        .is_some_and(|types| types.iter().any(|kind| kind.as_str() == Some("null")))
+            }
+            Some(_) => false,
+        })
         .map(str::to_string)
 }
 
@@ -2556,14 +2578,27 @@ mod first_missing_required_tests {
         );
     }
 
-    /// An explicit `null` is a caller who has not supplied the argument —
-    /// every `as_str()`/`as_array()` read would treat it that way, so the
-    /// check must too, or the two paths disagree.
+    /// Unless the property explicitly declares null, treat it as an omitted
+    /// value, like the required-argument readers.
     #[test]
     fn an_explicit_null_counts_as_absent() {
         assert_eq!(
             first_missing_required(&schema(json!(["board"])), &json!({ "board": null })).as_deref(),
             Some("board")
+        );
+    }
+
+    #[test]
+    fn explicitly_nullable_required_properties_accept_null_but_require_presence() {
+        let mut schema = schema(json!(["value"]));
+        schema["properties"]["value"]["type"] = json!(["number", "null"]);
+        assert_eq!(
+            first_missing_required(&schema, &json!({"value": null})),
+            None
+        );
+        assert_eq!(
+            first_missing_required(&schema, &json!({})).as_deref(),
+            Some("value")
         );
     }
 
@@ -2800,7 +2835,7 @@ mod config_state_dispatch_tests {
             ("load_project_config", json!({ "project_dir": project_dir })),
             (
                 "save_project_config",
-                json!({ "project_dir": project_dir, "key_path": "fab.house", "value": "JLCPCB" }),
+                json!({ "project_dir": project_dir, "key_path": "fab_constraints.fab_house", "value": "JLCPCB" }),
             ),
             (
                 "add_design_rule",
@@ -2849,7 +2884,7 @@ mod config_state_dispatch_tests {
         let (is_error, saved) = call(
             &handler,
             "save_project_config",
-            json!({ "project_dir": project_dir, "key_path": "fab.house", "value": "JLCPCB" }),
+            json!({ "project_dir": project_dir, "key_path": "fab_constraints.fab_house", "value": "JLCPCB" }),
         )
         .await;
         assert!(!is_error, "{saved}");
@@ -2862,7 +2897,10 @@ mod config_state_dispatch_tests {
         )
         .await;
         assert_eq!(reloaded["source"], "file", "{reloaded}");
-        assert_eq!(reloaded["config"]["fab"]["house"], "JLCPCB", "{reloaded}");
+        assert_eq!(
+            reloaded["config"]["fab_constraints"]["fab_house"], "JLCPCB",
+            "{reloaded}"
+        );
     }
 }
 

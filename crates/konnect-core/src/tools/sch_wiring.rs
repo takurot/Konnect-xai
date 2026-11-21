@@ -4,12 +4,14 @@
 //! junction dots. This uses `konnect_sexp::schematic::find_t_junctions`.
 
 use super::sch_route_safety::{
-    allow_join, check_coordinate_route, check_route, local_junctions, route_segments,
+    allow_join, check_coordinate_route, check_named_stub_route, check_route, local_junctions,
+    route_segments, NamedStubRoute,
 };
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    get_path, opt_f64, opt_str, require_array, require_f64, require_str, ToolContext, ToolDef,
+    get_path, invalid_arg, opt_f64, opt_str, require_array, require_f64, require_str, ToolContext,
+    ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_schematic_editor::types::fmt_f64;
@@ -19,7 +21,7 @@ use konnect_sexp::{
     parser::parse_sexp,
     schematic::{
         extract_symbol_instances, extract_wires, find_lib_symbol, format_junction, format_wire,
-        parse_at, pin_endpoint, pin_outward_direction, read_schematic, Wire,
+        parse_at, pin_endpoint, pin_outward_direction, read_schematic, LabelKind, Wire,
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
@@ -35,6 +37,9 @@ mod wire_safety_tests;
 #[cfg(test)]
 #[path = "sch_wiring_refusal_tests.rs"]
 mod wire_and_label_refusal_tests;
+
+const LABEL_TYPES: &[&str] = &["net_label", "global_label", "hierarchical_label"];
+const LABEL_SHAPES: &[&str] = &["input", "output", "bidirectional", "tri_state", "passive"];
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
@@ -140,12 +145,13 @@ pub fn tools() -> Vec<ToolDef> {
                     "rotation": { "type": "number", "default": 0 },
                     "label_type": {
                         "type": "string",
-                        "enum": ["net_label", "global_label", "hierarchical_label"],
+                        "enum": LABEL_TYPES,
                         "default": "net_label"
                     },
                     "shape": {
                         "type": "string",
-                        "description": "Shape for global/hierarchical labels (input/output/bidirectional/etc.)",
+                        "enum": LABEL_SHAPES,
+                        "description": "Shape for global and hierarchical labels",
                         "default": "input"
                     }
                 },
@@ -1655,6 +1661,24 @@ async fn handle_split_wire_at_point(
     })))
 }
 
+fn label_keyword(
+    args: &serde_json::Value,
+    field: &str,
+    default: &'static str,
+    allowed: &[&'static str],
+) -> Result<&'static str, CallToolResult> {
+    let value = if args.get(field).is_some() {
+        require_str(args, field)?
+    } else {
+        default
+    };
+    allowed
+        .iter()
+        .copied()
+        .find(|&keyword| keyword == value)
+        .ok_or_else(|| invalid_arg(field, &format!("must be one of: {}", allowed.join(", "))))
+}
+
 async fn handle_add_net_label(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -1673,8 +1697,14 @@ async fn handle_add_net_label(
         Err(e) => return Ok(e),
     };
     let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
-    let label_type = opt_str(args, "label_type").unwrap_or("net_label");
-    let shape = opt_str(args, "shape").unwrap_or("input");
+    let label_type = match label_keyword(args, "label_type", "net_label", LABEL_TYPES) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let shape = match label_keyword(args, "shape", "input", LABEL_SHAPES) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
 
@@ -2608,14 +2638,19 @@ async fn handle_connect_to_net(
         None => crate::tools::resolve_stub_direction(direction, (pin_x, pin_y), &tree),
     };
     let end = dir.end((pin_x, pin_y), stub_length);
-    if let Err(e) = check_route(
-        &tree,
-        &[((pin_x, pin_y), end)],
-        &[(pin_x, pin_y)],
-        Some(&net),
-        allow,
-    ) {
-        return Ok(e);
+    let label_kind = if label_type == "global_label" {
+        LabelKind::GlobalLabel
+    } else {
+        LabelKind::NetLabel
+    };
+    match check_named_stub_route(&tree, ((pin_x, pin_y), end), &net, label_kind, allow) {
+        Ok(NamedStubRoute::AlreadyConnected) => {
+            return Ok(CallToolResult::json(
+                &json!({"connected": net, "already_connected": true}),
+            ));
+        }
+        Ok(NamedStubRoute::Write) => {}
+        Err(error) => return Ok(error),
     }
     let mut sch = cse::Schematic::from_source(&sch_path, content)?;
     let pins = crate::tools::all_pin_endpoints(&tree);

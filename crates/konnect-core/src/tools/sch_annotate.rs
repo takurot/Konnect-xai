@@ -30,8 +30,9 @@ use konnect_sexp::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::info;
 
 const OPERATION: &str = "annotate_schematic";
@@ -287,6 +288,8 @@ pub(crate) struct AnnotationPlan {
     pub assignments: Vec<Assignment>,
     pub unresolved: Vec<Unresolved>,
     pub outside_project: Vec<OutsideProject>,
+    #[serde(skip)]
+    preserve_shared_reference: bool,
 }
 
 const REASON_DUPLICATE: &str = "duplicate designator in this project; set resolve_duplicates \
@@ -390,7 +393,7 @@ type NewGroupKey = (String, String, String, String);
 /// and a designator shared across instances is a duplicate unless it is the
 /// units of one package. Instance records of other projects are never planned
 /// or edited. Numbers used on the project's other sheets arrive through
-/// `reserved` (see [`reserved_on_other_sheets`]); duplicates that already
+/// `reserved` (see [`inspect_sheets`]); duplicates that already
 /// exist across files are not detected here — annotating a whole hierarchy
 /// from its root is #463.
 #[cfg(test)]
@@ -399,7 +402,13 @@ pub(crate) fn plan_annotation(
     project: &str,
     resolve_duplicates: bool,
 ) -> AnnotationPlan {
-    plan_annotation_reserving(symbols, project, &Reserved::default(), resolve_duplicates)
+    plan_annotation_reserving(
+        symbols,
+        project,
+        &Reserved::default(),
+        &PlacementOrder::default(),
+        resolve_duplicates,
+    )
 }
 
 /// Numbers in use per prefix on the project's other sheets, so the file being
@@ -407,10 +416,11 @@ pub(crate) fn plan_annotation(
 /// owns.
 pub(crate) type Reserved = BTreeMap<String, BTreeSet<u32>>;
 
-pub(crate) fn plan_annotation_reserving(
+fn plan_annotation_reserving(
     symbols: &[PlacedSymbol],
     project: &str,
     reserved: &Reserved,
+    placement: &PlacementOrder,
     resolve_duplicates: bool,
 ) -> AnnotationPlan {
     let mut plan = AnnotationPlan {
@@ -418,8 +428,7 @@ pub(crate) fn plan_annotation_reserving(
         ..AnnotationPlan::default()
     };
 
-    // Entries of the selected project: (symbol index, path index), in path
-    // order then file order.
+    // Entries of the selected project in saved file order.
     let mut entries: Vec<(usize, usize)> = Vec::new();
     for (si, symbol) in symbols.iter().enumerate() {
         if symbol.paths.is_empty() {
@@ -453,13 +462,21 @@ pub(crate) fn plan_annotation_reserving(
             });
         }
     }
-    entries.sort_by(|a, b| {
-        symbols[a.0].paths[a.1]
-            .path
-            .cmp(&symbols[b.0].paths[b.1].path)
-            .then(a.cmp(b))
-    });
+    let mut saved_order = BTreeMap::new();
+    for (index, &(symbol, entry)) in entries.iter().enumerate() {
+        saved_order
+            .entry(symbols[symbol].paths[entry].path.as_str())
+            .or_insert(index);
+    }
+    let by_placement = |a: &str, b: &str| match (placement.get(a), placement.get(b)) {
+        (Some(a), Some(b)) => compare_pages(a.page.as_deref(), b.page.as_deref())
+            .then_with(|| a.hierarchy.cmp(&b.hierarchy)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => saved_order.get(a).cmp(&saved_order.get(b)),
+    };
     plan.paths = distinct_paths(symbols, &entries);
+    plan.paths.sort_by(|a, b| by_placement(a, b));
 
     // Numbers in use anywhere in the project, per prefix: the other sheets'
     // first, then every instance in this file.
@@ -498,9 +515,7 @@ pub(crate) fn plan_annotation_reserving(
         }
         let mut ordered = members.clone();
         ordered.sort_by(|a, b| {
-            symbols[a.0].paths[a.1]
-                .path
-                .cmp(&symbols[b.0].paths[b.1].path)
+            by_placement(&symbols[a.0].paths[a.1].path, &symbols[b.0].paths[b.1].path)
                 .then_with(|| kicad_order(&symbols[a.0], &symbols[b.0]))
         });
         let uuids: Vec<String> = ordered
@@ -590,8 +605,7 @@ pub(crate) fn plan_annotation_reserving(
     }
 
     allocations.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| kicad_order(&symbols[a.1], &symbols[b.1]))
+        by_placement(&a.0, &b.0).then_with(|| kicad_order(&symbols[a.1], &symbols[b.1]))
     });
     for (path, _, members) in allocations {
         let prefix = parse_designator(&symbols[members[0].0].paths[members[0].1].reference).prefix;
@@ -639,7 +653,21 @@ pub(crate) fn symbol_block(content: &str, uuid: &str) -> Result<(usize, usize), 
 /// path in the file (the `multichannel` demo has `#PWR016` in the property
 /// and `#PWR024` on its first path). So the property follows the instance
 /// whose designator it currently shows, and is otherwise left alone.
-fn property_after(symbol: &PlacedSymbol, assignments: &[&Assignment]) -> String {
+fn property_after(
+    symbol: &PlacedSymbol,
+    assignments: &[&Assignment],
+    preserve_shared_reference: bool,
+) -> String {
+    if preserve_shared_reference
+        && symbol.paths.iter().any(|row| {
+            row.reference == symbol.property_reference
+                && !assignments.iter().any(|assignment| {
+                    assignment.project == row.project && assignment.path == row.path
+                })
+        })
+    {
+        return symbol.property_reference.clone();
+    }
     assignments
         .iter()
         .find(|a| a.from == symbol.property_reference)
@@ -732,7 +760,7 @@ pub(crate) fn plan_edits(
                 &format!("symbol {uuid} instance '{}'", assignment.path),
             )?);
         }
-        let property = property_after(symbol, &assignments);
+        let property = property_after(symbol, &assignments, plan.preserve_shared_reference);
         if property != symbol.property_reference {
             edits.push(replace_quoted_after(
                 content,
@@ -809,7 +837,7 @@ pub(crate) fn verify_applied(
             .iter()
             .filter(|a| a.uuid == symbol.uuid)
             .collect();
-        let expected_property = property_after(symbol, &own);
+        let expected_property = property_after(symbol, &own, plan.preserve_shared_reference);
         if observed.property_reference != expected_property {
             return Err(format!(
                 "symbol {} Reference property reads '{}', expected '{expected_property}'",
@@ -855,6 +883,7 @@ fn select_project(
     path: &Path,
     symbols: &[PlacedSymbol],
     requested: Option<&str>,
+    require_proven_owner: bool,
 ) -> Result<(String, Option<std::path::PathBuf>), CallToolResult> {
     let named: Vec<String> = symbols
         .iter()
@@ -875,16 +904,11 @@ fn select_project(
             ),
         )
     };
-    if named.is_empty() && requested.is_none() {
-        // Nothing carries an instance record; the plan reports every symbol
-        // as untied to a sheet instance.
-        return Ok((String::new(), None));
-    }
     // Ownership is consulted even for an explicit project: it is what makes
     // the other sheets' numbers visible.
     let owner = match crate::tools::resolve_schematic_ownership(path) {
         Ok(owner) => owner,
-        Err(error) if requested.is_some() => {
+        Err(error) if requested.is_some() && !require_proven_owner => {
             info!("[annotate] project ownership not proven ({error}); only this file's numbers are reserved");
             None
         }
@@ -899,14 +923,30 @@ fn select_project(
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default()
     });
+    if let Some((requested, owner)) = requested
+        .zip(owner_stem.as_deref())
+        .filter(|(requested, owner)| require_proven_owner && requested != owner)
+    {
+        return Err(refuse(format!(
+            "saved project '{requested}' does not own this schematic; the owner is '{owner}'"
+        )));
+    }
     let root_for = |project: &str| {
         owner
             .as_ref()
             .filter(|_| owner_stem.as_deref() == Some(project))
-            .map(|owner| owner.root_schematic.clone())
+            .map(|owner| owner.project_file.clone())
     };
+    if named.is_empty() && requested.is_none() {
+        return Ok((
+            owner_stem.unwrap_or_default(),
+            owner.map(|owner| owner.project_file),
+        ));
+    }
     if let Some(requested) = requested {
-        return if named.iter().any(|n| n == requested) {
+        return if named.iter().any(|n| n == requested)
+            || (named.is_empty() && owner_stem.as_deref() == Some(requested))
+        {
             Ok((requested.to_string(), root_for(requested)))
         } else {
             Err(refuse(format!(
@@ -931,75 +971,273 @@ fn select_project(
     }
 }
 
-/// Numbered instance references of `project` on every sheet of the tree
-/// under `root` except `target` itself, plus the files consulted. A sheet
-/// that cannot be read is skipped and named in the second list, so a caller
-/// knows which numbers stayed invisible.
-pub(crate) fn reserved_on_other_sheets(
+type SheetRoot = (PathBuf, Option<String>);
+type ProjectInput = (PathBuf, String);
+
+#[derive(Default)]
+struct SheetSurvey {
+    reserved: Reserved,
+    consulted: Vec<String>,
+    unreadable: BTreeSet<String>,
+    unannotated: Vec<OtherSheet>,
+    trees: BTreeMap<PathBuf, SexpNode>,
+    sources: BTreeMap<PathBuf, String>,
+    offer_recovery: bool,
+}
+
+#[derive(Serialize)]
+struct OtherSheet {
+    schematic: String,
+    unannotated_instances: usize,
+}
+
+struct SavedPlacement {
+    page: Option<String>,
+    hierarchy: Vec<usize>,
+}
+
+type PlacementOrder = BTreeMap<String, SavedPlacement>;
+
+fn canonical_file(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn sheet_file(sheet: &SexpNode) -> Option<&str> {
+    sheet.find_all("property").into_iter().find_map(|property| {
+        let name = property.get(1)?.as_str()?;
+        if name.eq_ignore_ascii_case("Sheetfile") || name.eq_ignore_ascii_case("Sheet file") {
+            property.get(2)?.as_str()
+        } else {
+            None
+        }
+    })
+}
+
+fn saved_roots(
+    path: &Path,
+    project_file: Option<&Path>,
+) -> Result<(Vec<SheetRoot>, Option<ProjectInput>), CallToolResult> {
+    let Some(project_file) = project_file else {
+        return Ok((vec![(path.to_path_buf(), None)], None));
+    };
+    let refusal = |error: &dyn std::fmt::Display| {
+        CallToolResult::error(format!("Cannot read the project roots: {error}"))
+    };
+    let source = read_consistent(project_file).map_err(|error| refusal(&error))?;
+    let roots =
+        super::project_schematic_roots(project_file, &source).map_err(|error| refusal(&error))?;
+    Ok((roots, Some((canonical_file(project_file), source))))
+}
+
+/// Inspect saved files without changing them. A repeat of a physical sheet
+/// is consulted once; its saved rows already identify every logical instance.
+fn inspect_sheets(roots: &[SheetRoot], path: &Path, project: &str) -> SheetSurvey {
+    let mut survey = SheetSurvey::default();
+    let target = canonical_file(path);
+    let mut stack: Vec<_> = roots
+        .iter()
+        .rev()
+        .map(|(file, _)| (file.clone(), Vec::new()))
+        .collect();
+    let mut seen = BTreeSet::new();
+    while let Some((file, mut ancestors)) = stack.pop() {
+        let canonical = canonical_file(&file);
+        let display = file.display().to_string();
+        if ancestors.len() > super::sch_hierarchy::MAX_HIERARCHY_DEPTH
+            || ancestors.contains(&canonical)
+        {
+            survey.unreadable.insert(display);
+            continue;
+        }
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        let parsed = read_consistent(&file)
+            .ok()
+            .and_then(|source| parse_sexp(&source).ok().map(|tree| (source, tree)));
+        let Some((source, tree)) = parsed.filter(|(_, tree)| tree.head() == Some("kicad_sch"))
+        else {
+            survey.unreadable.insert(display);
+            continue;
+        };
+        ancestors.push(canonical.clone());
+        let directory = file.parent().unwrap_or_else(|| Path::new("."));
+        for child in tree
+            .find_all("sheet")
+            .into_iter()
+            .rev()
+            .filter_map(sheet_file)
+        {
+            stack.push((directory.join(child), ancestors.clone()));
+        }
+        if canonical != target {
+            match placed_symbols(&tree) {
+                Ok(symbols) => {
+                    let mut unannotated_instances = 0;
+                    for row in symbols
+                        .iter()
+                        .flat_map(|symbol| &symbol.paths)
+                        .filter(|row| project.is_empty() || row.project == project)
+                    {
+                        let designator = parse_designator(&row.reference);
+                        if let Some(number) = designator.number {
+                            survey
+                                .reserved
+                                .entry(designator.prefix)
+                                .or_default()
+                                .insert(number);
+                        } else {
+                            unannotated_instances += 1;
+                        }
+                    }
+                    if unannotated_instances > 0 {
+                        survey.unannotated.push(OtherSheet {
+                            schematic: display.clone(),
+                            unannotated_instances,
+                        });
+                    }
+                    survey.consulted.push(display);
+                }
+                Err(_) => {
+                    survey.unreadable.insert(display);
+                }
+            }
+        }
+        survey.sources.insert(canonical.clone(), source);
+        survey.trees.insert(canonical, tree);
+    }
+    survey
+}
+
+#[cfg(test)]
+fn reserved_on_other_sheets(
     root: &Path,
     target: &Path,
     project: &str,
 ) -> (Reserved, Vec<String>, Vec<String>) {
-    let mut reserved = Reserved::new();
-    let mut consulted = Vec::new();
-    let mut unreadable = Vec::new();
-    let mut stack = vec![(root.to_path_buf(), 0usize)];
-    let mut seen: BTreeSet<std::path::PathBuf> = BTreeSet::new();
-    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let target_canonical = canonical(target);
-    while let Some((file, depth)) = stack.pop() {
-        if depth > crate::tools::sch_hierarchy::MAX_HIERARCHY_DEPTH
-            || !seen.insert(canonical(&file))
-        {
-            continue;
-        }
-        let content = match read_consistent(&file) {
-            Ok(content) => content,
-            Err(_) => {
-                unreadable.push(file.display().to_string());
-                continue;
-            }
-        };
-        let tree = match parse_sexp(&content) {
-            Ok(tree) => tree,
-            Err(_) => {
-                unreadable.push(file.display().to_string());
-                continue;
-            }
-        };
-        let directory = file.parent().unwrap_or_else(|| Path::new("."));
-        for sheet in tree.find_all("sheet") {
-            let child = sheet
-                .find_all("property")
-                .into_iter()
-                .find(|property| property.get(1).and_then(SexpNode::as_str) == Some("Sheetfile"))
-                .and_then(|property| property.get(2))
-                .and_then(SexpNode::as_str);
-            if let Some(child) = child {
-                stack.push((directory.join(child), depth + 1));
-            }
-        }
-        if canonical(&file) == target_canonical {
-            continue;
-        }
-        let Ok(symbols) = placed_symbols(&tree) else {
-            unreadable.push(file.display().to_string());
-            continue;
-        };
-        consulted.push(file.display().to_string());
-        for symbol in &symbols {
-            for entry in symbol.paths.iter().filter(|p| p.project == project) {
-                let designator = parse_designator(&entry.reference);
-                if let Some(number) = designator.number {
-                    reserved
-                        .entry(designator.prefix)
-                        .or_default()
-                        .insert(number);
+    let survey = inspect_sheets(&[(root.to_path_buf(), None)], target, project);
+    (
+        survey.reserved,
+        survey.consulted,
+        survey.unreadable.into_iter().collect(),
+    )
+}
+
+/// Numeric pages precede text pages. Compare digit runs in text naturally,
+/// so a page labelled A2 also precedes A10.
+fn compare_pages(a: Option<&str>, b: Option<&str>) -> Ordering {
+    let (a, b) = match (a, b) {
+        (Some(a), Some(b)) => (a, b),
+        (Some(_), None) => return Ordering::Less,
+        (None, Some(_)) => return Ordering::Greater,
+        (None, None) => return Ordering::Equal,
+    };
+    match (a.parse::<i64>(), b.parse::<i64>()) {
+        (Ok(a), Ok(b)) => return a.cmp(&b),
+        (Ok(_), Err(_)) => return Ordering::Less,
+        (Err(_), Ok(_)) => return Ordering::Greater,
+        (Err(_), Err(_)) => {}
+    }
+    let same_kind = |a: &u8, b: &u8| a.is_ascii_digit() == b.is_ascii_digit();
+    let mut a = a.as_bytes().chunk_by(same_kind);
+    let mut b = b.as_bytes().chunk_by(same_kind);
+    loop {
+        match (a.next(), b.next()) {
+            (Some(a), Some(b)) => {
+                let result = if a[0].is_ascii_digit() && b[0].is_ascii_digit() {
+                    let a = &a[a.iter().take_while(|&&c| c == b'0').count()..];
+                    let b = &b[b.iter().take_while(|&&c| c == b'0').count()..];
+                    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+                } else {
+                    a.cmp(b)
+                };
+                if !result.is_eq() {
+                    return result;
                 }
             }
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+            (None, None) => return Ordering::Equal,
         }
     }
-    (reserved, consulted, unreadable)
+}
+
+fn saved_placement(
+    instance: &str,
+    roots: &[SheetRoot],
+    target: &Path,
+    project: &str,
+    survey: &SheetSurvey,
+) -> Option<SavedPlacement> {
+    let mut parts = instance.strip_prefix('/')?.split('/');
+    let first = parts.next()?;
+    let (index, mut file) = roots.iter().enumerate().find_map(|(index, (root, uuid))| {
+        let file = canonical_file(root);
+        let tree = survey.trees.get(&file)?;
+        (uuid.as_deref().or_else(|| tree.find_str("uuid")) == Some(first)).then_some((index, file))
+    })?;
+    let mut hierarchy = vec![index];
+    let mut parent_path = format!("/{first}");
+    let mut page = survey
+        .trees
+        .get(&file)?
+        .find("sheet_instances")
+        .and_then(|footer| {
+            footer
+                .find_all("path")
+                .into_iter()
+                .find(|row| row.get(1).and_then(SexpNode::as_str) == Some("/"))
+        })
+        .and_then(|row| row.find_str("page"))
+        .map(str::to_owned);
+    for uuid in parts {
+        let tree = survey.trees.get(&file)?;
+        let (index, sheet) = tree
+            .find_all("sheet")
+            .into_iter()
+            .enumerate()
+            .find(|(_, sheet)| sheet.find_str("uuid") == Some(uuid))?;
+        page = sheet
+            .find("instances")
+            .and_then(|instances| {
+                instances
+                    .find_all("project")
+                    .into_iter()
+                    .filter(|node| node.get(1).and_then(SexpNode::as_str) == Some(project))
+                    .flat_map(|node| node.find_all("path"))
+                    .find(|row| row.get(1).and_then(SexpNode::as_str) == Some(parent_path.as_str()))
+            })
+            .and_then(|row| row.find_str("page"))
+            .map(str::to_owned);
+        file = canonical_file(&file.parent()?.join(sheet_file(sheet)?));
+        hierarchy.push(index);
+        parent_path.push('/');
+        parent_path.push_str(uuid);
+    }
+    (file == target).then_some(SavedPlacement { page, hierarchy })
+}
+
+fn placement_order(
+    roots: &[SheetRoot],
+    path: &Path,
+    project: &str,
+    symbols: &[PlacedSymbol],
+    survey: &SheetSurvey,
+) -> PlacementOrder {
+    let target = canonical_file(path);
+    let paths: BTreeSet<_> = symbols
+        .iter()
+        .flat_map(|symbol| &symbol.paths)
+        .filter(|row| row.project == project)
+        .map(|row| row.path.as_str())
+        .collect();
+    paths
+        .into_iter()
+        .filter_map(|instance| {
+            saved_placement(instance, roots, &target, project, survey)
+                .map(|placement| (instance.to_owned(), placement))
+        })
+        .collect()
 }
 
 fn parse_file(path: &Path, content: &str) -> Result<Vec<PlacedSymbol>, String> {
@@ -1022,18 +1260,100 @@ fn retry_for(plan: &AnnotationPlan, resolve_duplicates: bool) -> Option<Value> {
         Some(json!({
             "safe": false,
             "scope": "unresolved_designators",
-            "instruction": "the listed groups need a decision the tool will not guess at; edit the designators (edit_schematic_component) and call again"
+            "instruction": "Inspect unresolved groups. Where recovery is listed, choose one repeated unit and pass its arguments to edit_schematic_component, then run annotate_schematic again."
         }))
     }
+}
+
+fn reserved_designators(
+    symbols: &[PlacedSymbol],
+    project: &str,
+    other: &Reserved,
+    assignments: &[Assignment],
+) -> Reserved {
+    let mut used = other.clone();
+    for reference in symbols
+        .iter()
+        .flat_map(|symbol| &symbol.paths)
+        .filter(|row| row.project == project)
+        .map(|row| row.reference.as_str())
+        .chain(assignments.iter().map(|assignment| assignment.to.as_str()))
+    {
+        let designator = parse_designator(reference);
+        if let Some(number) = designator.number {
+            used.entry(designator.prefix).or_default().insert(number);
+        }
+    }
+    used
+}
+
+fn recovery_actions(
+    path: &Path,
+    symbols: &[PlacedSymbol],
+    unresolved: &Unresolved,
+    used: &Reserved,
+) -> Vec<Value> {
+    if unresolved.reason != REASON_UNPROVEN_NEW_PACKAGE {
+        return Vec::new();
+    }
+    let designator = parse_designator(&unresolved.reference);
+    let Some(number) = (1u32..=u32::MAX).find(|number| {
+        !used
+            .get(&designator.prefix)
+            .is_some_and(|numbers| numbers.contains(number))
+    }) else {
+        return Vec::new();
+    };
+    let new_reference = format_designator(&designator.prefix, number);
+    let selected: Vec<_> = symbols
+        .iter()
+        .filter(|symbol| unresolved.uuids.contains(&symbol.uuid))
+        .collect();
+    let mut counts = BTreeMap::new();
+    for symbol in &selected {
+        *counts.entry(symbol.unit).or_insert(0usize) += 1;
+    }
+    let mut actions = Vec::new();
+    for symbol in selected.iter().filter(|symbol| counts[&symbol.unit] > 1) {
+        for row in symbol
+            .paths
+            .iter()
+            .filter(|row| row.project == unresolved.project && unresolved.paths.contains(&row.path))
+        {
+            actions.push(json!({
+                "tool": "edit_schematic_component",
+                "unit": symbol.unit,
+                "arguments": {
+                    "schematic": path, "uuid": symbol.uuid, "project": row.project,
+                    "instance_path": row.path, "new_reference": new_reference
+                }
+            }));
+        }
+    }
+    actions
 }
 
 fn body(
     path: &Path,
     options: &AnnotateOptions,
     plan: &AnnotationPlan,
-    sheets: (&[String], &[String]),
+    survey: &SheetSurvey,
+    symbols: &[PlacedSymbol],
     written: bool,
 ) -> Value {
+    let mut unresolved = json!(plan.unresolved);
+    if survey.offer_recovery && survey.unreadable.is_empty() {
+        let used =
+            reserved_designators(symbols, &plan.project, &survey.reserved, &plan.assignments);
+        if let Some(reports) = unresolved.as_array_mut() {
+            for (report, group) in reports.iter_mut().zip(&plan.unresolved) {
+                let actions = recovery_actions(path, symbols, group, &used);
+                if !actions.is_empty() {
+                    report["recovery"] = json!(actions);
+                }
+            }
+        }
+    }
     json!({
         "schematic": path.display().to_string(),
         "dry_run": options.dry_run,
@@ -1042,13 +1362,173 @@ fn body(
         "project": plan.project,
         "paths": plan.paths,
         "outside_project": plan.outside_project,
-        "other_sheets_consulted": sheets.0,
-        "other_sheets_unreadable": sheets.1,
+        "scope": "saved_schematic",
+        "other_sheets_consulted": survey.consulted,
+        "other_sheets_unreadable": survey.unreadable,
+        "other_sheets_unannotated": survey.unannotated,
         "unannotated_before": plan.unannotated_before,
         "duplicates_before": plan.duplicates_before,
         "assigned": plan.assignments,
-        "unresolved": plan.unresolved,
+        "unresolved": unresolved,
     })
+}
+
+/// Rename exactly one logical placement selected by the recovery response.
+pub(crate) fn rename_instance_reference(
+    path: &Path,
+    uuid: &str,
+    project: Option<&str>,
+    instance_path: Option<&str>,
+    new_reference: &str,
+) -> CallToolResult {
+    use konnect_sexp::transaction::commit_file_transaction_with_dependencies;
+
+    let Ok(id) = uuid::Uuid::parse_str(uuid) else {
+        return super::invalid_arg("uuid", "expected a saved symbol UUID");
+    };
+    let content = match read_consistent(path) {
+        Ok(source) => source,
+        Err(error) => return CallToolResult::error(format!("Cannot read the schematic: {error}")),
+    };
+    let before = match parse_file(path, &content) {
+        Ok(symbols) => symbols,
+        Err(error) => return CallToolResult::error(error),
+    };
+    let matches: Vec<_> = before
+        .iter()
+        .filter(|symbol| uuid::Uuid::parse_str(&symbol.uuid).ok() == Some(id))
+        .collect();
+    let [symbol] = matches.as_slice() else {
+        return super::invalid_arg("uuid", "expected exactly one matching placed symbol");
+    };
+    let (project, project_file) = match select_project(path, &before, project, true) {
+        Ok(selected) => selected,
+        Err(error) => return error,
+    };
+    let rows: Vec<_> = symbol
+        .paths
+        .iter()
+        .filter(|row| row.project == project && instance_path.is_none_or(|path| row.path == path))
+        .collect();
+    let [row] = rows.as_slice() else {
+        return super::invalid_arg(
+            "instance_path",
+            "choose exactly one of the symbol's saved instance paths in the selected project",
+        );
+    };
+    let from = parse_designator(&row.reference);
+    let to = parse_designator(new_reference);
+    let Some(number) = to.number.filter(|&number| number > 0) else {
+        return super::invalid_arg("new_reference", "expected a positive numbered designator");
+    };
+    if to.prefix != from.prefix
+        || to.prefix.trim_start_matches('#').is_empty()
+        || !to
+            .prefix
+            .trim_start_matches('#')
+            .bytes()
+            .all(|byte| byte.is_ascii_alphabetic())
+        || format_designator(&to.prefix, number) != new_reference
+    {
+        return super::invalid_arg(
+            "new_reference",
+            "expected the original prefix followed by a canonical number",
+        );
+    }
+    let (roots, project_input) = match saved_roots(path, project_file.as_deref()) {
+        Ok(scope) => scope,
+        Err(error) => return error,
+    };
+    let target = canonical_file(path);
+    let survey = inspect_sheets(&roots, path, &project);
+    if !survey.unreadable.is_empty() || survey.sources.get(&target) != Some(&content) {
+        return CallToolResult::error(
+            "Could not verify the selected project files. Inspect them before retrying.",
+        );
+    }
+    if project_file.is_some()
+        && saved_placement(&row.path, &roots, &target, &project, &survey).is_none()
+    {
+        return super::invalid_arg(
+            "instance_path",
+            "the saved instance path does not resolve to this schematic",
+        );
+    }
+    let result = |written: bool| {
+        CallToolResult::json(&json!({
+            "reference": new_reference, "uuid": symbol.uuid, "project": project,
+            "instance_path": row.path, "written": written,
+            "changes": if written { vec![format!("Reference → {new_reference} (1 unit)")] } else { vec![] }
+        }))
+    };
+    if row.reference == new_reference {
+        return result(false);
+    }
+    let used = reserved_designators(&before, &project, &survey.reserved, &[]);
+    if used
+        .get(&to.prefix)
+        .is_some_and(|numbers| numbers.contains(&number))
+    {
+        return super::invalid_arg(
+            "new_reference",
+            "that designator is already used in the selected project",
+        );
+    }
+    let plan = AnnotationPlan {
+        project: project.clone(),
+        assignments: vec![Assignment {
+            uuid: symbol.uuid.clone(),
+            unit: symbol.unit,
+            project: project.clone(),
+            path: row.path.clone(),
+            from: row.reference.clone(),
+            to: new_reference.to_string(),
+        }],
+        preserve_shared_reference: true,
+        ..Default::default()
+    };
+    let edits = match plan_edits(&content, &before, &plan) {
+        Ok(edits) => edits,
+        Err(error) => return CallToolResult::error(error),
+    };
+    let prospective = apply_edits(content.clone(), edits);
+    if let Err(error) =
+        parse_file(path, &prospective).and_then(|saved| verify_applied(&before, &saved, &plan))
+    {
+        return CallToolResult::error(format!(
+            "Prospective reference edit could not be verified: {error}"
+        ));
+    }
+
+    const EDIT: &str = "edit_schematic_component";
+    let Some(directory) = target.parent() else {
+        return CallToolResult::error("The schematic has no containing directory");
+    };
+    let mut dependencies: Vec<_> = survey
+        .sources
+        .into_iter()
+        .filter(|(file, _)| file != &target)
+        .collect();
+    dependencies.extend(project_input);
+    if let Err(error) = commit_file_transaction_with_dependencies(
+        directory,
+        vec![konnect_sexp::FileTransition::replace(
+            &target,
+            content,
+            prospective,
+        )],
+        dependencies,
+    ) {
+        return super::mutation_outcome_uncertain(path, EDIT, error.to_string());
+    }
+    let verified = read_consistent(path)
+        .map_err(|error| error.to_string())
+        .and_then(|source| parse_file(path, &source))
+        .and_then(|saved| verify_applied(&before, &saved, &plan));
+    match verified {
+        Ok(()) => result(true),
+        Err(error) => super::mutation_outcome_uncertain(path, EDIT, error),
+    }
 }
 
 /// Annotate the schematic at `path` and report exactly what happened.
@@ -1094,20 +1574,32 @@ fn annotate_file_with_persistence(
             );
         }
     };
-    let (project, root) = match select_project(path, &before, options.project.as_deref()) {
-        Ok(selected) => selected,
-        Err(refusal) => return refusal,
+    let (project, project_file) =
+        match select_project(path, &before, options.project.as_deref(), false) {
+            Ok(selected) => selected,
+            Err(refusal) => return refusal,
+        };
+    let (roots, _) = match saved_roots(path, project_file.as_deref()) {
+        Ok(roots) => roots,
+        Err(error) => return error,
     };
-    let (reserved, other_sheets, unreadable_sheets) = match &root {
-        Some(root) => reserved_on_other_sheets(root, path, &project),
-        None => (Reserved::new(), Vec::new(), Vec::new()),
-    };
-    let plan = plan_annotation_reserving(&before, &project, &reserved, options.resolve_duplicates);
+    let mut survey = inspect_sheets(&roots, path, &project);
+    let placement = placement_order(&roots, path, &project, &before, &survey);
+    let plan = plan_annotation_reserving(
+        &before,
+        &project,
+        &survey.reserved,
+        &placement,
+        options.resolve_duplicates,
+    );
+    survey.offer_recovery = !plan.unresolved.is_empty()
+        && (project_file.is_some()
+            || super::schematic_project_candidates(path).is_ok_and(|paths| paths.is_empty()));
     let target = path.display().to_string();
     let requested = plan.assignments.len() + plan.unresolved.len();
 
     if options.dry_run || plan.assignments.is_empty() {
-        let status = if plan.unresolved.is_empty() {
+        let status = if plan.unresolved.is_empty() && survey.unreadable.is_empty() {
             OutcomeStatus::Complete
         } else {
             OutcomeStatus::Partial
@@ -1117,19 +1609,15 @@ fn annotate_file_with_persistence(
         } else {
             "saved_file"
         };
-        let mut response = body(
-            path,
-            &options,
-            &plan,
-            (&other_sheets, &unreadable_sheets),
-            false,
-        );
+        let mut response = body(path, &options, &plan, &survey, &before, false);
         response["message"] = json!(if options.dry_run {
             "Dry run: nothing was written; assigned lists what a real run would write."
+        } else if plan.unresolved.is_empty() && !survey.unreadable.is_empty() {
+            "Nothing was written: some other sheets could not be read."
         } else if plan.unresolved.is_empty() {
-            "Nothing to annotate: every designator is numbered and unique on every sheet instance."
+            "Nothing was written: no designator in the requested schematic needed annotation. See other_sheets_unannotated for other files."
         } else {
-            "Nothing was written: no designator needed a number, but the listed groups are unresolved."
+            "Nothing was written: the requested schematic contains unresolved designators."
         });
         return outcome::attach(
             CallToolResult::json(&response),
@@ -1229,24 +1717,28 @@ fn annotate_file_with_persistence(
         );
     }
     // What still needs a decision after the write, read from the file.
-    let remaining =
-        plan_annotation_reserving(&committed, &project, &reserved, options.resolve_duplicates);
-    let status = if remaining.assignments.is_empty() && remaining.unresolved.is_empty() {
+    let remaining = plan_annotation_reserving(
+        &committed,
+        &project,
+        &survey.reserved,
+        &placement,
+        options.resolve_duplicates,
+    );
+    let status = if remaining.assignments.is_empty()
+        && remaining.unresolved.is_empty()
+        && survey.unreadable.is_empty()
+    {
         OutcomeStatus::Complete
     } else {
         OutcomeStatus::Partial
     };
-    let mut response = body(
-        path,
-        &options,
-        &plan,
-        (&other_sheets, &unreadable_sheets),
-        true,
-    );
+    let mut response = body(path, &options, &plan, &survey, &committed, true);
     response["remaining_unannotated"] = json!(remaining.unannotated_before);
     response["message"] = json!(match status {
         OutcomeStatus::Complete =>
-            "Annotated; every designator is numbered and unique on every sheet instance.",
+            "Annotated the requested schematic. See other_sheets_unannotated for other files.",
+        _ if remaining.unresolved.is_empty() =>
+            "Annotated the requested schematic; some other sheets could not be read.",
         _ => "Annotated what could be decided; the listed groups are unresolved.",
     });
     outcome::attach(
@@ -1843,8 +2335,8 @@ mod tests {
         assert_eq!(placed_units, vec![1, 2, 3], "the package keeps its units");
     }
 
-    #[test]
-    fn unannotated_units_forming_two_packages_are_not_guessed() {
+    #[tokio::test]
+    async fn unannotated_units_forming_two_packages_are_not_guessed() {
         let symbols = symbols_of(MULTI_UNIT);
         let units: Vec<String> = symbols
             .iter()
@@ -1884,6 +2376,182 @@ mod tests {
         assert_eq!(body["outcome"]["status"], "partial", "{body}");
         assert_eq!(body["written"], false, "{body}");
         assert_eq!(std::fs::read(&path).unwrap(), before, "nothing is guessed");
+
+        let unresolved_body = body["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["reference"] == "U?")
+            .unwrap();
+        let recovery = &unresolved_body["recovery"][0];
+        let args = recovery["arguments"].clone();
+        assert_eq!(recovery["tool"], "edit_schematic_component", "{body}");
+        assert!(unresolved
+            .uuids
+            .iter()
+            .any(|uuid| args["uuid"].as_str() == Some(uuid.as_str())));
+        let handler = crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            auto_load_toolsets: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let edited = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": recovery["tool"], "arguments": args}
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(edited["isError"], false, "{edited}");
+        let annotated = response_json(&annotate_file(&path, AnnotateOptions::default()));
+        assert_eq!(annotated["outcome"]["status"], "complete", "{annotated}");
+        let units = symbols_of(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(
+            units
+                .iter()
+                .filter(|unit| unit.property_reference == "U?")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn uuid_recovery_refuses_cached_project_that_does_not_own_the_sheet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("different-owner.kicad_sch");
+        std::fs::write(&path, MULTI_UNIT).unwrap();
+        std::fs::write(path.with_extension("kicad_pro"), "{}").unwrap();
+        let symbols = symbols_of(MULTI_UNIT);
+        let symbol = symbols
+            .iter()
+            .find(|symbol| !symbol.paths.is_empty())
+            .unwrap();
+        let row = &symbol.paths[0];
+        let result = rename_instance_reference(
+            &path,
+            &symbol.uuid,
+            Some(&row.project),
+            Some(&row.path),
+            "U1234",
+        );
+        assert!(result.is_error);
+        assert!(response_json(&result).to_string().contains("does not own"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), MULTI_UNIT);
+    }
+
+    #[test]
+    fn uuid_recovery_preserves_the_reference_showing_an_untouched_instance() {
+        let symbols = symbols_of(REUSED_SHEET);
+        let resistor = symbols
+            .iter()
+            .find(|symbol| symbol.property_reference.starts_with('R'))
+            .unwrap();
+        let source = set_every_reference(REUSED_SHEET, &resistor.uuid, "R?");
+        let (_dir, path) = write_fixture(&source);
+        let paths = symbols_of(&source)
+            .into_iter()
+            .find(|symbol| symbol.uuid == resistor.uuid)
+            .unwrap()
+            .paths;
+        assert!(paths.len() > 1);
+        let chosen = &paths[0];
+        let result = rename_instance_reference(
+            &path,
+            &resistor.uuid,
+            Some(&chosen.project),
+            Some(&chosen.path),
+            "R99999",
+        );
+        assert!(!result.is_error, "{result:?}");
+        let after = symbols_of(&std::fs::read_to_string(&path).unwrap())
+            .into_iter()
+            .find(|symbol| symbol.uuid == resistor.uuid)
+            .unwrap();
+        assert_eq!(after.property_reference, "R?");
+        for (before, after) in paths.iter().zip(&after.paths) {
+            let reference = if before == chosen { "R99999" } else { "R?" };
+            assert_eq!(after.reference, reference);
+            assert_eq!(
+                (&after.project, &after.path),
+                (&before.project, &before.path)
+            );
+        }
+    }
+
+    #[test]
+    fn native_page_order_wins_over_uuid_and_empty_root_reports_unannotated_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("multichannel_mixer.kicad_sch");
+        let child = dir.path().join("channel_strip.kicad_sch");
+        let root_source = include_str!("../../tests/fixtures/multichannel_mixer.kicad_sch");
+        let root_symbols = konnect_sexp::writer::find_direct_child_blocks(root_source, "kicad_sch")
+            .into_iter()
+            .filter(|&(start, end)| {
+                parse_sexp(&root_source[start..end]).unwrap().head() == Some("symbol")
+            })
+            .map(|(start, end)| SexpEdit::delete(start, end))
+            .collect();
+        let root_source = apply_edits(root_source.to_owned(), root_symbols);
+        std::fs::write(&root, &root_source).unwrap();
+        std::fs::write(
+            root.with_extension("kicad_pro"),
+            include_str!("../../tests/fixtures/multichannel_mixer.kicad_pro"),
+        )
+        .unwrap();
+        let symbols = symbols_of(REUSED_SHEET);
+        let resistor = symbols
+            .iter()
+            .find(|symbol| symbol.property_reference.starts_with('R'))
+            .unwrap();
+        let unannotated = set_every_reference(REUSED_SHEET, &resistor.uuid, "R?");
+        std::fs::write(&child, &unannotated).unwrap();
+
+        let report = response_json(&annotate_file(&root, AnnotateOptions::default()));
+        assert_eq!(report["project"], "multichannel_mixer", "{report}");
+        assert_eq!(report["scope"], "saved_schematic", "{report}");
+        assert_eq!(report["written"], false, "{report}");
+        assert!(
+            report["other_sheets_unannotated"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["schematic"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("channel_strip.kicad_sch")
+                    && entry["unannotated_instances"] == 4),
+            "{report}"
+        );
+        assert_eq!(std::fs::read_to_string(&root).unwrap(), root_source);
+        assert_eq!(std::fs::read_to_string(&child).unwrap(), unannotated);
+
+        let preview = response_json(&annotate_file(
+            &child,
+            AnnotateOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        ));
+        let assignment_paths: Vec<&str> = preview["assigned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap().rsplit('/').next().unwrap())
+            .collect();
+        assert_eq!(
+            assignment_paths,
+            [
+                "8b945230-5f99-4834-98ec-44a11b86c8e7", // Page 2
+                "28f12a69-adb8-432e-b16f-23450e62f642", // Page 3
+                "b924e033-d20d-4b7d-8c8a-6be6c11f2802", // Page 4
+                "eaae7191-0144-4728-9382-3abf6e7a2d68", // Page 5
+            ],
+            "{preview}"
+        );
+        assert_eq!(std::fs::read_to_string(&child).unwrap(), unannotated);
     }
 
     #[test]

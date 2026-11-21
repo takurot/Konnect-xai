@@ -150,6 +150,64 @@ fn body(result: &Value) -> Value {
 }
 
 #[test]
+#[ignore = "requires kicad-cli and stock libraries; run via e2e workflow"]
+fn pcbway_package_excludes_schematic_dnp_from_bom_and_positions() {
+    let cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("project");
+    let schematic = project.join("assembly.kicad_sch");
+    let board = project.join("assembly.kicad_pcb");
+    let output = directory.path().join("package");
+    let footprint = "Resistor_SMD:R_0603_1608Metric";
+    let mut mcp = Mcp::spawn(&cli);
+    mcp.tool(
+        "create_project",
+        json!({"name": "assembly", "path": project}),
+    );
+    mcp.load("sch_components");
+    mcp.load("pcb_components");
+    mcp.load("manufacturing");
+    for (reference, x, dnp) in [("R1", 55.88, false), ("R2", 68.58, true)] {
+        mcp.tool(
+            "add_schematic_component",
+            json!({
+                "schematic": schematic, "lib_id": "Device:R", "reference": reference,
+                "footprint": footprint, "x": x, "y": 50.8, "dnp": dnp
+            }),
+        );
+        mcp.tool(
+            "place_component",
+            json!({
+                "board": board, "footprint": footprint, "reference": reference, "x": x, "y": 50.8
+            }),
+        );
+    }
+    let saved = std::fs::read(&board).unwrap();
+    let package = body(&mcp.tool(
+        "export_manufacturing_package",
+        json!({
+            "board": board, "schematic": schematic, "output_dir": output, "fab_house": "pcbway",
+            "bom_fields": "Reference,Value,Footprint,${QUANTITY}"
+        }),
+    ));
+    assert_eq!(package["complete"], true, "{package}");
+    for file in ["bom.csv", "positions.csv"] {
+        let contents = std::fs::read_to_string(output.join(file)).unwrap();
+        assert!(
+            contents
+                .lines()
+                .any(|line| line.starts_with("R1,") || line.starts_with("\"R1\",")),
+            "populated control R1 missing from {file}: {contents}"
+        );
+        assert!(
+            !contents.contains("R2"),
+            "unfitted R2 included in {file}: {contents}"
+        );
+    }
+    assert_eq!(std::fs::read(board).unwrap(), saved);
+}
+
+#[test]
 #[ignore = "requires kicad-cli; run via e2e workflow"]
 fn schematic_calls_preserve_the_board_and_project_when_passed_the_wrong_file() {
     let kicad_cli = find_kicad_cli().expect("kicad-cli not found; set KICAD_CLI or install KiCad");
@@ -990,8 +1048,8 @@ fn full_design_loop_with_real_kicad() {
         "R1 pin 1 is not a node of VIN — the label did not bind its pin:\n{vin}"
     );
 
-    // The review's runtime coverage uses Konnect's parser so the tool remains
-    // usable without kicad-cli. Cross-check that count here against KiCad's
+    // The review counts schematic placements using Konnect's parser.
+    // Cross-check that count here against KiCad's
     // own netlist so parser drift cannot turn incomplete extraction into a
     // clean verdict (#184).
     let netlist_tree = konnect_sexp::parse_sexp(&netlist).expect("KiCad netlist must parse");
@@ -1180,6 +1238,185 @@ fn a_written_default_netclass_still_plots_wires() {
     assert!(
         (after - radius).abs() < 1e-6,
         "a sparse named class changed the junction dot: {radius} -> {after}"
+    );
+}
+
+#[test]
+#[ignore = "requires KiCad 10 and its stock symbol and footprint libraries"]
+fn design_review_and_readiness_use_native_evidence() {
+    let cli = find_kicad_cli().expect("KiCad 10 required for design review");
+    let dir = tempfile::tempdir().unwrap();
+    let mut mcp = Mcp::spawn(&cli);
+    for toolset in [
+        "sch_components",
+        "sch_wiring",
+        "design_review",
+        "verification",
+        "pcb_board",
+        "pcb_components",
+        "manufacturing",
+    ] {
+        mcp.load(toolset);
+    }
+    let gates = dir.path().join("gates");
+    mcp.tool("create_project", json!({"name": "gates", "path": gates}));
+    let schematic = gates.join("gates.kicad_sch");
+    let board = gates.join("gates.kicad_pcb");
+    for (reference, x, y) in [("U1", 50.8, 50.8), ("U2", 76.2, 76.2)] {
+        mcp.tool(
+            "add_schematic_component",
+            json!({
+                "schematic": schematic, "lib_id": "74xGxx:74LVC1G04", "reference": reference,
+                "footprint": "Package_TO_SOT_SMD:SOT-23-5", "x": x, "y": y
+            }),
+        );
+        mcp.tool(
+            "edit_schematic_component",
+            json!({
+                "schematic": schematic, "reference": reference, "fields": {"MPN": "SN74LVC1G04DBV"}
+            }),
+        );
+    }
+    mcp.tool(
+        "connect_pins",
+        json!({
+            "schematic": schematic, "ref1": "U1", "pin1": "4", "ref2": "U2", "pin2": "4"
+        }),
+    );
+    for (cap, gate, x, y) in [("C1", "U1", 45.72, 31.75), ("C2", "U2", 71.12, 57.15)] {
+        mcp.tool(
+            "add_schematic_component",
+            json!({
+                "schematic": schematic, "lib_id": "Device:C", "reference": cap,
+                "footprint": "Capacitor_SMD:C_0603_1608Metric", "value": "100n", "x": x, "y": y
+            }),
+        );
+        mcp.tool(
+            "connect_pins",
+            json!({
+                "schematic": schematic, "ref1": cap, "pin1": "2", "ref2": gate, "pin2": "5"
+            }),
+        );
+    }
+    mcp.tool(
+        "add_schematic_net_label",
+        json!({
+            "schematic": schematic, "net": "OUTPUTS", "x": 63.5, "y": 50.8
+        }),
+    );
+    let standalone = body(&mcp.tool("audit_connections", json!({"schematic": schematic})));
+    assert!(standalone["coverage"]["not_checked"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("shorted_outputs")));
+    let unified = body(&mcp.tool("run_design_review", json!({"schematic": schematic})));
+    let review = &unified["design_review"];
+    assert_eq!(review["status"], "complete", "{review}");
+    assert!(
+        review["verdict"].as_str().unwrap().starts_with("NOT READY"),
+        "{review}"
+    );
+    assert!(
+        review["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["audit"] == "erc"
+                && finding["rule"] == "pin_to_pin"
+                && finding["severity"] == "error"),
+        "{review}"
+    );
+
+    let dfm = body(&mcp.tool("audit_manufacturing", json!({"board": board})));
+    assert!(
+        dfm["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["issue"]
+                .as_str()
+                .unwrap()
+                .contains("No board outline")),
+        "{dfm}"
+    );
+    mcp.tool(
+        "set_design_rules",
+        json!({"board": board, "min_trace_width": 0.08}),
+    );
+    let dfm = body(&mcp.tool("audit_manufacturing", json!({"board": board})));
+    assert!(
+        dfm["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["issue"]
+                .as_str()
+                .unwrap()
+                .contains("Minimum trace width (0.080mm)")),
+        "{dfm}"
+    );
+
+    let pairs = dir.path().join("pairs");
+    mcp.tool("create_project", json!({"name": "pairs", "path": pairs}));
+    let schematic = pairs.join("pairs.kicad_sch");
+    let board = pairs.join("pairs.kicad_pcb");
+    let footprint = "Resistor_SMD:R_0603_1608Metric";
+    for (reference, x) in [("R1", 50.8), ("R2", 76.2)] {
+        mcp.tool(
+            "add_schematic_component",
+            json!({
+                "schematic": schematic, "lib_id": "Device:R", "reference": reference,
+                "footprint": footprint, "x": x, "y": 50.8
+            }),
+        );
+    }
+    for (pin, net, y) in [("1", "SUPPLY", 46.99), ("2", "RETURN", 54.61)] {
+        mcp.tool(
+            "connect_pins",
+            json!({
+                "schematic": schematic, "ref1": "R1", "pin1": pin, "ref2": "R2", "pin2": pin
+            }),
+        );
+        mcp.tool(
+            "add_schematic_net_label",
+            json!({"schematic": schematic, "net": net, "x": 50.8, "y": y}),
+        );
+    }
+    mcp.tool(
+        "add_board_outline",
+        json!({"board": board, "x1": 20.0, "y1": 20.0, "x2": 70.0, "y2": 70.0}),
+    );
+    for (reference, x) in [("R1", 30.0), ("R2", 50.0)] {
+        mcp.tool(
+            "place_component",
+            json!({
+                "board": board, "footprint": footprint, "reference": reference, "x": x, "y": 35.0
+            }),
+        );
+    }
+    mcp.tool(
+        "set_design_rules",
+        json!({"board": board, "min_trace_width": 0.20}),
+    );
+    let readiness = body(&mcp.tool("validate_for_manufacturing", json!({"board": board})));
+    assert_eq!(readiness["board_info"]["net_count"], 0, "{readiness}");
+    assert!(
+        readiness["drc"]["schematic_parity"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "{readiness}"
+    );
+    assert_ne!(readiness["verdict"], "READY", "{readiness}");
+    assert!(
+        readiness["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["issue"]
+                .as_str()
+                .unwrap()
+                .starts_with("DRC schematic parity")),
+        "{readiness}"
     );
 }
 

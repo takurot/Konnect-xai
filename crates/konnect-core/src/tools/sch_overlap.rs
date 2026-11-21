@@ -172,8 +172,8 @@ fn component_overlap(a: &PlacedSymbol<'_>, b: &PlacedSymbol<'_>, tolerance: f64)
                 })
             };
             let mut finding = report("symbol_geometry");
-            finding["overlap_x_mm"] = json!(x);
-            finding["overlap_y_mm"] = json!(y);
+            finding["overlap_x_mm"] = json!(round6(x));
+            finding["overlap_y_mm"] = json!(round6(y));
             finding["bounds_a"] = bounds_json(a_body);
             finding["bounds_b"] = bounds_json(b_body);
             return Some(finding);
