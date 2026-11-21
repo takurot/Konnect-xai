@@ -445,7 +445,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `audit_power_rails` | Check named power rails for decoupling, bulk capacitance, and test points. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
 | `audit_manufacturing` | Check saved outline geometry, footprint sides and origin proximity, and the saved project minimum track width for the selected fab house. |
 | `run_design_review` | Review every reachable schematic sheet and run KiCad ERC. With a saved board, also run DFM and KiCad DRC. Missing required evidence yields `INCOMPLETE`. |
-| `check_bom_health` | Inspect saved values, footprints, and part identifiers. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
+| `check_bom_health` | Check saved BOM packages for missing values, footprints, and MPN or LCSC fields. Defaults to one file. Use `schematic_scope: hierarchy` for saved sheet-instance references, and `check_passive_mpn: false` to exempt standard Device passives from the MPN check. |
 
 ---
 

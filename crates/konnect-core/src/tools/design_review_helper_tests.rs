@@ -187,27 +187,35 @@ async fn bom_health_counts_each_missing_field_and_skips_power_symbols() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bom.kicad_sch");
     std::fs::write(&path, BOM_SHEET).unwrap();
-    let result = handle_check_bom_health_file(
-        &json!({"schematic": path.display().to_string()}),
-        &test_ctx(),
-    )
-    .await
-    .unwrap();
-    assert!(!result.is_error);
-    let ToolContent::Text { text } = &result.content[0] else {
-        panic!("expected text");
-    };
-    let body: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(body["total_components"], 3, "#PWR01 is not a component");
-    assert_eq!(body["missing_value"], 1);
-    assert_eq!(body["missing_footprint"], 1);
-    assert_eq!(body["missing_mpn"], 1, "U2 has an LCSC part number");
-    let findings = body["findings"].as_array().unwrap();
-    assert_eq!(findings.len(), 3);
-    assert!(findings
-        .iter()
-        .any(|f| f["component"] == "U1" && f["issue"].as_str().unwrap().contains("no MPN")));
-    assert!(!findings.iter().any(|f| f["component"] == "U2"));
+    for (check_passives, expected_missing_mpn) in [(true, 2), (false, 1)] {
+        let mut args = json!({"schematic": path});
+        if !check_passives {
+            args["check_passive_mpn"] = json!(false);
+        }
+        let result = handle_check_bom_health_file(&args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["total_components"], 3, "#PWR01 is not a component");
+        assert_eq!(body["missing_value"], 1);
+        assert_eq!(body["missing_footprint"], 1);
+        assert_eq!(body["missing_mpn"], expected_missing_mpn);
+        let findings = body["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), expected_missing_mpn + 2);
+        let needs_mpn = |reference: &str| {
+            findings.iter().any(|finding| {
+                finding["component"] == reference
+                    && finding["issue"].as_str().unwrap().contains("no MPN")
+            })
+        };
+        assert_eq!(needs_mpn("R1"), check_passives);
+        assert!(needs_mpn("U1"));
+        assert!(!findings.iter().any(|finding| finding["component"] == "U2"));
+    }
 }
 
 #[tokio::test]

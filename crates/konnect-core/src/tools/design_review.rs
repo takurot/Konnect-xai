@@ -16,7 +16,7 @@ use crate::tools::{
 use konnect_schematic_editor as cse;
 use konnect_sexp::geometry::round6;
 use konnect_sexp::{
-    parser::parse_sexp,
+    parser::{parse_sexp, SexpNode},
     schematic::{
         extract_all_net_labels, extract_lib_pins, extract_lib_pins_for_unit,
         extract_symbol_instances, extract_wires, find_lib_symbol, pin_endpoint, read_schematic,
@@ -24,7 +24,7 @@ use konnect_sexp::{
     },
 };
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -134,9 +134,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_bom_health",
-            "Inspect saved schematic components for missing values, footprints and part identifiers. \
-             Defaults to one file; set schematic_scope to 'hierarchy' to audit every \
-             reachable sheet instance.",
+            "Inspect saved schematic packages for missing values, footprints and MPN or LCSC \
+             fields. Defaults to one file; set schematic_scope to 'hierarchy' to audit every \
+             reachable sheet instance. Set check_passive_mpn to false to exempt standard Device \
+             resistors, capacitors, inductors and diodes from the MPN check.",
             json!({
                 "type": "object",
                 "properties": {
@@ -146,6 +147,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "enum": ["file", "hierarchy"],
                         "description": "Audit only the supplied file (default) or every reachable hierarchy instance",
                         "default": "file"
+                    },
+                    "check_passive_mpn": {
+                        "type": "boolean",
+                        "description": "Check MPN and LCSC fields on standard Device passives (default true)",
+                        "default": true
                     }
                 },
                 "required": ["schematic"]
@@ -221,6 +227,24 @@ impl StandaloneSchematicAudit {
             Self::BomHealth => handle_check_bom_health_file(args, ctx).await,
         }
     }
+
+    fn run_instance(
+        self,
+        path: &Path,
+        project: &str,
+        instance_path: &str,
+        reused: bool,
+        args: &Value,
+    ) -> anyhow::Result<CallToolResult> {
+        let (_, mut tree) = read_schematic(path)?;
+        apply_saved_references(&mut tree, project, instance_path, reused)?;
+        match self {
+            Self::Decoupling => audit_decoupling_tree(&tree),
+            Self::Connections => audit_connections_tree(&tree),
+            Self::PowerRails => audit_power_rails_tree(&tree),
+            Self::BomHealth => check_bom_health_tree(&tree, check_passive_mpn(args)),
+        }
+    }
 }
 
 async fn handle_audit_decoupling(
@@ -248,6 +272,12 @@ async fn handle_check_bom_health(
     args: &Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    if args
+        .get("check_passive_mpn")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Ok(invalid_arg("check_passive_mpn", "expected a boolean"));
+    }
     handle_scoped_schematic_audit(StandaloneSchematicAudit::BomHealth, args, ctx).await
 }
 
@@ -260,11 +290,14 @@ async fn handle_audit_decoupling_file(
     let sch_path = get_path(args, "schematic")?;
     info!(schematic = %sch_path.display(), "[BETA] Running decoupling audit");
     let (_, tree) = read_schematic(&sch_path)?;
+    audit_decoupling_tree(&tree)
+}
 
-    let placed = placed_pins_by_reference(&tree);
-    let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
-    let mut graph = net_graph_for(&tree, &wires, &labels);
+fn audit_decoupling_tree(tree: &SexpNode) -> anyhow::Result<CallToolResult> {
+    let placed = placed_pins_by_reference(tree);
+    let wires = extract_wires(tree);
+    let labels = extract_all_net_labels(tree);
+    let mut graph = net_graph_for(tree, &wires, &labels);
 
     let mut findings = Vec::new();
     let mut pass_count = 0;
@@ -353,11 +386,14 @@ async fn handle_audit_connections_file(
     let sch_path = get_path(args, "schematic")?;
     info!(schematic = %sch_path.display(), "[BETA] Running connection audit");
     let (_, tree) = read_schematic(&sch_path)?;
+    audit_connections_tree(&tree)
+}
 
-    let placed = placed_pins_by_reference(&tree);
-    let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
-    let mut graph = net_graph_for(&tree, &wires, &labels);
+fn audit_connections_tree(tree: &SexpNode) -> anyhow::Result<CallToolResult> {
+    let placed = placed_pins_by_reference(tree);
+    let wires = extract_wires(tree);
+    let labels = extract_all_net_labels(tree);
+    let mut graph = net_graph_for(tree, &wires, &labels);
     let pull_up_roots = pull_up_nets(&mut graph, &placed);
 
     let mut findings = Vec::new();
@@ -450,11 +486,14 @@ async fn handle_audit_power_rails_file(
     let sch_path = get_path(args, "schematic")?;
     info!(schematic = %sch_path.display(), "[BETA] Running power rail audit");
     let (_, tree) = read_schematic(&sch_path)?;
+    audit_power_rails_tree(&tree)
+}
 
-    let placed = placed_pins_by_reference(&tree);
-    let wires = extract_wires(&tree);
-    let labels = extract_all_net_labels(&tree);
-    let mut graph = net_graph_for(&tree, &wires, &labels);
+fn audit_power_rails_tree(tree: &SexpNode) -> anyhow::Result<CallToolResult> {
+    let placed = placed_pins_by_reference(tree);
+    let wires = extract_wires(tree);
+    let labels = extract_all_net_labels(tree);
+    let mut graph = net_graph_for(tree, &wires, &labels);
 
     let mut findings = Vec::new();
 
@@ -775,6 +814,7 @@ impl AuditAggregate {
 #[derive(Clone)]
 struct SchematicSheetInstance {
     path: PathBuf,
+    canonical_path: PathBuf,
     instance_path: String,
 }
 
@@ -795,7 +835,7 @@ fn collect_hierarchy(
 ) {
     traversal.sheet_instances += 1;
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if traversal.seen_files.insert(canonical) {
+    if traversal.seen_files.insert(canonical.clone()) {
         traversal.schematic_files.push(path.to_path_buf());
     }
 
@@ -810,6 +850,7 @@ fn collect_hierarchy(
     } else {
         traversal.auditable_instances.push(SchematicSheetInstance {
             path: path.to_path_buf(),
+            canonical_path: canonical,
             instance_path: instance_path.to_string(),
         });
     }
@@ -857,6 +898,95 @@ fn inspect_hierarchy(root_path: &Path) -> anyhow::Result<SchematicHierarchyTrave
     let mut traversal = SchematicHierarchyTraversal::default();
     collect_hierarchy(root_path, "/", &hierarchy, &mut traversal);
     Ok(traversal)
+}
+
+/// Keep the saved instance path separate from the relative response path.
+fn saved_audit_root(path: &Path) -> anyhow::Result<(String, String)> {
+    if let Some(owner) = super::resolve_schematic_ownership(path)? {
+        let [instance] = owner.instance_paths.as_slice() else {
+            anyhow::bail!("the requested schematic has multiple saved project instances; start at its project root");
+        };
+        return Ok((project_name_for(&owner.project_file), instance.clone()));
+    }
+    let (_, tree) = read_schematic(path)?;
+    let uuid = tree
+        .find_str("uuid")
+        .ok_or_else(|| anyhow::anyhow!("the requested root has no saved UUID"))?;
+    Ok((project_name_for(path), format!("/{uuid}")))
+}
+
+/// Adapt the raw analysis tree to the editor's typed saved-symbol model.
+fn editor_symbol(node: &SexpNode) -> anyhow::Result<cse::Symbol> {
+    fn convert(node: &SexpNode) -> cse::sexp::SexpNode {
+        match node {
+            SexpNode::Atom(text) => cse::sexp::SexpNode::Atom(text.clone()),
+            SexpNode::Str(text) => cse::sexp::SexpNode::Str(text.clone()),
+            SexpNode::List(items) => cse::sexp::SexpNode::List(items.iter().map(convert).collect()),
+        }
+    }
+    Ok(cse::Symbol::from_sexp(&convert(node))?)
+}
+
+/// Update only the in-memory reference view used to generate findings.
+fn apply_saved_references(
+    tree: &mut SexpNode,
+    project: &str,
+    instance_path: &str,
+    reused: bool,
+) -> anyhow::Result<()> {
+    let SexpNode::List(children) = tree else {
+        anyhow::bail!("invalid schematic document");
+    };
+    for node in children
+        .iter_mut()
+        .filter(|node| node.head() == Some("symbol"))
+    {
+        let symbol = editor_symbol(node)?;
+        let rows = symbol.instances();
+        if rows.is_empty() && !reused {
+            continue;
+        }
+        let matches: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row.project.as_deref() == Some(project)
+                    && row.path.as_deref() == Some(instance_path)
+            })
+            .collect();
+        let [row] = matches.as_slice() else {
+            anyhow::bail!("symbol {} has no unique saved reference for project {project:?}, instance {instance_path}", symbol.uuid);
+        };
+        let Some(reference) = row.reference.as_ref().filter(|value| !value.is_empty()) else {
+            anyhow::bail!(
+                "symbol {} has an empty saved reference for instance {instance_path}",
+                symbol.uuid
+            );
+        };
+        let SexpNode::List(fields) = node else {
+            unreachable!("placed symbol is a list");
+        };
+        let property = fields.iter_mut().find_map(|field| {
+            if field.head() != Some("property") {
+                return None;
+            }
+            let SexpNode::List(items) = field else {
+                return None;
+            };
+            let offset = usize::from(
+                matches!(items.get(1), Some(SexpNode::Atom(flag)) if flag == "private"),
+            );
+            if items.get(1 + offset).and_then(SexpNode::as_str) == Some("Reference") {
+                items.get_mut(2 + offset)
+            } else {
+                None
+            }
+        });
+        let Some(value) = property else {
+            anyhow::bail!("symbol {} has no Reference property", symbol.uuid);
+        };
+        *value = SexpNode::Str(reference.clone());
+    }
+    Ok(())
 }
 
 fn inspect_schematic_coverage(
@@ -1013,10 +1143,29 @@ async fn handle_scoped_schematic_audit(
     let mut sheet_results = Vec::new();
     let mut findings = Vec::new();
     let mut symbol_instances = 0usize;
+    let identity = saved_audit_root(&root_path);
+    let mut occurrences = BTreeMap::new();
+    for sheet in &traversal.auditable_instances {
+        *occurrences.entry(&sheet.canonical_path).or_insert(0usize) += 1;
+    }
 
     for sheet in &traversal.auditable_instances {
-        let sheet_args = args_for_schematic(args, &sheet.path);
-        let result = match audit.run_file(&sheet_args, ctx).await {
+        let result = match &identity {
+            Ok((project, root_instance)) => audit.run_instance(
+                &sheet.path,
+                project,
+                &format!(
+                    "{root_instance}{}",
+                    sheet.instance_path.trim_end_matches('/')
+                ),
+                occurrences[&sheet.canonical_path] > 1,
+                args,
+            ),
+            Err(error) => Err(anyhow::anyhow!(
+                "saved project instance unavailable: {error:#}"
+            )),
+        };
+        let result = match result {
             Ok(result) => result,
             Err(error) => {
                 diagnostics.push(json!({
@@ -1499,24 +1648,84 @@ async fn handle_check_bom_health_file(
     let sch_path = get_path(args, "schematic")?;
     info!(schematic = %sch_path.display(), "[BETA] Running BOM health check");
 
-    let sch = cse::Schematic::load(&sch_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load schematic: {e}"))?;
+    let (_, tree) = read_schematic(&sch_path)
+        .map_err(|error| anyhow::anyhow!("Failed to load schematic: {error}"))?;
+    check_bom_health_tree(&tree, check_passive_mpn(args))
+}
 
+fn check_passive_mpn(args: &Value) -> bool {
+    args["check_passive_mpn"].as_bool().unwrap_or(true)
+}
+
+fn is_standard_passive(symbol: &cse::Symbol) -> bool {
+    let Some(part) = symbol.lib_id.strip_prefix("Device:") else {
+        return false;
+    };
+    matches!(part.split('_').next(), Some("R" | "C" | "L" | "D" | "CP"))
+}
+
+fn check_bom_health_tree(
+    tree: &SexpNode,
+    check_passive_mpn: bool,
+) -> anyhow::Result<CallToolResult> {
     let mut findings = Vec::new();
+    let mut packages = BTreeMap::<String, Vec<cse::Symbol>>::new();
+    let mut components = Vec::new();
+    for node in tree.find_all("symbol") {
+        let symbol = editor_symbol(node)?;
+        let Some(reference) = symbol.reference() else {
+            continue;
+        };
+        if !symbol.in_bom || super::is_power_symbol_reference(reference) {
+            continue;
+        }
+        if super::sch_annotate::parse_designator(reference)
+            .number
+            .is_none()
+        {
+            components.push(symbol);
+        } else {
+            packages
+                .entry(reference.to_owned())
+                .or_default()
+                .push(symbol);
+        }
+    }
+    for (reference, mut units) in packages {
+        let first = &units[0];
+        let mut unit_numbers = HashSet::new();
+        let one_package = units.iter().all(|unit| {
+            unit.lib_symbol_name() == first.lib_symbol_name()
+                && unit.value_str() == first.value_str()
+                && unit_numbers.insert(unit.unit)
+        });
+        if one_package {
+            units.sort_by_key(|symbol| symbol.unit);
+            components.push(units.swap_remove(0));
+        } else {
+            findings.push(AuditFinding {
+                severity: "warning",
+                category: "bom",
+                component: Some(reference.clone()),
+                issue: format!(
+                    "{} has conflicting units or symbols with the same designator",
+                    reference
+                ),
+                recommendation: "Verify the assigned component references and re-run BOM health"
+                    .to_string(),
+            });
+            components.extend(units);
+        }
+    }
     let mut total_components = 0;
     let mut missing_mpn = 0;
     let mut missing_footprint = 0;
     let mut missing_value = 0;
 
-    for sym in sch.symbols.iter() {
-        let reference = match sym.reference() {
-            Some(r) => r,
-            None => continue,
-        };
-
-        if crate::tools::is_power_symbol_reference(reference) {
+    for sym in &components {
+        let Some(reference) = sym.reference() else {
             continue;
-        }
+        };
         total_components += 1;
 
         let value = sym.value_str().unwrap_or("");
@@ -1548,8 +1757,11 @@ async fn handle_check_bom_health_file(
         }
 
         // Check for missing MPN (per-component check via properties)
-        let has_mpn = sym.property("MPN").is_some() || sym.property("LCSC").is_some();
-        if reference.starts_with('U') && !has_mpn {
+        let has_mpn = ["MPN", "LCSC"].iter().any(|name| {
+            sym.property(name)
+                .is_some_and(|value| !matches!(value.trim(), "" | "~"))
+        });
+        if (check_passive_mpn || !is_standard_passive(sym)) && !has_mpn {
             missing_mpn += 1;
             findings.push(AuditFinding {
                 severity: "warning",
@@ -2071,6 +2283,7 @@ mod review_completion_tests {
     (property "Reference" "R1" (at 20 20 0))
     (property "Value" "10k" (at 20 20 0))
     (property "Footprint" "{footprint}" (at 20 20 0))
+    (property "MPN" "TEST-10K" (at 20 20 0))
     (pin "1" (uuid "44444444-4444-4444-8444-444444444444"))
   )
 )
@@ -2338,8 +2551,29 @@ mod review_completion_tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("root.kicad_sch");
         let child = tmp.path().join("shared.kicad_sch");
-        std::fs::write(&root, root_with_reused_child("shared.kicad_sch")).unwrap();
-        std::fs::write(&child, single_unit_schematic("")).unwrap();
+        let root_source = root_with_reused_child("shared.kicad_sch");
+        std::fs::write(&root, &root_source).unwrap();
+        let root_tree = parse_sexp(&root_source).unwrap();
+        let root_uuid = root_tree.find_str("uuid").unwrap();
+        let rows = root_tree
+            .find_all("sheet")
+            .iter()
+            .enumerate()
+            .map(|(index, sheet)| {
+                let uuid = sheet.find_str("uuid").unwrap();
+                format!(
+                    r#"(path "/{root_uuid}/{uuid}" (reference "R{}") (unit 1))"#,
+                    index + 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let legacy = single_unit_schematic("");
+        let qualified = legacy.replace(
+            r#"(pin "1" (uuid "44444444-4444-4444-8444-444444444444"))"#,
+            &format!(r#"(instances (project "root" {rows}))"#),
+        );
+        std::fs::write(&child, qualified).unwrap();
         let args = json!({
             "schematic": root.display().to_string(),
             "schematic_scope": "hierarchy"
@@ -2362,6 +2596,109 @@ mod review_completion_tests {
             assert_eq!(audit["sheet_results"].as_array().unwrap().len(), 3);
             assert!(audit["diagnostics"].as_array().unwrap().is_empty());
         }
+
+        std::fs::write(&child, legacy).unwrap();
+        let audit = tool_json(handle_check_bom_health(&args, &test_ctx()).await.unwrap());
+        assert_eq!(audit["status"], "partial", "{audit}");
+        assert_eq!(audit["coverage"]["audited_sheet_instances"], 1);
+        assert_eq!(audit["diagnostics"].as_array().unwrap().len(), 2);
+        assert!(audit["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|diagnostic| {
+                diagnostic["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no unique saved reference")
+            }));
+    }
+
+    #[tokio::test]
+    async fn kicad_hierarchy_audits_use_saved_instance_references() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("complex_hierarchy.kicad_sch");
+        for (name, content) in [
+            (
+                "complex_hierarchy.kicad_pro",
+                include_str!("../../tests/fixtures/project_ownership/complex_hierarchy.kicad_pro"),
+            ),
+            (
+                "complex_hierarchy.kicad_sch",
+                include_str!("../../tests/fixtures/project_ownership/complex_hierarchy.kicad_sch"),
+            ),
+            (
+                "ampli_ht.kicad_sch",
+                include_str!("../../tests/fixtures/project_ownership/ampli_ht.kicad_sch"),
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), content).unwrap();
+        }
+        let args = json!({"schematic": root, "schematic_scope": "hierarchy"});
+        let ctx = test_ctx();
+        let decoupling = tool_json(handle_audit_decoupling(&args, &ctx).await.unwrap());
+        let channel = decoupling["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| {
+                finding["sheet_instance_path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("4b3a13a4/"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            channel.iter().any(|finding| {
+                finding["component"] == "U301"
+                    && finding["issue"].as_str().unwrap().contains("U301")
+                    && finding["recommendation"].as_str().unwrap().contains("U301")
+            }),
+            "{decoupling}"
+        );
+        assert!(channel.iter().all(|finding| finding["component"] != "U201"));
+
+        let health = tool_json(handle_check_bom_health(&args, &ctx).await.unwrap());
+        assert_eq!(health["total_components"], 68, "{health}");
+        assert!(
+            health["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| {
+                    finding["component"] == "U301"
+                        && finding["sheet_instance_path"]
+                            .as_str()
+                            .unwrap()
+                            .ends_with("4b3a13a4/")
+                }),
+            "{health}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kicad_bom_health_counts_ecc83_packages_once() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ecc83-pp.kicad_sch");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch"),
+        )
+        .unwrap();
+        let result = tool_json(
+            handle_check_bom_health(&json!({"schematic": path}), &test_ctx())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(result["total_components"], 11, "{result}");
+        let missing_u1_mpn = result["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| {
+                finding["component"] == "U1" && finding["issue"].as_str().unwrap().contains("MPN")
+            })
+            .count();
+        assert_eq!(missing_u1_mpn, 1, "{result}");
     }
 
     #[tokio::test]
