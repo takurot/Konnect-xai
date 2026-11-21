@@ -869,7 +869,15 @@ fn format_outline(primitives: &[OutlinePrimitive], layer: &str, width: f64) -> S
         .join("")
 }
 
-fn format_gr_text(text: &str, x: f64, y: f64, rot: f64, layer: &str, size: f64) -> String {
+fn format_gr_text(
+    text: &str,
+    x: f64,
+    y: f64,
+    rot: f64,
+    layer: &str,
+    size: f64,
+    mirrored: bool,
+) -> String {
     let uuid = new_uuid();
     let layer = konnect_sexp::quoted(layer);
     let text = konnect_sexp::quoted(text);
@@ -877,9 +885,11 @@ fn format_gr_text(text: &str, x: f64, y: f64, rot: f64, layer: &str, size: f64) 
     let y = fmt_mm(y);
     let rot = fmt_mm(rot);
     let size = fmt_mm(size);
+    let justify = if mirrored { " (justify mirror)" } else { "" };
     format!(
         "\n  (gr_text {text}\n    (at {x} {y} {rot})\n    (layer {layer})\n    \
-         (effects (font (size {size} {size}) (thickness 0.15)))\n    (uuid \"{uuid}\")\n  )"
+         (effects (font (size {size} {size}) (thickness 0.15)){justify})\n    \
+         (uuid \"{uuid}\")\n  )"
     )
 }
 
@@ -2437,19 +2447,19 @@ async fn handle_add_board_outline(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
-    let x1 = match require_f64(args, "x1") {
+    let x1 = match super::require_board_mm(args, "x1") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y1 = match require_f64(args, "y1") {
+    let y1 = match super::require_board_mm(args, "y1") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let x2 = match require_f64(args, "x2") {
+    let x2 = match super::require_board_mm(args, "x2") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y2 = match require_f64(args, "y2") {
+    let y2 = match super::require_board_mm(args, "y2") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -2682,11 +2692,11 @@ async fn handle_add_mounting_hole(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
-    let x = match require_f64(args, "x") {
+    let x = match super::require_board_mm(args, "x") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y = match require_f64(args, "y") {
+    let y = match super::require_board_mm(args, "y") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -2820,14 +2830,20 @@ async fn handle_add_board_text(
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let text = match require_str(args, "text") {
+        Ok(v) if v.trim().is_empty() => {
+            return Ok(super::invalid_arg(
+                "text",
+                "must contain visible characters",
+            ))
+        }
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let x = match require_f64(args, "x") {
+    let x = match super::require_board_mm(args, "x") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y = match require_f64(args, "y") {
+    let y = match super::require_board_mm(args, "y") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -2835,15 +2851,15 @@ async fn handle_add_board_text(
         Ok(layer) => layer,
         Err(error) => return Ok(error),
     };
-    let (x, y) = match (super::checked_mm(x, "x"), super::checked_mm(y, "y")) {
-        (Ok(x), Ok(y)) => (x, y),
-        (Err(error), _) | (_, Err(error)) => return Ok(error),
-    };
-    let size = args["size"].as_f64().unwrap_or(1.0);
-    let size = match super::checked_mm(size, "size") {
-        Ok(value) => value,
+    let size = match super::opt_positive_f64(args, "size")
+        .and_then(|size| super::checked_board_mm(size.unwrap_or(1.0), "size"))
+    {
+        Ok(value) if value > 0.0 => value,
+        Ok(_) => return Ok(super::invalid_arg("size", "must be at least 1 nm")),
         Err(error) => return Ok(error),
     };
+    // pcbnew mirrors every back-layer text; KiCad's DRC flags one that is not.
+    let mirrored = layer.starts_with("B.");
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
     if !round6(rotation).is_finite() {
         return Ok(super::invalid_arg(
@@ -2855,7 +2871,7 @@ async fn handle_add_board_text(
     let text_ipc = text.clone();
     let layer_ipc = layer.clone();
     let fallback_reason = match attempt_ipc_write(ctx, &board_path, "board text", move |c| {
-        let bt = builders::board_text(&layer_ipc, &text_ipc, x, y, size, rotation, false)?;
+        let bt = builders::board_text(&layer_ipc, &text_ipc, x, y, size, rotation, mirrored)?;
         let any = builders::pack_any(&bt, "kiapi.board.types.BoardText");
         c.create_items(vec![any]).map(|_| ())
     })
@@ -2871,7 +2887,7 @@ async fn handle_add_board_text(
         BoardWrite::File(reason) => reason,
     };
 
-    let gr_text = format_gr_text(&text, x, y, rotation, &layer, size);
+    let gr_text = format_gr_text(&text, x, y, rotation, &layer, size, mirrored);
     let content = std::fs::read_to_string(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());
     let new_content = apply_edits(content.clone(), vec![SexpEdit::insert(close_pos, gr_text)]);
@@ -6454,7 +6470,7 @@ mod string_safety_tests {
         for block in [
             format_gr_line(0., 0., 1., 1., value, 0.1),
             format_gr_arc((0., 0.), (1., 1.), (2., 0.), value, 0.1),
-            format_gr_text(value, 0., 0., 0., value, 1.),
+            format_gr_text(value, 0., 0., 0., value, 1., false),
             format_gr_poly(&[(0., 0.), (1., 0.), (0., 1.)], value),
         ] {
             let tree = parse_sexp(block.trim()).unwrap();

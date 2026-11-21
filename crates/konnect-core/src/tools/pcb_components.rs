@@ -836,6 +836,12 @@ fn normalize_root_angle(degrees: f64) -> f64 {
     }
 }
 
+/// The root angle as written and reported: nanometre-rounded on both sides of
+/// normalising, so 180.0000004 stays 180 and 725.1 is exactly 5.1.
+fn stored_root_angle(degrees: f64) -> f64 {
+    round6(normalize_root_angle(round6(degrees)))
+}
+
 /// Render `(at x y angle)`, dropping a zero angle as KiCad's writer does and
 /// trimming trailing zeros from the decimals.
 fn format_at(x: f64, y: f64, angle: f64) -> String {
@@ -1253,8 +1259,13 @@ fn prepare_closed_board_footprint_update(
 }
 
 fn validate_placement_values(x: f64, y: f64, rotation: f64) -> anyhow::Result<()> {
-    konnect_ipc::builders::mm_to_nm(x).context("invalid footprint X coordinate")?;
-    konnect_ipc::builders::mm_to_nm(y).context("invalid footprint Y coordinate")?;
+    for (axis, value) in [("X", x), ("Y", y)] {
+        anyhow::ensure!(
+            value.is_finite() && value.abs() <= super::KICAD_BOARD_MAX_MM,
+            "footprint {axis} coordinate {value} is outside KiCad's ±{} mm board range",
+            super::KICAD_BOARD_MAX_MM
+        );
+    }
     anyhow::ensure!(
         rotation.is_finite() && round6(rotation).is_finite(),
         "footprint rotation must remain finite when formatted"
@@ -1302,7 +1313,13 @@ fn update_footprint_placement(
         .get_f64(2)
         .context("footprint root placement has an invalid Y position")?;
     let old_rotation = at.get_f64(3).unwrap_or(0.0);
-    validate_placement_values(old_x, old_y, old_rotation)?;
+    // The board may already hold an out-of-range anchor (written before #131);
+    // a move must still be able to repair it, so only the new values face the
+    // board range.
+    anyhow::ensure!(
+        old_x.is_finite() && old_y.is_finite() && old_rotation.is_finite(),
+        "footprint root placement is not finite"
+    );
     match update {
         FootprintPlacementUpdate::Move { x, y } => validate_placement_values(x, y, old_rotation)?,
         FootprintPlacementUpdate::Rotate { rotation } => {
@@ -1319,9 +1336,9 @@ fn update_footprint_placement(
     let (x, y, rotation) = match update {
         FootprintPlacementUpdate::Move { x, y } => (x, y, old_rotation),
         FootprintPlacementUpdate::Rotate { rotation } => {
-            (old_x, old_y, normalize_root_angle(rotation))
+            (old_x, old_y, stored_root_angle(rotation))
         }
-        FootprintPlacementUpdate::Set { x, y, rotation } => (x, y, normalize_root_angle(rotation)),
+        FootprintPlacementUpdate::Set { x, y, rotation } => (x, y, stored_root_angle(rotation)),
     };
 
     // Replace the root `(at …)` FIRST, while `at_start`/`at_end` still index
@@ -2300,15 +2317,15 @@ async fn handle_place_component(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let x = match require_f64(args, "x") {
+    let x = match super::require_board_mm(args, "x") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y = match require_f64(args, "y") {
+    let y = match super::require_board_mm(args, "y") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let rotation = args["rotation"].as_f64().unwrap_or(0.0);
+    let rotation = stored_root_angle(args["rotation"].as_f64().unwrap_or(0.0));
     let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
     if let Some(rejection) = back_side_layer_error(&layer) {
         return Ok(rejection);
@@ -2404,11 +2421,11 @@ async fn handle_move_component(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let x = match require_f64(args, "x") {
+    let x = match super::require_board_mm(args, "x") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y = match require_f64(args, "y") {
+    let y = match super::require_board_mm(args, "y") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -2515,6 +2532,8 @@ async fn handle_rotate_component(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    // KiCad keeps a footprint root angle in (-180, 180]; report that spelling.
+    let stored_rotation = stored_root_angle(rotation);
 
     let ref_ipc = reference.clone();
     match attempt_ipc_write(ctx, &board, "rotation", move |c| {
@@ -2524,7 +2543,7 @@ async fn handle_rotate_component(
     {
         BoardWrite::Ipc(()) => Ok(CallToolResult::json(&json!({
             "rotated": reference,
-            "rotation": rotation,
+            "rotation": stored_rotation,
             "source": "ipc"
         }))),
         BoardWrite::Refused(result) => Ok(result),
@@ -2536,7 +2555,7 @@ async fn handle_rotate_component(
             ) {
                 Ok(()) => Ok(CallToolResult::json(&json!({
                     "rotated": reference,
-                    "rotation": rotation,
+                    "rotation": stored_rotation,
                     "source": "file",
                     "fallback_reason": reason.evidence(),
                     "warning": reason.warning()
@@ -2597,10 +2616,11 @@ fn parse_component_placements(
                 .and_then(serde_json::Value::as_f64)
                 .ok_or_else(|| invalid_placement(field(name), "missing or not a number"))
         };
+        let coordinate = |name: &str| super::checked_board_mm(number(name)?, &field(name));
         placements.push(konnect_ipc::types::IpcFootprintPlacement {
             reference,
-            x: number("x")?,
-            y: number("y")?,
+            x: coordinate("x")?,
+            y: coordinate("y")?,
             rotation: number("rotation")?,
         });
     }
@@ -3747,11 +3767,11 @@ async fn handle_place_array(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let start_x = match require_f64(args, "start_x") {
+    let start_x = match super::require_board_mm(args, "start_x") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let start_y = match require_f64(args, "start_y") {
+    let start_y = match super::require_board_mm(args, "start_y") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -3780,6 +3800,13 @@ async fn handle_place_array(
         Err(e) => return Ok(e),
     };
     let spacing_y = args["spacing_y"].as_f64().unwrap_or(spacing_x);
+    let far_corner = (
+        super::checked_board_mm(start_x + spacing_x * (count_x - 1) as f64, "spacing_x"),
+        super::checked_board_mm(start_y + spacing_y * (count_y - 1) as f64, "spacing_y"),
+    );
+    if let (Err(error), _) | (_, Err(error)) = far_corner {
+        return Ok(error);
+    }
     let prefix = args["ref_prefix"].as_str().unwrap_or("U").to_string();
     let ref_start = args["ref_start"].as_u64().unwrap_or(1);
     if ref_start.checked_add(total_count - 1).is_none() {
@@ -3926,7 +3953,7 @@ async fn handle_align_components(
     if axis != "x" && axis != "y" {
         return Ok(CallToolResult::error("'axis' must be either 'x' or 'y'."));
     }
-    let value = match require_f64(args, "value") {
+    let value = match super::require_board_mm(args, "value") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -3973,11 +4000,11 @@ async fn handle_duplicate_component(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let x = match require_f64(args, "x") {
+    let x = match super::require_board_mm(args, "x") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let y = match require_f64(args, "y") {
+    let y = match super::require_board_mm(args, "y") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
