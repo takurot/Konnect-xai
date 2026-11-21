@@ -66,7 +66,7 @@ and Windows servers do not.
 | `open_project` | List PCB documents open in the running KiCad UI and optionally check a specific `.kicad_pro` or `.kicad_pcb` path over IPC; when KiCad does not answer, `ipc_failure` names why. |
 | `save_project` | Save the currently open PCB board file via KiCAD IPC. Requires KiCAD to be running with IPC enabled. |
 | `get_project_info` | Read project metadata from a `.kicad_pro` file. Returns name, schematic/PCB paths, last-modified time, project-file format version, and the generator versions recorded by the sibling design files. |
-| `rename_project` | Rename the `.kicad_pro`/`.kicad_sch`/`.kicad_pcb`/`.kicad_prl` files *and* the internal references that carry the old name. Renaming the files alone makes KiCad treat the design as unannotated, losing every reference designator, because each symbol instance stores `(project "name")`. Supports `dry_run`. |
+| `rename_project` | Rename the `.kicad_pro`/`.kicad_sch`/`.kicad_pcb`/`.kicad_prl` files and update schematic annotations, project metadata, and PCB footprint references to the renamed root schematic. Supports `dry_run`. |
 | `snapshot_project` | Export the schematic and PCB to PDF as a timestamped snapshot/checkpoint. Useful before major edits. |
 | `open_schematic_viewer` | Launch the live schematic viewer (SVG with auto-refresh on file change). Use after placing components so the user can see changes in real time. |
 
@@ -94,14 +94,14 @@ and Windows servers do not.
 |------|-------------|
 | `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid, copies the library Value and Footprint unless explicitly overridden, preserves every saved hierarchy instance, and reports committed-file readback. Refuses stale instance metadata before writing. |
 | `delete_schematic_component` | Remove a component and all of its placed units by reference designator. |
-| `edit_schematic_component` | Update shared fields and native `dnp`, `in_bom`, `on_board`, `exclude_from_sim`, and `in_pos_files` attributes on every placed unit. Omitted attributes stay unchanged. Use the native `dnp` boolean instead of a custom `DNP` property. Move or hide any field's text. |
+| `edit_schematic_component` | Update shared fields and native `dnp`, `in_bom`, `on_board`, `exclude_from_sim`, and `in_pos_files` attributes on every placed unit. Omitted attributes stay unchanged. Use the native `dnp` boolean instead of a custom `DNP` property. Move or hide any field's text. Use `uuid` and `new_reference` to reassign one saved instance, with `instance_path` if the sheet is reused. |
 | `get_schematic_component` | Get shared properties and every placed unit's position for a component. |
 | `list_schematic_components` | List all symbol instances with positions, values, footprints, and properties. |
 | `move_schematic_component` | Move the lowest-numbered unit to a new position and translate every other unit by the same delta. Does NOT adjust connected wires. Junction dots are re-judged, and a no-connect flag travels with the pin it protects. |
 | `rotate_schematic_component` | Set the lowest-numbered unit's absolute rotation and rotate every other unit by the same delta. Does NOT adjust connected wires; junction dots are re-judged where the pins turned, and a no-connect flag travels with the pin it protects. |
 | `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
 | `move_region` | Move all symbols within a bounding box by a given offset. |
-| `annotate_schematic` | Number `?` designators the way eeschema's Tools → Annotate does (first free number in the project, ascending X per sheet instance, numbers reserved across every instance in the file, both places written). The units of one multi-unit part share one designator. Separate parts sharing a designator are reported as `unresolved` with a `partial` outcome, or renumbered with `resolve_duplicates`; a shared designator that could be a package is never renumbered. Annotates one project's instance records (`project`, default the schematic's owner). Konnect's own implementation; kicad-cli has no annotate command. |
+| `annotate_schematic` | Number `?` designators the way eeschema's Tools → Annotate does (first free number in the project, saved page and hierarchy order, then X/Y). The units of one multi-unit part share one designator. Separate parts sharing a designator are reported as `unresolved` with a `partial` outcome, or renumbered with `resolve_duplicates`; a shared designator that could be a package is never renumbered. Annotates one saved file for the selected project and lists other files with unnumbered instances. Ambiguous unnumbered unit groups can include an exact recovery call. Konnect's own implementation; kicad-cli has no annotate command. |
 | `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on every placed unit, accounting for rotation/mirroring, plus each pin's `orientation_degrees` and `length_mm`. |
 | `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read, with the same per-pin fields. |
 | `add_component_annotation` | Add or update a custom property across every placed unit of a component. |
@@ -122,7 +122,7 @@ and Windows servers do not.
 | `delete_schematic_wire` | Delete a wire segment by UUID or by matching start/end coordinates, pruning the junction dots it leaves unjustified. |
 | `batch_delete_schematic_wire` | Delete multiple wire segments in a single file read/write cycle, pruning the junction dots they leave unjustified. |
 | `split_wire_at_point` | Split a wire at a given point, creating two segments and a junction. |
-| `add_schematic_net_label` | Add a net label (`net_label`, `global_label`, or `hierarchical_label`). |
+| `add_schematic_net_label` | Add a net label (`net_label`, `global_label`, or `hierarchical_label`). Global and hierarchical labels support `input` (default), `output`, `bidirectional`, `tri_state`, and `passive`. |
 | `delete_schematic_net_label` | Delete a net label by net name and position. |
 | `rotate_schematic_label` | Rotate a net label to a new angle and update its justify direction. |
 | `move_labels_by_offset` | Move all labels matching a net name by a given X/Y offset. |
@@ -441,11 +441,11 @@ the router or relying on the KiCad ActionPlugin workflow.
 | Tool | Description |
 |------|-------------|
 | `audit_decoupling` | Audit schematic connectivity between IC power nets and decoupling capacitors; does not measure PCB placement distance. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
-| `audit_connections` | Check for common connection mistakes: missing pull-ups on I2C/reset, missing series resistors on LEDs, floating inputs, shorted outputs. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
-| `audit_power_rails` | Check power rail integrity: missing bulk capacitance, no test points, missing regulator output caps. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
-| `audit_manufacturing` | DFM checks for the configured fab house: component spacing, silkscreen overlap, via-in-pad, acid traps, board-outline issues. |
-| `run_design_review` | Run all available audit checks across every reachable schematic sheet and produce a consolidated report with status, coverage, and diagnostics. Returns `INCOMPLETE` rather than approval when coverage is partial or failed. |
-| `check_bom_health` | Analyze the BOM for supply-chain risks: parts with no MPN, lifecycle warnings, low stock, unavailable from preferred distributors. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
+| `audit_connections` | Check pull-up resistors on named I2C and reset nets. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
+| `audit_power_rails` | Check named power rails for decoupling, bulk capacitance, and test points. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
+| `audit_manufacturing` | Check saved outline geometry, footprint sides and origin proximity, and the saved project minimum track width for the selected fab house. |
+| `run_design_review` | Review every reachable schematic sheet and run KiCad ERC. With a saved board, also run DFM and KiCad DRC. Missing required evidence yields `INCOMPLETE`. |
+| `check_bom_health` | Inspect saved values, footprints, and part identifiers. Defaults to one file; `schematic_scope: hierarchy` covers every reachable sheet instance. |
 
 ---
 
@@ -476,7 +476,7 @@ the router or relying on the KiCad ActionPlugin workflow.
 | Tool | Description |
 |------|-------------|
 | `export_manufacturing_package` | Generate Gerbers, drill, fab-house BOM, and pick-and-place. JLCPCB assembly requires the exact board open with IPC enabled: native pad-box midpoints and board exports share a stable live snapshot, then versioned CPL corrections apply. Geometry and correction evidence remain separate; Component Placements preview is required. |
-| `validate_for_manufacturing` | Board pre-flight before ordering: checks outline, design rules, footprints, routing evidence, and complete DRC results. |
+| `validate_for_manufacturing` | Check the saved board outline, project minimum track width, footprints, and native DRC before ordering. Unconnected items block readiness and schematic parity requires review. |
 | `estimate_cost` | Estimate fabrication and assembly. JLCPCB pricing uses local catalog unit prices for LCSC IDs from saved PCB fields or UUID-linked root schematic components, reports fallback references and counts known Extended feeder fees once per part number. The model compares the saved Edge.Cuts bounding box with 100 × 100 mm, reports unknown dimensions when it cannot read the outline bounds, and excludes quantity discounts, attrition and shipping. |
 
 ---

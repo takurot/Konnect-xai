@@ -18,9 +18,11 @@
 //! baseline context stays small. The LLM reads `list_toolboxes` and calls
 //! `load_toolset(name)` to expose the tools it actually needs for the task.
 
+#[cfg(unix)]
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::{CallToolResult, McpToolDescription};
-use crate::tools::ToolContext;
+use crate::observability::MAX_RECENT_CALLS;
+use crate::tools::{invalid_arg, ToolContext};
 use serde_json::{json, Value};
 use std::ffi::OsString;
 #[cfg(unix)]
@@ -212,7 +214,8 @@ pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescriptio
             name: "load_toolset".to_string(),
             description:
                 "Load a toolset by name so its tools appear in tools/list and can be called. \
-                 Returns the list of tools that were added. Use list_toolboxes() first to \
+                 Returns only tools added by this call. An already loaded toolset adds none. \
+                 Use list_toolboxes() first to \
                  see valid names. Pass an array to load several toolsets in one call -- \
                  cheaper, one tools/list refresh."
                     .to_string(),
@@ -271,7 +274,9 @@ pub fn meta_tool_descriptions_for(reload_enabled: bool) -> Vec<McpToolDescriptio
                 "properties": {
                     "limit": {
                         "type": "integer",
-                        "description": "Max number of calls to return (default 20, max 100). Pass 0 for all buffered calls.",
+                        "description": "Max number of calls to return (1–100, default 20).",
+                        "minimum": 1,
+                        "maximum": MAX_RECENT_CALLS,
                         "default": 20
                     }
                 },
@@ -361,20 +366,33 @@ pub async fn handle_meta_tool_with_reload(
     ctx: &std::sync::Arc<ToolContext>,
     reload: &ReloadControl,
 ) -> Option<CallToolResult> {
+    dispatch_meta_tool(name, args, ctx, reload)
+        .await
+        .map(|(result, _)| result)
+}
+
+/// Return the tool result and whether the advertised catalogue changed.
+pub(crate) async fn dispatch_meta_tool(
+    name: &str,
+    args: &Value,
+    ctx: &std::sync::Arc<ToolContext>,
+    reload: &ReloadControl,
+) -> Option<(CallToolResult, bool)> {
     #[cfg(not(unix))]
     let _ = reload;
-    match name {
-        "list_toolboxes" => Some(handle_list_toolboxes(ctx).await),
-        "load_toolset" => Some(handle_load_toolset(args, ctx).await),
-        "unload_toolset" => Some(handle_unload_toolset(args, ctx).await),
-        "get_active_toolsets" => Some(handle_get_active_toolsets(ctx).await),
-        "get_recent_calls" => Some(handle_get_recent_calls(args, ctx).await),
-        "server_stats" => Some(handle_server_stats(ctx).await),
-        "get_installation_info" => Some(handle_get_installation_info(ctx).await),
+    let result = match name {
+        "list_toolboxes" => handle_list_toolboxes(ctx).await,
+        "load_toolset" => return Some(handle_load_toolset(args, ctx).await),
+        "unload_toolset" => return Some(handle_unload_toolset(args, ctx).await),
+        "get_active_toolsets" => handle_get_active_toolsets(ctx).await,
+        "get_recent_calls" => handle_get_recent_calls(args, ctx).await,
+        "server_stats" => handle_server_stats(ctx).await,
+        "get_installation_info" => handle_get_installation_info(ctx).await,
         #[cfg(unix)]
-        "reload_server" if reload.is_enabled() => Some(handle_reload_server(args, reload).await),
-        _ => None,
-    }
+        "reload_server" if reload.is_enabled() => handle_reload_server(args, reload).await,
+        _ => return None,
+    };
+    Some((result, false))
 }
 
 #[cfg(unix)]
@@ -541,100 +559,97 @@ async fn handle_list_toolboxes(ctx: &std::sync::Arc<ToolContext>) -> CallToolRes
     }))
 }
 
-async fn handle_load_toolset(args: &Value, ctx: &std::sync::Arc<ToolContext>) -> CallToolResult {
-    match &args["name"] {
-        // Legacy single-name form: result shape is byte-identical to the
-        // pre-batch behavior (`loaded` is a string, `tools` echoes descriptions).
-        Value::String(name) => match ctx.router.load(name).await {
-            Some(tools) => {
-                let tool_list: Vec<Value> = tools
-                    .iter()
-                    .map(|t| json!({ "name": t.name, "description": t.description }))
-                    .collect();
-                CallToolResult::json(&json!({
-                    "loaded": name,
-                    "tools_added": tools.len(),
-                    "tools": tool_list
-                }))
-            }
-            None => CallToolResult::error(format!(
-                "Unknown toolset '{}'. Call list_toolboxes() to see valid names.",
-                name
-            )),
-        },
-        // New array form: one load, one tools/list_changed notification.
-        Value::Array(arr) => {
-            let mut names: Vec<String> =
-                match arr.iter().map(|v| v.as_str().map(str::to_string)).collect() {
-                    Some(names) => names,
-                    None => return CallToolResult::error("name array must contain only strings"),
-                };
-            // Duplicate names in one call would double-count tools_added.
-            let mut seen = std::collections::HashSet::new();
-            names.retain(|n| seen.insert(n.clone()));
-
-            let mut loaded = Vec::new();
-            let mut tools_added = 0usize;
-            let mut tool_list: Vec<Value> = Vec::new();
-            let mut errors = Vec::new();
-
-            for name in &names {
-                match ctx.router.load(name).await {
-                    Some(tools) => {
-                        loaded.push(name.clone());
-                        tools_added += tools.len();
-                        tool_list.extend(
-                            tools
-                                .iter()
-                                .map(|t| json!({ "name": t.name, "description": t.description })),
-                        );
-                    }
-                    None => errors.push(format!(
-                        "Unknown toolset '{}'. Call list_toolboxes() to see valid names.",
-                        name
-                    )),
-                }
-            }
-
-            // Nothing loaded at all -- a typed error so the observer keeps a kind,
-            // rather than a JSON body with a manually-set is_error flag.
-            if loaded.is_empty() {
-                let kind = ToolErrorKind::InvalidArgument {
-                    field: "name".to_string(),
-                    reason: names.join(", "),
-                };
-                return CallToolResult::error_kind(
-                    kind,
-                    format!(
-                        "No toolsets loaded -- all names were unknown: {}. Call list_toolboxes() to see valid names.",
-                        names.join(", ")
-                    ),
+async fn handle_load_toolset(
+    args: &Value,
+    ctx: &std::sync::Arc<ToolContext>,
+) -> (CallToolResult, bool) {
+    let single = args["name"].is_string();
+    let mut names = match &args["name"] {
+        Value::String(name) => vec![name.as_str()],
+        Value::Array(names) => {
+            let Some(names) = names.iter().map(Value::as_str).collect::<Option<Vec<_>>>() else {
+                return (
+                    invalid_arg("name", "must contain only toolset names as strings"),
+                    false,
+                );
+            };
+            if names.is_empty() {
+                return (
+                    invalid_arg("name", "must contain at least one toolset name"),
+                    false,
                 );
             }
-
-            // Partial success (some names unknown, some loaded) is not an error --
-            // the caller gets what loaded plus an errors array for the rest.
-            CallToolResult::json(&json!({
-                "loaded": loaded,
-                "tools_added": tools_added,
-                "tools": tool_list,
-                "errors": errors,
-            }))
+            names
         }
-        _ => CallToolResult::error("Missing required argument: name (string or array of strings)"),
+        _ => {
+            return (
+                invalid_arg("name", "must be a toolset name or an array of names"),
+                false,
+            )
+        }
+    };
+    let mut seen = std::collections::HashSet::new();
+    names.retain(|name| seen.insert(*name));
+
+    let mut loaded = Vec::new();
+    let mut tools = Vec::new();
+    let mut errors = Vec::new();
+    for name in names {
+        match ctx.router.load(name).await {
+            Some(added) => {
+                loaded.push(name);
+                tools.extend(
+                    added
+                        .iter()
+                        .map(|tool| json!({ "name": tool.name, "description": tool.description })),
+                );
+            }
+            None => errors.push(format!(
+                "Unknown toolset '{name}'. Call list_toolboxes() to see valid names."
+            )),
+        }
     }
+    if loaded.is_empty() {
+        return (invalid_arg("name", &errors.join(" ")), false);
+    }
+
+    let tools_added = tools.len();
+    // Keep the single-name response shape. In a batch, a known no-op can
+    // still be listed as loaded but must not contribute to the new tools.
+    let mut body = json!({
+        "loaded": if single { json!(loaded[0]) } else { json!(loaded) },
+        "tools_added": tools_added,
+        "tools": tools,
+    });
+    if !single {
+        body["errors"] = json!(errors);
+    }
+    (CallToolResult::json(&body), tools_added != 0)
 }
 
-async fn handle_unload_toolset(args: &Value, ctx: &std::sync::Arc<ToolContext>) -> CallToolResult {
-    let name = match args["name"].as_str() {
-        Some(n) => n,
-        None => return CallToolResult::error("Missing required argument: name"),
+async fn handle_unload_toolset(
+    args: &Value,
+    ctx: &std::sync::Arc<ToolContext>,
+) -> (CallToolResult, bool) {
+    let Some(name) = args["name"].as_str() else {
+        return (invalid_arg("name", "must be a toolset name"), false);
     };
-
-    if ctx.router.unload(name).await {
-        CallToolResult::text(format!("Toolset '{}' unloaded.", name))
-    } else {
-        CallToolResult::error(format!("Unknown toolset '{}'.", name))
+    match ctx.router.unload_tools(name).await {
+        Some(removed) if removed.is_empty() => (
+            CallToolResult::text(format!("Toolset '{name}' is already unloaded.")),
+            false,
+        ),
+        Some(_) => (
+            CallToolResult::text(format!("Toolset '{name}' unloaded.")),
+            true,
+        ),
+        None => (
+            invalid_arg(
+                "name",
+                &format!("Unknown toolset '{name}'. Call list_toolboxes() to see valid names."),
+            ),
+            false,
+        ),
     }
 }
 
@@ -642,16 +657,24 @@ async fn handle_get_recent_calls(
     args: &Value,
     ctx: &std::sync::Arc<ToolContext>,
 ) -> CallToolResult {
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or(20);
+    let limit = match args.get("limit") {
+        None => 20,
+        Some(value) => {
+            let Some(limit) = value.as_f64().filter(|limit| {
+                limit.fract() == 0.0 && (1.0..=MAX_RECENT_CALLS as f64).contains(limit)
+            }) else {
+                return invalid_arg(
+                    "limit",
+                    &format!("must be an integer from 1 to {MAX_RECENT_CALLS}"),
+                );
+            };
+            limit as usize
+        }
+    };
     let records = ctx.observer.recent(limit).await;
-    let count = records.len();
     CallToolResult::json(&json!({
-        "count": count,
-        "limit_applied": if limit == 0 { count } else { limit },
+        "count": records.len(),
+        "limit_applied": limit,
         "calls": records,
         "hint": "Calls are ordered newest-first. Use server_stats for aggregates.",
     }))
@@ -990,7 +1013,8 @@ mod meta_boundary_contract_tests {
         let ctx = context();
         let before = ctx.router.active_names().await;
         for names in [json!([]), json!(["unknown"]), json!(["unknown", "unknown"])] {
-            let response = handle_load_toolset(&json!({"name":names}), &ctx).await;
+            let (response, changed) = handle_load_toolset(&json!({"name":names}), &ctx).await;
+            assert!(!changed);
             assert!(response.is_error);
             assert_eq!(
                 crate::mcp::error::extract_error_kind(&response).as_deref(),
@@ -1001,23 +1025,26 @@ mod meta_boundary_contract_tests {
         assert!(
             handle_unload_toolset(&json!({"name":"not-a-toolset"}), &ctx)
                 .await
+                .0
                 .is_error
         );
         assert!(
             !handle_load_toolset(&json!({"name":"project"}), &ctx)
                 .await
+                .0
                 .is_error
         );
         assert!(
             !handle_unload_toolset(&json!({"name":"project"}), &ctx)
                 .await
+                .0
                 .is_error
         );
         assert!(ctx.router.get_tool("create_project").await.is_none());
     }
 
     #[tokio::test]
-    async fn zero_recent_call_limit_reports_all_retained_calls_and_its_actual_limit() {
+    async fn recent_calls_checks_bounds_and_preserves_newest_first_order() {
         let ctx = context();
         for index in 0..2 {
             ctx.observer
@@ -1034,10 +1061,15 @@ mod meta_boundary_contract_tests {
                 })
                 .await;
         }
-        let unlimited = body(&handle_get_recent_calls(&json!({"limit":0}), &ctx).await);
-        assert_eq!(unlimited["count"], 2);
-        assert_eq!(unlimited["limit_applied"], 2);
-        assert_eq!(unlimited["calls"][0]["call_id"], "test-1");
+        for limit in [json!(0), json!(-1), json!(MAX_RECENT_CALLS + 1), json!(1.5)] {
+            let result = handle_get_recent_calls(&json!({"limit":limit}), &ctx).await;
+            assert!(result.is_error);
+            assert_eq!(body(&result)["error"]["kind"], "invalid_argument");
+        }
+        let default = body(&handle_get_recent_calls(&json!({}), &ctx).await);
+        assert_eq!(default["count"], 2);
+        assert_eq!(default["limit_applied"], 20);
+        assert_eq!(default["calls"][0]["call_id"], "test-1");
         let limited = body(&handle_get_recent_calls(&json!({"limit":1}), &ctx).await);
         assert_eq!(limited["count"], 1);
         assert_eq!(limited["limit_applied"], 1);

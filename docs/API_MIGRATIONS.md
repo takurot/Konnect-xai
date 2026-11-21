@@ -3,6 +3,22 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: toolset changes and observed tool errors
+
+`load_toolset` reports only newly added tools in `tools_added` and `tools`.
+Its `loaded` field still uses a name for a single request and an array for a
+batch. An active toolset is a successful no-op, and a mixed batch retains its
+per-name `errors` entries. An unknown or empty request returns
+`invalid_argument`. Unloading a known inactive toolset reports that it is
+already unloaded. Konnect sends `notifications/tools/list_changed` only when
+the advertised catalogue changes.
+
+`server_stats` counts every served `isError: true` result, including unknown
+or unloaded tools. Recent calls and the JSONL log record their structured
+error kind, with `handler_error` when a legacy reply contains only text.
+`get_recent_calls.limit` accepts integers from 1 to 100 and defaults to 20.
+Use 100 to request the full bounded buffer.
+
 ## Unreleased – Server configuration and terminal startup
 
 Automatic server configuration discovery now uses the recognized PCM plugin
@@ -27,6 +43,27 @@ Move or copy durable files into the selected root before enabling the override
 if you want that process to use them. `KONNECT_BRIDGE_DIR` must also be an
 absolute path when set. Server configuration can disable disk call logging
 with `call_log = false`.
+
+## Unreleased: schematic arguments require a KiCad schematic
+
+Pass a `.kicad_sch` file to a tool's `schematic` argument. A board, project
+settings file, or other document returns `invalid_argument` with
+`reason: "not_a_schematic"` before a tool edits or analyzes it. Renaming a
+different kind of file to `.kicad_sch` does not make it a schematic.
+`create_schematic` also requires a `.kicad_sch` output path.
+
+## Unreleased: library writes validate document types and identifiers
+
+`create_symbol` and `delete_symbol` use `.kicad_sym` symbol libraries.
+`create_footprint` and `edit_footprint_pad` use `.kicad_mod` footprints.
+Existing files must also contain the corresponding KiCad document type.
+Convert a pre-6.0 footprint with `kicad-cli fp upgrade` before editing it.
+
+Symbol names and new library nicknames must be nonempty and cannot contain
+a colon or double quote. `delete_symbol` refuses to remove a symbol that
+another symbol extends and reports the direct dependents. Footprint creation
+accepts the documented pad types and shapes. New pad sizes and supplied
+drill diameters must remain positive at KiCad's nanometre precision.
 
 ## v0.14.0: conditional-write failures distinguish committed uncertainty
 
@@ -301,6 +338,15 @@ known price, and `max_price_usd` excludes it. The response adds
 `ranking` (the criteria and the effective settings), `count`, `matched_count`
 and `exclusions`, which counts the parts the stock floor and the price limit
 removed (#785).
+
+## Unreleased: LCSC datasheet lookups report their outcome
+
+`get_datasheet_url` still prefers the local catalog. Online lookups read LCSC's
+`pdfUrl` and fall back to the older `dataManualUrl` when the primary value is
+absent. Its `lookup` object records the source and status (`found`, `not_found`,
+or `error`), with a diagnostic for failures. `enrich_datasheets` exposes the same
+information in `lookups`, keyed by part number. A failed lookup does not write a
+Datasheet field for that part. Existing fields still follow `overwrite_existing`.
 
 ## Unreleased: `konnect init` refreshes stale Claude hook matchers (patch release)
 
@@ -839,6 +885,26 @@ defaults in place of one that cannot be used.
 No argument changed. A caller that relied on a broken preferences file being
 silently reset must now repair or remove it.
 
+## Unreleased: configuration writes validate settings and the effective view combines design rules
+
+`get_effective_config` returns user rules followed by project rules as strings
+in `effective_config.design_rules`. The top-level `design_rule_sources` list
+provides the same order with entries `{rule, source}`, where `source` is
+`"user"` or `"project"`. Other preferences retain project override semantics,
+including replacement of arrays such as `sourcing.avl`. An absent project
+configuration adds no overrides.
+
+`save_user_config` and `save_project_config` validate key paths and incoming
+values against known settings. They reject unknown keys, malformed paths,
+incorrect types, and values outside supported ranges with `invalid_argument`.
+Pass `value: null` to remove an existing known key from the selected file.
+Removing a project override exposes the corresponding user setting when it
+exists. Project-scoped writes require an existing directory.
+
+`add_design_rule` accepts `scope: "user"` or `scope: "project"` and defaults to
+project scope. It trims the requested rule and rejects a blank rule or a
+duplicate in that scope. Existing rules and unrelated settings are preserved.
+
 ## Unreleased: `get_schematic_component` and `list_schematic_components` return every property (minor release)
 
 Both tools answered from a fixed list of keys, so neither reported a custom
@@ -1305,10 +1371,11 @@ The response is now JSON, with the shared `outcome` envelope:
 - `unresolved` — designator groups the tool will not decide for you, each with
   its `project`, `paths`, `uuids` and a `reason`;
 - `written`, `dry_run`, `resolve_duplicates`, `remaining_unannotated`;
-- `outcome.status` is `complete` only when the committed file, read back, has
-  no `?` and no duplicate in the project; `partial` when `unresolved` is
-  non-empty; `failed` when the tool refused before writing; `uncertain` when
-  the write or the readback could not be proven.
+- `outcome.status` is `complete` when the requested file has no unresolved
+  annotation and any consulted project files were readable. It is `partial`
+  when a group is unresolved or a consulted file is unreadable, `failed` when
+  the tool refuses before writing, and `uncertain` when the write or readback
+  cannot be verified.
 
 A caller matching "Annotation complete." must update. No argument was renamed
 or removed. Persistence conflicts return `mutation_outcome_uncertain` with an
@@ -1319,10 +1386,9 @@ error. Reload and inspect the schematic before retrying; applied work is not
 known on this path and the response does not claim that nothing was written.
 Three optional arguments are added: `resolve_duplicates` (default
 false) renumbers all but the first of each group of separate parts sharing a
-designator, in ascending X, which is what eeschema's "Reset existing
-annotations" produced on the fixture; `dry_run` (default false) returns the
-plan without writing; `project` (string) names the project whose instance
-records to annotate.
+designator, in saved page, hierarchy, and X/Y order. `dry_run` (default
+false) returns the plan without writing. `project` names the project whose
+instance records to annotate.
 
 References are unique across a project (KiCad's flat list), so numbers are
 reserved per project across every sheet instance the file carries: a reused
@@ -1342,15 +1408,40 @@ When the owning project is proven, the numbers used on its other sheets are
 reserved by walking the sheet tree from the root (`other_sheets_consulted`
 lists them; `other_sheets_unreadable` names any that could not be read), so a
 child sheet annotated on its own never hands out a number the root owns.
-Duplicates that already exist across sheets are not detected or renumbered
-here; annotating a hierarchy from its root is tracked in #463.
+The response's `scope: "saved_schematic"` identifies the only file eligible
+for writes. `other_sheets_unannotated` lists each consulted file that still
+has unnumbered instance records, with the count for the selected project.
+This also works when the requested root file has no placed symbols.
+Project-wide writes are tracked in #463.
 
-Numbering now follows eeschema's Tools → Annotate defaults, measured on
-eeschema 10.0.5 rather than assumed: ascending X per sheet instance, the first
-free number for a prefix (a gap between `R1` and `R3` is filled; before, the
-next number was always the maximum plus one), and `#`-prefixed designators
-spelled `#PWR01`, `#PWR010`, `#PWR0100` as eeschema spells them (before:
-`#PWR1`). Both places a designator lives are written.
+Saved page numbers control allocation in reused sheets. Equal or missing
+page numbers use saved hierarchy order, and placements on the same sheet
+instance use ascending X then Y. Positions without a provable placement use
+the instance order in the saved file. The tool assigns the first free number
+for the prefix, including gaps, and uses KiCad's spelling for designators
+such as `#PWR01`, `#PWR010`, and `#PWR0100`.
+
+When repeated units make a group of unnumbered symbols ambiguous, its
+`unresolved[].recovery` can include a tool call for each candidate unit to
+separate. Choose a unit that belongs to its own package, pass the returned
+arguments to `edit_schematic_component`, then run `annotate_schematic`
+again. The new selector accepts `uuid` with `new_reference` and optional
+`project` and `instance_path`. Pass an explicit path when a UUID has several
+instances in the selected project. If another instance still uses the
+displayed Reference property value, the edit preserves that shared property.
+The existing `reference` selector continues to edit shared fields across
+a component's placed units.
+
+
+## Unreleased schematic symbol and label rotations
+
+Component placement and rotation, power symbol placement, and label placement
+and rotation accept angles in degrees that are multiples of 90. Konnect writes
+0, 90, 180, or 270 after normalizing modulo 360, so `-90` and `270` have
+the same effect. Other values return `invalid_argument` before anything is
+written. Batch placement and batch label rotation check every requested angle
+before making any changes.
+
 ## Unreleased: `rotate_schematic_component` carries field text round (patch release)
 
 `rotate_schematic_component` wrote the symbol's new angle and nothing else.
@@ -1708,6 +1799,15 @@ No tool mirrors an already-placed symbol: changing a placement's reflection
 still means deleting it and placing it again. This additive change is planned
 for the next minor release; no tool or argument was renamed or removed.
 
+## Unreleased – Export and rules-check options use closed choices
+
+Pass `mm` or `in` for IPC-2581 and ODB++ units. ODB++ compression accepts
+`zip`, `none`, or `tgz`. The `severity` filter on `run_drc`,
+`get_drc_violations`, and `run_erc` accepts `error`, `warning`, or `info`.
+Defaults remain `mm`, `zip`, and `warning`, respectively. The names are
+case-sensitive. An unsupported value returns `invalid_argument` naming the
+field before starting the export or rules check.
+
 ## Unreleased: DRC checks schematic parity on every run (minor release)
 
 `run_drc`, `get_drc_violations`, `run_design_review`, `validate_for_manufacturing`
@@ -1742,6 +1842,33 @@ Two visible consequences:
 `schematic_parity_diagnostic` is additive and absent when parity was checked
 or when the kicad-cli never reported the category at all. No tool, argument, or
 existing field was renamed or removed.
+
+## Unreleased: design review and manufacturing evidence
+
+`run_design_review` runs native KiCad ERC on the supplied schematic root and
+includes the report counts and coordinate status in `design_review.erc`.
+ERC findings contribute to the verdict regardless of the presentation
+`severity_filter`. An unavailable or unreadable ERC report leaves `erc` null
+and yields an `INCOMPLETE` verdict with an `erc_unavailable` diagnostic.
+
+Standalone schematic audits describe their implemented and unchecked tests
+in `coverage.checked` and `coverage.not_checked`. The connection
+audit checks pull-ups on named I2C and reset nets. Use ERC for undriven
+inputs and outputs connected together.
+
+`audit_manufacturing` checks actual Edge.Cuts geometry and uses
+`board.design_settings.rules.min_track_width` from the same-stem saved
+`.kicad_pro`. Missing rules yield a partial audit with a named diagnostic.
+Its `coverage.not_checked` also lists outline closure, component clearance,
+silkscreen overlap, via-in-pad and acid traps. The proximity finding compares
+footprint origins within 1 mm. Both manufacturing checks accept only
+`jlcpcb`, `pcbway` and `oshpark` for `fab_house`.
+
+`validate_for_manufacturing` uses KiCad's DRC categories directly. An
+unconnected item makes the board `NOT READY` regardless of the native
+finding's severity. Schematic parity findings require at least
+`NEEDS REVIEW`. The raw DRC category counts and the reported board net and
+track counts retain their existing meaning.
 
 ## Unreleased: `add_mounting_hole` uses KiCad's shipped footprint names (minor release)
 
@@ -2234,6 +2361,19 @@ footprints with matching symbol identity, footprint and value. When omitted,
 the estimator tries the same-stem root schematic. The saved PCB determines the
 assembly population.
 
+
+## Unreleased: fabrication packages omit DNP assembly rows
+
+`export_manufacturing_package` excludes DNP symbols from the BOM for every fab
+house. Non-JLCPCB position CSVs exclude DNP footprints and honor DNP annotations
+from the explicitly selected schematic. For a same-stem schematic next to the
+board, a unique reference and matching footprint can identify a DNP position
+when the footprint has no schematic link yet. An ambiguous or conflicting link
+leaves the package incomplete.
+
+`estimate_cost` lists the identified LCSC references using fallback average
+pricing when the local JLCPCB catalog file is absent.
+
 ## Unreleased: `flip_component` on an open board uses KiCad 10.0.6's native `FlipItems`
 
 `flip_component` previously refused unconditionally whenever KiCad was
@@ -2360,3 +2500,12 @@ result. Unreadable and malformed tables return a diagnostic.
 or a project directory. It defaults to the server's configured
 `project_dir`. Project footprint libraries are searched first. When a project
 and global table use the same nickname, the project entry is used for search.
+
+## Unreleased `connect_to_net` checks the endpoint's saved net
+
+When an attached label proves the requested name and scope on the saved sheet,
+`connect_to_net` returns `connected` and `already_connected: true` without
+writing another wire or label. The existing label type and geometry stay in
+place. If the endpoint belongs to a different named net or label scope, the tool returns
+`would_join_nets` with the existing names, the requested name, and the endpoint
+position. Pass `allow_join: true` to authorize an intentional join.

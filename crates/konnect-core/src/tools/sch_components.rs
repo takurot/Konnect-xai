@@ -10,17 +10,18 @@ use crate::mcp::{
 };
 use crate::tool;
 use crate::tools::{
-    find_all_symbol_instance_blocks, get_path, opt_f64, opt_str, opt_u32, reembed_lib_symbols,
-    require_array, require_f64, require_str,
+    find_all_symbol_instance_blocks, get_path, invalid_arg, normalize_schematic_rotation, opt_str,
+    opt_u32, reembed_lib_symbols, require_array, require_f64, require_str,
     sch_wiring::{
         apply_no_connect_carries, carry_no_connects, no_connect_carry_unwritable,
         observed_no_connect_moves, plan_no_connect_carry_for_replacement,
         reconcile_junctions_for_placement,
     },
-    ReembedOutcome, ToolContext, ToolDef,
+    schematic_rotation_arg, ReembedOutcome, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::geometry::round6;
+use konnect_sexp::schematic::write_schematic_if_unchanged;
 use konnect_sexp::{
     commit_command,
     geometry::snap_point,
@@ -29,9 +30,7 @@ use konnect_sexp::{
         extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
         pin_outward_direction, read_schematic,
     },
-    writer::{
-        apply_edits, find_direct_child_blocks, read_consistent, write_atomic_if_unchanged, SexpEdit,
-    },
+    writer::{apply_edits, find_direct_child_blocks, read_consistent, SexpEdit},
     ItemAnchor, ItemId, SchematicCommand, SexpError,
 };
 use serde_json::json;
@@ -53,7 +52,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "lib_id": { "type": "string", "description": "Library:Symbol (e.g. 'Device:R')" },
                     "x": { "type": "number", "description": "X position in mm" },
                     "y": { "type": "number", "description": "Y position in mm" },
-                    "rotation": { "type": "number", "description": "Rotation in degrees (0/90/180/270)", "default": 0 },
+                    "rotation": { "type": "number", "description": "Multiple of 90 degrees, normalized modulo 360", "default": 0 },
                     "mirror": { "type": "string", "enum": ["x", "y", "none"], "description": "Reflect the placed symbol about an axis, using eeschema's own vocabulary: 'x' negates screen-Y, 'y' negates screen-X. Omit (or 'none') for an unmirrored symbol. Mirroring is applied after rotation, and is not interchangeable with rotation 180 for a symbol whose pins are not symmetric." },
                     "reference": { "type": "string", "description": "Optional reference designator. Default: the library prefix plus '?' (e.g. 'R?', '#FLG?'), which annotate_schematic numbers" },
                     "value": { "type": "string", "description": "Optional override for the library symbol's Value" },
@@ -85,13 +84,16 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_schematic_component",
-            "Update fields and native dnp, in_bom, on_board, exclude_from_sim and in_pos_files attributes consistently across every placed unit. Omitted attributes remain unchanged. Move or hide field text.",
+            "Update fields and native dnp, in_bom, on_board, exclude_from_sim and in_pos_files attributes consistently across every placed unit. Omitted attributes remain unchanged. Move or hide field text. Use uuid with new_reference to reassign one saved symbol instance instead of editing shared fields.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
                     "reference": { "type": "string", "description": "Current reference designator" },
                     "new_reference": { "type": "string", "description": "New reference designator (optional)" },
+                    "uuid": { "type": "string", "description": "Select exactly one saved symbol for new_reference. Omit reference and any field or attribute changes." },
+                    "project": { "type": "string", "description": "Project of the selected saved instance when using uuid" },
+                    "instance_path": { "type": "string", "description": "Saved path of the selected project instance when using uuid. Required if the symbol has several saved paths in that project." },
                     "value": { "type": "string", "description": "New value (optional)" },
                     "footprint": { "type": "string", "description": "New footprint (optional)" },
                     "dnp": { "type": "boolean" },
@@ -123,7 +125,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Which placed unit field_placements applies to. Required when x or y is given and the component has more than one placed unit, because a field position is absolute and one coordinate cannot be right for several placements."
                     }
                 },
-                "required": ["schematic", "reference"]
+                "required": ["schematic"],
+                "anyOf": [
+                    { "required": ["reference"] },
+                    { "required": ["uuid", "new_reference"] }
+                ]
             }),
             |args, ctx| async move { handle_edit_schematic_component(args, ctx).await }
         ),
@@ -190,7 +196,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "schematic": { "type": "string" },
                     "reference": { "type": "string" },
-                    "rotation": { "type": "number", "description": "Absolute rotation in degrees" }
+                    "rotation": { "type": "number", "description": "Absolute multiple of 90 degrees, normalized modulo 360" }
                 },
                 "required": ["schematic", "reference", "rotation"]
             }),
@@ -237,19 +243,19 @@ pub fn tools() -> Vec<ToolDef> {
             "annotate_schematic",
             "Assign reference designators in the saved schematic the way eeschema's Tools → \
              Annotate does with its defaults: every '?' designator gets the first free number \
-             for its prefix in the project, in ascending X per sheet instance, numbers used on \
+             for its prefix in the project, by saved page then hierarchy and X/Y, numbers used on \
              any sheet instance in the file are reserved, and numbered designators are kept. \
              The units of one multi-unit part (same embedded definition and value, distinct \
              units) share one designator; when which units belong together is not proven they \
              are reported in 'unresolved', never guessed. Two separate parts sharing a \
              designator are reported in 'unresolved' with a 'partial' outcome; they are \
-             renumbered only when resolve_duplicates is true (the first in ascending X keeps \
+             renumbered only when resolve_duplicates is true (the first in page and X/Y order keeps \
              the number). Annotates one project's instance records — the schematic's owner by \
              default, or 'project' — and never touches another project's. Writes both the \
              Reference property and the instances block, then reads the file back; every count \
              in the response comes from that readback. Numbers used on the project's other \
              sheets are reserved through its sheet tree ('other_sheets_consulted'); duplicates \
-             already spread across sheets are not detected here. Konnect's own implementation \
+             already spread across sheets are not detected here. Other unannotated files are reported and stay untouched. Konnect's own implementation \
              — kicad-cli has no annotate command. dry_run returns the plan without writing.",
             json!({
                 "type": "object",
@@ -257,7 +263,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Path to the .kicad_sch file" },
                     "resolve_duplicates": {
                         "type": "boolean",
-                        "description": "Renumber separate single-unit parts that share a designator in the project: the first in ascending X keeps it, the rest get the first free number. Default false: duplicates are reported, not changed. A shared designator that could be the units of one multi-unit package is never renumbered either way.",
+                        "description": "Renumber separate single-unit parts that share a designator in the project: the first in page and X/Y order keeps it, the rest get the first free number. Default false: duplicates are reported, not changed. A shared designator that could be the units of one multi-unit package is never renumbered either way.",
                         "default": false
                     },
                     "dry_run": {
@@ -586,7 +592,10 @@ async fn handle_add_schematic_component(
         Ok(v) => v,
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
     };
-    let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
+    let rotation = match schematic_rotation_arg(args.get("rotation"), "rotation", Some(0.0)) {
+        Ok(rotation) => rotation,
+        Err(error) => return Ok(failed_component_placement(error, &sch_path)),
+    };
     let mirror = match mirror_arg(args, "mirror") {
         Ok(mirror) => mirror,
         Err(error) => return Ok(failed_component_placement(error, &sch_path)),
@@ -2903,6 +2912,56 @@ async fn handle_edit_schematic_component(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
+    if args.get("uuid").is_some() {
+        for field in ["uuid", "project", "instance_path"] {
+            if args.get(field).is_some_and(|value| !value.is_string()) {
+                return Ok(crate::tools::invalid_arg(field, "expected a string"));
+            }
+        }
+        if let Some(field) = args
+            .as_object()
+            .into_iter()
+            .flat_map(|object| object.keys())
+            .find(|field| {
+                !matches!(
+                    field.as_str(),
+                    "schematic" | "uuid" | "project" | "instance_path" | "new_reference"
+                )
+            })
+        {
+            return Ok(crate::tools::invalid_arg(
+                field,
+                "only new_reference can be set with a UUID selector",
+            ));
+        }
+        let new_reference = match require_str(args, "new_reference") {
+            Ok(value) => value.to_owned(),
+            Err(error) => return Ok(error),
+        };
+        let uuid = match require_str(args, "uuid") {
+            Ok(value) => value.to_owned(),
+            Err(error) => return Ok(error),
+        };
+        let project = opt_str(args, "project").map(str::to_owned);
+        let instance_path = opt_str(args, "instance_path").map(str::to_owned);
+        return Ok(
+            crate::tools::blocking_work::spawn_tracked_blocking(move || {
+                super::sch_annotate::rename_instance_reference(
+                    &sch_path,
+                    &uuid,
+                    project.as_deref(),
+                    instance_path.as_deref(),
+                    &new_reference,
+                )
+            })
+            .await?,
+        );
+    }
+    for field in ["project", "instance_path"] {
+        if args.get(field).is_some() {
+            return Ok(crate::tools::invalid_arg(field, "requires a UUID selector"));
+        }
+    }
     let reference = match require_str(args, "reference") {
         Ok(r) => r.to_string(),
         Err(e) => return Ok(e),
@@ -3417,7 +3476,7 @@ async fn handle_move_schematic_component(
     };
     let candidate = sch.to_source();
     let (candidate, added, pruned) = reconcile_junctions_for_placement(&before_source, candidate);
-    write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
+    write_schematic_if_unchanged(&sch_path, &before_source, &candidate)?;
     let moved_markers =
         match observed_no_connect_moves(&sch_path, "move_schematic_component", &carried)? {
             Ok(moved) => moved,
@@ -3451,9 +3510,9 @@ async fn handle_rotate_schematic_component(
         Ok(r) => r.to_string(),
         Err(e) => return Ok(e),
     };
-    let rotation = match require_f64(args, "rotation") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
+    let rotation = match schematic_rotation_arg(args.get("rotation"), "rotation", None) {
+        Ok(rotation) => rotation,
+        Err(error) => return Ok(error),
     };
 
     let before_source = read_consistent(&sch_path)?;
@@ -3462,31 +3521,37 @@ async fn handle_rotate_schematic_component(
         Ok(target) => target,
         Err(error) => return Ok(error.into_result()),
     };
-    let target_uuids = target.uuids();
-    let selected = target_uuids.iter().cloned().collect::<BTreeSet<_>>();
-    let anchor_uuid = &target.units[0].uuid;
-    let anchor = sch
-        .symbols
-        .iter()
-        .find(|symbol| symbol.uuid == *anchor_uuid)
-        .expect("structural target UUID is present in the loaded schematic");
-    let rotation_delta = rotation - anchor.at.rotation.unwrap_or(0.0);
-    for unit in &mut target.units {
-        unit.rotation = (unit.rotation + rotation_delta).rem_euclid(360.0);
+    // Apply the anchor's delta to every other unit while preserving its
+    // relative orientation. Refuse if any unit would still be non-cardinal.
+    let anchor_rotation = target.units[0].rotation;
+    if !anchor_rotation.is_finite() {
+        return Ok(invalid_arg(
+            "rotation",
+            "saved anchor rotation is not finite",
+        ));
     }
-    for symbol in sch
-        .symbols
-        .iter_mut()
-        .filter(|symbol| selected.contains(&symbol.uuid))
-    {
-        // The delta lands each unit at its own angle, so a unit already at
-        // 270° asked to follow a +90° turn computes 360° — normalize into
-        // [0, 360) before writing; eeschema only ever stores 0/90/180/270
-        // and re-saves anything else, so an unnormalized angle survives only
-        // until KiCad touches the file and then silently diverges from what
-        // this response reported.
-        let new_rotation = (symbol.at.rotation.unwrap_or(0.0) + rotation_delta).rem_euclid(360.0);
-        symbol.set_rotation(new_rotation);
+    let rotation_delta = rotation - anchor_rotation.rem_euclid(360.0);
+    target.units[0].rotation = rotation;
+    for unit in &mut target.units[1..] {
+        let Some(angle) =
+            normalize_schematic_rotation(unit.rotation.rem_euclid(360.0) + rotation_delta)
+        else {
+            return Ok(invalid_arg(
+                "rotation",
+                &format!("would leave unit {} at a non-cardinal angle", unit.unit),
+            ));
+        };
+        unit.rotation = angle;
+    }
+    let planned_rotations = target
+        .units
+        .iter()
+        .map(|unit| (unit.uuid.as_str(), unit.rotation))
+        .collect::<BTreeMap<_, _>>();
+    for symbol in sch.symbols.iter_mut() {
+        if let Some(&angle) = planned_rotations.get(symbol.uuid.as_str()) {
+            symbol.set_rotation(angle);
+        }
     }
     // A turn relocates pin endpoints exactly as a move does, so the markers on
     // those pins travel with them here too (#626).
@@ -3496,7 +3561,7 @@ async fn handle_rotate_schematic_component(
     };
     let candidate = sch.to_source();
     let (candidate, added, pruned) = reconcile_junctions_for_placement(&before_source, candidate);
-    write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
+    write_schematic_if_unchanged(&sch_path, &before_source, &candidate)?;
     let moved_markers =
         match observed_no_connect_moves(&sch_path, "rotate_schematic_component", &carried)? {
             Ok(moved) => moved,
@@ -3600,7 +3665,7 @@ async fn handle_move_region(
     };
     let candidate = sch.to_source();
     let (candidate, added, pruned) = reconcile_junctions_for_placement(&before_source, candidate);
-    write_atomic_if_unchanged(&sch_path, &before_source, &candidate)?;
+    write_schematic_if_unchanged(&sch_path, &before_source, &candidate)?;
 
     let moved_markers = match observed_no_connect_moves(&sch_path, "move_region", &carried)? {
         Ok(moved) => moved,
@@ -4151,7 +4216,7 @@ async fn handle_update_symbols_from_library(
     }
 
     if !updated.is_empty() && !dry_run {
-        write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+        write_schematic_if_unchanged(&sch_path, &expected, &content)?;
     }
 
     let mut body = json!({
@@ -4481,7 +4546,7 @@ async fn handle_replace_component(
         None => return Ok(no_connect_carry_unwritable(&sch_path)),
     };
     let (content, added, pruned) = reconcile_junctions_for_placement(&expected, content);
-    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+    write_schematic_if_unchanged(&sch_path, &expected, &content)?;
 
     let moved_markers = match observed_no_connect_moves(&sch_path, "replace_component", &carries)? {
         Ok(moved) => moved,
@@ -8315,6 +8380,34 @@ mod multi_unit_component_tests {
         assert_eq!(placed[1].rotation, 270.0);
     }
 
+    #[tokio::test]
+    async fn noncardinal_schematic_rotation_refuses_an_invalid_sibling_result() {
+        let (_directory, path) = fixture();
+        let mut schematic = cse::Schematic::load(&path).unwrap();
+        schematic
+            .symbols
+            .iter_mut()
+            .find(|symbol| symbol.reference() == Some("U1") && symbol.unit == 2)
+            .unwrap()
+            .at
+            .rotation = Some(45.0);
+        schematic.overwrite().unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let result = handle_rotate_schematic_component(
+            &json!({ "schematic": path, "reference": "U1", "rotation": -90 }),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument"),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
     /// The same real eeschema save as [`eeschema_fixture`], but written under
     /// the file stem its own instance paths name (`ecc83-pp`). Placement
     /// preflights the project name against those paths and rightly refuses a
@@ -10479,6 +10572,21 @@ mod coverage_component_observation_contracts {
                 Some("stale_target")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_uuid_selector_cannot_fall_back_to_reference_edit() {
+        let original = source();
+        let (_dir, path) = fixture(&original);
+        let result = handle_edit_schematic_component(
+            &json!({"schematic": path, "uuid": null, "reference": "R1", "value": "20k"}),
+            &context(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(body(&result)["error"]["field"], "uuid");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
     }
 
     #[tokio::test]

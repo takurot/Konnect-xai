@@ -37,11 +37,15 @@ impl ToolRouter {
         self.registry
     }
 
+    /// Return only definitions added by this call. An active toolset returns
+    /// an empty list, while an unknown toolset returns `None`.
     pub async fn load(&self, name: &str) -> Option<Vec<ToolDef>> {
         let defs = registry::tools_for(name)?;
         let mut active = self.active.write().await;
         let mut loaded = self.loaded_tools.write().await;
-        active.insert(name.to_string());
+        if !active.insert(name.to_owned()) {
+            return Some(Vec::new());
+        }
         for def in &defs {
             loaded.insert(def.name.to_string(), def.clone());
         }
@@ -92,17 +96,21 @@ impl ToolRouter {
     }
 
     pub async fn unload(&self, name: &str) -> bool {
-        let defs = match registry::tools_for(name) {
-            Some(d) => d,
-            None => return false,
-        };
+        self.unload_tools(name).await.is_some()
+    }
+
+    pub(crate) async fn unload_tools(&self, name: &str) -> Option<Vec<&'static str>> {
+        let defs = registry::tools_for(name)?;
         let mut active = self.active.write().await;
         let mut loaded = self.loaded_tools.write().await;
-        active.remove(name);
-        for def in &defs {
-            loaded.remove(def.name);
+        if !active.remove(name) {
+            return Some(Vec::new());
         }
-        true
+        Some(
+            defs.iter()
+                .filter_map(|def| loaded.remove(def.name).map(|def| def.name))
+                .collect(),
+        )
     }
 
     pub async fn active_names(&self) -> Vec<String> {
@@ -140,6 +148,20 @@ mod tests {
             );
         }
         assert!(router.load("nonexistent_toolset").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn overlapping_toolset_requests_report_one_actual_delta() {
+        let router = ToolRouter::new();
+        let count = registry::tools_for("project").unwrap().len();
+        let (first, second) = tokio::join!(router.load("project"), router.load("project"));
+        assert_eq!(first.unwrap().len() + second.unwrap().len(), count);
+        let (first, second) = tokio::join!(
+            router.unload_tools("project"),
+            router.unload_tools("project")
+        );
+        assert_eq!(first.unwrap().len() + second.unwrap().len(), count);
+        assert!(router.active_tools().await.is_empty());
     }
 
     #[tokio::test]
@@ -201,7 +223,11 @@ mod tests {
                         "edit_schematic_component/properties/field_placements" |
                         "batch_edit_schematic_components/properties/edits/items/properties/fields" |
                         "copy_routing_pattern/properties/net_map" |
-                        "apply_template/properties/net_mappings"
+                        "apply_template/properties/net_mappings" |
+                        // A config value's object shape depends on key_path and
+                        // is checked before either save can persist it.
+                        "save_user_config/properties/value" |
+                        "save_project_config/properties/value"
                     ),
                         "unreviewed open input record: {path}"
                     );
