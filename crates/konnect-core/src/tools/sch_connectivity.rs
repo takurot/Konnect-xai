@@ -465,6 +465,19 @@ fn seed_net_graph(
     sheet_pins: &[(f64, f64)],
     on_wire: &WireIndex,
 ) -> NetGraph {
+    let mut graph = seed_physically_connected_graph(wires, labels, junctions, sheet_pins, on_wire);
+    graph.merge_named_nets();
+    graph.name_nets();
+    graph
+}
+
+fn seed_physically_connected_graph(
+    wires: &[Wire],
+    labels: &[Label],
+    junctions: &[(f64, f64)],
+    sheet_pins: &[(f64, f64)],
+    on_wire: &WireIndex,
+) -> NetGraph {
     let mut graph = NetGraph::new();
     for wire in wires {
         graph.add_wire(wire);
@@ -485,8 +498,6 @@ fn seed_net_graph(
     for &(x, y) in sheet_pins {
         graph.ensure(pt_key(x, y));
     }
-    graph.merge_named_nets();
-    graph.name_nets();
     graph
 }
 
@@ -524,6 +535,25 @@ pub(crate) fn net_graph_for(tree: &SexpNode, wires: &[Wire], labels: &[Label]) -
         &extract_sheet_pins(tree),
         &WireIndex::build(wires, COINCIDENT_TOLERANCE),
     )
+}
+
+/// The same physical attachments as the net graph, without merging remote
+/// labels solely because their text matches. A scoped stub request must prove
+/// what kind of label is actually attached to its selected endpoint.
+pub(crate) fn net_graph_for_physical_links(
+    tree: &SexpNode,
+    wires: &[Wire],
+    labels: &[Label],
+) -> NetGraph {
+    let mut graph = seed_physically_connected_graph(
+        wires,
+        labels,
+        &extract_junctions(tree),
+        &extract_sheet_pins(tree),
+        &WireIndex::build(wires, COINCIDENT_TOLERANCE),
+    );
+    graph.name_nets();
+    graph
 }
 
 // ─── The index ────────────────────────────────────────────────────────────────
