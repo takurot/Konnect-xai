@@ -990,4 +990,42 @@ mod tests {
         );
         assert_eq!(std::fs::read(&schematic).unwrap(), before);
     }
+
+    #[tokio::test]
+    async fn apply_template_snaps_and_warns_about_a_placement_off_the_page() {
+        let Some(schematic) =
+            template_fixture("apply_template_snaps_and_warns_about_a_placement_off_the_page")
+        else {
+            return;
+        };
+        let applied = call_registered(
+            tools(),
+            "apply_template",
+            json!({
+                "schematic": schematic.display().to_string(),
+                "template_id": "test_one_resistor",
+                "position_x": 100.33,
+                "position_y": -7.1
+            }),
+            test_ctx(),
+        )
+        .await;
+        assert!(!applied.is_error, "{applied:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &applied.content[0] else {
+            panic!("expected template placement result");
+        };
+        let result: serde_json::Value = serde_json::from_str(text).unwrap();
+        let placed = &result["components_placed"][0];
+        assert_eq!(placed["x"], json!(100.33), "{result}");
+        assert_eq!(placed["y"], json!(-7.62), "{result}");
+        let warnings = result["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "{result}");
+        assert!(
+            warnings[0]
+                .as_str()
+                .unwrap()
+                .contains("outside the 297 x 210 mm page"),
+            "{result}"
+        );
+    }
 }

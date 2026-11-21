@@ -53,6 +53,8 @@ pub mod sch_wiring;
 pub mod schematic_builder;
 #[cfg(test)]
 mod schematic_placement_tests;
+#[cfg(test)]
+mod sch_write_validation_tests;
 pub mod svg_import;
 pub mod templates;
 pub mod verification;
