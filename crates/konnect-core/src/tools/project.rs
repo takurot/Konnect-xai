@@ -125,7 +125,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "label": {
                         "type": "string",
-                        "description": "Optional label to include in the filename"
+                        "description": "Optional bare label to include in the filename"
                     }
                 },
                 "required": ["schematic", "output_dir"]
@@ -211,6 +211,9 @@ async fn handle_create_project(
         Ok(n) => n.to_string(),
         Err(e) => return Ok(e),
     };
+    if let Err(reason) = validate_project_name(&name) {
+        return Ok(invalid_arg("name", reason));
+    }
     if path
         .file_name()
         .and_then(|name| name.to_str())
@@ -425,6 +428,13 @@ async fn handle_get_project_info(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let path = get_path(args, "path")?;
+    if !path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("kicad_pro"))
+    {
+        return Ok(invalid_arg("path", "must name a .kicad_pro file"));
+    }
 
     // Demonstration of the structured-error pattern: returning a FileNotFound
     // kind lets clients branch (e.g. show a file picker) without string-parsing
@@ -494,52 +504,134 @@ async fn handle_snapshot_project(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let schematic = get_path(args, "schematic")?;
-    let output_dir = get_path(args, "output_dir")?;
-    let label = opt_str(args, "label").unwrap_or("snapshot");
-
-    tokio::fs::create_dir_all(&output_dir).await?;
-
-    let ts = std::time::SystemTime::now()
+    let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    snapshot_project_at(args, ctx, timestamp).await
+}
 
-    let stem = schematic
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
+async fn snapshot_project_at(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    ts: u64,
+) -> anyhow::Result<CallToolResult> {
+    let schematic = get_path(args, "schematic")?;
+    let output_dir = get_path(args, "output_dir")?;
+    let label = match args.get("label") {
+        Some(value) => match value.as_str() {
+            Some(label) => label,
+            None => return Ok(invalid_arg("label", "must be a string")),
+        },
+        None => "snapshot",
+    };
+    if let Err(reason) = validate_project_name(label) {
+        return Ok(invalid_arg("label", reason));
+    }
 
-    let pdf_name = format!("{}_{}_{}.pdf", stem, label, ts);
-    let pdf_path = output_dir.join(&pdf_name);
+    tokio::fs::create_dir_all(&output_dir).await?;
+    let resolved_output = output_dir.canonicalize()?;
+    let staging = tempfile::Builder::new()
+        .prefix(".konnect-snapshot-")
+        .tempdir_in(&resolved_output)?;
+    anyhow::ensure!(
+        staging.path().to_str().is_some(),
+        "snapshot staging path cannot be passed to KiCad as UTF-8"
+    );
+    let cli_directory = konnect_sexp::paths::display_path(staging.path());
+    let cli_directory = Path::new(cli_directory.as_ref());
+
+    let stem = schematic.file_stem().unwrap_or_default().to_string_lossy();
+    let id = uuid::Uuid::new_v4().simple();
+    let pdf_name = format!("{stem}_{label}_{ts}_{id}.pdf");
+    let staged_pdf = cli_directory.join(&pdf_name);
+    let pdf_path = resolved_output.join(pdf_name);
 
     crate::tools::cli::export_schematic_pdf(
         &ctx.config.kicad_cli,
         &schematic,
-        &pdf_path,
+        &staged_pdf,
         &crate::tools::cli::SchematicPdfOptions::default(),
     )
     .await?;
+    publish_snapshot_pdf(&staged_pdf, &pdf_path, &resolved_output)?;
 
+    let schematic_result = konnect_sexp::paths::display_path(&pdf_path);
     let mut result = json!({
-        "snapshot": pdf_path.display().to_string(),
+        "snapshot": schematic_result,
         "label": label,
         "timestamp": ts
     });
 
-    // Optionally snapshot PCB too
     if let Some(pcb_str) = opt_str(args, "pcb") {
         let pcb = PathBuf::from(pcb_str);
-        let pcb_pdf_name = format!("{}_pcb_{}_{}.pdf", stem, label, ts);
-        let pcb_pdf_path = output_dir.join(&pcb_pdf_name);
+        let pcb_pdf_name = format!("{stem}_pcb_{label}_{ts}_{id}.pdf");
+        let staged_pcb = cli_directory.join(&pcb_pdf_name);
+        let pcb_pdf_path = resolved_output.join(pcb_pdf_name);
         let layers = &["F.Cu", "B.Cu", "F.Silkscreen", "B.Silkscreen", "Edge.Cuts"];
-        crate::tools::cli::export_pdf(&ctx.config.kicad_cli, &pcb, &pcb_pdf_path, layers, false)
-            .await?;
-        result["pcb_snapshot"] = json!(pcb_pdf_path.display().to_string());
+        let pcb_export =
+            crate::tools::cli::export_pdf(&ctx.config.kicad_cli, &pcb, &staged_pcb, layers, false)
+                .await
+                .and_then(|()| publish_snapshot_pdf(&staged_pcb, &pcb_pdf_path, &resolved_output));
+        if let Err(error) = pcb_export {
+            result["artifacts_written"] = json!([schematic_result]);
+            result["message"] = json!("Schematic snapshot was saved, but the PCB snapshot failed.");
+            result["error"] = match error.downcast_ref::<SexpError>() {
+                Some(SexpError::MutationOutcomeUncertain { path, reason }) => {
+                    json!(ToolErrorKind::MutationOutcomeUncertain {
+                        operation: "snapshot_project".to_string(),
+                        path: konnect_sexp::paths::display_path(path).into_owned(),
+                        reason: reason.clone(),
+                    })
+                }
+                _ => json!(ToolErrorKind::HandlerError {
+                    reason: error.to_string(),
+                }),
+            };
+            let mut partial = CallToolResult::json(&result);
+            partial.is_error = true;
+            return Ok(partial);
+        }
+        result["pcb_snapshot"] = json!(konnect_sexp::paths::display_path(&pcb_pdf_path));
     }
 
     Ok(CallToolResult::json(&result))
+}
+
+/// Publish only a verified direct child of the resolved snapshot directory.
+fn publish_snapshot_pdf(
+    staged: &Path,
+    destination: &Path,
+    output_dir: &Path,
+) -> anyhow::Result<()> {
+    let staged_parent = staged
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok());
+    let destination_parent = destination
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok());
+    anyhow::ensure!(
+        destination_parent.as_deref() == Some(output_dir)
+            && staged_parent.as_deref().and_then(Path::parent) == Some(output_dir),
+        "snapshot paths no longer share the requested output directory"
+    );
+    let expected = std::fs::symlink_metadata(staged)?;
+    anyhow::ensure!(
+        expected.is_file() && expected.len() > 0,
+        "snapshot PDF is not a regular nonempty file"
+    );
+    konnect_sexp::rename_noreplace(staged, destination)?;
+    if std::fs::symlink_metadata(destination)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == expected.len())
+    {
+        Ok(())
+    } else {
+        Err(SexpError::MutationOutcomeUncertain {
+            path: destination.to_path_buf(),
+            reason: "published snapshot did not read back as the staged PDF".to_string(),
+        }
+        .into())
+    }
 }
 
 async fn handle_open_viewer(
@@ -1073,6 +1165,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_project_refuses_invalid_stems_before_directory_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        for (index, name) in ["", ".", "..", "demo.kicad_pro", "control\tname"]
+            .into_iter()
+            .enumerate()
+        {
+            let target = dir.path().join(index.to_string());
+            let result = handle_create_project(&json!({"path": target, "name": name}), &test_ctx())
+                .await
+                .unwrap();
+            assert!(result.is_error, "accepted invalid stem {name:?}");
+            assert_eq!(response_json(&result)["error"]["field"], "name");
+            assert!(
+                !target.exists(),
+                "created {target:?} before refusing the name"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_project_info_refuses_an_existing_schematic_without_parsing_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("voice.kicad_sch");
+        std::fs::write(&schematic, "(kicad_sch)").unwrap();
+        let result = handle_get_project_info(&json!({"path": schematic}), &test_ctx())
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(response_json(&result)["error"]["field"], "path");
+        assert_eq!(std::fs::read_to_string(&schematic).unwrap(), "(kicad_sch)");
+    }
+
+    #[tokio::test]
+    async fn snapshot_refuses_invalid_labels_before_directory_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx();
+        ctx.config.kicad_cli = crate::tools::cli::test_support::schematic_only_cli(dir.path())
+            .display()
+            .to_string();
+        let schematic = dir.path().join("voice.kicad_sch");
+        std::fs::write(&schematic, "(kicad_sch)").unwrap();
+
+        for (index, label) in [
+            json!(""),
+            json!("."),
+            json!(".."),
+            json!("named.kicad_pcb"),
+            json!("bad\nname"),
+            json!(5),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let output_dir = dir.path().join(index.to_string());
+            let result = handle_snapshot_project(
+                &json!({"schematic":schematic, "output_dir":output_dir, "label":label}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "accepted invalid label {label}");
+            assert_eq!(response_json(&result)["error"]["field"], "label");
+            assert!(
+                !output_dir.exists(),
+                "created {output_dir:?} before refusing the label"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn simultaneous_snapshots_at_the_same_timestamp_get_distinct_verified_pdfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx();
+        ctx.config.kicad_cli = crate::tools::cli::test_support::schematic_only_cli(dir.path())
+            .display()
+            .to_string();
+        let schematic = dir.path().join("voice.kicad_sch");
+        std::fs::write(&schematic, "(kicad_sch)").unwrap();
+        let output_dir = dir.path().join("snapshots");
+        #[cfg(unix)]
+        let requested_output = {
+            std::fs::create_dir(&output_dir).unwrap();
+            let alias = dir.path().join("snapshot-output");
+            std::os::unix::fs::symlink(&output_dir, &alias).unwrap();
+            alias
+        };
+        #[cfg(not(unix))]
+        let requested_output = output_dir.clone();
+        let args =
+            json!({"schematic":schematic, "output_dir": requested_output, "label":"checkpoint"});
+        let timestamp = 1_764_000_000;
+        let (a, b) = tokio::join!(
+            snapshot_project_at(&args, &ctx, timestamp),
+            snapshot_project_at(&args, &ctx, timestamp),
+        );
+        let paths = [a, b].map(|result| {
+            let result = result.unwrap();
+            assert!(!result.is_error, "{result:?}");
+            let body = response_json(&result);
+            assert_eq!(body["timestamp"], timestamp);
+            assert_eq!(body["label"], "checkpoint");
+            let path = PathBuf::from(body["snapshot"].as_str().unwrap());
+            assert_eq!(
+                path.parent().unwrap().canonicalize().unwrap(),
+                output_dir.canonicalize().unwrap()
+            );
+            assert!(std::fs::metadata(&path).unwrap().len() > 0);
+            path
+        });
+        assert_ne!(paths[0], paths[1]);
+        assert_eq!(std::fs::read_dir(output_dir).unwrap().count(), 2);
+    }
+
+    #[tokio::test]
     async fn get_project_info_missing_file_returns_file_not_found() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = test_ctx();
@@ -1087,6 +1297,24 @@ mod tests {
             extract_error_kind(&result).as_deref(),
             Some("file_not_found")
         );
+    }
+
+    #[test]
+    fn snapshot_publication_refuses_an_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().canonicalize().unwrap();
+        let staging = tempfile::tempdir_in(&output).unwrap();
+        let source = staging.path().join("staged.pdf");
+        let destination = output.join("snapshot.pdf");
+        std::fs::write(&source, "new PDF").unwrap();
+        std::fs::write(&destination, "original PDF").unwrap();
+
+        assert!(publish_snapshot_pdf(&source, &destination, &output).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "original PDF"
+        );
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "new PDF");
     }
 
     #[tokio::test]
@@ -1124,9 +1352,24 @@ mod tests {
             &ctx,
         )
         .await
-        .expect_err("missing PCB PDF must fail the snapshot call");
-        assert!(error.to_string().contains("did not create"), "{error:#}");
-        assert!(error.to_string().contains("pcb"), "{error:#}");
+        .expect("missing PCB PDF must report the partial snapshot");
+        assert!(error.is_error, "{error:?}");
+        let body = response_json(&error);
+        assert_eq!(body["error"]["kind"], "handler_error");
+        assert!(body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("did not create"));
+        let saved = PathBuf::from(body["snapshot"].as_str().unwrap());
+        assert_eq!(body["artifacts_written"], json!([saved]));
+        assert!(body["pcb_snapshot"].is_null());
+        assert!(std::fs::metadata(saved).unwrap().len() > 0);
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("snapshots"))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

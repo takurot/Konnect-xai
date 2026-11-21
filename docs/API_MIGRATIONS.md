@@ -44,6 +44,18 @@ if you want that process to use them. `KONNECT_BRIDGE_DIR` must also be an
 absolute path when set. Server configuration can disable disk call logging
 with `call_log = false`.
 
+## Unreleased – Project names and PDF snapshots
+
+`create_project` rejects invalid filename stems before creating its directory.
+`get_project_info` accepts paths to `.kicad_pro` files. Pass the project
+settings path when you need metadata for a schematic or PCB.
+
+`snapshot_project` requires a bare label when supplied. Each invocation
+publishes distinct PDFs directly below its resolved output directory. Callers
+should use the returned paths. If the schematic PDF was published and the
+PCB PDF failed, the tool returns an error with the verified schematic path in
+`snapshot` and `artifacts_written`.
+
 ## Unreleased – Numbered schematic component references
 
 Component placement, editing, replacement and template application check
