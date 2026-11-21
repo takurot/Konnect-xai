@@ -3296,6 +3296,18 @@ mod zone_net_format_tests {
         assert!(konnect_sexp::net::collect_net_keys(&tree).contains("GND"));
     }
 
+    /// #128 through the alias: same refusal, same unfilled report.
+    #[tokio::test]
+    async fn the_alias_refuses_an_unknown_net_and_reports_an_unfilled_zone() {
+        let (refused, untouched) = pour(KICAD_10, "TYPO_GDN").await;
+        assert!(refused.is_error, "{}", text_of(&refused));
+        assert_eq!(untouched, KICAD_10);
+
+        let (result, _) = pour(KICAD_10, "GND").await;
+        let body: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(body["filled"], json!(false));
+    }
+
     #[tokio::test]
     async fn a_legacy_zone_keeps_the_declared_id_and_net_name_pair() {
         let (result, after) = pour(LEGACY, "GND").await;
