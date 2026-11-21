@@ -392,7 +392,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "dry_run": { "type": "boolean", "default": false,
                         "description": "Report what would change without writing." },
                     "allow_pin_moves": { "type": "boolean", "default": false,
-                        "description": "Update symbols even when the library moved or removed pins. Wires and labels attached at the old pin positions are NOT moved with them — reconnect them afterwards." }
+                        "description": "Update symbols even when the library moved or removed pins. Wires and labels attached at the old pin positions are NOT moved with them — reconnect them afterwards." },
+                    "include_shared": { "type": "boolean", "default": false,
+                        "description": "A schematic keeps one definition per symbol, shared by every instance of it. With references set, the whole call is refused when an update would also change instances not listed; pass true to update them all. The response lists every changed instance in affected." }
                 },
                 "required": ["schematic"]
             }),
@@ -4299,6 +4301,8 @@ async fn handle_update_symbols_from_library(
     let (mut content, tree) = read_schematic(&sch_path)?;
     let expected = content.clone();
 
+    let include_shared = args["include_shared"].as_bool().unwrap_or(false);
+
     let instances = extract_symbol_instances(&tree);
     if let Some(refs) = &only {
         if let Some(missing) = refs
@@ -4315,12 +4319,12 @@ async fn handle_update_symbols_from_library(
 
     // One definition serves every instance of a lib_id, so refresh each once.
     let mut lib_ids: Vec<String> = Vec::new();
-    for inst in instances {
+    for inst in &instances {
         if only.as_ref().is_some_and(|r| !r.contains(&inst.reference)) {
             continue;
         }
         if !lib_ids.contains(&inst.lib_id) {
-            lib_ids.push(inst.lib_id);
+            lib_ids.push(inst.lib_id.clone());
         }
     }
 
@@ -4352,6 +4356,33 @@ async fn handle_update_symbols_from_library(
         }
     }
 
+    let affected: Vec<serde_json::Value> = updated
+        .iter()
+        .map(|lib_id| json!({ "lib_id": lib_id, "references": drawing_references(&instances, lib_id) }))
+        .collect();
+    if let (Some(named), false) = (&only, include_shared) {
+        let unnamed: Vec<String> = updated
+            .iter()
+            .filter_map(|lib_id| {
+                let others: Vec<String> = drawing_references(&instances, lib_id)
+                    .into_iter()
+                    .filter(|r| !named.contains(r))
+                    .collect();
+                (!others.is_empty())
+                    .then(|| format!("{} (also drawn by {})", lib_id, others.join(", ")))
+            })
+            .collect();
+        if !unnamed.is_empty() {
+            return Ok(CallToolResult::error(format!(
+                "Nothing was written: the schematic keeps one definition per symbol, shared by \
+                 every instance, so updating the requested references would also change \
+                 instances you did not name: {}. Add them to references, or pass \
+                 include_shared: true to update every instance.",
+                unnamed.join("; ")
+            )));
+        }
+    }
+
     if !updated.is_empty() && !dry_run {
         write_schematic_if_unchanged(&sch_path, &expected, &content)?;
     }
@@ -4359,6 +4390,7 @@ async fn handle_update_symbols_from_library(
     let mut body = json!({
         "updated": updated,
         "updated_count": updated.len(),
+        "affected": affected,
         "unchanged": unchanged,
         "pins_moved": pins_moved,
         "errors": errors,
@@ -4372,6 +4404,20 @@ async fn handle_update_symbols_from_library(
         );
     }
     Ok(CallToolResult::json(&body))
+}
+
+/// References of every instance drawn by the embedded definition `lib_id`,
+/// sorted and deduplicated so a multi-unit part is listed once.
+fn drawing_references(
+    instances: &[konnect_sexp::schematic::SymbolInstance],
+    lib_id: &str,
+) -> Vec<String> {
+    let refs: std::collections::BTreeSet<String> = instances
+        .iter()
+        .filter(|inst| inst.lib_symbol_name() == lib_id)
+        .map(|inst| inst.reference.clone())
+        .collect();
+    refs.into_iter().collect()
 }
 
 /// Put every instance field back on its library anchor.
@@ -6374,6 +6420,94 @@ mod tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("(at 0 -5.08 90)"), "{after}");
         assert!(konnect_sexp::parse_sexp(&after).is_ok(), "{after}");
+    }
+
+    /// #129: one embedded definition serves every instance of a lib_id, so
+    /// updating R1 alone would move R2's pins too and drop its wires. The
+    /// narrowed request is refused with R2 named until the caller opts in.
+    #[tokio::test]
+    async fn update_symbols_from_library_refuses_to_change_unnamed_shared_instances() {
+        let (symdir, _env) = stub_symbol_dir();
+        let path = symdir.path().join("shared.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        for (reference, x) in [("R1", 100.0), ("R2", 120.0)] {
+            let placed = handle_add_schematic_component(
+                &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                         "reference": reference, "x": x, "y": 100.0 }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!placed.is_error, "{placed:?}");
+        }
+        // An up-to-date definition changes nothing for R2, so nothing is refused.
+        let in_sync = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "references": ["R1"] }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!in_sync.is_error, "{in_sync:?}");
+
+        let lib = symdir
+            .path()
+            .join("Device.kicad_symdir")
+            .join("R.kicad_sym");
+        let edited = std::fs::read_to_string(&lib)
+            .unwrap()
+            .replace("(at 0 -3.81 90)", "(at 0 -5.08 90)");
+        std::fs::write(&lib, edited).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let refused = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "references": ["R1"],
+                     "allow_pin_moves": true }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(refused.is_error, "{refused:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &refused.content[0] else {
+            panic!("expected text")
+        };
+        assert!(
+            text.contains("R2") && text.contains("include_shared"),
+            "{text}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let named_both = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "references": ["R1", "R2"],
+                     "allow_pin_moves": true, "dry_run": true }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!named_both.is_error, "{named_both:?}");
+
+        let forced = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "references": ["R1"],
+                     "allow_pin_moves": true, "include_shared": true }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &forced.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["updated"], json!(["Device:R"]), "{body}");
+        assert_eq!(
+            body["affected"],
+            json!([{ "lib_id": "Device:R", "references": ["R1", "R2"] }]),
+            "{body}"
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("(at 0 -5.08 90)"));
     }
 
     /// #203: annotating the same key twice must update the one property in
