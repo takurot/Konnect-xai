@@ -15,6 +15,8 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use super::cli;
+
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
@@ -35,6 +37,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "refill_zones": { "type": "boolean", "default": false, "description": "Refill before checking: persisted IPC fill with sync_live_board, analysis-only CLI fill otherwise." },
                     "severity": {
                         "type": "string",
+                        "enum": cli::ReportSeverity::OPTIONS,
                         "description": "Minimum violation severity to include: 'error', 'warning' (default), 'info'",
                         "default": "warning"
                     },
@@ -240,7 +243,10 @@ async fn handle_run_drc(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let severity_filter = args["severity"].as_str().unwrap_or("warning");
+    let severity_filter = match cli::ReportSeverity::from_args(args) {
+        Ok(severity) => severity.as_str(),
+        Err(error) => return Ok(error),
+    };
     let min_rank = severity_rank(severity_filter);
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
@@ -1407,6 +1413,58 @@ async fn handle_set_layer_constraints(
                     || character == '_'),
         "Layer name contains unsupported characters"
     );
+    let clearance = args["min_clearance"].as_f64();
+    let trace_width = args["min_trace_width"].as_f64();
+    let expected_board = if clearance.is_some() || trace_width.is_some() {
+        let source = match tokio::fs::read_to_string(&board).await {
+            Ok(source) => source,
+            Err(error) => {
+                return Ok(invalid_arg(
+                    "board",
+                    &format!("cannot read its saved layer table: {error}"),
+                ));
+            }
+        };
+        let parsed = match konnect_sexp::parse_sexp(&source) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return Ok(invalid_arg(
+                    "board",
+                    &format!("cannot parse its saved layer table: {error}"),
+                ));
+            }
+        };
+        if !matches!(
+            parsed.children().and_then(|nodes| nodes.first()),
+            Some(konnect_sexp::SexpNode::Atom(root)) if root == "kicad_pcb"
+        ) {
+            return Ok(invalid_arg("board", "expected a KiCad PCB document"));
+        }
+        let board_layers = konnect_sexp::layers::layers(&parsed);
+        let enabled: Vec<&str> = board_layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .filter(|name| konnect_sexp::layers::is_canonical_name(name))
+            .collect();
+        if enabled.is_empty() {
+            return Ok(invalid_arg(
+                "board",
+                "its saved layer table has no enabled layers",
+            ));
+        }
+        if !enabled.contains(&layer.as_str()) {
+            return Ok(invalid_arg(
+                "layer",
+                &format!(
+                    "'{layer}' is not enabled on the board; choose one of {}",
+                    enabled.join(", ")
+                ),
+            ));
+        }
+        Some(source)
+    } else {
+        None
+    };
     let rules_path = sibling_custom_rules_path(&board);
     let source = match tokio::fs::read_to_string(&rules_path).await {
         Ok(content) => Some(content),
@@ -1418,7 +1476,7 @@ async fn handle_set_layer_constraints(
         .unwrap_or_else(|| "(version 1)\n".to_string());
     let mut changed = Vec::new();
 
-    if let Some(clearance) = args["min_clearance"].as_f64() {
+    if let Some(clearance) = clearance {
         let rule_name = format!("konnect:{layer}:clearance");
         content = upsert_named_rule(
             &content,
@@ -1428,7 +1486,7 @@ async fn handle_set_layer_constraints(
         changed.push(format!("clearance = {} on {}", clearance, layer));
     }
 
-    if let Some(trace_width) = args["min_trace_width"].as_f64() {
+    if let Some(trace_width) = trace_width {
         let rule_name = format!("konnect:{layer}:track_width");
         content = upsert_named_rule(
             &content,
@@ -1438,7 +1496,20 @@ async fn handle_set_layer_constraints(
         changed.push(format!("min_trace_width = {} on {}", trace_width, layer));
     }
 
-    if !changed.is_empty() {
+    if let Some(expected_board) = expected_board {
+        let unchanged = match tokio::fs::read(&board).await {
+            Ok(current) => current == expected_board.as_bytes(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if !unchanged {
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::Conflict {
+                    paths: vec![board.display().to_string()],
+                },
+                "The saved PCB changed during layer validation; retry against the current board",
+            ));
+        }
         if let Some(source) = &source {
             write_atomic_if_unchanged(&rules_path, source, &content)?;
         } else {
@@ -2264,6 +2335,63 @@ mod tests {
         assert!(rules.contains("(constraint clearance (min 0.25mm))"));
         assert!(rules.contains("(constraint track_width (min 0.25mm))"));
         assert!(rules.contains("(layer \"F.Cu\")"));
+    }
+
+    #[tokio::test]
+    async fn set_layer_constraints_rejects_non_enabled_layers_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let rules = board.with_extension("kicad_dru");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+        let existing =
+            b"(version 1)\n(rule \"width\" (layer \"F.Cu\") (constraint track_width (min 1mm)))\n";
+        tokio::fs::write(&rules, existing).await.unwrap();
+        let ctx = test_ctx();
+
+        for layer in ["f.cu", "Bogus.Cu", "In7.Cu"] {
+            let result = handle_set_layer_constraints(
+                &json!({"board": board, "layer": layer, "min_clearance": 0.2}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{layer} was accepted");
+            let body = match &result.content[0] {
+                crate::mcp::protocol::ToolContent::Text { text } => {
+                    serde_json::from_str::<Value>(text).unwrap()
+                }
+                _ => panic!("expected textual tool error"),
+            };
+            assert_eq!(body["error"]["kind"], "invalid_argument");
+            assert_eq!(body["error"]["field"], "layer");
+            assert!(body["error"]["reason"].as_str().unwrap().contains("F.Cu"));
+            assert_eq!(tokio::fs::read(&rules).await.unwrap(), existing);
+        }
+
+        tokio::fs::remove_file(&rules).await.unwrap();
+        let result = handle_set_layer_constraints(
+            &json!({"board": board, "layer": "In7.Cu", "min_clearance": 0.2}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(!rules.exists());
+
+        let with_inner = blank_board().replace(
+            "(31 \"B.Cu\" signal)",
+            "(4 \"In1.Cu\" power) (6 \"In2.Cu\" signal) (31 \"B.Cu\" signal)",
+        );
+        tokio::fs::write(&board, with_inner).await.unwrap();
+        let result = handle_set_layer_constraints(
+            &json!({"board": board, "layer": "In1.Cu", "min_clearance": 0.2}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        let text = tokio::fs::read_to_string(&rules).await.unwrap();
+        assert!(text.contains("(layer \"In1.Cu\")"));
     }
 
     /// #410 stage 1: the number is the distance between two placement

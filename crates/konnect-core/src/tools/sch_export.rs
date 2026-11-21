@@ -10,12 +10,13 @@ use crate::tools::{
     analysis_placed_pins_by_reference, get_path, placed_pins, ToolContext, ToolDef,
 };
 use konnect_sexp::{
-    geometry::{point_on_segment, points_coincident, round6},
+    geometry::{fmt_mm, point_on_segment, points_coincident, round6},
     parser::{parse_sexp, SexpNode},
+    schematic::write_schematic_if_unchanged,
     schematic::{
         extract_labels, extract_symbol_instances, extract_wires, pin_endpoint, read_schematic,
     },
-    writer::{apply_edits, find_direct_child_blocks, write_atomic_if_unchanged, SexpEdit},
+    writer::{apply_edits, find_direct_child_blocks, SexpEdit},
     SexpError,
 };
 use serde_json::json;
@@ -160,6 +161,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output":    { "type": "string", "description": "Optional path to write this tool's response as JSON, violations and coordinate provenance together (not KiCad's own ERC report)" },
                     "severity":  {
                         "type": "string",
+                        "enum": cli::ReportSeverity::OPTIONS,
                         "description": "Minimum severity to report: 'error', 'warning', 'info'",
                         "default": "warning"
                     }
@@ -267,6 +269,7 @@ async fn handle_render_png(
         Some(p) => std::path::PathBuf::from(p),
         None => sch_path.with_extension("png"),
     };
+    cli::ensure_export_destination_is_not_design_file(&output_path)?;
 
     // Render the SVG into a temp dir so the intermediate never collides with
     // caller files, then rasterize in-process.
@@ -289,10 +292,7 @@ async fn handle_render_png(
         }
     };
 
-    if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&output_path, &rendered.png)?;
+    cli::publish_verified_bytes(&output_path, &rendered.png, "schematic PNG").await?;
 
     // Dimensions come from the produced image, never echoed from the request.
     let mut response = json!({
@@ -710,7 +710,14 @@ async fn handle_run_erc(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let min_severity = args["severity"].as_str().unwrap_or("warning");
+    let min_severity = match cli::ReportSeverity::from_args(args) {
+        Ok(severity) => severity.as_str(),
+        Err(error) => return Ok(error),
+    };
+    let output = args["output"].as_str().map(Path::new);
+    if let Some(path) = output {
+        cli::ensure_export_destination_is_not_design_file(path)?;
+    }
 
     let owning_root = match owning_project_root(&sch_path) {
         Ok(root) => root,
@@ -747,8 +754,19 @@ async fn handle_run_erc(
     // the violation array alone: the file is the copy that gets handed to
     // another tool or another person, and a coordinate must not travel
     // without the `coordinates` block saying what it is worth.
-    if let Some(out_path) = args["output"].as_str() {
-        std::fs::write(out_path, serde_json::to_string_pretty(&response)?)?;
+    if let Some(path) = output {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            anyhow::ensure!(
+                parent.is_dir(),
+                "ERC report directory {} does not exist",
+                parent.display()
+            );
+        }
+        let contents = serde_json::to_vec_pretty(&response)?;
+        cli::publish_verified_bytes(path, &contents, "ERC report").await?;
     }
 
     Ok(CallToolResult::json(&response))
@@ -762,6 +780,7 @@ async fn handle_fix_connectivity(
     let snap_tol = args["snap_tolerance"].as_f64().unwrap_or(0.05);
     let dry_run = args["dry_run"].as_bool().unwrap_or(false);
     let exact_tol = 0.01_f64;
+    let format_point = |(x, y)| format!("({}, {})", fmt_mm(x), fmt_mm(y));
 
     let (content, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
@@ -833,13 +852,15 @@ async fn handle_fix_connectivity(
             let near = distinct_geometric_destinations(&raw_near, exact_tol);
             if near.len() > 1 {
                 let target = format!(
-                    "wire {} {} endpoint at ({px}, {py})",
+                    "wire {} {} endpoint at {}",
                     w.uuid.as_deref().unwrap_or("without UUID"),
-                    if *is_start { "start" } else { "end" }
+                    if *is_start { "start" } else { "end" },
+                    format_point((px, py))
                 );
                 let candidates = near
                     .iter()
-                    .map(|(x, y)| format!("({x}, {y})"))
+                    .copied()
+                    .map(format_point)
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Ok(stale_connectivity_target(
@@ -850,7 +871,7 @@ async fn handle_fix_connectivity(
 
             if let Some(&(tx, ty)) = near.first() {
                 let Some(uuid) = &w.uuid else {
-                    let target = format!("wire endpoint at ({px}, {py})");
+                    let target = format!("wire endpoint at {}", format_point((px, py)));
                     return Ok(stale_connectivity_target(
                         target,
                         "the wire has no UUID and cannot be identified after a concurrent edit",
@@ -938,7 +959,7 @@ async fn handle_fix_connectivity(
     }
 
     let new_content = apply_edits(content.clone(), file_edits);
-    if let Err(error) = write_atomic_if_unchanged(&sch_path, &content, &new_content) {
+    if let Err(error) = write_schematic_if_unchanged(&sch_path, &content, &new_content) {
         if let Some(refusal) = connectivity_write_refusal(&sch_path, &error) {
             return Ok(refusal);
         }
@@ -958,8 +979,9 @@ async fn handle_fix_connectivity(
             return Ok(stale_connectivity_target(
                 format!("wire {} {} endpoint", fix.uuid, fix.endpoint.name()),
                 format!(
-                    "committed readback was ({}, {}) instead of ({}, {})",
-                    actual.0, actual.1, fix.to.0, fix.to.1
+                    "committed readback differs from the planned endpoint (observed {}, planned {}, displayed at nanometre precision)",
+                    format_point(actual),
+                    format_point(fix.to)
                 ),
             ));
         }

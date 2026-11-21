@@ -4,10 +4,12 @@
 //! shipped as embedded defaults. Claude retrieves a template and adapts it to the
 //! user's project — this prevents hallucinating component values.
 
+use super::sch_annotate::format_designator;
+use super::sch_references::ReferenceInventory;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, require_str, ToolContext, ToolDef};
-use konnect_sexp::geometry::round6;
+use crate::tools::{get_path, invalid_arg, opt_u32, require_str, ToolContext, ToolDef};
+use konnect_sexp::{geometry::round6, read_consistent};
 use serde_json::json;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
@@ -354,7 +356,8 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "ref_start": {
                         "type": "integer",
-                        "description": "Starting reference number (e.g. 10 → R10, C10, U10). Auto-detected if omitted."
+                        "minimum": 1,
+                        "description": "First reference number to consider. Occupied numbers are skipped. Auto-detected if omitted."
                     }
                 },
                 "required": ["schematic", "template_id"]
@@ -520,7 +523,12 @@ async fn handle_apply_template(
     // instance context used by the single and batch placement tools rather
     // than hand-writing a second, incomplete interpretation of KiCad's
     // instance metadata (#609).
-    let mut sch = match konnect_schematic_editor::Schematic::load(&sch_path) {
+    let before = match read_consistent(&sch_path) {
+        Ok(source) => source,
+        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    };
+    let mut sch = match konnect_schematic_editor::Schematic::from_source(&sch_path, before.as_str())
+    {
         Ok(schematic) => schematic,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
@@ -536,18 +544,23 @@ async fn handle_apply_template(
         Err(error) => return Ok(error.into_tool_result()),
     };
 
-    // Determine starting reference numbers by scanning existing components
-    let ref_start = args["ref_start"]
-        .as_u64()
-        .map(|n| n as usize)
-        .unwrap_or_else(|| find_next_ref_number(&sch.to_source()));
+    let references =
+        match ReferenceInventory::load(&sch_path, &before, &sch.to_source(), Some(&context)) {
+            Ok(inventory) => inventory,
+            Err(error) => return Ok(error),
+        };
+    let ref_start = match opt_u32(args, "ref_start") {
+        Ok(Some(0)) => return Ok(invalid_arg("ref_start", "expected a positive integer")),
+        Ok(start) => start.unwrap_or_else(|| references.template_start()),
+        Err(error) => return Ok(error),
+    };
 
     let components = tmpl["components"].as_array().cloned().unwrap_or_default();
     let mut placed = Vec::new();
     let mut placed_targets = Vec::new();
     let mut placed_by_template_ref = std::collections::HashMap::new();
-    let mut ref_counters: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let mut ref_counters = std::collections::HashMap::<String, Option<u32>>::new();
+    let mut template_counters = std::collections::HashMap::<String, usize>::new();
 
     // Place components in a column layout
     let spacing_y = 15.0; // mm between components
@@ -561,13 +574,21 @@ async fn handle_apply_template(
         for _q in 0..quantity {
             let counter = ref_counters
                 .entry(ref_prefix.to_string())
-                .or_insert(ref_start);
-            let reference = format!("{}{}", ref_prefix, counter);
+                .or_insert(Some(ref_start));
+            let Some(number) = counter.and_then(|first| references.next_unused(ref_prefix, first))
+            else {
+                return Ok(CallToolResult::error(format!(
+                    "No free '{ref_prefix}' reference number"
+                )));
+            };
+            *counter = number.checked_add(1);
+            let reference = format_designator(ref_prefix, number);
             if is_builtin {
-                let template_ref = format!("{}{}", ref_prefix, *counter - ref_start + 1);
+                let template_number = template_counters.entry(ref_prefix.to_string()).or_default();
+                *template_number += 1;
+                let template_ref = format!("{}{}", ref_prefix, template_number);
                 placed_by_template_ref.insert(template_ref, reference.clone());
             }
-            *counter += 1;
 
             let x = base_x;
             let y = base_y + (placed.len() as f64) * spacing_y;
@@ -603,10 +624,11 @@ async fn handle_apply_template(
         }
     }
 
-    // The editor's overwrite is an atomic compare-and-swap against the exact
-    // revision loaded above. All placements are prepared in memory, so a
-    // preflight or library failure leaves the schematic byte-for-byte intact.
-    if let Err(error) = sch.overwrite() {
+    let candidate = sch.to_source();
+    if let Err(error) = references.validate(&candidate) {
+        return Ok(error);
+    }
+    if let Err(error) = references.commit(&before, &candidate) {
         return Ok(crate::tools::mutation_outcome_uncertain(
             &sch_path,
             "apply_template",
@@ -720,36 +742,6 @@ async fn handle_list_categories(
         }))
         .unwrap(),
     ))
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/// Find the next available reference number by scanning existing references in the schematic.
-fn find_next_ref_number(content: &str) -> usize {
-    let mut max_ref = 0usize;
-    let mut pos = 0;
-    while let Some(ref_pos) = content[pos..].find("(reference \"") {
-        let abs = pos + ref_pos + 12;
-        if let Some(end) = content[abs..].find('"') {
-            let reference = &content[abs..abs + end];
-            // Extract the numeric suffix
-            let num_str: String = reference
-                .chars()
-                .rev()
-                .take_while(|c| c.is_ascii_digit())
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-            if let Ok(num) = num_str.parse::<usize>() {
-                if num > max_ref {
-                    max_ref = num;
-                }
-            }
-        }
-        pos = abs + 1;
-    }
-    max_ref + 1
 }
 
 #[cfg(test)]
@@ -917,6 +909,48 @@ mod tests {
             .symbols
             .by_reference("R99")
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn repeated_template_skips_occupied_numbers_and_preserves_guide_ids() {
+        let Some(schematic) =
+            template_fixture("repeated_template_skips_occupied_numbers_and_preserves_guide_ids")
+        else {
+            return;
+        };
+        let ctx = test_ctx();
+        let arguments = json!({
+            "schematic": schematic,
+            "template_id": "test_one_resistor",
+            "ref_start": 1,
+            "position_x": 180.0,
+            "position_y": 100.0
+        });
+        for expected in ["R3", "R4"] {
+            let result =
+                call_registered(tools(), "apply_template", arguments.clone(), ctx.clone()).await;
+            assert!(!result.is_error, "{result:?}");
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected template placement result");
+            };
+            let response: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(response["connections_to_wire"][0]["from"], "R1.1");
+            let saved = konnect_schematic_editor::Schematic::load(&schematic).unwrap();
+            assert_eq!(
+                saved
+                    .symbols
+                    .iter()
+                    .filter(|symbol| symbol.reference() == Some(expected))
+                    .count(),
+                1
+            );
+        }
+        let before = std::fs::read(&schematic).unwrap();
+        let mut invalid = arguments;
+        invalid["ref_start"] = json!(-1);
+        let refused = call_registered(tools(), "apply_template", invalid, ctx).await;
+        assert!(refused.is_error, "{refused:?}");
+        assert_eq!(std::fs::read(&schematic).unwrap(), before);
     }
 
     #[tokio::test]

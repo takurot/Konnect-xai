@@ -33,6 +33,15 @@
 use super::protocol::{CallToolResult, ToolContent};
 use serde::Serialize;
 
+/// One physical and logical placement claiming a numbered schematic reference.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReferencePlacement {
+    pub(crate) schematic: String,
+    pub(crate) instance_path: String,
+    pub(crate) uuid: String,
+    pub(crate) unit: u32,
+}
+
 /// Structured error for tool call failures.
 ///
 /// Serializes with `kind` as a stable discriminant — the single field a client
@@ -49,6 +58,8 @@ pub enum ToolErrorKind {
     InvalidArgument { field: String, reason: String },
     /// A referenced file or discovery directory doesn't exist or can't be read.
     FileNotFound { path: String },
+    /// No project, user, or bundled table is available for this catalogue.
+    LibraryTableUnavailable { table: String },
     /// No item on the queried schematic sheet names the requested net.
     NotFound {
         net: String,
@@ -66,6 +77,12 @@ pub enum ToolErrorKind {
     AmbiguousReference {
         reference: String,
         uuids: Vec<String>,
+    },
+    /// One numbered reference would name incompatible component placements.
+    ReferenceConflict {
+        reference: String,
+        placements: Vec<ReferencePlacement>,
+        suggested_reference: Option<String>,
     },
     AmbiguousTarget {
         target: String,
@@ -170,10 +187,12 @@ impl ToolErrorKind {
             Self::UnknownTool { .. } => "unknown_tool",
             Self::InvalidArgument { .. } => "invalid_argument",
             Self::FileNotFound { .. } => "file_not_found",
+            Self::LibraryTableUnavailable { .. } => "library_table_unavailable",
             Self::NotFound { .. } => "not_found",
             Self::Conflict { .. } => "conflict",
             Self::WouldJoinNets { .. } => "would_join_nets",
             Self::AmbiguousReference { .. } => "ambiguous_reference",
+            Self::ReferenceConflict { .. } => "reference_conflict",
             Self::AmbiguousTarget { .. } => "ambiguous_target",
             Self::WrongDocument { .. } => "wrong_document",
             Self::WrongProject { .. } => "wrong_project",
@@ -378,6 +397,9 @@ mod tests {
                 reason: "r".into(),
             },
             ToolErrorKind::AmbiguousOpenBoard { path: "p".into() },
+            ToolErrorKind::LibraryTableUnavailable {
+                table: "sym-lib-table".into(),
+            },
             ToolErrorKind::HandlerError { reason: "r".into() },
         ];
         for kind in kinds {

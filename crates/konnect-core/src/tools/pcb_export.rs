@@ -17,6 +17,44 @@ use super::cli;
 
 // ─── Severity filter helpers ──────────────────────────────────────────────────
 
+#[derive(Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum FabricationUnits {
+    Mm,
+    In,
+}
+
+impl FabricationUnits {
+    const OPTIONS: [Self; 2] = [Self::Mm, Self::In];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mm => "mm",
+            Self::In => "in",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum OdbCompression {
+    Zip,
+    None,
+    Tgz,
+}
+
+impl OdbCompression {
+    const OPTIONS: [Self; 3] = [Self::Zip, Self::None, Self::Tgz];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Zip => "zip",
+            Self::None => "none",
+            Self::Tgz => "tgz",
+        }
+    }
+}
+
 fn severity_rank(s: &str) -> u8 {
     match s {
         "error" => 2,
@@ -425,7 +463,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "output": { "type": "string", "description": "Output file path (.xml)" },
-                    "units": { "type": "string", "description": "Output units: 'mm' (default) or 'in'", "default": "mm" },
+                    "units": { "type": "string", "enum": FabricationUnits::OPTIONS, "description": "Output units: 'mm' (default) or 'in'", "default": "mm" },
                     "compress": { "type": "boolean", "description": "Compress the output into a zip archive", "default": false }
                 },
                 "required": ["board", "output"]
@@ -441,8 +479,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "output": { "type": "string", "description": "Output file path" },
-                    "units": { "type": "string", "description": "Output units: 'mm' (default) or 'in'", "default": "mm" },
-                    "compression": { "type": "string", "description": "Compression mode: 'zip' (default), 'none', or 'tgz'", "default": "zip" }
+                    "units": { "type": "string", "enum": FabricationUnits::OPTIONS, "description": "Output units: 'mm' (default) or 'in'", "default": "mm" },
+                    "compression": { "type": "string", "enum": OdbCompression::OPTIONS, "description": "Compression mode: 'zip' (default), 'none', or 'tgz'", "default": "zip" }
                 },
                 "required": ["board", "output"]
             }),
@@ -476,6 +514,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "refill_zones": { "type": "boolean", "default": false, "description": "Refill before checking: persisted IPC fill with sync_live_board, analysis-only CLI fill otherwise." },
                     "severity": {
                         "type": "string",
+                        "enum": cli::ReportSeverity::OPTIONS,
                         "description": "Minimum severity to include: 'error', 'warning' (default), 'info'",
                         "default": "warning"
                     }
@@ -496,6 +535,7 @@ async fn handle_export_gerber(
     let board = get_path(args, "board")?;
     let output_dir = get_path(args, "output_dir")?;
     let drill = args["drill_file"].as_bool().unwrap_or(true);
+    cli::ensure_export_destination_is_not_design_file(&output_dir)?;
 
     let requested_layers = match optional_string_array(args, "layers") {
         Ok(layers) => layers,
@@ -806,6 +846,15 @@ async fn handle_export_specctra_dsn(
         .unwrap_or_else(|| default_specctra_manifest_path(&output_path));
     let native_bridge_mode = resolve_native_bridge_mode(args);
 
+    for (field, destination) in [
+        ("output", &output_path),
+        ("manifest_output_path", &manifest_output_path),
+    ] {
+        if let Err(error) = cli::ensure_export_destination_is_not_design_file(destination) {
+            return Ok(invalid_export_argument(field, error.to_string()));
+        }
+    }
+
     if !extension_is(&board_path, "kicad_pcb") {
         return Ok(invalid_export_argument(
             "board",
@@ -1055,6 +1104,7 @@ async fn handle_export_dxf(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let output_dir = get_path(args, "output_dir")?;
+    cli::ensure_export_destination_is_not_design_file(&output_dir)?;
     // Required here, unlike `export_pdf`/`export_svg` where it is genuinely
     // optional. An omitted `layers` became an empty vec, and `cli.rs` only
     // passes `--layers` when the list is non-empty — so the flag vanished from
@@ -1118,7 +1168,15 @@ async fn handle_export_ipc2581(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
-    let units = args["units"].as_str().unwrap_or("mm");
+    let units = match super::optional_enum(
+        args,
+        "units",
+        &FabricationUnits::OPTIONS,
+        FabricationUnits::Mm,
+    ) {
+        Ok(units) => units.as_str(),
+        Err(error) => return Ok(error),
+    };
     let compress = args["compress"].as_bool().unwrap_or(false);
 
     let cli = &ctx.config.kicad_cli;
@@ -1141,8 +1199,24 @@ async fn handle_export_odb(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let output = get_path(args, "output")?;
-    let units = args["units"].as_str().unwrap_or("mm");
-    let compression = args["compression"].as_str().unwrap_or("zip");
+    let units = match super::optional_enum(
+        args,
+        "units",
+        &FabricationUnits::OPTIONS,
+        FabricationUnits::Mm,
+    ) {
+        Ok(units) => units.as_str(),
+        Err(error) => return Ok(error),
+    };
+    let compression = match super::optional_enum(
+        args,
+        "compression",
+        &OdbCompression::OPTIONS,
+        OdbCompression::Zip,
+    ) {
+        Ok(compression) => compression.as_str(),
+        Err(error) => return Ok(error),
+    };
 
     let cli = &ctx.config.kicad_cli;
     cli::export_odb(cli, &board, &output, units, compression).await?;
@@ -1183,7 +1257,10 @@ async fn handle_get_drc_violations(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let severity_filter = args["severity"].as_str().unwrap_or("warning");
+    let severity_filter = match cli::ReportSeverity::from_args(args) {
+        Ok(severity) => severity.as_str(),
+        Err(error) => return Ok(error),
+    };
     let min_rank = severity_rank(severity_filter);
 
     let (report, provenance) = match super::drc::run(ctx, &board, args).await? {
@@ -1265,6 +1342,130 @@ mod new_export_format_tests {
             },
             Arc::new(ToolRouter::new()),
         )
+    }
+
+    #[tokio::test]
+    async fn registered_export_and_rule_options_refuse_values_outside_their_enum() {
+        use crate::mcp::handler::McpHandler;
+        use crate::router::registry::tools_for;
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("source.kicad_pcb");
+        let schematic = dir.path().join("source.kicad_sch");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        std::fs::write(&schematic, crate::tools::blank_schematic_template()).unwrap();
+        let output = dir.path().join("output");
+        let fake_cli = cli::test_support::write_script(
+            dir.path(),
+            "unexpected-cli",
+            "#!/bin/sh\nprintf started > \"$0.started\"\nexit 3\n",
+            "@echo off\r\necho started>\"%~f0.started\"\r\nexit /b 3\r\n",
+        );
+        let marker = PathBuf::from(format!("{}.started", fake_cli.display()));
+        let mut config = test_ctx().config;
+        config.kicad_cli = fake_cli.display().to_string();
+        config.eager_toolsets = true;
+        let handler = McpHandler::new(config.clone()).await.unwrap();
+        let direct_ctx = Arc::new(ToolContext::new(config, Arc::new(ToolRouter::new())));
+
+        let units = &["mm", "in"][..];
+        let severity = &["error", "warning", "info"][..];
+        for (toolset, name, field, choices, default, unknown) in [
+            (
+                "pcb_export",
+                "export_ipc2581",
+                "units",
+                units,
+                "mm",
+                "furlong",
+            ),
+            ("pcb_export", "export_odb", "units", units, "mm", "furlong"),
+            (
+                "pcb_export",
+                "export_odb",
+                "compression",
+                &["zip", "none", "tgz"],
+                "zip",
+                "rar",
+            ),
+            (
+                "pcb_export",
+                "get_drc_violations",
+                "severity",
+                severity,
+                "warning",
+                "bogus",
+            ),
+            (
+                "verification",
+                "run_drc",
+                "severity",
+                severity,
+                "warning",
+                "bogus",
+            ),
+            (
+                "sch_export",
+                "run_erc",
+                "severity",
+                severity,
+                "warning",
+                "bogus",
+            ),
+        ] {
+            let tool = tools_for(toolset)
+                .unwrap()
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .unwrap();
+            let option = &tool.input_schema["properties"][field];
+            assert_eq!(option["enum"], json!(choices), "{name}.{field}");
+            assert_eq!(option["default"], default, "{name}.{field}");
+            let mut args = if toolset == "sch_export" {
+                json!({"schematic": schematic, "output": output})
+            } else {
+                json!({"board": board, "output": output})
+            };
+            assert!(
+                tool.input_validator.is_valid(&args),
+                "{name}.{field} default"
+            );
+            for choice in choices {
+                args[field] = json!(choice);
+                assert!(
+                    tool.input_validator.is_valid(&args),
+                    "{name}.{field} {choice}"
+                );
+            }
+            for bad in [json!(unknown), json!(null), json!(7)] {
+                args[field] = bad;
+                let direct = (tool.handler)(&args, direct_ctx.clone()).await.unwrap();
+                let served = handler
+                    .handle_message(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": name, "arguments": args},
+                    }))
+                    .await
+                    .unwrap()
+                    .result
+                    .unwrap();
+                for result in [serde_json::to_value(direct).unwrap(), served] {
+                    assert_eq!(result["isError"], true, "{name}.{field}: {result}");
+                    let details: serde_json::Value =
+                        serde_json::from_str(result["content"][0]["text"].as_str().unwrap())
+                            .unwrap();
+                    assert_eq!(
+                        details["error"]["kind"], "invalid_argument",
+                        "{name}: {details}"
+                    );
+                    assert_eq!(details["error"]["field"], field, "{name}: {details}");
+                }
+                assert!(!marker.exists(), "{name} attempted to invoke KiCad");
+                assert!(!output.exists(), "{name} published an artifact");
+            }
+        }
     }
 
     #[test]
@@ -1698,6 +1899,105 @@ mod export_boundary_contract_tests {
     fn response_body(result: &CallToolResult) -> serde_json::Value {
         let wire = serde_json::to_value(result).unwrap();
         serde_json::from_str(wire["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn registered_export_paths_refuse_design_files_before_work() {
+        use crate::mcp::handler::McpHandler;
+        use crate::router::registry::tools_for;
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("source.kicad_pcb");
+        let schematic = dir.path().join("source.kicad_sch");
+        std::fs::write(
+            &board,
+            r#"(kicad_pcb (layers (0 "F.Cu" signal) (44 "Edge.Cuts" user)))"#,
+        )
+        .unwrap();
+        std::fs::write(&schematic, crate::tools::blank_schematic_template()).unwrap();
+        let protected = dir.path().join("designs");
+        std::fs::create_dir(&protected).unwrap();
+        let cli = cli::test_support::write_script(
+            dir.path(),
+            "unexpected-cli",
+            "#!/bin/sh\nprintf started > \"$0.started\"\nexit 3\n",
+            "@echo off\r\necho started>\"%~f0.started\"\r\nexit /b 3\r\n",
+        );
+        let marker = PathBuf::from(format!("{}.started", cli.display()));
+        let mut config = context().config;
+        config.kicad_cli = cli.display().to_string();
+        config.eager_toolsets = true;
+        let handler = McpHandler::new(config).await.unwrap();
+
+        let mut failures = Vec::new();
+        let mut checked = 0;
+        for toolset in ["pcb_export", "sch_export", "verification", "manufacturing"] {
+            for tool in tools_for(toolset).unwrap() {
+                let properties = &tool.input_schema["properties"];
+                for field in ["output", "output_dir", "manifest_output_path"] {
+                    if properties.get(field).is_none() {
+                        continue;
+                    }
+                    checked += 1;
+                    for name in [
+                        "board.kicad_pcb",
+                        "sheet.kicad_sch",
+                        "project.kicad_pro",
+                        "library.KICAD_SYM",
+                        "footprint.kicad_mod",
+                        "part.pretty",
+                        "sym-lib-table",
+                    ] {
+                        let path = protected.join(name);
+                        std::fs::write(&path, b"original design bytes").unwrap();
+                        let mut arguments = json!({});
+                        if properties.get("board").is_some() {
+                            arguments["board"] = json!(board);
+                        }
+                        if properties.get("schematic").is_some() {
+                            arguments["schematic"] = json!(schematic);
+                        }
+                        if tool.name == "export_dxf" {
+                            arguments["layers"] = json!(["Edge.Cuts"]);
+                        }
+                        if tool.name == "export_manufacturing_package" {
+                            arguments["include_assembly"] = json!(false);
+                        }
+                        if tool.name == "export_specctra_dsn" {
+                            arguments["output"] = json!(dir.path().join("new.dsn"));
+                        }
+                        arguments[field] = json!(path);
+                        let response = handler
+                            .handle_message(json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "tools/call",
+                                "params": { "name": tool.name, "arguments": arguments }
+                            }))
+                            .await
+                            .unwrap()
+                            .result
+                            .expect("tool returns a JSON-RPC result");
+                        let text = response["content"][0]["text"].as_str().unwrap();
+                        if response["isError"] != true
+                            || !text.contains("reserved for a KiCad design or library")
+                        {
+                            failures.push(format!("{} {field} {name}: {text}", tool.name));
+                        }
+                        if marker.exists() {
+                            failures.push(format!("{} {field} {name}: CLI started", tool.name));
+                            std::fs::remove_file(&marker).unwrap();
+                        }
+                        assert_eq!(std::fs::read(&path).unwrap(), b"original design bytes");
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 21,
+            "export catalogue only covered {checked} paths"
+        );
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[tokio::test]
