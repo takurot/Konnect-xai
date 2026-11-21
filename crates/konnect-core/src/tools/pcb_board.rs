@@ -1192,8 +1192,8 @@ pub fn tools() -> Vec<ToolDef> {
             "Add a new inner copper or technical layer to the board layer stack, numbered with \
              KiCad's ordinal for that name. Inner copper is added as the next pair in front of \
              B.Cu so the copper count stays even; a layer already present, a layer_type that \
-             does not fit the layer, and inner copper on a board that defines a stackup are \
-             refused.",
+             does not fit the layer, and a copper, mask, paste or silkscreen layer on a board \
+             that defines a stackup are refused.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2128,6 +2128,11 @@ async fn handle_add_layer(
 
 use konnect_sexp::layers::Layer;
 
+/// The non-copper layers a KiCad stackup lists (`BOARD_STACKUP::BuildDefaultStackupList`).
+const STACKUP_LAYERS: &[&str] = &[
+    "F.SilkS", "F.Paste", "F.Mask", "B.Mask", "B.Paste", "B.SilkS",
+];
+
 /// What `add_layer` will write: the new entries, where they go, and the whole
 /// table as it must read back afterwards.
 #[derive(Debug)]
@@ -2145,8 +2150,8 @@ struct AddLayerPlan {
 /// Every rule here was measured with `kicad-cli pcb upgrade` 10.0.8 (#127):
 /// KiCad will not load a board with an odd copper count, silently drops a
 /// repeated name or an inner layer past a gap, and keeps a written `(stackup …)`
-/// as it was, so inner copper added to such a board is missing from its
-/// stackup. Konnect does not write stackups (#716).
+/// as it was, so a copper, mask, paste or silkscreen layer added to such a
+/// board is missing from its stackup. Konnect does not write stackups (#716).
 fn plan_add_layer(tree: &SexpNode, name: &str, kind: &str) -> Result<AddLayerPlan, String> {
     use konnect_sexp::layers::{
         canonical_id, copper, inner_copper_index, layers, numbering, LayerNumbering,
@@ -2171,7 +2176,14 @@ fn plan_add_layer(tree: &SexpNode, name: &str, kind: &str) -> Result<AddLayerPla
             odd.name, odd.id
         ));
     }
-    let layer = |n: &str| -> Result<Layer, String> {
+    let in_stackup = STACKUP_LAYERS.contains(&name) || inner_copper_index(name).is_some();
+    if in_stackup && tree.find("setup").and_then(|s| s.find("stackup")).is_some() {
+        return Err(format!(
+            "The board defines a stackup, and Konnect cannot add '{name}' to it (#716). \
+             Add the layer in KiCad's Board Setup, under Board Stackup. Nothing was written."
+        ));
+    }
+    let layer = |n: &str, kind: &str| -> Result<Layer, String> {
         Ok(Layer {
             id: canonical_id(n, scheme).ok_or(format!(
                 "'{n}' has no ordinal in this board's {} numbering; re-save the board in \
@@ -2188,15 +2200,8 @@ fn plan_add_layer(tree: &SexpNode, name: &str, kind: &str) -> Result<AddLayerPla
     };
 
     let (added, back_copper_index) = match inner_copper_index(name) {
-        None => (vec![layer(name)?], None),
+        None => (vec![layer(name, kind)?], None),
         Some(n) => {
-            if tree.find("setup").and_then(|s| s.find("stackup")).is_some() {
-                return Err(format!(
-                    "The board defines a stackup, and Konnect cannot add '{name}' to it \
-                     (#716). Add the copper layers in KiCad's Board Setup, under Board \
-                     Stackup. Nothing was written."
-                ));
-            }
             let present: Vec<&str> = copper(&stack).iter().map(|l| l.name.as_str()).collect();
             let inner = present.len().saturating_sub(2) as u32;
             let expected: Vec<String> = std::iter::once("F.Cu".to_string())
@@ -2218,9 +2223,14 @@ fn plan_add_layer(tree: &SexpNode, name: &str, kind: &str) -> Result<AddLayerPla
                     inner + 2
                 ));
             }
+            // The caller typed only the layer it named; its partner is a
+            // plain signal layer.
             let pair = [inner + 1, inner + 2]
                 .iter()
-                .map(|i| layer(&format!("In{i}.Cu")))
+                .map(|&i| {
+                    let partner = format!("In{i}.Cu");
+                    layer(&partner, if i == n { kind } else { "signal" })
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let back = stack.iter().position(|l| l.name == "B.Cu");
             (pair, back)
