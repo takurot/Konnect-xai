@@ -190,6 +190,24 @@ impl BatchOutcome {
         refuse_batch(refusal, self.failures, self.requested, target)
     }
 
+    /// The write happened but its readback failed: what the file holds is
+    /// unknown, so nothing is claimed applied and a blind retry is unsafe.
+    pub fn uncertain(self, result: CallToolResult, target: &std::path::Path) -> CallToolResult {
+        let mut outcome = summary(
+            OutcomeStatus::Uncertain,
+            target.display().to_string(),
+            "saved_file_readback",
+            self.requested,
+            0,
+            self.requested,
+            Some(inspect_before_retry()),
+        );
+        outcome["applied"] = json!([]);
+        outcome["failures"] = json!(self.failures);
+        outcome["written"] = Value::Null;
+        attach(result, outcome)
+    }
+
     fn to_json(&self, target: &str, source: &str) -> Value {
         let status = self.status();
         let retry = match status {
@@ -271,6 +289,8 @@ pub fn refuse_batch(
             .unwrap_or_else(|| json!({ "message": text })),
         _ => json!({ "message": "the batch was refused" }),
     };
+    let mut failures = failures;
+    failures.sort_by_key(|failure| failure.index);
     let outcome = BatchOutcome {
         failures,
         ..BatchOutcome::new(requested)
@@ -585,6 +605,48 @@ mod tests {
             crate::mcp::error::extract_error_kind(&plain).as_deref(),
             Some("batch_failed")
         );
+    }
+
+    #[test]
+    fn a_failed_readback_after_a_write_is_uncertain_not_failed() {
+        let refusal = crate::mcp::protocol::CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::StaleTarget {
+                target: "s.kicad_sch".into(),
+                reason: "post-write readback still contains 1 unit(s) of R1".into(),
+            },
+            "readback failed",
+        );
+        let result = BatchOutcome {
+            applied: vec![0],
+            ..BatchOutcome::new(1)
+        }
+        .uncertain(refusal, std::path::Path::new("s.kicad_sch"));
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert!(result.is_error);
+        assert_eq!(body["error"]["kind"], "stale_target");
+        assert_eq!(body["outcome"]["status"], "uncertain");
+        assert_eq!(body["outcome"]["applied"], json!([]));
+        assert_eq!(body["outcome"]["written"], Value::Null);
+        assert_eq!(body["outcome"]["retry"]["safe"], false);
+    }
+
+    #[test]
+    fn refused_failures_are_reported_in_index_order() {
+        let refusal = crate::mcp::protocol::CallToolResult::error("joined");
+        let outcome = BatchOutcome {
+            failures: vec![ItemFailure::new(2, NOT_FOUND, "missing")],
+            ..BatchOutcome::new(3)
+        };
+        let result = outcome.refuse(&refusal, Some(1), std::path::Path::new("s.kicad_sch"));
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["outcome"]["failures"][0]["index"], 1);
+        assert_eq!(body["outcome"]["failures"][1]["index"], 2);
     }
 
     #[test]

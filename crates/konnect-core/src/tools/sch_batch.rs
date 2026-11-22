@@ -213,7 +213,8 @@ pub fn tools() -> Vec<ToolDef> {
              Writes per item: valid items land, each refused item is listed by \
              index in outcome.failures, and a call that applies nothing is an error \
              and writes nothing. \
-             A moved position outside KiCad's range refuses the whole batch.",
+             A moved position outside KiCad's range, or a unit without a position, \
+             refuses the whole batch.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1074,9 +1075,6 @@ async fn handle_batch_delete(
     handle_structural_batch_delete(args, ctx, true).await
 }
 
-/// Kind of a `batch_delete` UUID naming the schematic's own skeleton.
-const PROTECTED_STRUCTURE: &str = "protected_structure";
-
 // Blocklist of structural forms, not an allowlist of item kinds: deleting a
 // drawing item (text, bus, sheet, image, polyline, …) by UUID has always
 // worked and must keep working — only the schematic's skeleton is protected.
@@ -1214,7 +1212,6 @@ async fn handle_bulk_move(
         }
 
         let mut placements: Vec<serde_json::Value> = Vec::new();
-        let errors_before = errors.len();
         for (sym_start, sym_end) in blocks {
             // Find first (at X Y [ROT]) inside this symbol block
             let sym_block = &content[sym_start..sym_end];
@@ -1222,8 +1219,11 @@ async fn handle_bulk_move(
             let at_rel = match sym_block.find(at_pat) {
                 Some(r) => r,
                 None => {
-                    errors.push(format!("No (at) in symbol '{}'", reference));
-                    continue;
+                    let refusal = super::invalid_arg(
+                        "references",
+                        &format!("symbol '{reference}' has a unit without (at)"),
+                    );
+                    return Ok(result.refuse(&refusal, Some(index), &sch_path));
                 }
             };
             let at_abs = sym_start + at_rel + at_pat.len();
@@ -1304,22 +1304,9 @@ async fn handle_bulk_move(
             }));
         }
 
-        if errors.len() != errors_before {
-            result.failures.push(ItemFailure::new(
-                index,
-                outcome::INVALID_ITEM,
-                errors[errors_before..].join("; "),
-            ));
-        }
-        // A unit that could not be read does not hold back the units that
-        // moved, so such a reference can be both applied and failed.
-        if !placements.is_empty() || errors.len() == errors_before {
-            result.applied.push(index);
-        }
+        result.applied.push(index);
         if placements.is_empty() {
-            if errors.len() == errors_before {
-                unchanged.push(reference.to_string());
-            }
+            unchanged.push(reference.to_string());
         } else {
             moved.push(json!({
                 "reference": reference,
@@ -1348,13 +1335,12 @@ async fn handle_bulk_move(
     // sees it at the arrival point and adds no dot (#626).
     let carried = if expected.contains("(no_connect") {
         let (Some(before), Some(after)) = (&before_tree, &after_tree) else {
-            return Ok(crate::tools::sch_wiring::no_connect_carry_unreadable(
-                &sch_path,
-            ));
+            let refusal = crate::tools::sch_wiring::no_connect_carry_unreadable(&sch_path);
+            return Ok(result.refuse(&refusal, None, &sch_path));
         };
         match crate::tools::sch_wiring::plan_no_connect_carry(before, after) {
             Ok(carried) => carried,
-            Err(error) => return Ok(error.into_result(&sch_path)),
+            Err(error) => return Ok(result.refuse(&error.into_result(&sch_path), None, &sch_path)),
         }
     } else {
         Vec::new()
@@ -1362,9 +1348,8 @@ async fn handle_bulk_move(
     let Some(new_content) =
         crate::tools::sch_wiring::apply_no_connect_carries(new_content, &carried)
     else {
-        return Ok(crate::tools::sch_wiring::no_connect_carry_unwritable(
-            &sch_path,
-        ));
+        let refusal = crate::tools::sch_wiring::no_connect_carry_unwritable(&sch_path);
+        return Ok(result.refuse(&refusal, None, &sch_path));
     };
 
     let (new_content, junctions_added, junctions_pruned) =
@@ -1775,7 +1760,7 @@ async fn handle_structural_batch_delete(
                 &mut result,
                 &mut errors,
                 index,
-                PROTECTED_STRUCTURE,
+                outcome::INVALID_ITEM,
                 format!(
                     "UUID '{}' belongs to protected schematic structure '{}'",
                     uuid, item.kind
@@ -1838,7 +1823,12 @@ async fn handle_structural_batch_delete(
     };
     let deletion = match commit_component_deletion(&sch_path, plan)? {
         Ok(deletion) => deletion,
-        Err(refusal) => return Ok(result.refuse(&refusal, None, &sch_path)),
+        // A refusal after the write (failed readback) leaves the file
+        // changed; only an untouched file may be reported as not written.
+        Err(refusal) if std::fs::read_to_string(&sch_path).is_ok_and(|now| now == content) => {
+            return Ok(result.refuse(&refusal, None, &sch_path))
+        }
+        Err(refusal) => return Ok(result.uncertain(refusal, &sch_path)),
     };
 
     let deleted_references = selected_references

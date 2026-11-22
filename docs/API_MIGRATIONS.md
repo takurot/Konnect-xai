@@ -85,6 +85,16 @@ Behaviour changes:
 
 A persistence failure after the plan still returns the server-level
 `mutation_outcome_uncertain` or `conflict` result, not a per-item outcome.
+When the readback after a `batch_delete` or
+`batch_delete_schematic_components` write fails, the refusal keeps its kind
+and carries `status: uncertain`, `written: null` and an unsafe retry. The
+verified-commit errors of `group_components` and of
+`batch_edit_schematic_components` with native attributes keep their previous
+shape without `outcome`.
+
+`bulk_move_schematic_components` refuses the whole batch when a moved
+symbol has a unit without `(at …)`. Before, it reported that unit in
+`errors` and moved the others.
 
 ## Unreleased: schematic write validation (#132)
 

@@ -449,6 +449,26 @@ async fn a_whole_batch_refusal_keeps_its_kind_and_every_item_failure() {
 }
 
 #[tokio::test]
+async fn a_refusal_after_an_item_was_planned_still_applies_nothing() {
+    let (_dir, path) = fixture_with_a_crossing_wire().await;
+    let before = read(&path);
+    let result = call(
+        "batch_connect_pins",
+        &path,
+        json!({"connections": [
+            {"ref1": "R1", "pin1": "1", "ref2": "R2", "pin2": "1"},
+            {"ref1": "R1", "pin1": "2", "ref2": "R2", "pin2": "2"}
+        ]}),
+    )
+    .await;
+    let response = body(&result);
+    assert_eq!(response["error"]["kind"], "would_join_nets", "{response}");
+    assert_eq!(response["outcome"]["applied"], json!([]), "{response}");
+    assert_eq!(failure_indexes(&response["outcome"]), vec![1], "{response}");
+    assert_eq!(read(&path), before);
+}
+
+#[tokio::test]
 async fn all_or_nothing_wires_write_nothing_when_a_later_route_is_refused() {
     let (_dir, path) = fixture_with_a_crossing_wire().await;
     let before = read(&path);
