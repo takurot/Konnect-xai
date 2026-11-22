@@ -89,8 +89,13 @@ When the readback after a `batch_delete` or
 `batch_delete_schematic_components` write fails, the refusal keeps its kind
 and carries `status: uncertain`, `written: null` and an unsafe retry; reload
 the sheet before retrying any item, including those listed in `failures`. A
-refusal raised before the write, such as a concurrent change, stays
-`status: failed` with `written: false`. The
+refusal raised before the write, such as a change found while planning or a
+KiCad editor lock, stays `status: failed` with `written: false`.
+
+Every saved-schematic command commit (`SchematicCommand`) now reports a
+readback that differs right after the atomic replace as
+`mutation_outcome_uncertain`, as `write_atomic_if_unchanged` already did.
+Before, it was `conflict`, which read as a refusal that wrote nothing. The
 verified-commit errors of `group_components` and of
 `batch_edit_schematic_components` with native attributes keep their previous
 shape without `outcome`.

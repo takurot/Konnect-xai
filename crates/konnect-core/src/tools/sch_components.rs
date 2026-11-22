@@ -2407,7 +2407,7 @@ pub(crate) enum DeletionCommitError {
 }
 
 impl DeletionCommitError {
-    pub(crate) fn into_result(self) -> CallToolResult {
+    fn into_result(self) -> CallToolResult {
         match self {
             Self::Refused(result) | Self::Unverified(result) => result,
         }
