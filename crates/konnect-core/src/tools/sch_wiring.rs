@@ -9,6 +9,7 @@ use super::sch_route_safety::{
     route_segments, NamedStubRoute,
 };
 use crate::mcp::protocol::CallToolResult;
+use crate::outcome::{self, BatchOutcome, ItemFailure};
 use crate::tool;
 use crate::tools::{
     get_path, invalid_arg, opt_f64, opt_positive_f64, opt_str, require_array, require_f64,
@@ -63,7 +64,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_add_wire",
-            "Add multiple wire segments in a single file read/write cycle.",
+            "Add multiple wire segments in a single file read/write cycle. \
+             All-or-nothing: one refused item refuses the batch, writes nothing, \
+             and is listed by index in outcome.failures.",
             json!({
                 "type": "object",
                 "properties": {
@@ -108,7 +111,10 @@ pub fn tools() -> Vec<ToolDef> {
             "batch_delete_schematic_wire",
             "Delete multiple wire segments in a single file read/write cycle. \
              Junction dots the wires leave unjustified are removed with them, \
-             reported as junctions_pruned_count.",
+             reported as junctions_pruned_count. \
+             Writes per item: valid items land, each refused item is listed by \
+             index in outcome.failures, and a call that applies nothing is an error \
+             and writes nothing.",
             json!({
                 "type": "object",
                 "properties": {
@@ -206,7 +212,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_rotate_labels",
-            "Rotate multiple labels by net name in a single file read/write cycle.",
+            "Rotate multiple labels by net name in a single file read/write cycle. \
+             All-or-nothing: one refused item refuses the batch, writes nothing, \
+             and is listed by index in outcome.failures. \
+             A label named twice ends at its last rotation.",
             json!({
                 "type": "object",
                 "properties": {
@@ -275,7 +284,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_delete_no_connect",
-            "Delete multiple no-connect flags in a single file read/write cycle.",
+            "Delete multiple no-connect flags in a single file read/write cycle. \
+             Writes per item: valid items land, each refused item is listed by \
+             index in outcome.failures, and a call that applies nothing is an error \
+             and writes nothing.",
             json!({
                 "type": "object",
                 "properties": {
@@ -623,31 +635,71 @@ async fn handle_batch_add_wire(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    let mut segments = Vec::new();
+    let mut failures = Vec::new();
+    for (i, w) in wires.iter().enumerate() {
+        let missing = ["x1", "y1", "x2", "y2"]
+            .into_iter()
+            .find(|key| !w[*key].as_f64().is_some_and(f64::is_finite));
+        if let Some(key) = missing {
+            failures.push(ItemFailure::new(
+                i,
+                outcome::INVALID_ITEM,
+                format!("wires[{i}].{key}: missing or not a finite number"),
+            ));
+            continue;
+        }
+        let at = |key: &str| w[key].as_f64().unwrap_or_default();
+        segments.push((
+            i,
+            snap_point(at("x1"), at("y1"), 1.27),
+            snap_point(at("x2"), at("y2"), 1.27),
+        ));
+    }
+    if !failures.is_empty() {
+        let refusal = super::invalid_arg(
+            &format!("wires[{}]", failures[0].index),
+            &failures[0].message,
+        );
+        return Ok(outcome::refuse_batch(
+            &refusal,
+            failures,
+            wires.len(),
+            &sch_path,
+        ));
+    }
     let content = read_consistent(&sch_path)?;
     let mut new_content = content.clone();
-    for (i, w) in wires.iter().enumerate() {
-        let mut points = Vec::new();
-        for key in ["x1", "y1", "x2", "y2"] {
-            let Some(v) = w[key].as_f64().filter(|v| v.is_finite()) else {
-                return Ok(super::invalid_arg(
-                    &format!("wires[{i}].{key}"),
-                    "missing or not a finite number",
-                ));
-            };
-            points.push(v);
-        }
-        let (x1, y1) = snap_point(points[0], points[1], 1.27);
-        let (x2, y2) = snap_point(points[2], points[3], 1.27);
+    for (i, (x1, y1), (x2, y2)) in segments {
         let tree = parse_sexp(&new_content)?;
-        if let Err(e) =
+        if let Err(refusal) =
             check_coordinate_route(&tree, &[((x1, y1), (x2, y2))], &[(x1, y1), (x2, y2)], allow)
         {
-            return Ok(e);
+            let failure = ItemFailure::from_result(i, &refusal);
+            return Ok(outcome::refuse_batch(
+                &refusal,
+                vec![failure],
+                wires.len(),
+                &sch_path,
+            ));
         }
         new_content = insert_wire_with_junctions(new_content, x1, y1, x2, y2)?;
     }
-    write_schematic_if_unchanged(&sch_path, &content, &new_content)?;
-    Ok(CallToolResult::json(&json!({ "added_wires": wires.len() })))
+    let written = new_content != content;
+    if written {
+        write_schematic_if_unchanged(&sch_path, &content, &new_content)?;
+    }
+    let result = BatchOutcome {
+        applied: (0..wires.len()).collect(),
+        written,
+        ..BatchOutcome::new(wires.len())
+    };
+    Ok(outcome::batch_result(
+        json!({ "added_wires": wires.len() }),
+        &result,
+        &sch_path,
+        outcome::SAVED_FILE,
+    ))
 }
 
 async fn handle_delete_wire(
@@ -1508,42 +1560,46 @@ async fn handle_batch_delete_wire(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let uuids: Vec<String> = match require_array(args, "uuids") {
-        Ok(a) => a
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect(),
+    let uuids = match require_array(args, "uuids") {
+        Ok(a) => a,
         Err(e) => return Ok(e),
     };
 
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
     let mut errors = Vec::new();
+    let mut result = BatchOutcome::new(uuids.len());
 
     // Collect all delete ranges first, then apply in reverse order
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for uuid in &uuids {
-        let search = format!(r#"(uuid "{uuid}")"#);
-        match content.find(&search) {
-            Some(offset) => match wire_block_with_leading_whitespace(&content, offset) {
-                Some(range) => ranges.push(range),
-                None => errors.push(format!(
-                    "UUID '{uuid}' exists but is not inside a parseable wire block"
+    for (index, uuid) in uuids.iter().enumerate() {
+        let located = match uuid.as_str() {
+            None => Err((
+                outcome::INVALID_ITEM,
+                "Wire UUID must be a string".to_string(),
+            )),
+            Some(uuid) => match content.find(&format!(r#"(uuid "{uuid}")"#)) {
+                Some(offset) => wire_block_with_leading_whitespace(&content, offset).ok_or((
+                    outcome::NOT_FOUND,
+                    format!("UUID '{uuid}' exists but is not inside a parseable wire block"),
                 )),
+                None => Err((outcome::NOT_FOUND, format!("Wire UUID '{uuid}' not found"))),
             },
-            None => errors.push(format!("Wire UUID '{uuid}' not found")),
+        };
+        match located {
+            Ok(range) => {
+                ranges.push(range);
+                result.applied.push(index);
+            }
+            Err((kind, message)) => {
+                errors.push(message.clone());
+                result.failures.push(ItemFailure::new(index, kind, message));
+            }
         }
     }
     ranges.sort_unstable();
     ranges.dedup();
     let deleted = ranges.len();
-
-    if deleted == 0 && !uuids.is_empty() {
-        return Ok(CallToolResult::error(format!(
-            "No wires deleted: {}",
-            errors.join("; ")
-        )));
-    }
 
     let removed = wires_in_ranges(&content, &ranges);
     let edits: Vec<SexpEdit> = ranges
@@ -1552,12 +1608,20 @@ async fn handle_batch_delete_wire(
         .collect();
     let content = apply_edits(content, edits);
     let (content, pruned) = prune_orphaned_junctions(content, &removed);
-    write_schematic_if_unchanged(&sch_path, &expected, &content)?;
-    Ok(CallToolResult::json(&json!({
-        "deleted": deleted,
-        "junctions_pruned_count": pruned,
-        "errors": errors
-    })))
+    result.written = deleted > 0;
+    if result.written {
+        write_schematic_if_unchanged(&sch_path, &expected, &content)?;
+    }
+    Ok(outcome::batch_result(
+        json!({
+            "deleted": deleted,
+            "junctions_pruned_count": pruned,
+            "errors": errors
+        }),
+        &result,
+        &sch_path,
+        outcome::SAVED_FILE,
+    ))
 }
 
 fn wire_block_with_leading_whitespace(
@@ -1918,9 +1982,37 @@ async fn handle_rotate_label(
     };
 
     let content = read_consistent(&sch_path)?;
-    let expected = content.clone();
+    let planned = match plan_label_rotation(&content, &net, x, y, rotation)? {
+        Ok(planned) => planned,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
+    write_schematic_if_unchanged(&sch_path, &content, &planned.content)?;
+    // The shared CAS verifies committed bytes and preserves typed uncertainty.
+    Ok(CallToolResult::json(&json!({
+        "rotated_label": net,
+        "type": planned.kind,
+        "rotation": rotation,
+        "justify": planned.justify
+    })))
+}
 
-    let labels = find_label_blocks(&content);
+/// A label rotation applied to a document in memory.
+struct PlannedLabelRotation {
+    content: String,
+    kind: &'static str,
+    justify: &'static str,
+}
+
+/// Rotate the label named `net` at `(x, y)` within `content`, or say why no
+/// such label exists.
+fn plan_label_rotation(
+    content: &str,
+    net: &str,
+    x: f64,
+    y: f64,
+    rotation: f64,
+) -> anyhow::Result<Result<PlannedLabelRotation, String>> {
+    let labels = find_label_blocks(content);
     let named: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
     let Some(label) = named
         .iter()
@@ -1930,7 +2022,7 @@ async fn handle_rotate_label(
             .iter()
             .map(|l| format!("{} at ({}, {})", l.kind, l.x, l.y))
             .collect();
-        return Ok(CallToolResult::error(if positions.is_empty() {
+        return Ok(Err(if positions.is_empty() {
             format!("No label named '{}' in this schematic", net)
         } else {
             format!(
@@ -1943,7 +2035,7 @@ async fn handle_rotate_label(
         }));
     };
 
-    let (block_start, block_end) = find_balanced_block(&content, label.start)
+    let (block_start, block_end) = find_balanced_block(content, label.start)
         .ok_or_else(|| anyhow::anyhow!("Cannot parse label block"))?;
     let block = &content[block_start..block_end];
 
@@ -1987,14 +2079,14 @@ async fn handle_rotate_label(
     if let Some(j_rel) = justify_child {
         // Replace the existing justify in place.
         let j_start = block_start + j_rel;
-        let j_end = find_balanced_block(&content, j_start)
+        let j_end = find_balanced_block(content, j_start)
             .map(|(_, e)| e)
             .ok_or_else(|| anyhow::anyhow!("Malformed (justify)"))?;
         edits.push(SexpEdit::replace(j_start, j_end, justify_sexp));
     } else if let Some((e_rel, _)) = effects {
         // An effects block with no justify — add one just inside it.
         let e_start = block_start + e_rel;
-        let (_, e_end) = find_balanced_block(&content, e_start)
+        let (_, e_end) = find_balanced_block(content, e_start)
             .ok_or_else(|| anyhow::anyhow!("Malformed (effects)"))?;
         edits.push(SexpEdit::insert(e_end - 1, format!(" {justify_sexp}")));
     } else {
@@ -2018,15 +2110,11 @@ async fn handle_rotate_label(
         ));
     }
 
-    let new_content = apply_edits(content, edits);
-    write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
-    // The shared CAS verifies committed bytes and preserves typed uncertainty.
-    Ok(CallToolResult::json(&json!({
-        "rotated_label": net,
-        "type": label.kind,
-        "rotation": rotation,
-        "justify": justify
-    })))
+    Ok(Ok(PlannedLabelRotation {
+        content: apply_edits(content.to_string(), edits),
+        kind: label.kind,
+        justify,
+    }))
 }
 
 async fn handle_move_labels_by_offset(
@@ -2145,7 +2233,7 @@ async fn handle_move_labels_by_offset(
 
 async fn handle_batch_rotate_labels(
     args: &serde_json::Value,
-    ctx: &ToolContext,
+    _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let labels = match require_array(args, "labels") {
@@ -2168,28 +2256,46 @@ async fn handle_batch_rotate_labels(
         Err(error) => return Ok(error),
     };
 
-    let mut rotated = 0usize;
-    for (index, (label_arg, rotation)) in labels.iter().zip(rotations).enumerate() {
-        let full_args = json!({
-            "schematic": sch_path.display().to_string(),
-            "net": label_arg["net"],
-            "x": label_arg["x"],
-            "y": label_arg["y"],
-            "rotation": rotation
-        });
-        let outcome = handle_rotate_label(&full_args, ctx).await?;
-        if outcome.is_error {
-            let reason = match outcome.content.first() {
-                Some(crate::mcp::protocol::ToolContent::Text { text }) => text.as_str(),
-                _ => "rotation was refused",
-            };
-            return Ok(CallToolResult::error(format!(
-                "labels[{index}] was not rotated: {reason} ({rotated} earlier label(s) were already rotated and written)"
-            )));
+    // All-or-nothing: each label is planned against the document as the
+    // earlier entries left it, so naming one label twice rotates it to the
+    // last angle. Any refused entry refuses the batch and nothing is written.
+    let content = read_consistent(&sch_path)?;
+    let mut planned = content.clone();
+    let mut failures = Vec::new();
+    for (index, (label, rotation)) in labels.iter().zip(rotations).enumerate() {
+        let (Some(net), Some(x), Some(y)) = (
+            label["net"].as_str(),
+            label["x"].as_f64(),
+            label["y"].as_f64(),
+        ) else {
+            failures.push(ItemFailure::new(
+                index,
+                outcome::INVALID_ITEM,
+                format!("labels[{index}] needs a string net and numeric x and y"),
+            ));
+            continue;
+        };
+        match plan_label_rotation(&planned, net, x, y, rotation)? {
+            Ok(rotated) => planned = rotated.content,
+            Err(message) => failures.push(ItemFailure::new(index, outcome::NOT_FOUND, message)),
         }
-        rotated += 1;
     }
-    Ok(CallToolResult::json(&json!({ "rotated": rotated })))
+    let mut result = BatchOutcome::new(labels.len());
+    if failures.is_empty() {
+        result.applied = (0..labels.len()).collect();
+        result.written = planned != content;
+        if result.written {
+            write_schematic_if_unchanged(&sch_path, &content, &planned)?;
+        }
+    } else {
+        result.failures = failures;
+    }
+    Ok(outcome::batch_result(
+        json!({ "rotated": result.applied.len() }),
+        &result,
+        &sch_path,
+        outcome::SAVED_FILE,
+    ))
 }
 
 /// The lowest `#PWR` number no symbol on the sheet is using.
@@ -2698,37 +2804,52 @@ async fn handle_batch_delete_no_connect(
     let expected = content.clone();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
-    for pos in &positions {
+    let mut result = BatchOutcome::new(positions.len());
+    for (index, pos) in positions.iter().enumerate() {
         let (Some(x), Some(y)) = (pos["x"].as_f64(), pos["y"].as_f64()) else {
-            errors.push(format!("Position {pos} needs numeric x and y"));
+            let message = format!("Position {pos} needs numeric x and y");
+            errors.push(message.clone());
+            result
+                .failures
+                .push(ItemFailure::new(index, outcome::INVALID_ITEM, message));
             continue;
         };
         match find_no_connect_block_at(&content, x, y) {
-            Some(range) => ranges.push(range),
-            None => errors.push(format!("No no-connect at ({x}, {y})")),
+            Some(range) => {
+                ranges.push(range);
+                result.applied.push(index);
+            }
+            None => {
+                let message = format!("No no-connect at ({x}, {y})");
+                errors.push(message.clone());
+                result
+                    .failures
+                    .push(ItemFailure::new(index, outcome::NOT_FOUND, message));
+            }
         }
     }
     ranges.sort_unstable();
     ranges.dedup();
     let deleted = ranges.len();
 
-    if deleted == 0 && !positions.is_empty() {
-        return Ok(CallToolResult::error(format!(
-            "No no-connects deleted: {}",
-            errors.join("; ")
-        )));
-    }
-
     let edits: Vec<SexpEdit> = ranges
         .into_iter()
         .map(|(s, e)| SexpEdit::delete(s, e))
         .collect();
     let content = apply_edits(content, edits);
-    write_schematic_if_unchanged(&sch_path, &expected, &content)?;
-    Ok(CallToolResult::json(&json!({
-        "deleted": deleted,
-        "errors": errors
-    })))
+    result.written = deleted > 0;
+    if result.written {
+        write_schematic_if_unchanged(&sch_path, &expected, &content)?;
+    }
+    Ok(outcome::batch_result(
+        json!({
+            "deleted": deleted,
+            "errors": errors
+        }),
+        &result,
+        &sch_path,
+        outcome::SAVED_FILE,
+    ))
 }
 
 async fn handle_add_junction(

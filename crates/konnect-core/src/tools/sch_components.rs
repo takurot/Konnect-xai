@@ -334,7 +334,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "group_components",
-            "Add or update a group property on every placed unit of multiple components.",
+            "Add or update a group property on every placed unit of multiple components. \
+             Writes per item: valid items land, each refused item is listed by \
+             index in outcome.failures, and a call that applies nothing is an error \
+             and writes nothing.",
             json!({
                 "type": "object",
                 "properties": {
@@ -4198,14 +4201,28 @@ async fn handle_group_components(
     let mut item_ids = Vec::new();
     let mut targets = Vec::new();
     let mut errors = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut result = crate::outcome::BatchOutcome::new(refs.len());
+    let mut fail = |index: usize, kind: &str, message: String| {
+        errors.push(message.clone());
+        result
+            .failures
+            .push(crate::outcome::ItemFailure::new(index, kind, message));
+    };
+    // A repeated reference is applied with its first occurrence; a repeat of
+    // a refused one is checked, and refused, on its own.
+    let mut grouped_indexes: BTreeMap<String, Vec<usize>> = BTreeMap::new();
 
-    for value in refs {
+    for (index, value) in refs.iter().enumerate() {
         let Some(reference) = value.as_str() else {
-            errors.push("Component reference must be a string".to_owned());
+            fail(
+                index,
+                crate::outcome::INVALID_ITEM,
+                "Component reference must be a string".to_owned(),
+            );
             continue;
         };
-        if !seen.insert(reference.to_owned()) {
+        if let Some(indexes) = grouped_indexes.get_mut(reference) {
+            indexes.push(index);
             continue;
         }
         let target = match component_target_from_source(&sch_path, &expected, reference) {
@@ -4213,10 +4230,23 @@ async fn handle_group_components(
             Err(ComponentDeleteTargetError::Stale { reason, .. })
                 if reason.contains("is not present") =>
             {
-                errors.push(format!("Component '{reference}' not found"));
+                fail(
+                    index,
+                    crate::outcome::NOT_FOUND,
+                    format!("Component '{reference}' not found"),
+                );
                 continue;
             }
-            Err(error) => return Ok(error.into_result()),
+            Err(error) => {
+                let refusal = error.into_result();
+                let failure = crate::outcome::ItemFailure::from_result(index, &refusal);
+                return Ok(crate::outcome::refuse_batch(
+                    &refusal,
+                    vec![failure],
+                    refs.len(),
+                    &sch_path,
+                ));
+            }
         };
         match set_property_value(&content, reference, "Group", &group_name, true) {
             Ok((updated, _)) => {
@@ -4226,21 +4256,23 @@ async fn handle_group_components(
                     Err(error) => return Ok(error.into_result()),
                 });
                 targets.push(target);
+                grouped_indexes.insert(reference.to_owned(), vec![index]);
             }
-            Err(error) => errors.push(format!("{reference}: {error}")),
+            Err(error) => fail(
+                index,
+                crate::outcome::INVALID_ITEM,
+                format!("{reference}: {error}"),
+            ),
         }
     }
 
     if item_ids.is_empty() {
-        return Ok(ComponentDeleteTargetError::stale(
+        return Ok(crate::outcome::batch_result(
+            json!({ "grouped_count": 0, "grouped": [], "errors": errors }),
+            &result,
             &sch_path,
-            if errors.is_empty() {
-                "no components were selected".to_owned()
-            } else {
-                errors.join("; ")
-            },
-        )
-        .into_result());
+            crate::outcome::SAVED_FILE,
+        ));
     }
     let command = SchematicCommand::replace_items_from_document(
         &expected,
@@ -4281,14 +4313,22 @@ async fn handle_group_components(
     let observed_group_name = components[0]["fields"]["Group"].clone();
     let observed_schematic = components[0]["schematic"].clone();
 
-    Ok(CallToolResult::json(&json!({
-        "group_name": observed_group_name,
-        "grouped_count": grouped.len(),
-        "grouped": grouped,
-        "components": components,
-        "schematic": observed_schematic,
-        "errors": errors
-    })))
+    result.applied = grouped_indexes.into_values().flatten().collect();
+    result.applied.sort_unstable();
+    result.written = true;
+    Ok(crate::outcome::batch_result(
+        json!({
+            "group_name": observed_group_name,
+            "grouped_count": grouped.len(),
+            "grouped": grouped,
+            "components": components,
+            "schematic": observed_schematic,
+            "errors": errors
+        }),
+        &result,
+        &sch_path,
+        "saved_file_readback",
+    ))
 }
 
 async fn handle_update_symbols_from_library(

@@ -17,7 +17,19 @@ use serde_json::{json, Value};
 pub const ADOPTED_OUTCOME_TOOLS: &[&str] = &[
     "add_schematic_component",
     "annotate_schematic",
+    "batch_add_wire",
+    "batch_connect_pins",
+    "batch_connect_to_net",
+    "batch_delete",
+    "batch_delete_no_connect",
+    "batch_delete_schematic_components",
+    "batch_delete_schematic_wire",
+    "batch_edit_schematic_components",
     "batch_place_components",
+    "batch_rotate_labels",
+    "bulk_move_schematic_components",
+    "connect_pins_to_bus",
+    "group_components",
     "run_design_review",
 ];
 
@@ -90,6 +102,174 @@ pub fn inspect_before_retry() -> Value {
         "instruction": "reload and inspect the target before retrying; do not blindly repeat the mutation"
     })
 }
+
+/// Kind of a batch item whose own spec is malformed.
+pub const INVALID_ITEM: &str = "invalid_item";
+/// Kind of a batch item whose target is not in the document.
+pub const NOT_FOUND: &str = "not_found";
+
+/// One batch input item that was refused, by its index in the request.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ItemFailure {
+    pub index: usize,
+    pub kind: String,
+    pub message: String,
+}
+
+impl ItemFailure {
+    pub fn new(index: usize, kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            index,
+            kind: kind.into(),
+            message: message.into(),
+        }
+    }
+
+    /// The item refused by a single-item handler's error result.
+    pub fn from_result(index: usize, result: &CallToolResult) -> Self {
+        let text = match result.content.first() {
+            Some(ToolContent::Text { text }) => text.as_str(),
+            _ => "the item was refused",
+        };
+        let body = serde_json::from_str::<Value>(text).ok();
+        let kind = body
+            .as_ref()
+            .and_then(|body| body.pointer("/error/kind"))
+            .and_then(Value::as_str)
+            .unwrap_or("handler_error");
+        let message = body
+            .as_ref()
+            .and_then(|body| body["message"].as_str())
+            .unwrap_or(text);
+        Self::new(index, kind, message)
+    }
+}
+
+/// What a batch call did with each input item.
+///
+/// `applied` holds the indexes whose effect is in the file afterwards,
+/// including items that were already satisfied. `failures` holds the items at
+/// fault. An all-or-nothing tool that refuses a batch applies nothing, so its
+/// valid items appear in neither list.
+#[derive(Debug, Clone, Default)]
+pub struct BatchOutcome {
+    pub requested: usize,
+    pub applied: Vec<usize>,
+    pub failures: Vec<ItemFailure>,
+    pub written: bool,
+}
+
+impl BatchOutcome {
+    pub fn new(requested: usize) -> Self {
+        Self {
+            requested,
+            ..Self::default()
+        }
+    }
+
+    pub fn status(&self) -> OutcomeStatus {
+        if self.applied.len() == self.requested && self.failures.is_empty() {
+            OutcomeStatus::Complete
+        } else if self.applied.is_empty() {
+            OutcomeStatus::Failed
+        } else {
+            OutcomeStatus::Partial
+        }
+    }
+
+    fn to_json(&self, target: &str, source: &str) -> Value {
+        let status = self.status();
+        let retry = match status {
+            OutcomeStatus::Complete => None,
+            OutcomeStatus::Partial => Some(retry_failed_items(
+                self.failures.iter().map(|failure| failure.index).collect(),
+            )),
+            OutcomeStatus::Failed | OutcomeStatus::Uncertain => Some(retry_whole_request()),
+        };
+        let mut outcome = summary(
+            status,
+            target,
+            source,
+            self.requested,
+            self.applied.len(),
+            self.requested.saturating_sub(self.applied.len()),
+            retry,
+        );
+        outcome["applied"] = json!(self.applied);
+        outcome["failures"] = json!(self.failures);
+        outcome["written"] = json!(self.written);
+        outcome
+    }
+}
+
+/// A batch tool's response: `body` plus the shared `outcome`.
+///
+/// A batch in which nothing was applied is an error. Unless `body` already
+/// carries a structured `error`, it gains a `batch_failed` one so the result
+/// still has a stable kind.
+pub fn batch_result(
+    body: Value,
+    outcome: &BatchOutcome,
+    target: &std::path::Path,
+    source: &str,
+) -> CallToolResult {
+    let mut body = match body {
+        Value::Object(object) => object,
+        other => serde_json::Map::from_iter([("result".to_string(), other)]),
+    };
+    let failed = outcome.status() == OutcomeStatus::Failed;
+    if failed && !body.contains_key("error") {
+        let detail = outcome
+            .failures
+            .iter()
+            .map(|failure| format!("[{}] {}", failure.index, failure.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        body.insert(
+            "message".to_string(),
+            json!(format!("no batch item was applied: {detail}")),
+        );
+        body.insert(
+            "error".to_string(),
+            json!(crate::mcp::error::ToolErrorKind::BatchFailed {
+                failed: outcome.failures.len()
+            }),
+        );
+    }
+    body.insert(
+        "outcome".to_string(),
+        outcome.to_json(&target.display().to_string(), source),
+    );
+    let mut result = CallToolResult::json(&Value::Object(body));
+    result.is_error = failed;
+    result
+}
+
+/// A whole-batch refusal raised while planning item `failures`: nothing was
+/// applied. A structured refusal keeps its own error kind.
+pub fn refuse_batch(
+    refusal: &CallToolResult,
+    failures: Vec<ItemFailure>,
+    requested: usize,
+    target: &std::path::Path,
+) -> CallToolResult {
+    let body = match refusal.content.first() {
+        Some(ToolContent::Text { text }) => serde_json::from_str::<Value>(text)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({ "message": text })),
+        _ => json!({ "message": "the batch was refused" }),
+    };
+    let outcome = BatchOutcome {
+        failures,
+        ..BatchOutcome::new(requested)
+    };
+    batch_result(body, &outcome, target, SAVED_FILE)
+}
+
+/// Source of an outcome whose write was revision-checked against the bytes
+/// it was planned from.
+pub const SAVED_FILE: &str = "saved_file";
 
 /// Add the shared envelope while preserving every existing response field.
 pub fn attach(mut result: CallToolResult, outcome: Value) -> CallToolResult {
@@ -259,6 +439,141 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Served batch tools that have not adopted the batch outcome, and why.
+    const BATCH_TOOLS_WITHOUT_OUTCOME: &[(&str, &str)] = &[
+        (
+            "batch_add_no_connect",
+            "not listed in #133; keeps its per-position errors from #132",
+        ),
+        (
+            "batch_add_junction",
+            "not listed in #133; refuses the whole batch with invalid_argument",
+        ),
+        ("batch_add_bus", "not listed in #133"),
+        ("batch_get_schematic_pin_locations", "read-only"),
+    ];
+
+    #[test]
+    fn every_served_schematic_batch_tool_adopts_the_outcome_or_says_why_not() {
+        let batch_like = |name: &str| {
+            name.starts_with("batch_")
+                || name.starts_with("bulk_")
+                || matches!(name, "group_components" | "connect_pins_to_bus")
+        };
+        for toolset in crate::router::registry::ALL_TOOLSETS {
+            if !toolset.name.starts_with("sch_") {
+                continue;
+            }
+            for definition in crate::router::registry::tools_for(toolset.name).unwrap_or_default() {
+                let name = definition.name;
+                if !batch_like(name) {
+                    continue;
+                }
+                let exempt = BATCH_TOOLS_WITHOUT_OUTCOME
+                    .iter()
+                    .any(|(exempt, _)| *exempt == name);
+                assert!(
+                    ADOPTED_OUTCOME_TOOLS.contains(&name) != exempt,
+                    "{name} must either adopt the batch outcome or be listed with a reason"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batch_status_follows_applied_and_failed_items() {
+        let failure = |index| ItemFailure::new(index, NOT_FOUND, "missing");
+        let cases = [
+            (BatchOutcome::new(0), OutcomeStatus::Complete),
+            (
+                BatchOutcome {
+                    applied: vec![0, 1],
+                    ..BatchOutcome::new(2)
+                },
+                OutcomeStatus::Complete,
+            ),
+            (
+                BatchOutcome {
+                    applied: vec![0],
+                    failures: vec![failure(1)],
+                    ..BatchOutcome::new(2)
+                },
+                OutcomeStatus::Partial,
+            ),
+            (
+                BatchOutcome {
+                    applied: vec![0, 1],
+                    failures: vec![failure(1)],
+                    ..BatchOutcome::new(2)
+                },
+                OutcomeStatus::Partial,
+            ),
+            (
+                BatchOutcome {
+                    failures: vec![failure(1)],
+                    ..BatchOutcome::new(2)
+                },
+                OutcomeStatus::Failed,
+            ),
+        ];
+        for (outcome, expected) in cases {
+            assert_eq!(outcome.status(), expected, "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn failed_batch_is_an_error_with_a_kind_unless_the_refusal_has_one() {
+        let path = std::path::Path::new("s.kicad_sch");
+        let outcome = BatchOutcome {
+            failures: vec![ItemFailure::new(0, NOT_FOUND, "Component 'R99' not found")],
+            ..BatchOutcome::new(1)
+        };
+        let result = batch_result(json!({"errors": []}), &outcome, path, SAVED_FILE);
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("batch_failed")
+        );
+        assert_eq!(status(&result), Some(OutcomeStatus::Failed));
+
+        let refusal = crate::mcp::protocol::CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "wires[1]".into(),
+                reason: "missing".into(),
+            },
+            "bad",
+        );
+        let refused = refuse_batch(
+            &refusal,
+            vec![ItemFailure::from_result(1, &refusal)],
+            2,
+            path,
+        );
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&refused).as_deref(),
+            Some("invalid_argument")
+        );
+        let ToolContent::Text { text } = &refused.content[0] else {
+            panic!("expected text")
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["outcome"]["failures"][0]["kind"], "invalid_argument");
+        assert_eq!(body["outcome"]["failures"][0]["index"], 1);
+        assert_eq!(body["outcome"]["failed"], 2);
+        assert_eq!(body["outcome"]["retry"]["scope"], "whole_request");
+
+        let plain = refuse_batch(
+            &crate::mcp::protocol::CallToolResult::error("plain refusal"),
+            Vec::new(),
+            1,
+            path,
+        );
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&plain).as_deref(),
+            Some("batch_failed")
+        );
     }
 
     #[test]

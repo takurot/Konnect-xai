@@ -6,6 +6,7 @@
 //! cycles.
 
 use crate::mcp::protocol::CallToolResult;
+use crate::outcome::{self, BatchOutcome, ItemFailure};
 use crate::tool;
 use crate::tools::{
     find_all_symbol_instance_blocks, get_path, invalid_arg, opt_f64, opt_str, opt_u32,
@@ -47,7 +48,11 @@ pub fn tools() -> Vec<ToolDef> {
             "Connect multiple component pins to a named net. By default it adds a net label \
              at each pin endpoint with no wire. Pass stub_length, direction and label_type \
              for connect_to_net's placement, applied to every pin in the call. \
-             Single file read → all edits → single file write. Refuses the complete batch if a route \
+             Single file read → all edits → single file write. \
+             Writes per item: valid items land, each refused item is listed by \
+             index in outcome.failures, and a call that applies nothing is an error \
+             and writes nothing. \
+             Refuses the complete batch if a route \
              touches an unselected net unless allow_join is explicitly true. \
              Labels are sheet-local: a sheet instanced N times gets N independent nets. \
              Use add_power_symbol or a global_label for a rail shared by every instance, and \
@@ -103,7 +108,10 @@ pub fn tools() -> Vec<ToolDef> {
              junctions_added_count and junctions_pruned_count. \
              There is no auto-numbering: an omitted reference becomes the library prefix \
              plus '?' (e.g. 'R?', '#FLG?'), like an eeschema-unannotated symbol, same as \
-             add_schematic_component; annotate_schematic numbers it.",
+             add_schematic_component; annotate_schematic numbers it. \
+             Writes per item: valid items land, each refused item is listed by \
+             index in outcome.failures, and a call that applies nothing is an error \
+             and writes nothing.",
             json!({
                 "type": "object",
                 "properties": {
@@ -139,7 +147,11 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_connect_pins",
             "Connect multiple component pin pairs by reference and pin number, in a single \
-             file read/write cycle. Refuses the complete batch if a route touches an unselected \
+             file read/write cycle. \
+             Writes per item: valid items land, each refused item is listed by \
+             index in outcome.failures, and a call that applies nothing is an error \
+             and writes nothing. \
+             Refuses the complete batch if a route touches an unselected \
              net unless allow_join is explicitly true.",
             json!({
                 "type": "object",
@@ -165,7 +177,11 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_delete",
             "Delete multiple schematic items (wires, labels, junctions, components) by UUID \
-             or component reference designator — single file write.",
+             or component reference designator — single file write. \
+             Writes per item: valid items land, each refused item is listed by \
+             index in outcome.failures, and a call that applies nothing is an error \
+             and writes nothing. \
+             Item indexes count through references, then uuids.",
             json!({
                 "type": "object",
                 "properties": {
@@ -193,7 +209,11 @@ pub fn tools() -> Vec<ToolDef> {
              one, reported as junctions_pruned_count and junctions_added_count. A \
              no-connect flag travels with the pin it protects, reported as \
              no_connects_moved; the shift is refused before writing when that pin \
-             cannot be followed one-to-one.",
+             cannot be followed one-to-one. \
+             Writes per item: valid items land, each refused item is listed by \
+             index in outcome.failures, and a call that applies nothing is an error \
+             and writes nothing. \
+             A moved position outside KiCad's range refuses the whole batch.",
             json!({
                 "type": "object",
                 "properties": {
@@ -214,7 +234,13 @@ pub fn tools() -> Vec<ToolDef> {
             "batch_edit_schematic_components",
             "Apply field updates and native symbol attributes to multiple components \
              in a single atomic file write. Missing custom properties are created on every \
-             placed unit only when create_missing is true.",
+             placed unit only when create_missing is true. \
+             Writes per item: valid items land, each refused item is listed by \
+             index in outcome.failures, and a call that applies nothing is an error \
+             and writes nothing. \
+             Within one edit each field lands on its own, so an edit with a refused \
+             field can be both applied and failed. When any edit sets a native attribute the \
+             batch is all-or-nothing instead.",
             json!({
                 "type": "object",
                 "properties": {
@@ -252,7 +278,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_delete_schematic_components",
-            "Delete multiple components by reference designator in a single atomic file write.",
+            "Delete multiple components by reference designator in a single atomic file write. \
+             Writes per item: valid items land, each refused item is listed by \
+             index in outcome.failures, and a call that applies nothing is an error \
+             and writes nothing.",
             json!({
                 "type": "object",
                 "properties": {
@@ -491,6 +520,7 @@ async fn handle_batch_connect_to_net(
     let mut inserts = String::new();
     let mut added: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut result = BatchOutcome::new(pins.len());
     // Label positions already carrying this net, so a second never lands on
     // the first. Seeded from the file, extended as we go.
     let mut labelled: Vec<(f64, f64)> = extract_labels(&tree)
@@ -499,29 +529,39 @@ async fn handle_batch_connect_to_net(
         .map(|l| (l.x, l.y))
         .collect();
 
-    for pin_spec in &pins {
-        let reference = match pin_spec["reference"].as_str() {
-            Some(r) => r,
-            None => {
-                errors.push("Missing 'reference' in pin spec".into());
-                continue;
-            }
-        };
-        let pin_number = match pin_spec["pin_number"].as_str() {
-            Some(p) => p,
-            None => {
-                errors.push("Missing 'pin_number' in pin spec".into());
-                continue;
-            }
+    for (index, pin_spec) in pins.iter().enumerate() {
+        let (Some(reference), Some(pin_number)) = (
+            pin_spec["reference"].as_str(),
+            pin_spec["pin_number"].as_str(),
+        ) else {
+            let message = if pin_spec["reference"].is_string() {
+                "Missing 'pin_number' in pin spec"
+            } else {
+                "Missing 'reference' in pin spec"
+            };
+            errors.push(message.into());
+            result
+                .failures
+                .push(ItemFailure::new(index, outcome::INVALID_ITEM, message));
+            continue;
         };
 
         let (pin, t) = match resolve_placed_pin(&instances, &lib_syms, reference, pin_number) {
             Ok(p) => p,
             Err(e) => {
                 if let Some(refusal) = ambiguous_reference_result(&e) {
-                    return Ok(refusal);
+                    let failure = ItemFailure::from_result(index, &refusal);
+                    return Ok(outcome::refuse_batch(
+                        &refusal,
+                        vec![failure],
+                        pins.len(),
+                        &sch_path,
+                    ));
                 }
                 errors.push(e.to_string());
+                result
+                    .failures
+                    .push(ItemFailure::new(index, outcome::NOT_FOUND, e.to_string()));
                 continue;
             }
         };
@@ -543,7 +583,13 @@ async fn handle_batch_connect_to_net(
             Some(&net_name),
             allow,
         ) {
-            return Ok(refusal);
+            let failure = ItemFailure::from_result(index, &refusal);
+            return Ok(outcome::refuse_batch(
+                &refusal,
+                vec![failure],
+                pins.len(),
+                &sch_path,
+            ));
         }
 
         // Symbols stack several pins on one endpoint; a label each renders as
@@ -589,7 +635,9 @@ async fn handle_batch_connect_to_net(
             entry["deduplicated"] = json!(true);
         }
         added.push(entry);
+        result.applied.push(index);
     }
+    result.written = is_changed;
 
     if is_changed {
         match sch {
@@ -618,7 +666,12 @@ async fn handle_batch_connect_to_net(
         body["stub_length"] = json!(stub_length);
         body["label_type"] = json!(label_type);
     }
-    Ok(CallToolResult::json(&body))
+    Ok(outcome::batch_result(
+        body,
+        &result,
+        &sch_path,
+        outcome::SAVED_FILE,
+    ))
 }
 
 /// Whether `sch` already has a wire between `a` and `b`, either way round.
@@ -901,44 +954,36 @@ async fn handle_batch_place_components(
         }
     }
 
-    let status = if failures.is_empty() {
-        crate::outcome::OutcomeStatus::Complete
-    } else if placed.is_empty() {
-        crate::outcome::OutcomeStatus::Failed
-    } else {
-        crate::outcome::OutcomeStatus::Partial
+    let item_failures = failures
+        .iter()
+        .map(|failure| {
+            ItemFailure::new(
+                failure["index"].as_u64().unwrap_or_default() as usize,
+                failure["kind"].as_str().unwrap_or("placement_failed"),
+                failure["message"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let result = BatchOutcome {
+        applied: (0..components.len())
+            .filter(|index| !item_failures.iter().any(|failure| failure.index == *index))
+            .collect(),
+        failures: item_failures,
+        written: !placed.is_empty(),
+        ..BatchOutcome::new(components.len())
     };
-    let retry = match status {
-        crate::outcome::OutcomeStatus::Complete => None,
-        crate::outcome::OutcomeStatus::Partial => Some(crate::outcome::retry_failed_items(
-            failures
-                .iter()
-                .filter_map(|failure| failure["index"].as_u64().map(|index| index as usize))
-                .collect(),
-        )),
-        crate::outcome::OutcomeStatus::Failed => Some(crate::outcome::retry_whole_request()),
-        crate::outcome::OutcomeStatus::Uncertain => unreachable!(),
-    };
-    let mut result = CallToolResult::json(&json!({
-        "placed": placed,
-        "placed_count": placed.len(),
-        "junctions_added_count": junctions_added,
-        "junctions_pruned_count": junctions_pruned,
-        "errors": errors,
-        "failures": failures
-    }));
-    result.is_error = placed.is_empty() && !errors.is_empty();
-    Ok(crate::outcome::attach(
-        result,
-        crate::outcome::summary(
-            status,
-            sch_path.display().to_string(),
-            "saved_file_readback",
-            components.len(),
-            placed.len(),
-            failures.len(),
-            retry,
-        ),
+    Ok(outcome::batch_result(
+        json!({
+            "placed": placed,
+            "placed_count": placed.len(),
+            "junctions_added_count": junctions_added,
+            "junctions_pruned_count": junctions_pruned,
+            "errors": errors,
+            "failures": failures
+        }),
+        &result,
+        &sch_path,
+        "saved_file_readback",
     ))
 }
 
@@ -967,35 +1012,49 @@ async fn handle_batch_connect_pins(
     // Resolve every endpoint from the initial tree before any wire is
     // inserted -- symbols/lib_symbols never change as wires are added, so
     // this is safe to do up front instead of re-resolving per connection.
-    let mut resolved: Vec<(f64, f64, f64, f64)> = Vec::new();
+    let mut resolved: Vec<(usize, (f64, f64, f64, f64))> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
-    for conn in &connections {
+    let mut result = BatchOutcome::new(connections.len());
+    for (index, conn) in connections.iter().enumerate() {
         let (Some(ref1), Some(pin1), Some(ref2), Some(pin2)) = (
             conn["ref1"].as_str(),
             conn["pin1"].as_str(),
             conn["ref2"].as_str(),
             conn["pin2"].as_str(),
         ) else {
-            errors.push("Missing ref1/pin1/ref2/pin2 in connection spec".into());
+            let message = "Missing ref1/pin1/ref2/pin2 in connection spec";
+            errors.push(message.into());
+            result
+                .failures
+                .push(ItemFailure::new(index, outcome::INVALID_ITEM, message));
             continue;
         };
         match (
             resolve_pin_endpoint(&instances, &lib_syms, ref1, pin1),
             resolve_pin_endpoint(&instances, &lib_syms, ref2, pin2),
         ) {
-            (Ok((x1, y1)), Ok((x2, y2))) => resolved.push((x1, y1, x2, y2)),
+            (Ok((x1, y1)), Ok((x2, y2))) => resolved.push((index, (x1, y1, x2, y2))),
             (Err(e), _) | (_, Err(e)) => {
                 if let Some(refusal) = ambiguous_reference_result(&e) {
-                    return Ok(refusal);
+                    let failure = ItemFailure::from_result(index, &refusal);
+                    return Ok(outcome::refuse_batch(
+                        &refusal,
+                        vec![failure],
+                        connections.len(),
+                        &sch_path,
+                    ));
                 }
                 errors.push(e.to_string());
+                result
+                    .failures
+                    .push(ItemFailure::new(index, outcome::NOT_FOUND, e.to_string()));
             }
         }
     }
 
     // ponytail: re-parses content per wire; incremental tree edits if batches get huge.
     let mut new_content = content;
-    for (x1, y1, x2, y2) in &resolved {
+    for (index, (x1, y1, x2, y2)) in &resolved {
         let staged_tree = konnect_sexp::parse_sexp(&new_content)?;
         if let Err(refusal) = check_route(
             &staged_tree,
@@ -1004,21 +1063,32 @@ async fn handle_batch_connect_pins(
             None,
             allow,
         ) {
-            return Ok(refusal);
+            let failure = ItemFailure::from_result(*index, &refusal);
+            return Ok(outcome::refuse_batch(
+                &refusal,
+                vec![failure],
+                connections.len(),
+                &sch_path,
+            ));
         }
         new_content = route_between(new_content, *x1, *y1, *x2, *y2)?;
+        result.applied.push(*index);
     }
 
-    if !resolved.is_empty() {
+    result.written = new_content != expected;
+    if result.written {
         write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
     }
 
-    let mut result = CallToolResult::json(&json!({
-        "connected_count": resolved.len(),
-        "errors": errors
-    }));
-    result.is_error = resolved.is_empty() && !errors.is_empty();
-    Ok(result)
+    Ok(outcome::batch_result(
+        json!({
+            "connected_count": resolved.len(),
+            "errors": errors
+        }),
+        &result,
+        &sch_path,
+        outcome::SAVED_FILE,
+    ))
 }
 
 async fn handle_batch_delete(
@@ -1027,6 +1097,9 @@ async fn handle_batch_delete(
 ) -> anyhow::Result<CallToolResult> {
     handle_structural_batch_delete(args, ctx, true).await
 }
+
+/// Kind of a `batch_delete` UUID naming the schematic's own skeleton.
+const PROTECTED_STRUCTURE: &str = "protected_structure";
 
 // Blocklist of structural forms, not an allowlist of item kinds: deleting a
 // drawing item (text, bus, sheet, image, polyline, …) by UUID has always
@@ -1140,18 +1213,31 @@ async fn handle_bulk_move(
     let mut moved: Vec<serde_json::Value> = Vec::new();
     let mut unchanged: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut result = BatchOutcome::new(refs.len());
+    let refuse = |index: usize, refusal: CallToolResult| {
+        let failure = ItemFailure::from_result(index, &refusal);
+        outcome::refuse_batch(&refusal, vec![failure], refs.len(), &sch_path)
+    };
 
-    for ref_val in &refs {
-        let reference = match ref_val.as_str() {
-            Some(r) => r,
-            None => continue,
+    for (index, ref_val) in refs.iter().enumerate() {
+        let Some(reference) = ref_val.as_str() else {
+            let message = "Component reference must be a string";
+            errors.push(message.to_owned());
+            result
+                .failures
+                .push(ItemFailure::new(index, outcome::INVALID_ITEM, message));
+            continue;
         };
 
         // Every placement of this reference — a multi-unit part has one block
         // per unit, and shifting only the first would tear the part apart.
         let blocks = find_all_symbol_instance_blocks(&content, reference);
         if blocks.is_empty() {
-            errors.push(format!("'{}' not found", reference));
+            let message = format!("'{}' not found", reference);
+            errors.push(message.clone());
+            result
+                .failures
+                .push(ItemFailure::new(index, outcome::NOT_FOUND, message));
             continue;
         }
 
@@ -1191,24 +1277,27 @@ async fn handle_bulk_move(
             let moved_y = y + dy;
             for (field, value) in [("x", moved_x), ("y", moved_y)] {
                 if let Err(error) = super::checked_mm(value, field) {
-                    return Ok(error);
+                    return Ok(refuse(index, error));
                 }
             }
             let (new_x, new_y) = snap_point(moved_x, moved_y, 1.27);
             let new_x = match super::checked_mm(new_x, "x") {
                 Ok(value) => value,
-                Err(error) => return Ok(error),
+                Err(error) => return Ok(refuse(index, error)),
             };
             let new_y = match super::checked_mm(new_y, "y") {
                 Ok(value) => value,
-                Err(error) => return Ok(error),
+                Err(error) => return Ok(refuse(index, error)),
             };
             if !rot.is_finite() {
-                return Ok(super::invalid_arg("rotation", "must be finite"));
+                return Ok(refuse(
+                    index,
+                    super::invalid_arg("rotation", "must be finite"),
+                ));
             }
             for (field, value) in [("x", new_x), ("y", new_y)] {
                 if let Err(error) = super::sch_values::check_schematic_coord(value, field) {
-                    return Ok(error);
+                    return Ok(refuse(index, error));
                 }
             }
             // Snapping can absorb a small delta entirely; that placement did
@@ -1234,7 +1323,7 @@ async fn handle_bulk_move(
             // part. `Symbol::translate` does the same on the typed path.
             match property_translation_edits(&content, sym_start, sym_end, new_x - x, new_y - y) {
                 Ok(property_edits) => edits.extend(property_edits),
-                Err(error) => return Ok(error),
+                Err(error) => return Ok(refuse(index, error)),
             }
             placements.push(json!({
                 "old_x": x, "old_y": y,
@@ -1242,6 +1331,15 @@ async fn handle_bulk_move(
             }));
         }
 
+        if errors.len() != errors_before {
+            result.failures.push(ItemFailure::new(
+                index,
+                outcome::INVALID_ITEM,
+                errors[errors_before..].join("; "),
+            ));
+        } else {
+            result.applied.push(index);
+        }
         if placements.is_empty() {
             if errors.len() == errors_before {
                 unchanged.push(reference.to_string());
@@ -1296,7 +1394,10 @@ async fn handle_bulk_move(
     let (new_content, junctions_added, junctions_pruned) =
         crate::tools::sch_wiring::reconcile_junctions_for_placement(&expected, new_content);
 
-    write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
+    result.written = new_content != expected;
+    if result.written {
+        write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
+    }
 
     let moved_markers = match crate::tools::sch_wiring::observed_no_connect_moves(
         &sch_path,
@@ -1307,17 +1408,22 @@ async fn handle_bulk_move(
         Err(error) => return Ok(error),
     };
 
-    Ok(CallToolResult::json(&json!({
-        "moved_count": moved.len(),
-        "moved": moved,
-        "unchanged": unchanged,
-        "dx": round6(dx), "dy": round6(dy),
-        "junctions_added_count": junctions_added,
-        "junctions_pruned_count": junctions_pruned,
-        "no_connects_moved_count": moved_markers.len(),
-        "no_connects_moved": moved_markers,
-        "errors": errors
-    })))
+    Ok(outcome::batch_result(
+        json!({
+            "moved_count": moved.len(),
+            "moved": moved,
+            "unchanged": unchanged,
+            "dx": round6(dx), "dy": round6(dy),
+            "junctions_added_count": junctions_added,
+            "junctions_pruned_count": junctions_pruned,
+            "no_connects_moved_count": moved_markers.len(),
+            "no_connects_moved": moved_markers,
+            "errors": errors
+        }),
+        &result,
+        &sch_path,
+        outcome::SAVED_FILE,
+    ))
 }
 
 async fn handle_batch_edit(
@@ -1370,15 +1476,26 @@ async fn handle_batch_edit(
     let mut seen_assignments = HashSet::new();
     let mut updated_unit_copies = 0;
     let mut created_unit_copies = 0;
+    let mut result = BatchOutcome::new(edits_arr.len());
 
-    for (edit_spec, attribute_patch) in prepared_edits {
-        let reference = match edit_spec["reference"].as_str() {
-            Some(r) => r,
-            None => {
-                errors.push("Missing 'reference' in edit spec".into());
-                continue;
-            }
+    for (index, (edit_spec, attribute_patch)) in prepared_edits.into_iter().enumerate() {
+        let Some(reference) = edit_spec["reference"].as_str() else {
+            let message = "Missing 'reference' in edit spec";
+            errors.push(message.into());
+            result
+                .failures
+                .push(ItemFailure::new(index, outcome::INVALID_ITEM, message));
+            continue;
         };
+        if super::find_all_symbol_instance_blocks(&content, reference).is_empty() {
+            let message = format!("Component '{reference}' not found");
+            errors.push(message.clone());
+            result
+                .failures
+                .push(ItemFailure::new(index, outcome::NOT_FOUND, message));
+            continue;
+        }
+        let errors_before = errors.len();
 
         let mut component_changes: Vec<String> = Vec::new();
         let mut field_results = Vec::new();
@@ -1481,6 +1598,18 @@ async fn handle_batch_edit(
             };
             component_changes.push("native symbol attributes".to_owned());
         }
+        if errors.len() != errors_before {
+            result.failures.push(ItemFailure::new(
+                index,
+                outcome::INVALID_ITEM,
+                errors[errors_before..].join("; "),
+            ));
+        }
+        // Field assignments land one by one: an edit with a refused field
+        // still applies its other fields, so its index can be in both lists.
+        if !component_changes.is_empty() || errors.len() == errors_before {
+            result.applied.push(index);
+        }
         if !component_changes.is_empty() {
             changed.push(json!({
                 "reference": reference,
@@ -1493,13 +1622,29 @@ async fn handle_batch_edit(
     }
 
     if !attribute_patches.is_empty() && !errors.is_empty() {
-        return Ok(CallToolResult::error(format!(
-            "No fields or native attributes were updated: {}",
-            errors.join("; ")
-        )));
+        let refused = BatchOutcome {
+            failures: result.failures,
+            ..BatchOutcome::new(edits_arr.len())
+        };
+        return Ok(outcome::batch_result(
+            json!({
+                "message": format!(
+                    "No fields or native attributes were updated: {}",
+                    errors.join("; ")
+                ),
+                "updated_count": 0,
+                "errors": errors
+            }),
+            &refused,
+            &sch_path,
+            outcome::SAVED_FILE,
+        ));
     }
+    result.written = content != expected;
     let attributes_observed = if attribute_patches.is_empty() {
-        write_schematic_if_unchanged(&sch_path, &expected, &content)?;
+        if result.written {
+            write_schematic_if_unchanged(&sch_path, &expected, &content)?;
+        }
         Vec::new()
     } else {
         match super::sch_components::commit_attribute_batch(
@@ -1513,14 +1658,19 @@ async fn handle_batch_edit(
         }
     };
 
-    Ok(CallToolResult::json(&json!({
-        "attributes_observed": attributes_observed,
-        "updated_count": changed.len(),
-        "updated_unit_copies": updated_unit_copies,
-        "created_unit_copies": created_unit_copies,
-        "updated": changed,
-        "errors": errors
-    })))
+    Ok(outcome::batch_result(
+        json!({
+            "attributes_observed": attributes_observed,
+            "updated_count": changed.len(),
+            "updated_unit_copies": updated_unit_copies,
+            "created_unit_copies": created_unit_copies,
+            "updated": changed,
+            "errors": errors
+        }),
+        &result,
+        &sch_path,
+        outcome::SAVED_FILE,
+    ))
 }
 
 async fn handle_batch_delete_components(
@@ -1577,78 +1727,122 @@ async fn handle_structural_batch_delete(
     let mut selected_item_uuids = Vec::new();
     let mut seen_item_uuids = HashSet::new();
     let mut errors: Vec<String> = Vec::new();
+    // Item indexes run through `references`, then through `uuids`.
+    let uuids = if allow_uuids {
+        args["uuids"].as_array().cloned().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let requested = refs.len() + uuids.len();
+    let mut result = BatchOutcome::new(requested);
+    let mut fail = |index: usize, kind: &str, message: String| {
+        errors.push(message.clone());
+        result.failures.push(ItemFailure::new(index, kind, message));
+    };
+    let refuse = |index: usize, refusal: CallToolResult| {
+        let failure = ItemFailure::from_result(index, &refusal);
+        outcome::refuse_batch(&refusal, vec![failure], requested, &sch_path)
+    };
+    let mut applied = Vec::new();
 
-    for ref_val in &refs {
-        let reference = match ref_val.as_str() {
-            Some(r) => r,
-            None => {
-                errors.push("Component reference must be a string".to_owned());
-                continue;
-            }
+    for (index, ref_val) in refs.iter().enumerate() {
+        let Some(reference) = ref_val.as_str() else {
+            fail(
+                index,
+                outcome::INVALID_ITEM,
+                "Component reference must be a string".to_owned(),
+            );
+            continue;
         };
         if !available_references.contains(reference) {
-            errors.push(format!("Component '{}' not found", reference));
+            fail(
+                index,
+                outcome::NOT_FOUND,
+                format!("Component '{}' not found", reference),
+            );
             continue;
         }
+        applied.push(index);
         if seen_references.insert(reference.to_owned()) {
             selected_references.push(reference.to_owned());
         }
     }
 
-    if allow_uuids {
-        if let Some(uuids) = args["uuids"].as_array() {
-            for uuid_value in uuids {
-                let Some(uuid) = uuid_value.as_str() else {
-                    errors.push("Schematic UUID must be a string".to_owned());
-                    continue;
-                };
-                let Some(item) = indexed.get(uuid) else {
-                    errors.push(format!("UUID '{}' not found", uuid));
-                    continue;
-                };
-                if !is_deletable_schematic_tag(&item.kind) {
-                    errors.push(format!(
-                        "UUID '{}' belongs to protected schematic structure '{}'",
-                        uuid, item.kind
-                    ));
-                    continue;
-                }
-                if item.kind == "symbol" {
-                    let Some(references) = reference_by_uuid.get(uuid) else {
-                        return Ok(ComponentDeleteTargetError::Stale {
-                            target: format!("schematic symbol UUID {uuid}"),
-                            reason: "the symbol has no structural reference identity".to_owned(),
-                        }
-                        .into_result());
-                    };
-                    if references.len() != 1 {
-                        return Ok(ComponentDeleteTargetError::Ambiguous {
-                            target: format!("schematic symbol UUID {uuid}"),
-                            candidates: references.iter().cloned().collect(),
-                        }
-                        .into_result());
+    for (offset, uuid_value) in uuids.iter().enumerate() {
+        let index = refs.len() + offset;
+        let Some(uuid) = uuid_value.as_str() else {
+            fail(
+                index,
+                outcome::INVALID_ITEM,
+                "Schematic UUID must be a string".to_owned(),
+            );
+            continue;
+        };
+        let Some(item) = indexed.get(uuid) else {
+            fail(
+                index,
+                outcome::NOT_FOUND,
+                format!("UUID '{}' not found", uuid),
+            );
+            continue;
+        };
+        if !is_deletable_schematic_tag(&item.kind) {
+            fail(
+                index,
+                PROTECTED_STRUCTURE,
+                format!(
+                    "UUID '{}' belongs to protected schematic structure '{}'",
+                    uuid, item.kind
+                ),
+            );
+            continue;
+        }
+        applied.push(index);
+        if item.kind == "symbol" {
+            let Some(references) = reference_by_uuid.get(uuid) else {
+                return Ok(refuse(
+                    index,
+                    ComponentDeleteTargetError::Stale {
+                        target: format!("schematic symbol UUID {uuid}"),
+                        reason: "the symbol has no structural reference identity".to_owned(),
                     }
-                    let reference = references.iter().next().expect("one reference").clone();
-                    if seen_references.insert(reference.clone()) {
-                        selected_references.push(reference);
+                    .into_result(),
+                ));
+            };
+            if references.len() != 1 {
+                return Ok(refuse(
+                    index,
+                    ComponentDeleteTargetError::Ambiguous {
+                        target: format!("schematic symbol UUID {uuid}"),
+                        candidates: references.iter().cloned().collect(),
                     }
-                } else if seen_item_uuids.insert(uuid.to_owned()) {
-                    selected_item_uuids.push(uuid.to_owned());
-                }
+                    .into_result(),
+                ));
             }
+            let reference = references.iter().next().expect("one reference").clone();
+            if seen_references.insert(reference.clone()) {
+                selected_references.push(reference);
+            }
+        } else if seen_item_uuids.insert(uuid.to_owned()) {
+            selected_item_uuids.push(uuid.to_owned());
         }
     }
 
+    result.applied = applied;
     if selected_references.is_empty() && selected_item_uuids.is_empty() {
-        return Ok(ComponentDeleteTargetError::Stale {
-            target: sch_path.display().to_string(),
-            reason: if errors.is_empty() {
-                "no schematic items were selected".to_owned()
-            } else {
-                errors.join("; ")
-            },
+        if result.failures.is_empty() {
+            return Ok(ComponentDeleteTargetError::Stale {
+                target: sch_path.display().to_string(),
+                reason: "no schematic items were selected".to_owned(),
+            }
+            .into_result());
         }
-        .into_result());
+        return Ok(outcome::batch_result(
+            json!({ "deleted_count": 0, "deleted": [], "errors": errors }),
+            &result,
+            &sch_path,
+            outcome::SAVED_FILE,
+        ));
     }
 
     let plan = match plan_component_and_item_deletions(
@@ -1658,25 +1852,39 @@ async fn handle_structural_batch_delete(
         &selected_item_uuids,
     ) {
         Ok(plan) => plan,
-        Err(error) => return Ok(error.into_result()),
+        Err(error) => {
+            return Ok(outcome::refuse_batch(
+                &error.into_result(),
+                Vec::new(),
+                requested,
+                &sch_path,
+            ))
+        }
     };
-    let outcome = match commit_component_deletion(&sch_path, plan)? {
-        Ok(outcome) => outcome,
-        Err(refusal) => return Ok(refusal),
+    let deletion = match commit_component_deletion(&sch_path, plan)? {
+        Ok(deletion) => deletion,
+        Err(refusal) => {
+            return Ok(outcome::refuse_batch(
+                &refusal,
+                Vec::new(),
+                requested,
+                &sch_path,
+            ))
+        }
     };
 
     let deleted_references = selected_references
         .into_iter()
-        .filter(|reference| outcome.units_by_reference.contains_key(reference))
+        .filter(|reference| deletion.units_by_reference.contains_key(reference))
         .collect::<Vec<_>>();
     let deleted_items = selected_item_uuids
         .into_iter()
-        .filter(|uuid| outcome.item_uuids.contains(uuid))
+        .filter(|uuid| deletion.item_uuids.contains(uuid))
         .collect::<Vec<_>>();
     let deleted_components = deleted_references
         .iter()
         .map(|reference| {
-            let unit_uuids = &outcome.units_by_reference[reference];
+            let unit_uuids = &deletion.units_by_reference[reference];
             json!({
                 "reference": reference,
                 "deleted_units": unit_uuids.len(),
@@ -1690,19 +1898,25 @@ async fn handle_structural_batch_delete(
         .chain(deleted_items.iter().cloned())
         .collect::<Vec<_>>();
 
-    Ok(CallToolResult::json(&json!({
-        "deleted_count": deleted.len(),
-        "deleted": deleted,
-        "deleted_components": deleted_components,
-        "deleted_item_uuids": deleted_items,
-        "removed_no_connects_count": outcome.marker_uuids.len(),
-        "removed_no_connect_uuids": outcome.marker_uuids,
-        "junctions_added_count": outcome.added_junctions.len(),
-        "junctions_added_uuids": outcome.added_junctions,
-        "junctions_pruned_count": outcome.pruned_junctions.len(),
-        "junctions_pruned_uuids": outcome.pruned_junctions,
-        "errors": errors
-    })))
+    result.written = true;
+    Ok(outcome::batch_result(
+        json!({
+            "deleted_count": deleted.len(),
+            "deleted": deleted,
+            "deleted_components": deleted_components,
+            "deleted_item_uuids": deleted_items,
+            "removed_no_connects_count": deletion.marker_uuids.len(),
+            "removed_no_connect_uuids": deletion.marker_uuids,
+            "junctions_added_count": deletion.added_junctions.len(),
+            "junctions_added_uuids": deletion.added_junctions,
+            "junctions_pruned_count": deletion.pruned_junctions.len(),
+            "junctions_pruned_uuids": deletion.pruned_junctions,
+            "errors": errors
+        }),
+        &result,
+        &sch_path,
+        outcome::SAVED_FILE,
+    ))
 }
 
 async fn handle_connect_passthrough(
@@ -2426,19 +2640,33 @@ mod connectivity_safe_batch_delete_tests {
     }
 
     #[tokio::test]
-    async fn total_missing_or_protected_selection_is_structured_stale_and_unchanged() {
+    async fn total_missing_or_protected_selection_is_batch_failed_and_unchanged() {
         let cases = [
-            json!({ "references": ["MISSING"] }),
-            json!({ "uuids": ["5a1d3bbf-65fe-4cc0-9d9e-4ec47d238186"] }),
-            json!({ "uuids": ["8026d02f-ff62-464a-9ce5-e55f42254b73"] }),
+            (json!({ "references": ["MISSING"] }), "not_found"),
+            (
+                json!({ "uuids": ["5a1d3bbf-65fe-4cc0-9d9e-4ec47d238186"] }),
+                "not_found",
+            ),
+            (
+                json!({ "uuids": ["8026d02f-ff62-464a-9ce5-e55f42254b73"] }),
+                "not_found",
+            ),
         ];
-        for selection in cases {
+        for (selection, item_kind) in cases {
             let (_directory, path) = fixture(CONNECTIVITY);
             let mut args = selection;
             args["schematic"] = json!(path);
             let result = handle_batch_delete(&args, &context()).await.unwrap();
 
-            assert_eq!(extract_error_kind(&result).as_deref(), Some("stale_target"));
+            assert_eq!(extract_error_kind(&result).as_deref(), Some("batch_failed"));
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text content");
+            };
+            let response: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                response["outcome"]["failures"][0]["kind"], item_kind,
+                "{response}"
+            );
             assert_eq!(std::fs::read_to_string(&path).unwrap(), CONNECTIVITY);
         }
     }
@@ -3499,14 +3727,24 @@ mod multi_unit_handler_tests {
     async fn batch_edit_missing_custom_field_is_opt_in_and_multi_unit_safe() {
         let schematic = fixture_file();
         let original = std::fs::read_to_string(schematic.path()).unwrap();
-        let refused = call(
-            schematic.path(),
-            "batch_edit_schematic_components",
-            json!({
+        let refused = handle_batch_edit(
+            &json!({
+                "schematic": schematic.path().to_str().unwrap(),
                 "edits": [{"reference": "U1", "fields": {"Tolerance": "1%"}}]
             }),
+            &ToolContext::new(
+                ServerConfig::default(),
+                Arc::new(crate::router::ToolRouter::new()),
+            ),
         )
-        .await;
+        .await
+        .unwrap();
+        assert!(refused.is_error, "nothing applied: {refused:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &refused.content[0] else {
+            panic!("expected text content");
+        };
+        let refused: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(refused["outcome"]["status"], "failed");
         assert_eq!(refused["updated_count"], 0);
         assert_eq!(refused["created_unit_copies"], 0);
         assert_eq!(
@@ -4799,7 +5037,7 @@ mod batch_connect_options_tests {
             let body = body(&result);
             assert_eq!(
                 keys(&body),
-                BTreeSet::from(["net", "added", "added_count", "errors"]),
+                BTreeSet::from(["net", "added", "added_count", "errors", "outcome"]),
                 "{options}"
             );
             for (entry, (x, y, rot)) in body["added"].as_array().unwrap().iter().zip(promised) {

@@ -41,6 +41,8 @@ mod project_file_writer_tests;
 pub mod sch_analysis;
 pub(crate) mod sch_annotate;
 pub mod sch_batch;
+#[cfg(test)]
+mod sch_batch_outcome_tests;
 pub mod sch_bus;
 pub mod sch_components;
 pub(crate) mod sch_connectivity;

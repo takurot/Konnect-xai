@@ -22,6 +22,7 @@
 use super::sch_route_safety::{allow_join, check_route};
 use super::sch_wiring::{ambiguous_reference_result, resolve_pin_endpoint};
 use crate::mcp::protocol::CallToolResult;
+use crate::outcome::{self, BatchOutcome, ItemFailure};
 use crate::tool;
 use crate::tools::{get_path, opt_f64, opt_str, require_f64, ToolContext, ToolDef};
 use konnect_sexp::geometry::round6;
@@ -107,7 +108,11 @@ pub fn tools() -> Vec<ToolDef> {
              entry, the bus entry itself, and a net label naming the member. This is the whole \
              connection — a stub without a label joins nothing, since bus membership is by name. \
              Give the bus's fixed coordinate ('bus_y' for a horizontal bus, 'bus_x' for a \
-             vertical one); the bus segment itself is drawn separately with add_bus.",
+             vertical one); the bus segment itself is drawn separately with add_bus. \
+             Writes per item: valid items land, each refused item is listed by index in \
+             outcome.failures, and a call that applies nothing is an error and writes nothing. \
+             A route that touches an unselected net, or an ambiguous reference, refuses the \
+             complete batch.",
             json!({
                 "type": "object",
                 "properties": {
@@ -339,8 +344,9 @@ async fn handle_connect_pins_to_bus(
     let mut inserts = String::new();
     let mut added: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut result = BatchOutcome::new(conns.len());
 
-    for conn in &conns {
+    for (index, conn) in conns.iter().enumerate() {
         let (reference, pin_number, net) = match (
             conn["reference"].as_str(),
             conn["pin_number"].as_str(),
@@ -348,7 +354,11 @@ async fn handle_connect_pins_to_bus(
         ) {
             (Some(r), Some(p), Some(n)) => (r, p, n),
             _ => {
-                errors.push("Each connection needs reference, pin_number and net".into());
+                let message = "Each connection needs reference, pin_number and net";
+                errors.push(message.into());
+                result
+                    .failures
+                    .push(ItemFailure::new(index, outcome::INVALID_ITEM, message));
                 continue;
             }
         };
@@ -357,9 +367,20 @@ async fn handle_connect_pins_to_bus(
             Ok(point) => point,
             Err(error) => {
                 if let Some(refusal) = ambiguous_reference_result(&error) {
-                    return Ok(refusal);
+                    let failure = ItemFailure::from_result(index, &refusal);
+                    return Ok(outcome::refuse_batch(
+                        &refusal,
+                        vec![failure],
+                        conns.len(),
+                        &sch_path,
+                    ));
                 }
                 errors.push(error.to_string());
+                result.failures.push(ItemFailure::new(
+                    index,
+                    outcome::NOT_FOUND,
+                    error.to_string(),
+                ));
                 continue;
             }
         };
@@ -390,7 +411,13 @@ async fn handle_connect_pins_to_bus(
             Some(net),
             allow,
         ) {
-            return Ok(refusal);
+            let failure = ItemFailure::from_result(index, &refusal);
+            return Ok(outcome::refuse_batch(
+                &refusal,
+                vec![failure],
+                conns.len(),
+                &sch_path,
+            ));
         }
 
         // Stub from the pin up to the entry's wire-side end. Zero-length when
@@ -411,16 +438,25 @@ async fn handle_connect_pins_to_bus(
             "pin_at": { "x": round6(px), "y": round6(py) },
             "entry_at": { "x": round6(entry_x), "y": round6(entry_y) }
         }));
+        result.applied.push(index);
     }
 
-    let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts)?;
-    write_schematic_if_unchanged(&sch_path, &content, &new_content)?;
+    result.written = !inserts.is_empty();
+    if result.written {
+        let new_content = crate::tools::sch_wiring::insert_before_close(&content, &inserts)?;
+        write_schematic_if_unchanged(&sch_path, &content, &new_content)?;
+    }
 
-    Ok(CallToolResult::json(&json!({
-        "connected_count": added.len(),
-        "connected": added,
-        "errors": errors
-    })))
+    Ok(outcome::batch_result(
+        json!({
+            "connected_count": added.len(),
+            "connected": added,
+            "errors": errors
+        }),
+        &result,
+        &sch_path,
+        outcome::SAVED_FILE,
+    ))
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
