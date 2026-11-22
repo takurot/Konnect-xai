@@ -188,8 +188,9 @@ fn choose_route_on_graph(
         if route_hits.is_empty() {
             return Ok(segments.clone());
         }
+        let earlier = hits.len();
         for hit in route_hits {
-            if !hits.contains(&hit) {
+            if !hits[..earlier].contains(&hit) {
                 hits.push(hit);
             }
         }

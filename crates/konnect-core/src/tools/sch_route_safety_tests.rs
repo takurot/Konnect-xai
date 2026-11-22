@@ -150,7 +150,26 @@ fn both_routes_blocked_reports_both_refusals() {
 fn straight_route_has_no_alternative() {
     let sheet = tree(r#"(label "FOREIGN" (at 5 0 0))"#);
     let error = select_route(&sheet, (0., 0.), (10., 0.), false).unwrap_err();
-    assert_eq!(refusal_body(&error)["error"]["at"], json!([[5.0, 0.0]]));
+    let body = refusal_body(&error);
+    assert_eq!(body["error"]["at"], json!([[5.0, 0.0]]));
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Route would join"),
+        "{body}"
+    );
+}
+
+#[test]
+fn single_route_refusal_keeps_repeated_hits() {
+    let sheet =
+        tree(r#"(wire (pts (xy 5 -5) (xy 5 0)) (uuid "foreign")) (label "FOO" (at 5 0 0))"#);
+    let error = check_route(&sheet, &route(), &endpoints(), None, false).unwrap_err();
+    assert_eq!(
+        refusal_body(&error)["error"]["at"],
+        json!([[5.0, 0.0], [5.0, 0.0]])
+    );
 }
 
 #[test]
