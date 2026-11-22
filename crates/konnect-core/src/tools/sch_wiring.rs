@@ -637,16 +637,19 @@ async fn handle_batch_add_wire(
     };
     let mut segments = Vec::new();
     let mut failures = Vec::new();
+    let mut first_bad_field = None;
     for (i, w) in wires.iter().enumerate() {
         let missing = ["x1", "y1", "x2", "y2"]
             .into_iter()
             .find(|key| !w[*key].as_f64().is_some_and(f64::is_finite));
         if let Some(key) = missing {
+            let field = format!("wires[{i}].{key}");
             failures.push(ItemFailure::new(
                 i,
                 outcome::INVALID_ITEM,
-                format!("wires[{i}].{key}: missing or not a finite number"),
+                format!("{field}: missing or not a finite number"),
             ));
+            first_bad_field.get_or_insert(field);
             continue;
         }
         let at = |key: &str| w[key].as_f64().unwrap_or_default();
@@ -656,11 +659,8 @@ async fn handle_batch_add_wire(
             snap_point(at("x2"), at("y2"), 1.27),
         ));
     }
-    if !failures.is_empty() {
-        let refusal = super::invalid_arg(
-            &format!("wires[{}]", failures[0].index),
-            &failures[0].message,
-        );
+    if let Some(field) = first_bad_field {
+        let refusal = super::invalid_arg(&field, "missing or not a finite number");
         return Ok(outcome::refuse_batch(
             &refusal,
             failures,
@@ -2240,21 +2240,19 @@ async fn handle_batch_rotate_labels(
         Ok(a) => a.clone(),
         Err(e) => return Ok(e),
     };
-    let rotations = labels
-        .iter()
-        .enumerate()
-        .map(|(index, label)| {
-            schematic_rotation_arg(
-                label.get("rotation"),
-                &format!("labels[{index}].rotation"),
-                None,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>();
-    let rotations = match rotations {
-        Ok(rotations) => rotations,
-        Err(error) => return Ok(error),
-    };
+    let mut rotations = Vec::with_capacity(labels.len());
+    for (index, label) in labels.iter().enumerate() {
+        match schematic_rotation_arg(
+            label.get("rotation"),
+            &format!("labels[{index}].rotation"),
+            None,
+        ) {
+            Ok(rotation) => rotations.push(rotation),
+            Err(error) => {
+                return Ok(BatchOutcome::new(labels.len()).refuse(&error, Some(index), &sch_path))
+            }
+        }
+    }
 
     // All-or-nothing: each label is planned against the document as the
     // earlier entries left it, so naming one label twice rotates it to the

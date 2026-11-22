@@ -367,13 +367,7 @@ async fn handle_connect_pins_to_bus(
             Ok(point) => point,
             Err(error) => {
                 if let Some(refusal) = ambiguous_reference_result(&error) {
-                    let failure = ItemFailure::from_result(index, &refusal);
-                    return Ok(outcome::refuse_batch(
-                        &refusal,
-                        vec![failure],
-                        conns.len(),
-                        &sch_path,
-                    ));
+                    return Ok(result.refuse(&refusal, Some(index), &sch_path));
                 }
                 errors.push(error.to_string());
                 result.failures.push(ItemFailure::new(
@@ -411,13 +405,7 @@ async fn handle_connect_pins_to_bus(
             Some(net),
             allow,
         ) {
-            let failure = ItemFailure::from_result(index, &refusal);
-            return Ok(outcome::refuse_batch(
-                &refusal,
-                vec![failure],
-                conns.len(),
-                &sch_path,
-            ));
+            return Ok(result.refuse(&refusal, Some(index), &sch_path));
         }
 
         // Stub from the pin up to the entry's wire-side end. Zero-length when

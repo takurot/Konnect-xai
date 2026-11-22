@@ -550,13 +550,7 @@ async fn handle_batch_connect_to_net(
             Ok(p) => p,
             Err(e) => {
                 if let Some(refusal) = ambiguous_reference_result(&e) {
-                    let failure = ItemFailure::from_result(index, &refusal);
-                    return Ok(outcome::refuse_batch(
-                        &refusal,
-                        vec![failure],
-                        pins.len(),
-                        &sch_path,
-                    ));
+                    return Ok(result.refuse(&refusal, Some(index), &sch_path));
                 }
                 errors.push(e.to_string());
                 result
@@ -583,13 +577,7 @@ async fn handle_batch_connect_to_net(
             Some(&net_name),
             allow,
         ) {
-            let failure = ItemFailure::from_result(index, &refusal);
-            return Ok(outcome::refuse_batch(
-                &refusal,
-                vec![failure],
-                pins.len(),
-                &sch_path,
-            ));
+            return Ok(result.refuse(&refusal, Some(index), &sch_path));
         }
 
         // Symbols stack several pins on one endpoint; a label each renders as
@@ -1036,13 +1024,7 @@ async fn handle_batch_connect_pins(
             (Ok((x1, y1)), Ok((x2, y2))) => resolved.push((index, (x1, y1, x2, y2))),
             (Err(e), _) | (_, Err(e)) => {
                 if let Some(refusal) = ambiguous_reference_result(&e) {
-                    let failure = ItemFailure::from_result(index, &refusal);
-                    return Ok(outcome::refuse_batch(
-                        &refusal,
-                        vec![failure],
-                        connections.len(),
-                        &sch_path,
-                    ));
+                    return Ok(result.refuse(&refusal, Some(index), &sch_path));
                 }
                 errors.push(e.to_string());
                 result
@@ -1063,13 +1045,7 @@ async fn handle_batch_connect_pins(
             None,
             allow,
         ) {
-            let failure = ItemFailure::from_result(*index, &refusal);
-            return Ok(outcome::refuse_batch(
-                &refusal,
-                vec![failure],
-                connections.len(),
-                &sch_path,
-            ));
+            return Ok(result.refuse(&refusal, Some(*index), &sch_path));
         }
         new_content = route_between(new_content, *x1, *y1, *x2, *y2)?;
         result.applied.push(*index);
@@ -1214,10 +1190,6 @@ async fn handle_bulk_move(
     let mut unchanged: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut result = BatchOutcome::new(refs.len());
-    let refuse = |index: usize, refusal: CallToolResult| {
-        let failure = ItemFailure::from_result(index, &refusal);
-        outcome::refuse_batch(&refusal, vec![failure], refs.len(), &sch_path)
-    };
 
     for (index, ref_val) in refs.iter().enumerate() {
         let Some(reference) = ref_val.as_str() else {
@@ -1277,27 +1249,28 @@ async fn handle_bulk_move(
             let moved_y = y + dy;
             for (field, value) in [("x", moved_x), ("y", moved_y)] {
                 if let Err(error) = super::checked_mm(value, field) {
-                    return Ok(refuse(index, error));
+                    return Ok(result.refuse(&error, Some(index), &sch_path));
                 }
             }
             let (new_x, new_y) = snap_point(moved_x, moved_y, 1.27);
             let new_x = match super::checked_mm(new_x, "x") {
                 Ok(value) => value,
-                Err(error) => return Ok(refuse(index, error)),
+                Err(error) => return Ok(result.refuse(&error, Some(index), &sch_path)),
             };
             let new_y = match super::checked_mm(new_y, "y") {
                 Ok(value) => value,
-                Err(error) => return Ok(refuse(index, error)),
+                Err(error) => return Ok(result.refuse(&error, Some(index), &sch_path)),
             };
             if !rot.is_finite() {
-                return Ok(refuse(
-                    index,
-                    super::invalid_arg("rotation", "must be finite"),
+                return Ok(result.refuse(
+                    &super::invalid_arg("rotation", "must be finite"),
+                    Some(index),
+                    &sch_path,
                 ));
             }
             for (field, value) in [("x", new_x), ("y", new_y)] {
                 if let Err(error) = super::sch_values::check_schematic_coord(value, field) {
-                    return Ok(refuse(index, error));
+                    return Ok(result.refuse(&error, Some(index), &sch_path));
                 }
             }
             // Snapping can absorb a small delta entirely; that placement did
@@ -1323,7 +1296,7 @@ async fn handle_bulk_move(
             // part. `Symbol::translate` does the same on the typed path.
             match property_translation_edits(&content, sym_start, sym_end, new_x - x, new_y - y) {
                 Ok(property_edits) => edits.extend(property_edits),
-                Err(error) => return Ok(refuse(index, error)),
+                Err(error) => return Ok(result.refuse(&error, Some(index), &sch_path)),
             }
             placements.push(json!({
                 "old_x": x, "old_y": y,
@@ -1337,7 +1310,10 @@ async fn handle_bulk_move(
                 outcome::INVALID_ITEM,
                 errors[errors_before..].join("; "),
             ));
-        } else {
+        }
+        // A unit that could not be read does not hold back the units that
+        // moved, so such a reference can be both applied and failed.
+        if !placements.is_empty() || errors.len() == errors_before {
             result.applied.push(index);
         }
         if placements.is_empty() {
@@ -1594,7 +1570,7 @@ async fn handle_batch_edit(
                 attribute_patch,
             ) {
                 Ok(content) => content,
-                Err(error) => return Ok(error),
+                Err(error) => return Ok(result.refuse(&error, Some(index), &sch_path)),
             };
             component_changes.push("native symbol attributes".to_owned());
         }
@@ -1735,19 +1711,21 @@ async fn handle_structural_batch_delete(
     };
     let requested = refs.len() + uuids.len();
     let mut result = BatchOutcome::new(requested);
-    let mut fail = |index: usize, kind: &str, message: String| {
+    let fail = |result: &mut BatchOutcome,
+                errors: &mut Vec<String>,
+                index: usize,
+                kind: &str,
+                message: String| {
         errors.push(message.clone());
         result.failures.push(ItemFailure::new(index, kind, message));
-    };
-    let refuse = |index: usize, refusal: CallToolResult| {
-        let failure = ItemFailure::from_result(index, &refusal);
-        outcome::refuse_batch(&refusal, vec![failure], requested, &sch_path)
     };
     let mut applied = Vec::new();
 
     for (index, ref_val) in refs.iter().enumerate() {
         let Some(reference) = ref_val.as_str() else {
             fail(
+                &mut result,
+                &mut errors,
                 index,
                 outcome::INVALID_ITEM,
                 "Component reference must be a string".to_owned(),
@@ -1756,6 +1734,8 @@ async fn handle_structural_batch_delete(
         };
         if !available_references.contains(reference) {
             fail(
+                &mut result,
+                &mut errors,
                 index,
                 outcome::NOT_FOUND,
                 format!("Component '{}' not found", reference),
@@ -1772,6 +1752,8 @@ async fn handle_structural_batch_delete(
         let index = refs.len() + offset;
         let Some(uuid) = uuid_value.as_str() else {
             fail(
+                &mut result,
+                &mut errors,
                 index,
                 outcome::INVALID_ITEM,
                 "Schematic UUID must be a string".to_owned(),
@@ -1780,6 +1762,8 @@ async fn handle_structural_batch_delete(
         };
         let Some(item) = indexed.get(uuid) else {
             fail(
+                &mut result,
+                &mut errors,
                 index,
                 outcome::NOT_FOUND,
                 format!("UUID '{}' not found", uuid),
@@ -1788,6 +1772,8 @@ async fn handle_structural_batch_delete(
         };
         if !is_deletable_schematic_tag(&item.kind) {
             fail(
+                &mut result,
+                &mut errors,
                 index,
                 PROTECTED_STRUCTURE,
                 format!(
@@ -1800,24 +1786,20 @@ async fn handle_structural_batch_delete(
         applied.push(index);
         if item.kind == "symbol" {
             let Some(references) = reference_by_uuid.get(uuid) else {
-                return Ok(refuse(
-                    index,
-                    ComponentDeleteTargetError::Stale {
-                        target: format!("schematic symbol UUID {uuid}"),
-                        reason: "the symbol has no structural reference identity".to_owned(),
-                    }
-                    .into_result(),
-                ));
+                let refusal = ComponentDeleteTargetError::Stale {
+                    target: format!("schematic symbol UUID {uuid}"),
+                    reason: "the symbol has no structural reference identity".to_owned(),
+                }
+                .into_result();
+                return Ok(result.refuse(&refusal, Some(index), &sch_path));
             };
             if references.len() != 1 {
-                return Ok(refuse(
-                    index,
-                    ComponentDeleteTargetError::Ambiguous {
-                        target: format!("schematic symbol UUID {uuid}"),
-                        candidates: references.iter().cloned().collect(),
-                    }
-                    .into_result(),
-                ));
+                let refusal = ComponentDeleteTargetError::Ambiguous {
+                    target: format!("schematic symbol UUID {uuid}"),
+                    candidates: references.iter().cloned().collect(),
+                }
+                .into_result();
+                return Ok(result.refuse(&refusal, Some(index), &sch_path));
             }
             let reference = references.iter().next().expect("one reference").clone();
             if seen_references.insert(reference.clone()) {
@@ -1852,25 +1834,11 @@ async fn handle_structural_batch_delete(
         &selected_item_uuids,
     ) {
         Ok(plan) => plan,
-        Err(error) => {
-            return Ok(outcome::refuse_batch(
-                &error.into_result(),
-                Vec::new(),
-                requested,
-                &sch_path,
-            ))
-        }
+        Err(error) => return Ok(result.refuse(&error.into_result(), None, &sch_path)),
     };
     let deletion = match commit_component_deletion(&sch_path, plan)? {
         Ok(deletion) => deletion,
-        Err(refusal) => {
-            return Ok(outcome::refuse_batch(
-                &refusal,
-                Vec::new(),
-                requested,
-                &sch_path,
-            ))
-        }
+        Err(refusal) => return Ok(result.refuse(&refusal, None, &sch_path)),
     };
 
     let deleted_references = selected_references
@@ -2640,7 +2608,7 @@ mod connectivity_safe_batch_delete_tests {
     }
 
     #[tokio::test]
-    async fn total_missing_or_protected_selection_is_batch_failed_and_unchanged() {
+    async fn total_missing_or_nested_uuid_selection_is_batch_failed_and_unchanged() {
         let cases = [
             (json!({ "references": ["MISSING"] }), "not_found"),
             (

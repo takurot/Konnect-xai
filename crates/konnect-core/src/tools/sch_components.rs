@@ -4202,7 +4202,11 @@ async fn handle_group_components(
     let mut targets = Vec::new();
     let mut errors = Vec::new();
     let mut result = crate::outcome::BatchOutcome::new(refs.len());
-    let mut fail = |index: usize, kind: &str, message: String| {
+    let fail = |result: &mut crate::outcome::BatchOutcome,
+                errors: &mut Vec<String>,
+                index: usize,
+                kind: &str,
+                message: String| {
         errors.push(message.clone());
         result
             .failures
@@ -4215,6 +4219,8 @@ async fn handle_group_components(
     for (index, value) in refs.iter().enumerate() {
         let Some(reference) = value.as_str() else {
             fail(
+                &mut result,
+                &mut errors,
                 index,
                 crate::outcome::INVALID_ITEM,
                 "Component reference must be a string".to_owned(),
@@ -4231,6 +4237,8 @@ async fn handle_group_components(
                 if reason.contains("is not present") =>
             {
                 fail(
+                    &mut result,
+                    &mut errors,
                     index,
                     crate::outcome::NOT_FOUND,
                     format!("Component '{reference}' not found"),
@@ -4239,13 +4247,7 @@ async fn handle_group_components(
             }
             Err(error) => {
                 let refusal = error.into_result();
-                let failure = crate::outcome::ItemFailure::from_result(index, &refusal);
-                return Ok(crate::outcome::refuse_batch(
-                    &refusal,
-                    vec![failure],
-                    refs.len(),
-                    &sch_path,
-                ));
+                return Ok(result.refuse(&refusal, Some(index), &sch_path));
             }
         };
         match set_property_value(&content, reference, "Group", &group_name, true) {
@@ -4253,12 +4255,16 @@ async fn handle_group_components(
                 content = updated;
                 item_ids.extend(match target.item_ids() {
                     Ok(item_ids) => item_ids,
-                    Err(error) => return Ok(error.into_result()),
+                    Err(error) => {
+                        return Ok(result.refuse(&error.into_result(), Some(index), &sch_path))
+                    }
                 });
                 targets.push(target);
                 grouped_indexes.insert(reference.to_owned(), vec![index]);
             }
             Err(error) => fail(
+                &mut result,
+                &mut errors,
                 index,
                 crate::outcome::INVALID_ITEM,
                 format!("{reference}: {error}"),

@@ -410,6 +410,64 @@ async fn batch_delete_indexes_count_references_then_uuids() {
     );
 }
 
+/// A vertical wire at x = 114.3 crosses the straight route from R1 pin 2 to
+/// R2 pin 2 mid-span, so that route would join it and is refused.
+async fn fixture_with_a_crossing_wire() -> (tempfile::TempDir, PathBuf) {
+    let (dir, path) = fixture();
+    let added = call(
+        "batch_add_wire",
+        &path,
+        json!({"wires": [{"x1": 114.3, "y1": 100.33, "x2": 114.3, "y2": 110.49}]}),
+    )
+    .await;
+    assert!(!added.is_error, "{}", body(&added));
+    (dir, path)
+}
+
+#[tokio::test]
+async fn a_whole_batch_refusal_keeps_its_kind_and_every_item_failure() {
+    let (_dir, path) = fixture_with_a_crossing_wire().await;
+    let before = read(&path);
+    let result = call(
+        "batch_connect_pins",
+        &path,
+        json!({"connections": [
+            {"ref1": "R99", "pin1": "1", "ref2": "R1", "pin2": "1"},
+            {"ref1": "R1", "pin1": "2", "ref2": "R2", "pin2": "2"}
+        ]}),
+    )
+    .await;
+    let response = body(&result);
+    assert!(result.is_error, "{response}");
+    assert_eq!(response["error"]["kind"], "would_join_nets", "{response}");
+    let outcome = &response["outcome"];
+    assert_eq!(failure_indexes(outcome), vec![0, 1], "{response}");
+    assert_eq!(outcome["failures"][0]["kind"], "not_found", "{response}");
+    assert_eq!(outcome["failures"][1]["kind"], "would_join_nets");
+    assert_eq!(outcome["applied"], json!([]), "{response}");
+    assert_eq!(read(&path), before);
+}
+
+#[tokio::test]
+async fn all_or_nothing_wires_write_nothing_when_a_later_route_is_refused() {
+    let (_dir, path) = fixture_with_a_crossing_wire().await;
+    let before = read(&path);
+    let result = call(
+        "batch_add_wire",
+        &path,
+        json!({"wires": [
+            {"x1": 25.4, "y1": 25.4, "x2": 30.48, "y2": 25.4},
+            {"x1": 107.95, "y1": 105.41, "x2": 120.65, "y2": 105.41}
+        ]}),
+    )
+    .await;
+    let response = body(&result);
+    assert!(result.is_error, "{response}");
+    assert_eq!(response["error"]["kind"], "would_join_nets", "{response}");
+    assert_eq!(failure_indexes(&response["outcome"]), vec![1], "{response}");
+    assert_eq!(read(&path), before, "wire 0 must not be written");
+}
+
 #[tokio::test]
 async fn every_repeated_item_is_reported_under_its_own_index() {
     let (_dir, path) = fixture();

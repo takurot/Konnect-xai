@@ -177,6 +177,19 @@ impl BatchOutcome {
         }
     }
 
+    /// Refuse the whole batch: nothing is applied, and the item failures found
+    /// so far are reported with the item at `index` that raised `refusal`.
+    pub fn refuse(
+        mut self,
+        refusal: &CallToolResult,
+        index: Option<usize>,
+        target: &std::path::Path,
+    ) -> CallToolResult {
+        self.failures
+            .extend(index.map(|index| ItemFailure::from_result(index, refusal)));
+        refuse_batch(refusal, self.failures, self.requested, target)
+    }
+
     fn to_json(&self, target: &str, source: &str) -> Value {
         let status = self.status();
         let retry = match status {
@@ -225,10 +238,8 @@ pub fn batch_result(
             .map(|failure| format!("[{}] {}", failure.index, failure.message))
             .collect::<Vec<_>>()
             .join("; ");
-        body.insert(
-            "message".to_string(),
-            json!(format!("no batch item was applied: {detail}")),
-        );
+        body.entry("message")
+            .or_insert_with(|| json!(format!("no batch item was applied: {detail}")));
         body.insert(
             "error".to_string(),
             json!(crate::mcp::error::ToolErrorKind::BatchFailed {

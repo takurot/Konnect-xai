@@ -19,8 +19,9 @@ already used: `connect_pins_to_bus`, `batch_connect_to_net`,
 - `applied` lists the input indexes whose effect is in the file, including
   items that were already satisfied.
 - `failures` lists the items at fault as `{index, kind, message}`. Kinds are
-  `invalid_item`, `not_found`, `protected_structure`, or the structured kind
-  that refused the item.
+  `invalid_item`, `not_found`, or the structured kind that refused the item.
+  A whole-batch refusal lists every item failure found before it, plus the
+  item that raised it.
 - `written` says whether the call changed the file.
 
 The issue proposed `status: none` and a `failed` list. `none` is spelled
@@ -47,14 +48,29 @@ Behaviour changes:
   earlier labels rotated. Its error text "N earlier label(s) were already
   rotated and written" is gone. A label named twice ends at its last
   rotation.
-- An all-failed batch now has error kind `batch_failed`. Before,
-  `batch_delete`, `batch_delete_schematic_components` and `group_components`
-  returned `stale_target`, `batch_place_components` returned a body without a
-  kind, and `connect_pins_to_bus`, `batch_connect_to_net`,
-  `batch_edit_schematic_components` and `bulk_move_schematic_components`
-  returned `isError: false`. A whole-batch refusal that has its own kind
-  (`would_join_nets`, `ambiguous_reference`, `ambiguous_target`,
-  `invalid_argument`) keeps it and gains the `outcome` block.
+- An all-failed batch now has error kind `batch_failed`, with the message
+  `no batch item was applied: [index] reason; ...`. Before:
+  - `batch_delete`, `batch_delete_schematic_components` and
+    `group_components` returned `stale_target`.
+  - `batch_place_components` and `batch_connect_pins` returned a body without
+    a kind.
+  - `batch_delete_schematic_wire` and `batch_delete_no_connect` returned the
+    plain text `No wires deleted: ...` / `No no-connects deleted: ...`.
+  - `batch_rotate_labels` returned the plain text `labels[i] was not rotated:
+    ...`; a label with a non-numeric `x` or `y` was `invalid_argument` and is
+    now an `invalid_item` failure.
+  - `batch_edit_schematic_components` with a native attribute returned the
+    plain text `No fields or native attributes were updated: ...`; that text
+    is now the message of a `batch_failed` body.
+  - `connect_pins_to_bus`, `batch_connect_to_net`,
+    `batch_edit_schematic_components` and `bulk_move_schematic_components`
+    returned `isError: false`.
+- A whole-batch refusal that has its own kind (`would_join_nets`,
+  `ambiguous_reference`, `ambiguous_target`, `stale_target`,
+  `invalid_argument`) keeps it and gains the `outcome` block. This includes
+  `batch_add_wire`'s coordinate refusal, still `invalid_argument` naming
+  `wires[i].x1` (or the first missing coordinate), and
+  `batch_rotate_labels`'s `labels[i].rotation` refusal.
 - `connect_pins_to_bus`, `bulk_move_schematic_components`,
   `batch_delete_schematic_wire` and `batch_delete_no_connect` no longer
   rewrite the file when nothing changes.
