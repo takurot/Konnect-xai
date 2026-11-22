@@ -93,9 +93,12 @@ refusal raised before the write, such as a change found while planning or a
 KiCad editor lock, stays `status: failed` with `written: false`.
 
 Every saved-schematic command commit (`SchematicCommand`) now reports a
-readback that differs right after the atomic replace as
+readback that differs, or cannot be read, right after the atomic replace as
 `mutation_outcome_uncertain`, as `write_atomic_if_unchanged` already did.
-Before, it was `conflict`, which read as a refusal that wrote nothing. The
+Before, a differing readback was `conflict`, or a `stale_target` refusal in
+`batch_delete`, `batch_delete_schematic_components`,
+`delete_schematic_component` and datasheet enrichment, and an unreadable one
+was a plain I/O error. Each read as a refusal that wrote nothing. The
 verified-commit errors of `group_components` and of
 `batch_edit_schematic_components` with native attributes keep their previous
 shape without `outcome`.
