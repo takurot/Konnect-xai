@@ -87,7 +87,10 @@ A persistence failure after the plan still returns the server-level
 `mutation_outcome_uncertain` or `conflict` result, not a per-item outcome.
 When the readback after a `batch_delete` or
 `batch_delete_schematic_components` write fails, the refusal keeps its kind
-and carries `status: uncertain`, `written: null` and an unsafe retry. The
+and carries `status: uncertain`, `written: null` and an unsafe retry; reload
+the sheet before retrying any item, including those listed in `failures`. A
+refusal raised before the write, such as a concurrent change, stays
+`status: failed` with `written: false`. The
 verified-commit errors of `group_components` and of
 `batch_edit_schematic_components` with native attributes keep their previous
 shape without `outcome`.

@@ -31,8 +31,9 @@ use super::sch_route_safety::{allow_join, check_route, route_segments};
 // Re-use the single-item component placer and pin-to-pin router.
 use super::sch_annotate::opt_string;
 use super::sch_components::{
-    commit_component_deletion, indexed_uuid_items, place_one_component, placed_component_readback,
-    plan_component_and_item_deletions, set_property_value, ComponentDeleteTargetError,
+    commit_component_deletion_checked, indexed_uuid_items, place_one_component,
+    placed_component_readback, plan_component_and_item_deletions, set_property_value,
+    ComponentDeleteTargetError, DeletionCommitError,
 };
 use super::sch_wiring::{
     add_stub_label, add_stub_wire, ambiguous_reference_result, resolve_pin_endpoint,
@@ -1821,14 +1822,14 @@ async fn handle_structural_batch_delete(
         Ok(plan) => plan,
         Err(error) => return Ok(result.refuse(&error.into_result(), None, &sch_path)),
     };
-    let deletion = match commit_component_deletion(&sch_path, plan)? {
+    let deletion = match commit_component_deletion_checked(&sch_path, plan)? {
         Ok(deletion) => deletion,
-        // A refusal after the write (failed readback) leaves the file
-        // changed; only an untouched file may be reported as not written.
-        Err(refusal) if std::fs::read_to_string(&sch_path).is_ok_and(|now| now == content) => {
+        Err(DeletionCommitError::Refused(refusal)) => {
             return Ok(result.refuse(&refusal, None, &sch_path))
         }
-        Err(refusal) => return Ok(result.uncertain(refusal, &sch_path)),
+        Err(DeletionCommitError::Unverified(refusal)) => {
+            return Ok(result.uncertain(refusal, &sch_path))
+        }
     };
 
     let deleted_references = selected_references
@@ -2668,9 +2669,11 @@ mod connectivity_safe_batch_delete_tests {
         let newer = CONNECTIVITY.replace("(paper \"A4\")", "(paper \"A3\")");
         std::fs::write(&path, &newer).unwrap();
 
-        let refusal = commit_component_deletion(&path, plan)
-            .unwrap()
-            .expect_err("stale batch must refuse");
+        let Err(DeletionCommitError::Refused(refusal)) =
+            commit_component_deletion_checked(&path, plan).unwrap()
+        else {
+            panic!("a batch planned from older bytes is refused before any write");
+        };
         assert_eq!(
             extract_error_kind(&refusal).as_deref(),
             Some("stale_target")

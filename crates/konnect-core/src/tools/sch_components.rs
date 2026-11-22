@@ -2398,28 +2398,50 @@ pub(crate) fn plan_component_and_item_deletions(
     })
 }
 
+/// Why a planned component deletion did not commit cleanly.
+pub(crate) enum DeletionCommitError {
+    /// Refused before anything was written.
+    Refused(CallToolResult),
+    /// Written, but the readback did not prove the deletion.
+    Unverified(CallToolResult),
+}
+
+impl DeletionCommitError {
+    pub(crate) fn into_result(self) -> CallToolResult {
+        match self {
+            Self::Refused(result) | Self::Unverified(result) => result,
+        }
+    }
+}
+
 pub(crate) fn commit_component_deletion(
     path: &std::path::Path,
     plan: ComponentDeletePlan,
 ) -> anyhow::Result<Result<ComponentDeleteOutcome, CallToolResult>> {
+    Ok(commit_component_deletion_checked(path, plan)?.map_err(DeletionCommitError::into_result))
+}
+
+pub(crate) fn commit_component_deletion_checked(
+    path: &std::path::Path,
+    plan: ComponentDeletePlan,
+) -> anyhow::Result<Result<ComponentDeleteOutcome, DeletionCommitError>> {
     if let Err(error) = commit_command(path, &plan.command) {
         if let Some(refusal) = component_delete_commit_refusal(path, &error) {
-            return Ok(Err(refusal));
+            return Ok(Err(DeletionCommitError::Refused(refusal)));
         }
         return Err(error.into());
     }
+    let unverified = |result: CallToolResult| Ok(Err(DeletionCommitError::Unverified(result)));
 
     let committed = read_consistent(path)?;
     let after_items = match indexed_uuid_items(path, &committed) {
         Ok(items) => items,
-        Err(error) => return Ok(Err(error.into_result())),
+        Err(error) => return unverified(error.into_result()),
     };
     let after_tree = match parse_sexp(&committed) {
         Ok(tree) => tree,
         Err(error) => {
-            return Ok(Err(
-                ComponentDeleteTargetError::from_sexp(path, error).into_result()
-            ));
+            return unverified(ComponentDeleteTargetError::from_sexp(path, error).into_result());
         }
     };
     for reference in plan.units_by_reference.keys() {
@@ -2428,11 +2450,15 @@ pub(crate) fn commit_component_deletion(
             .filter(|instance| instance.reference == *reference)
             .count();
         if remaining != 0 {
-            return Ok(Err(ComponentDeleteTargetError::stale(
-                path,
-                format!("post-write readback still contains {remaining} unit(s) of {reference}"),
-            )
-            .into_result()));
+            return unverified(
+                ComponentDeleteTargetError::stale(
+                    path,
+                    format!(
+                        "post-write readback still contains {remaining} unit(s) of {reference}"
+                    ),
+                )
+                .into_result(),
+            );
         }
     }
     for uuid in plan
@@ -2442,11 +2468,13 @@ pub(crate) fn commit_component_deletion(
         .chain(&plan.item_uuids)
     {
         if after_items.contains_key(uuid) {
-            return Ok(Err(ComponentDeleteTargetError::stale(
-                path,
-                format!("post-write readback still contains deleted item UUID {uuid}"),
-            )
-            .into_result()));
+            return unverified(
+                ComponentDeleteTargetError::stale(
+                    path,
+                    format!("post-write readback still contains deleted item UUID {uuid}"),
+                )
+                .into_result(),
+            );
         }
     }
 
