@@ -1,6 +1,6 @@
 //! Preflight new wire routes against the saved sheet before any mutation.
 use super::sch_connectivity::{
-    net_graph_for, net_graph_for_physical_links, ConnectivityIndex, NetGraph,
+    net_graph_for, net_graph_for_physical_links, ConnectivityIndex, NetGraph, NetRoot,
 };
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -21,12 +21,15 @@ fn on(p: Point, s: Segment) -> bool {
 fn segment(w: &Wire) -> Segment {
     ((w.x1, w.y1), (w.x2, w.y2))
 }
-pub(crate) fn route_segments(a: Point, b: Point) -> Vec<Segment> {
+/// Horizontal-first, then vertical-first; a straight pair has one route.
+fn route_candidates(a: Point, b: Point) -> Vec<Vec<Segment>> {
     if (a.0 - b.0).abs() < TOL || (a.1 - b.1).abs() < TOL {
-        vec![(a, b)]
-    } else {
-        vec![(a, (b.0, a.1)), ((b.0, a.1), b)]
+        return vec![vec![(a, b)]];
     }
+    [(b.0, a.1), (a.0, b.1)]
+        .into_iter()
+        .map(|corner| vec![(a, corner), (corner, b)])
+        .collect()
 }
 fn intersection(a: Segment, b: Segment) -> Option<Point> {
     for point in [a.0, a.1] {
@@ -71,15 +74,42 @@ pub(crate) fn check_route(
     named_net: Option<&str>,
     allow_join: bool,
 ) -> Result<(), CallToolResult> {
+    choose_route(tree, &[segments.to_vec()], endpoints, named_net, allow_join).map(|_| ())
+}
+
+fn choose_route(
+    tree: &SexpNode,
+    candidates: &[Vec<Segment>],
+    endpoints: &[Point],
+    named_net: Option<&str>,
+    allow_join: bool,
+) -> Result<Vec<Segment>, CallToolResult> {
     if allow_join {
-        return Ok(());
+        return Ok(candidates[0].clone());
     }
     let wires = extract_wires(tree);
     let labels = extract_all_net_labels(tree);
     let graph = net_graph_for(tree, &wires, &labels);
-    check_route_on_graph(tree, segments, endpoints, &wires, &labels, graph, |label| {
-        named_net == Some(label.net.as_str())
-    })
+    choose_route_on_graph(
+        tree,
+        candidates,
+        endpoints,
+        &wires,
+        &labels,
+        graph,
+        |label| named_net == Some(label.net.as_str()),
+    )
+}
+
+/// An L route between pin endpoints: horizontal-first unless only
+/// vertical-first keeps clear of unselected nets.
+pub(crate) fn select_route(
+    tree: &SexpNode,
+    a: Point,
+    b: Point,
+    allow_join: bool,
+) -> Result<Vec<Segment>, CallToolResult> {
+    choose_route(tree, &route_candidates(a, b), &[a, b], None, allow_join)
 }
 
 pub(crate) enum NamedStubRoute {
@@ -118,9 +148,9 @@ pub(crate) fn check_named_stub_route(
                 "The selected endpoint uses a different net name or label scope. Set allow_join: true to join the nets explicitly.",
             ));
         }
-        check_route_on_graph(
+        choose_route_on_graph(
             tree,
-            &[segment],
+            &[vec![segment]],
             &[(x, y)],
             &wires,
             &labels,
@@ -131,15 +161,17 @@ pub(crate) fn check_named_stub_route(
     Ok(NamedStubRoute::Write)
 }
 
-fn check_route_on_graph(
+/// The first candidate that joins no unselected net. When every candidate
+/// would, one refusal carries the hits of all of them.
+fn choose_route_on_graph(
     tree: &SexpNode,
-    segments: &[Segment],
+    candidates: &[Vec<Segment>],
     endpoints: &[Point],
     wires: &[Wire],
     labels: &[Label],
     mut graph: NetGraph,
     matches_request: impl Fn(&Label) -> bool,
-) -> Result<(), CallToolResult> {
+) -> Result<Vec<Segment>, CallToolResult> {
     let index = ConnectivityIndex::build(tree, wires, &[], labels, TOL);
     let mut allowed = HashSet::new();
     for &(x, y) in endpoints {
@@ -150,6 +182,44 @@ fn check_route_on_graph(
             allowed.insert(graph.root_at(label.x, label.y));
         }
     }
+    let mut hits = Vec::new();
+    for segments in candidates {
+        let route_hits = foreign_hits(tree, segments, &index, &mut graph, &allowed, wires, labels);
+        if route_hits.is_empty() {
+            return Ok(segments.clone());
+        }
+        for hit in route_hits {
+            if !hits.contains(&hit) {
+                hits.push(hit);
+            }
+        }
+    }
+    let message = if candidates.len() > 1 {
+        "Both the horizontal-first and the vertical-first route would join unselected nets; inspect the routes or explicitly set allow_join: true"
+    } else {
+        "Route would join unselected nets; inspect the route or explicitly set allow_join: true"
+    };
+    let mut nets: Vec<_> = hits.iter().map(|h| h.0.clone()).collect();
+    nets.sort();
+    nets.dedup();
+    Err(CallToolResult::error_kind(
+        ToolErrorKind::WouldJoinNets {
+            nets,
+            at: hits.into_iter().map(|(_, p)| [p.0, p.1]).collect(),
+        },
+        message,
+    ))
+}
+
+fn foreign_hits(
+    tree: &SexpNode,
+    segments: &[Segment],
+    index: &ConnectivityIndex,
+    graph: &mut NetGraph,
+    allowed: &HashSet<NetRoot>,
+    wires: &[Wire],
+    labels: &[Label],
+) -> Vec<(String, Point)> {
     let mut hits = Vec::new();
     for pin in index.placed_pins() {
         let root = graph.root_at(pin.at.0, pin.at.1);
@@ -194,19 +264,7 @@ fn check_route_on_graph(
             ));
         }
     }
-    if hits.is_empty() {
-        return Ok(());
-    }
-    let mut nets: Vec<_> = hits.iter().map(|h| h.0.clone()).collect();
-    nets.sort();
-    nets.dedup();
-    Err(CallToolResult::error_kind(
-        ToolErrorKind::WouldJoinNets {
-            nets,
-            at: hits.into_iter().map(|(_, p)| [p.0, p.1]).collect(),
-        },
-        "Route would join unselected nets; inspect the route or explicitly set allow_join: true",
-    ))
+    hits
 }
 /// Coordinate-selected endpoints explicitly select wires passing that point.
 /// Pin-selected endpoints must use `check_route`: an undotted pin midspan
@@ -217,13 +275,40 @@ pub(crate) fn check_coordinate_route(
     endpoints: &[Point],
     allow_join: bool,
 ) -> Result<(), CallToolResult> {
+    choose_route(
+        tree,
+        &[segments.to_vec()],
+        &coordinate_selection(tree, endpoints),
+        None,
+        allow_join,
+    )
+    .map(|_| ())
+}
+
+/// `select_route` for coordinate-selected endpoints.
+pub(crate) fn select_coordinate_route(
+    tree: &SexpNode,
+    a: Point,
+    b: Point,
+    allow_join: bool,
+) -> Result<Vec<Segment>, CallToolResult> {
+    choose_route(
+        tree,
+        &route_candidates(a, b),
+        &coordinate_selection(tree, &[a, b]),
+        None,
+        allow_join,
+    )
+}
+
+fn coordinate_selection(tree: &SexpNode, endpoints: &[Point]) -> Vec<Point> {
     let mut selected = endpoints.to_vec();
     for wire in extract_wires(tree) {
         if endpoints.iter().any(|point| on(*point, segment(&wire))) {
             selected.push((wire.x1, wire.y1));
         }
     }
-    check_route(tree, segments, &selected, None, allow_join)
+    selected
 }
 
 /// Junction candidates made by this wire only. Never repair unrelated tees.
