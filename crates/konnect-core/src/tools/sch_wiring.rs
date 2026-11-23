@@ -5,8 +5,8 @@
 
 use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
 use super::sch_route_safety::{
-    allow_join, check_coordinate_route, check_named_stub_route, check_route, local_junctions,
-    route_segments, NamedStubRoute,
+    allow_join, check_coordinate_route, check_named_stub_route, local_junctions,
+    select_coordinate_route, select_route, NamedStubRoute, Segment,
 };
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -391,7 +391,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "connect_pins",
             "Connect two component pins by reference and pin number. \
-             Looks up pin coordinates automatically and routes a wire between them.",
+             Looks up pin coordinates automatically and routes a wire between them \
+             (H+V, or V+H when only V+H avoids other nets).",
             json!({
                 "type": "object",
                 "properties": {
@@ -411,7 +412,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_schematic_connection",
-            "Connect two schematic points directly with a wire (auto-routes H+V segments). \
+            "Connect two schematic points directly with a wire (auto-routes H+V segments, \
+             or V+H when only V+H avoids other nets). \
              Use connect_pins if you have component references instead of coordinates.",
             json!({
                 "type": "object",
@@ -561,17 +563,11 @@ pub(crate) fn insert_wire_with_junctions(
     Ok(c)
 }
 
-/// Route a wire between two points: a single straight wire when axis-aligned,
-/// otherwise an H-then-V L-bend, each leg going through T-junction detection.
-pub(crate) fn route_between(
-    content: String,
-    x1: f64,
-    y1: f64,
-    x2: f64,
-    y2: f64,
-) -> anyhow::Result<String> {
+/// Write a route chosen by `select_route`, each leg going through T-junction
+/// detection.
+pub(crate) fn insert_route(content: String, route: &[Segment]) -> anyhow::Result<String> {
     let mut content = content;
-    for (a, b) in route_segments((x1, y1), (x2, y2)) {
+    for &(a, b) in route {
         content = insert_wire_with_junctions(content, a.0, a.1, b.0, b.1)?;
     }
     Ok(content)
@@ -3035,16 +3031,11 @@ async fn handle_connect_pins(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    if let Err(e) = check_route(
-        &tree,
-        &route_segments((x1, y1), (x2, y2)),
-        &[(x1, y1), (x2, y2)],
-        None,
-        allow,
-    ) {
-        return Ok(e);
-    }
-    let new_content = route_between(content, x1, y1, x2, y2)?;
+    let route = match select_route(&tree, (x1, y1), (x2, y2), allow) {
+        Ok(route) => route,
+        Err(e) => return Ok(e),
+    };
+    let new_content = insert_route(content, &route)?;
 
     write_schematic_if_unchanged(&sch_path, &expected, &new_content)?;
 
@@ -3187,15 +3178,11 @@ async fn handle_add_schematic_connection(
         Err(e) => return Ok(e),
     };
     let tree = parse_sexp(&content)?;
-    if let Err(e) = check_coordinate_route(
-        &tree,
-        &route_segments((x1, y1), (x2, y2)),
-        &[(x1, y1), (x2, y2)],
-        allow,
-    ) {
-        return Ok(e);
-    }
-    let content = route_between(content, x1, y1, x2, y2)?;
+    let route = match select_coordinate_route(&tree, (x1, y1), (x2, y2), allow) {
+        Ok(route) => route,
+        Err(e) => return Ok(e),
+    };
+    let content = insert_route(content, &route)?;
 
     write_schematic_if_unchanged(&sch_path, &expected, &content)?;
     Ok(CallToolResult::json(&json!({

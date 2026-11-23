@@ -74,7 +74,7 @@
 | Pin to a named net (signal bus) | `connect_to_net` | Adds stub + label, clean |
 | Pin to power rail | `add_power_symbol` | Creates net automatically |
 | Multiple pins to same net | `batch_connect_to_net` | Single atomic write |
-| Two points already known by coordinates | `add_schematic_connection` | Auto H+V routing |
+| Two points already known by coordinates | `add_schematic_connection` | Auto H+V routing, or V+H when only V+H avoids other nets |
 | Simple horizontal/vertical wire | `add_wire` | Manual, use sparingly |
 
 ## Net Label Types

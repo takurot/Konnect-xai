@@ -35,6 +35,16 @@ not change under `unchanged` instead of `moved`. `apply_template` reports the
 grid-snapped coordinates it placed and adds `warnings` for placements off the
 page.
 
+## Unreleased: vertical-first fallback for schematic L routes (#136)
+
+`connect_pins`, `batch_connect_pins` and `add_schematic_connection` still try
+the horizontal-first L route first. When it would join an unselected net, they
+now write the vertical-first route if that one is clear, instead of refusing.
+When both routes would join nets, the `would_join_nets` refusal keeps its
+shape: `nets` is the union of both routes' nets, and `at` lists the
+horizontal-first hits followed by the vertical-first hits, without repeating
+a hit both routes share. `allow_join: true` keeps the horizontal-first route.
+
 ## Unreleased: toolset changes and observed tool errors
 
 `load_toolset` reports only newly added tools in `tools_added` and `tools`.

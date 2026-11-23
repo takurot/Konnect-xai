@@ -31,7 +31,10 @@ fn context() -> ToolContext {
     )
 }
 
-fn route_fixture(duplicate: bool) -> (tempfile::TempDir, std::path::PathBuf, String) {
+fn route_fixture(
+    duplicate: bool,
+    block_vertical_first: bool,
+) -> (tempfile::TempDir, std::path::PathBuf, String) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("route.kicad_sch");
     let mut source = String::from(
@@ -46,6 +49,9 @@ fn route_fixture(duplicate: bool) -> (tempfile::TempDir, std::path::PathBuf, Str
     ] {
         source.push_str(&format!(r#"(symbol (lib_id "Test:P") (at {x} {y} 0) (unit 1) (uuid "{uuid}") (property "Reference" "{reference}"))"#));
     }
+    if block_vertical_first {
+        source.push_str(r#"(label "FOREIGN_V" (at 0 5 0))"#);
+    }
     source.push_str(r#"(label "FOREIGN" (at 5 0 0)))"#);
     std::fs::write(&path, &source).unwrap();
     (dir, path, source)
@@ -53,7 +59,7 @@ fn route_fixture(duplicate: bool) -> (tempfile::TempDir, std::path::PathBuf, Str
 
 #[tokio::test]
 async fn single_pin_route_refuses_foreign_net_without_writing() {
-    let (_dir, path, before) = route_fixture(false);
+    let (_dir, path, before) = route_fixture(false, true);
     let result = handle_connect_pins(
         &json!({"schematic":path,"ref1":"R1","pin1":"1","ref2":"R2","pin2":"1"}),
         &context(),
@@ -63,15 +69,83 @@ async fn single_pin_route_refuses_foreign_net_without_writing() {
     assert!(result.is_error);
     let encoded = serde_json::to_string(&result).unwrap();
     assert!(
-        encoded.contains("would_join_nets") && encoded.contains("FOREIGN"),
+        encoded.contains("would_join_nets")
+            && encoded.contains("FOREIGN")
+            && encoded.contains("FOREIGN_V"),
         "{encoded}"
     );
     assert_eq!(std::fs::read_to_string(path).unwrap(), before);
 }
 
+fn wire_set(path: &std::path::Path) -> Vec<[f64; 4]> {
+    let tree = parse_sexp(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let mut wires: Vec<_> = extract_wires(&tree)
+        .iter()
+        .map(|w| [w.x1, w.y1, w.x2, w.y2])
+        .collect();
+    wires.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    wires
+}
+
+const VERTICAL_FIRST: [[f64; 4]; 2] = [[0., 0., 0., 10.], [0., 10., 10., 10.]];
+
+#[tokio::test]
+async fn connect_pins_routes_vertical_first_when_horizontal_first_would_join_nets() {
+    let (_dir, path, _) = route_fixture(false, false);
+    let result = handle_connect_pins(
+        &json!({"schematic":path,"ref1":"R1","pin1":"1","ref2":"R2","pin2":"1"}),
+        &context(),
+    )
+    .await
+    .unwrap();
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(wire_set(&path), VERTICAL_FIRST);
+}
+
+#[tokio::test]
+async fn coordinate_connection_routes_vertical_first_when_horizontal_first_would_join_nets() {
+    let (_dir, path, _) = route_fixture(false, false);
+    let result = handle_add_schematic_connection(
+        &json!({"schematic":path,"x1":0,"y1":0,"x2":10,"y2":10}),
+        &context(),
+    )
+    .await
+    .unwrap();
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(wire_set(&path), VERTICAL_FIRST);
+}
+
+#[tokio::test]
+async fn coordinate_connection_to_sheet_pin_routes_vertical_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("route.kicad_sch");
+    std::fs::write(
+        &path,
+        r#"(kicad_sch (version 20260306) (uuid "root")
+      (lib_symbols (symbol "Test:P" (symbol "P_1_1"
+        (pin passive line (at 0 0 0) (length 1) (name "P") (number "1")))))
+      (symbol (lib_id "Test:P") (at 0 0 0) (unit 1) (uuid "r10") (property "Reference" "R10"))
+      (symbol (lib_id "Test:P") (at 5 0 0) (unit 1) (uuid "c1") (property "Reference" "C1"))
+      (label "FOREIGN" (at 5 0 0))
+      (sheet (at 10 10) (size 10 10) (uuid "child")
+        (property "Sheetname" "child" (at 10 9 0))
+        (property "Sheetfile" "child.kicad_sch" (at 10 21 0))
+        (pin "IN" input (at 10 10 180) (uuid "in"))))"#,
+    )
+    .unwrap();
+    let result = handle_add_schematic_connection(
+        &json!({"schematic":path,"x1":0,"y1":0,"x2":10,"y2":10}),
+        &context(),
+    )
+    .await
+    .unwrap();
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(wire_set(&path), VERTICAL_FIRST);
+}
+
 #[tokio::test]
 async fn duplicate_reference_has_structured_candidates_and_preserves_file() {
-    let (_dir, path, before) = route_fixture(true);
+    let (_dir, path, before) = route_fixture(true, false);
     let result = handle_connect_pins(
         &json!({"schematic":path,"ref1":"R1","pin1":"1","ref2":"R2","pin2":"1"}),
         &context(),
@@ -95,7 +169,7 @@ fn malformed_wire_source_is_not_silently_edited() {
 
 #[tokio::test]
 async fn uuid_selectors_disambiguate_references() {
-    let (_dir, path, _) = route_fixture(true);
+    let (_dir, path, _) = route_fixture(true, false);
     let result = handle_connect_pins(&json!({"schematic":path,"uuid1":"one","pin1":"1","uuid2":"two","pin2":"1","allow_join":true}),&context()).await.unwrap();
     assert!(!result.is_error, "{result:?}");
     let tree = parse_sexp(&std::fs::read_to_string(path).unwrap()).unwrap();

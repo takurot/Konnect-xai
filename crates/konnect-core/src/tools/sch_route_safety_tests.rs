@@ -6,7 +6,7 @@ fn tree(children: &str) -> SexpNode {
     parse_sexp(&format!("(kicad_sch {children})")).unwrap()
 }
 fn route() -> Vec<Segment> {
-    route_segments((0., 0.), (10., 10.))
+    HV.to_vec()
 }
 fn endpoints() -> [Point; 2] {
     [(0., 0.), (10., 10.)]
@@ -97,4 +97,86 @@ fn selecting_a_pin_already_joined_by_a_dot_authorizes_its_actual_wire_net() {
       (junction (at 0 0))"#,
     );
     assert!(check_route(&sheet, &route(), &endpoints(), None, false).is_ok());
+}
+
+const HV: [Segment; 2] = [((0., 0.), (10., 0.)), ((10., 0.), (10., 10.))];
+const VH: [Segment; 2] = [((0., 0.), (0., 10.)), ((0., 10.), (10., 10.))];
+
+fn refusal_body(error: &CallToolResult) -> serde_json::Value {
+    let crate::mcp::protocol::ToolContent::Text { text } = &error.content[0] else {
+        panic!("text")
+    };
+    serde_json::from_str(text).unwrap()
+}
+
+#[test]
+fn horizontal_first_route_is_kept_when_it_is_clear() {
+    let sheet = tree(r#"(label "FOREIGN" (at 0 5 0))"#);
+    assert_eq!(
+        select_route(&sheet, (0., 0.), (10., 10.), false).unwrap(),
+        HV
+    );
+}
+
+#[test]
+fn vertical_first_route_is_chosen_when_horizontal_first_would_join_nets() {
+    let sheet = tree(r#"(label "FOREIGN" (at 5 0 0))"#);
+    assert_eq!(
+        select_route(&sheet, (0., 0.), (10., 10.), false).unwrap(),
+        VH
+    );
+}
+
+#[test]
+fn coordinate_route_falls_back_to_vertical_first() {
+    let sheet = tree(r#"(wire (pts (xy 5 -5) (xy 5 5)) (uuid "foreign"))"#);
+    assert_eq!(
+        select_coordinate_route(&sheet, (0., 0.), (10., 10.), false).unwrap(),
+        VH
+    );
+}
+
+#[test]
+fn both_routes_blocked_reports_both_refusals() {
+    let sheet = tree(r#"(label "FOREIGN_H" (at 5 0 0)) (label "FOREIGN_V" (at 0 5 0))"#);
+    let error = select_route(&sheet, (0., 0.), (10., 10.), false).unwrap_err();
+    let body = refusal_body(&error);
+    assert_eq!(body["error"]["kind"], "would_join_nets");
+    assert_eq!(body["error"]["nets"], json!(["FOREIGN_H", "FOREIGN_V"]));
+    assert_eq!(body["error"]["at"], json!([[5.0, 0.0], [0.0, 5.0]]));
+}
+
+#[test]
+fn straight_route_has_no_alternative() {
+    let sheet = tree(r#"(label "FOREIGN" (at 5 0 0))"#);
+    let error = select_route(&sheet, (0., 0.), (10., 0.), false).unwrap_err();
+    let body = refusal_body(&error);
+    assert_eq!(body["error"]["at"], json!([[5.0, 0.0]]));
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Route would join"),
+        "{body}"
+    );
+}
+
+#[test]
+fn single_route_refusal_keeps_repeated_hits() {
+    let sheet =
+        tree(r#"(wire (pts (xy 5 -5) (xy 5 0)) (uuid "foreign")) (label "FOO" (at 5 0 0))"#);
+    let error = check_route(&sheet, &route(), &endpoints(), None, false).unwrap_err();
+    assert_eq!(
+        refusal_body(&error)["error"]["at"],
+        json!([[5.0, 0.0], [5.0, 0.0]])
+    );
+}
+
+#[test]
+fn override_keeps_horizontal_first_route() {
+    let sheet = tree(r#"(label "FOREIGN" (at 5 0 0))"#);
+    assert_eq!(
+        select_route(&sheet, (0., 0.), (10., 10.), true).unwrap(),
+        HV
+    );
 }
