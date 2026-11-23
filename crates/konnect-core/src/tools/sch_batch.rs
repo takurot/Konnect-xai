@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
-use super::sch_route_safety::{allow_join, check_route, route_segments};
+use super::sch_route_safety::{allow_join, check_route, select_route};
 // Re-use the single-item component placer and pin-to-pin router.
 use super::sch_annotate::opt_string;
 use super::sch_components::{
@@ -36,8 +36,8 @@ use super::sch_components::{
     ComponentDeleteTargetError, DeletionCommitError,
 };
 use super::sch_wiring::{
-    add_stub_label, add_stub_wire, ambiguous_reference_result, resolve_pin_endpoint,
-    resolve_placed_pin, route_between,
+    add_stub_label, add_stub_wire, ambiguous_reference_result, insert_route, resolve_pin_endpoint,
+    resolve_placed_pin,
 };
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -148,7 +148,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_connect_pins",
             "Connect multiple component pin pairs by reference and pin number, in a single \
-             file read/write cycle. \
+             file read/write cycle. Each pair routes H+V, or V+H when only V+H avoids other \
+             nets. \
              Writes per item: valid items land, each refused item is listed by \
              index in outcome.failures, and a call that applies nothing is an error \
              and writes nothing. \
@@ -1040,16 +1041,11 @@ async fn handle_batch_connect_pins(
     let mut new_content = content;
     for (index, (x1, y1, x2, y2)) in &resolved {
         let staged_tree = konnect_sexp::parse_sexp(&new_content)?;
-        if let Err(refusal) = check_route(
-            &staged_tree,
-            &route_segments((*x1, *y1), (*x2, *y2)),
-            &[(*x1, *y1), (*x2, *y2)],
-            None,
-            allow,
-        ) {
-            return Ok(result.refuse(&refusal, Some(*index), &sch_path));
-        }
-        new_content = route_between(new_content, *x1, *y1, *x2, *y2)?;
+        let route = match select_route(&staged_tree, (*x1, *y1), (*x2, *y2), allow) {
+            Ok(route) => route,
+            Err(refusal) => return Ok(result.refuse(&refusal, Some(*index), &sch_path)),
+        };
+        new_content = insert_route(new_content, &route)?;
         result.applied.push(*index);
     }
 
@@ -3001,6 +2997,10 @@ mod batch_place_and_connect_tests {
         assert_eq!(parsed["errors"].as_array().unwrap().len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "sch_batch_route_tests.rs"]
+mod route_tests;
 
 #[cfg(test)]
 mod midwire_pin_tests {
