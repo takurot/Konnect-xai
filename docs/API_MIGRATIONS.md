@@ -3,6 +3,110 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: one outcome for schematic batch tools (#133)
+
+These tools now return the shared `outcome` block that `batch_place_components`
+already used: `connect_pins_to_bus`, `batch_connect_to_net`,
+`batch_connect_pins`, `batch_edit_schematic_components`,
+`bulk_move_schematic_components`, `batch_place_components`,
+`batch_delete_schematic_components`, `batch_delete`, `group_components`,
+`batch_rotate_labels`, `batch_add_wire`, `batch_delete_schematic_wire` and
+`batch_delete_no_connect`. Existing response fields stay.
+
+`outcome` keeps `status`, `target`, `source`, `requested`, `completed`,
+`failed` and `retry`, and adds three fields:
+
+- `applied` lists the input indexes whose effect is in the file, including
+  items that were already satisfied.
+- `failures` lists the items at fault as `{index, kind, message}`. Kinds are
+  `invalid_item`, `not_found`, or the structured kind that refused the item.
+  A whole-batch refusal lists every item failure found before it, plus the
+  item that raised it.
+- `written` says whether the call changed the file.
+
+The issue proposed `status: none` and a `failed` list. `none` is spelled
+`failed`, the status the other adopted tools already use. `failed` stays a
+count of items not applied, so the list is `failures`. For an all-or-nothing
+tool, `failed` counts every item while `failures` names only the items at
+fault.
+
+A batch that applies no item is `isError: true`, writes nothing, and has
+`status: failed`. A batch where some items fail is `isError: false` with
+`status: partial`. Each tool description states its write contract:
+
+- Per item: `connect_pins_to_bus`, `batch_connect_to_net`,
+  `batch_connect_pins`, `batch_edit_schematic_components`,
+  `bulk_move_schematic_components`, `batch_place_components`,
+  `batch_delete_schematic_components`, `batch_delete`, `group_components`,
+  `batch_delete_schematic_wire`, `batch_delete_no_connect`.
+- All-or-nothing: `batch_add_wire`, `batch_rotate_labels`.
+
+Behaviour changes:
+
+- `batch_rotate_labels` is all-or-nothing and writes once. Before, it wrote
+  each label separately and stopped at the first missing label, leaving the
+  earlier labels rotated. Its error text "N earlier label(s) were already
+  rotated and written" is gone. A label named twice ends at its last
+  rotation.
+- An all-failed batch now has error kind `batch_failed`, with the message
+  `no batch item was applied: [index] reason; ...`. Before:
+  - `batch_delete`, `batch_delete_schematic_components` and
+    `group_components` returned `stale_target`.
+  - `batch_place_components` and `batch_connect_pins` returned a body without
+    a kind.
+  - `batch_delete_schematic_wire` and `batch_delete_no_connect` returned the
+    plain text `No wires deleted: ...` / `No no-connects deleted: ...`.
+  - `batch_rotate_labels` returned the plain text `labels[i] was not rotated:
+    ...`; a label with a non-numeric `x` or `y` was `invalid_argument` and is
+    now an `invalid_item` failure.
+  - `batch_edit_schematic_components` with a native attribute returned the
+    plain text `No fields or native attributes were updated: ...`; that text
+    is now the message of a `batch_failed` body.
+  - `connect_pins_to_bus`, `batch_connect_to_net`,
+    `batch_edit_schematic_components` and `bulk_move_schematic_components`
+    returned `isError: false`.
+- A whole-batch refusal that has its own kind (`would_join_nets`,
+  `ambiguous_reference`, `ambiguous_target`, `stale_target`,
+  `invalid_argument`) keeps it and gains the `outcome` block. This includes
+  `batch_add_wire`'s coordinate refusal, still `invalid_argument` naming
+  `wires[i].x1` (or the first missing coordinate), and
+  `batch_rotate_labels`'s `labels[i].rotation` refusal.
+- `connect_pins_to_bus`, `bulk_move_schematic_components`,
+  `batch_delete_schematic_wire` and `batch_delete_no_connect` no longer
+  rewrite the file when nothing changes.
+- `batch_edit_schematic_components` reports a missing component as
+  `Component 'R99' not found` (`not_found`), once per edit. Before, it
+  reported every requested field as `Field 'Value' not found on 'R99'`.
+  Field assignments within one edit still land one by one, so an edit with a
+  refused field can be in both `applied` and `failures`.
+- `bulk_move_schematic_components` and `batch_delete_schematic_wire` report a
+  non-string item as `invalid_item`. Before, they skipped it silently.
+- `batch_delete` counts indexes through `references`, then through `uuids`.
+
+A persistence failure after the plan still returns the server-level
+`mutation_outcome_uncertain` or `conflict` result, not a per-item outcome.
+When the readback after a `batch_delete` or
+`batch_delete_schematic_components` write fails, the refusal keeps its kind
+and carries `status: uncertain`, `written: null` and an unsafe retry; reload
+the sheet before retrying any item, including those listed in `failures`. A
+refusal raised before the write, such as a change found while planning or a
+KiCad editor lock, stays `status: failed` with `written: false`.
+
+Every saved-schematic command commit (`SchematicCommand`) now reports a
+readback that differs, or cannot be read, right after the atomic replace as
+`mutation_outcome_uncertain`, as `write_atomic_if_unchanged` already did.
+Before, a differing readback was `conflict`, or a `stale_target` refusal in
+`batch_delete`, `batch_delete_schematic_components`,
+`delete_schematic_component` and datasheet enrichment, and an unreadable one
+was a plain I/O error. Each read as a refusal that wrote nothing. The
+verified-commit errors of `group_components` and of
+`batch_edit_schematic_components` with native attributes keep their previous
+shape without `outcome`.
+
+`bulk_move_schematic_components` refuses the whole batch when a moved
+symbol has a unit without `(at …)`. Before, it reported that unit in
+`errors` and moved the others.
+
 ## Unreleased: schematic write validation (#132)
 
 Schematic write tools refuse values KiCad would clamp, move or flag, with

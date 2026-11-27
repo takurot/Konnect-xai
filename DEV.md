@@ -310,6 +310,7 @@ Tool-call failures are typed via the `ToolErrorKind` enum in `crates/konnect-cor
 | `mutation_outcome_uncertain` | A schematic edit committed, but immediate readback could not prove its requested result — carries `operation`, `path`, and `reason`; reload and inspect the named file before retrying because it may have changed |
 | `ambiguous_open_board` | KiCad answered, and its open-document list could not be read as a complete set of comparable board identities — carries `path`; neither the live nor the file path may run |
 | `invalid_configuration` | A Konnect preferences file (`config.json`, `.konnect/project.json`) exists but cannot be used — carries `path` and a `reason` starting `malformed_json:` or `unreadable:`; defaults are never substituted, because the next save would persist them over the user's settings |
+| `batch_failed` | A schematic batch tool applied none of its items, so nothing was written — carries `failed`; each item's index, kind and message are in `outcome.failures` |
 | `handler_error` | Catch-all for unmigrated `anyhow::Error` returns |
 
 ### Producing structured errors in a handler

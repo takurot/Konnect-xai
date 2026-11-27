@@ -160,6 +160,9 @@ pub enum ToolErrorKind {
     /// over the user's own settings (#580). `reason` starts with
     /// `malformed_json:` or `unreadable:`.
     InvalidConfiguration { path: String, reason: String },
+    /// Every item of a batch was refused, so nothing was written. Each item's
+    /// own kind and index are in the response's `outcome.failures`.
+    BatchFailed { failed: usize },
     /// Catch-all for handler `anyhow::Error` that hasn't been migrated yet.
     /// Eventually each variant above subsumes a subset of these.
     HandlerError { reason: String },
@@ -207,6 +210,7 @@ impl ToolErrorKind {
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::AmbiguousOpenBoard { .. } => "ambiguous_open_board",
             Self::InvalidConfiguration { .. } => "invalid_configuration",
+            Self::BatchFailed { .. } => "batch_failed",
             Self::HandlerError { .. } => "handler_error",
             Self::IpcOutcomeUnknown { .. } => "ipc_outcome_unknown",
             Self::IpcBatchRecovered { .. } => "ipc_batch_recovered",

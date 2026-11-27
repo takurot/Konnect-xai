@@ -334,7 +334,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "group_components",
-            "Add or update a group property on every placed unit of multiple components.",
+            "Add or update a group property on every placed unit of multiple components. \
+             Writes per item: valid items land, each refused item is listed by \
+             index in outcome.failures, and a call that applies nothing is an error \
+             and writes nothing.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2395,28 +2398,50 @@ pub(crate) fn plan_component_and_item_deletions(
     })
 }
 
+/// Why a planned component deletion did not commit cleanly.
+pub(crate) enum DeletionCommitError {
+    /// Refused before anything was written.
+    Refused(CallToolResult),
+    /// Written, but the readback did not prove the deletion.
+    Unverified(CallToolResult),
+}
+
+impl DeletionCommitError {
+    fn into_result(self) -> CallToolResult {
+        match self {
+            Self::Refused(result) | Self::Unverified(result) => result,
+        }
+    }
+}
+
 pub(crate) fn commit_component_deletion(
     path: &std::path::Path,
     plan: ComponentDeletePlan,
 ) -> anyhow::Result<Result<ComponentDeleteOutcome, CallToolResult>> {
+    Ok(commit_component_deletion_checked(path, plan)?.map_err(DeletionCommitError::into_result))
+}
+
+pub(crate) fn commit_component_deletion_checked(
+    path: &std::path::Path,
+    plan: ComponentDeletePlan,
+) -> anyhow::Result<Result<ComponentDeleteOutcome, DeletionCommitError>> {
     if let Err(error) = commit_command(path, &plan.command) {
         if let Some(refusal) = component_delete_commit_refusal(path, &error) {
-            return Ok(Err(refusal));
+            return Ok(Err(DeletionCommitError::Refused(refusal)));
         }
         return Err(error.into());
     }
+    let unverified = |result: CallToolResult| Ok(Err(DeletionCommitError::Unverified(result)));
 
     let committed = read_consistent(path)?;
     let after_items = match indexed_uuid_items(path, &committed) {
         Ok(items) => items,
-        Err(error) => return Ok(Err(error.into_result())),
+        Err(error) => return unverified(error.into_result()),
     };
     let after_tree = match parse_sexp(&committed) {
         Ok(tree) => tree,
         Err(error) => {
-            return Ok(Err(
-                ComponentDeleteTargetError::from_sexp(path, error).into_result()
-            ));
+            return unverified(ComponentDeleteTargetError::from_sexp(path, error).into_result());
         }
     };
     for reference in plan.units_by_reference.keys() {
@@ -2425,11 +2450,15 @@ pub(crate) fn commit_component_deletion(
             .filter(|instance| instance.reference == *reference)
             .count();
         if remaining != 0 {
-            return Ok(Err(ComponentDeleteTargetError::stale(
-                path,
-                format!("post-write readback still contains {remaining} unit(s) of {reference}"),
-            )
-            .into_result()));
+            return unverified(
+                ComponentDeleteTargetError::stale(
+                    path,
+                    format!(
+                        "post-write readback still contains {remaining} unit(s) of {reference}"
+                    ),
+                )
+                .into_result(),
+            );
         }
     }
     for uuid in plan
@@ -2439,11 +2468,13 @@ pub(crate) fn commit_component_deletion(
         .chain(&plan.item_uuids)
     {
         if after_items.contains_key(uuid) {
-            return Ok(Err(ComponentDeleteTargetError::stale(
-                path,
-                format!("post-write readback still contains deleted item UUID {uuid}"),
-            )
-            .into_result()));
+            return unverified(
+                ComponentDeleteTargetError::stale(
+                    path,
+                    format!("post-write readback still contains deleted item UUID {uuid}"),
+                )
+                .into_result(),
+            );
         }
     }
 
@@ -4198,14 +4229,34 @@ async fn handle_group_components(
     let mut item_ids = Vec::new();
     let mut targets = Vec::new();
     let mut errors = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut result = crate::outcome::BatchOutcome::new(refs.len());
+    let fail = |result: &mut crate::outcome::BatchOutcome,
+                errors: &mut Vec<String>,
+                index: usize,
+                kind: &str,
+                message: String| {
+        errors.push(message.clone());
+        result
+            .failures
+            .push(crate::outcome::ItemFailure::new(index, kind, message));
+    };
+    // A repeated reference is applied with its first occurrence; a repeat of
+    // a refused one is checked, and refused, on its own.
+    let mut grouped_indexes: BTreeMap<String, Vec<usize>> = BTreeMap::new();
 
-    for value in refs {
+    for (index, value) in refs.iter().enumerate() {
         let Some(reference) = value.as_str() else {
-            errors.push("Component reference must be a string".to_owned());
+            fail(
+                &mut result,
+                &mut errors,
+                index,
+                crate::outcome::INVALID_ITEM,
+                "Component reference must be a string".to_owned(),
+            );
             continue;
         };
-        if !seen.insert(reference.to_owned()) {
+        if let Some(indexes) = grouped_indexes.get_mut(reference) {
+            indexes.push(index);
             continue;
         }
         let target = match component_target_from_source(&sch_path, &expected, reference) {
@@ -4213,34 +4264,49 @@ async fn handle_group_components(
             Err(ComponentDeleteTargetError::Stale { reason, .. })
                 if reason.contains("is not present") =>
             {
-                errors.push(format!("Component '{reference}' not found"));
+                fail(
+                    &mut result,
+                    &mut errors,
+                    index,
+                    crate::outcome::NOT_FOUND,
+                    format!("Component '{reference}' not found"),
+                );
                 continue;
             }
-            Err(error) => return Ok(error.into_result()),
+            Err(error) => {
+                let refusal = error.into_result();
+                return Ok(result.refuse(&refusal, Some(index), &sch_path));
+            }
         };
         match set_property_value(&content, reference, "Group", &group_name, true) {
             Ok((updated, _)) => {
                 content = updated;
                 item_ids.extend(match target.item_ids() {
                     Ok(item_ids) => item_ids,
-                    Err(error) => return Ok(error.into_result()),
+                    Err(error) => {
+                        return Ok(result.refuse(&error.into_result(), Some(index), &sch_path))
+                    }
                 });
                 targets.push(target);
+                grouped_indexes.insert(reference.to_owned(), vec![index]);
             }
-            Err(error) => errors.push(format!("{reference}: {error}")),
+            Err(error) => fail(
+                &mut result,
+                &mut errors,
+                index,
+                crate::outcome::INVALID_ITEM,
+                format!("{reference}: {error}"),
+            ),
         }
     }
 
     if item_ids.is_empty() {
-        return Ok(ComponentDeleteTargetError::stale(
+        return Ok(crate::outcome::batch_result(
+            json!({ "grouped_count": 0, "grouped": [], "errors": errors }),
+            &result,
             &sch_path,
-            if errors.is_empty() {
-                "no components were selected".to_owned()
-            } else {
-                errors.join("; ")
-            },
-        )
-        .into_result());
+            crate::outcome::SAVED_FILE,
+        ));
     }
     let command = SchematicCommand::replace_items_from_document(
         &expected,
@@ -4281,14 +4347,22 @@ async fn handle_group_components(
     let observed_group_name = components[0]["fields"]["Group"].clone();
     let observed_schematic = components[0]["schematic"].clone();
 
-    Ok(CallToolResult::json(&json!({
-        "group_name": observed_group_name,
-        "grouped_count": grouped.len(),
-        "grouped": grouped,
-        "components": components,
-        "schematic": observed_schematic,
-        "errors": errors
-    })))
+    result.applied = grouped_indexes.into_values().flatten().collect();
+    result.applied.sort_unstable();
+    result.written = true;
+    Ok(crate::outcome::batch_result(
+        json!({
+            "group_name": observed_group_name,
+            "grouped_count": grouped.len(),
+            "grouped": grouped,
+            "components": components,
+            "schematic": observed_schematic,
+            "errors": errors
+        }),
+        &result,
+        &sch_path,
+        "saved_file_readback",
+    ))
 }
 
 async fn handle_update_symbols_from_library(

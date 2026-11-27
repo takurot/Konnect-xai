@@ -236,7 +236,11 @@ async fn batch_delete_with_only_unknown_uuids_errors_and_writes_nothing() {
         .await
         .unwrap();
     assert!(r.is_error);
-    assert!(text(&r).contains("No wires deleted"), "{}", text(&r));
+    assert!(
+        text(&r).contains("Wire UUID 'ghost' not found"),
+        "{}",
+        text(&r)
+    );
     assert_eq!(read(&path), before);
 }
 
@@ -584,7 +588,7 @@ async fn batch_delete_no_connect_refuses_when_nothing_matches_and_allows_an_empt
     .await
     .unwrap();
     assert!(
-        r.is_error && text(&r).contains("No no-connects deleted"),
+        r.is_error && text(&r).contains("No no-connect at (9, 9)"),
         "{}",
         text(&r)
     );

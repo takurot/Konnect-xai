@@ -91,9 +91,11 @@ content while setting `is_error`.
 
 Common error kinds include `toolset_not_loaded`, `unknown_tool`,
 `invalid_argument`, `file_not_found`, `conflict`, `stale_target`,
-`mutation_outcome_uncertain`, and `handler_error`. The uncertain-mutation kind
-means a commit occurred but readback did not prove its result, so the caller
-must reload and inspect the named file before retrying. Add a new kind in
+`mutation_outcome_uncertain`, `batch_failed`, and `handler_error`. The
+uncertain-mutation kind means a commit occurred but readback did not prove its
+result, so the caller must reload and inspect the named file before retrying.
+`batch_failed` means a schematic batch tool applied none of its items and wrote
+nothing; the per-item kinds are in `outcome.failures`. Add a new kind in
 `mcp/error.rs` only when callers need a stable new classification; use
 `CallToolResult::error_kind` to return it.
 

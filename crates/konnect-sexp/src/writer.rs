@@ -374,11 +374,9 @@ pub fn transact_atomic<T>(
 
     if next != current {
         write_atomic_unlocked(path, &next)?;
-        if std::fs::read_to_string(path)? != next {
-            return Err(SexpError::Conflict {
-                path: path.to_path_buf(),
-            });
-        }
+        // The file is already replaced, so a differing readback is an
+        // unknown outcome, not a refusal that wrote nothing.
+        verify_cas_readback(path, &next, std::fs::read_to_string(path))?;
     }
 
     Ok(result)
